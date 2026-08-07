@@ -1,0 +1,26 @@
+manifest_version: 1
+name: ocuclaw
+kind: platform
+version: 2.0.0
+description: >
+  OcuClaw platform adapter for the hermes gateway. Spawns the shared OcuClaw
+  Node runtime (glasses/phone relay, Even-AI endpoint, liveui engine) as a
+  supervised child and bridges it over an NDJSON-over-stdio control link.
+author: OcuClaw
+provides_tools:
+  - render_glasses_ui
+requires_env:
+  # Keep this relay-token-only. Hermes 0.19.0 uses requires_env for the
+  # install prompt but documents it as a load gate; listing optional Soniox
+  # or Even-AI secrets could disable the whole plugin if that gate is
+  # implemented by an in-range patch.
+  - name: OCUCLAW_RELAY_TOKEN
+    description: Token entered in the OcuClaw app's relay server token field
+    secret: true
+provides_hooks:
+  - on_session_end
+  - post_approval_response
+  - pre_tool_call
+  - post_tool_call
+  - post_api_request
+  - pre_llm_call

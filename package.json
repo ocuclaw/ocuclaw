@@ -1,0 +1,14 @@
+{
+  "name": "ocuclaw-hermes-runtime-bundle",
+  "private": true,
+  "description": "Runtime dependencies for the staged OcuClaw Hermes plugin bundle.",
+  "dependencies": {
+    "fflate": "^0.8.3",
+    "marked": "^18.0.7",
+    "undici": "^6.27.0",
+    "ws": "^8.21.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
