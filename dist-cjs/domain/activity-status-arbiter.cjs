@@ -1,6 +1,7 @@
 const RANK_INTERVENTION = "intervention";
 const RANK_GENERATED_SUMMARY = "generated_summary";
 const RANK_TOOL = "tool";
+const RANK_NARRATION = "narration";
 const RANK_GENERIC_THINKING = "generic_thinking";
 const RANK_QUIET = "quiet";
 
@@ -8,6 +9,7 @@ const RANKS = [
   RANK_INTERVENTION,
   RANK_GENERATED_SUMMARY,
   RANK_TOOL,
+  RANK_NARRATION,
   RANK_GENERIC_THINKING,
   RANK_QUIET,
 ];
@@ -18,6 +20,13 @@ function isInterventionSignal(s) {
     s.phaseIsError === true ||
     s.hasRateLimitInfo === true ||
     s.failoverPending === true
+  );
+}
+
+function isNarrationSignal(s) {
+  return (
+    typeof s.origin === "string" &&
+    s.origin.trim().toLowerCase() === "narration"
   );
 }
 
@@ -32,6 +41,8 @@ function classifyRank(signals) {
     return RANK_GENERATED_SUMMARY;
   }
   if (s.hasTool === true) return RANK_TOOL;
+
+  if (isNarrationSignal(s)) return RANK_NARRATION;
   if (s.isThinking === true && s.includeThinking === true) {
     return RANK_GENERIC_THINKING;
   }
@@ -73,4 +84,4 @@ function evaluateSummaryEligibility(thinkingSummarySource, label) {
   return true;
 }
 
-module.exports = { RANKS, RANK_INTERVENTION, RANK_GENERATED_SUMMARY, RANK_TOOL, RANK_GENERIC_THINKING, RANK_QUIET, evaluateSummaryEligibility, classifyRank };
+module.exports = { RANKS, RANK_INTERVENTION, RANK_GENERATED_SUMMARY, RANK_TOOL, RANK_NARRATION, RANK_GENERIC_THINKING, RANK_QUIET, evaluateSummaryEligibility, classifyRank };

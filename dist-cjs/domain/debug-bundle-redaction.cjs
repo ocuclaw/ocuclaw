@@ -27,7 +27,7 @@ const SAFE_KEYS = {
   "evenai": new Set([
     "requestId", "bodyBytes", "messageChars", "model", "extraSystemPromptChars",
     "routingMode", "sessionChanged", "listenEnabled", "dedupWindowMs",
-    "activeRequestId", "code", "elapsedMs", "timeoutMs", "textChars",
+    "activeRequestId", "code", "elapsedMs", "timeoutMs", "textChars", "failureReason",
   ]),
 
   "voice.timeline": new Set([
@@ -37,6 +37,10 @@ const SAFE_KEYS = {
 
   "voice.transport": new Set([
     "voiceSessionId", "trigger", "state", "transportMode",
+  ]),
+
+  "voice.ptt": new Set([
+    "provider", "endpointDetection", "count", "chars", "heldMs", "source",
   ]),
 
   "voice.waveform": new Set([

@@ -51,6 +51,27 @@ async function handleDebugBundleRequest(deps, clientId, msg) {
 
   const uploadDump = { ...dumpResult, events: filterUploadEvents(dumpResult.events) };
 
+  let connectionHealthDocument = null;
+  if (typeof deps.getConnectionHealthDocument === "function") {
+    try {
+      const candidate = await deps.getConnectionHealthDocument();
+      if (
+        candidate &&
+        typeof candidate === "object" &&
+        !Array.isArray(candidate) &&
+        (candidate.contract === "ocuclaw.connection-health-snapshot" ||
+          candidate.contract === "ocuclaw.connection-health-error") &&
+        candidate.contractVersion === 1
+      ) {
+        connectionHealthDocument = candidate;
+      } else {
+        connectionHealthDocument = connectionHealthError();
+      }
+    } catch {
+      connectionHealthDocument = connectionHealthError();
+    }
+  }
+
   try {
     const bundle = assembleBundle(uploadDump, {
       installId: msg.installId,
@@ -65,6 +86,7 @@ async function handleDebugBundleRequest(deps, clientId, msg) {
         const st = sanitizeCaptureState(msg.stateSnapshot);
         return st ? { atMs: deps.now(), ...st } : null;
       })(),
+      connectionHealthDocument,
     });
     deps.emit("bundle_assembled", {
       requestId: msg.requestId,
@@ -112,6 +134,16 @@ async function handleDebugBundleRequest(deps, clientId, msg) {
     deps.send(clientId, { type: "debug-bundle-error", requestId: msg.requestId, reason: "assembly_failed" });
     return;
   }
+}
+
+function connectionHealthError() {
+  return {
+    contract: "ocuclaw.connection-health-error",
+    contractVersion: 1,
+    generatedAt: new Date().toISOString(),
+    code: "snapshot_unavailable",
+    message: "The passive Connection Health Snapshot could not be generated.",
+  };
 }
 
 async function handleDebugBundleSave(deps, clientId, msg) {

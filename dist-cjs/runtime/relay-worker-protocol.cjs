@@ -8,6 +8,7 @@ const APP_PROTOCOL = Object.freeze({
   workerHealth: "ocuclaw.worker.health",
   protocolHelloAck: "protocolHelloAck",
   resumeAck: "ocuclaw.sync.resume.ack",
+  entries: "ocuclaw.ledger.entries",
   pages: "ocuclaw.view.pages.snapshot",
   status: "ocuclaw.runtime.status",
   debugConfigSnapshot: "ocuclaw.debug.config.snapshot",
@@ -33,6 +34,7 @@ const WORKER_FEATURES = Object.freeze([
   "worker-receipts",
   "worker-resume-metadata",
   "message-send-worker-queue",
+  "ledgerV1",
 ]);
 
 const DEFAULT_WORKER_QUEUE_CAPS = Object.freeze({
@@ -95,6 +97,12 @@ function parseNonNegativeRevision(value) {
 
 function parseNonNegativeInteger(value) {
   return parseNonNegativeRevision(value);
+}
+
+function parseOptionalInteger(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  return Number.isFinite(Number(value)) ? Math.floor(Number(value)) : null;
 }
 
 function parseNonNegativeDuration(value) {
@@ -251,14 +259,18 @@ function formatProtocolHelloAck(payload = {}) {
 }
 
 function formatResumeAck(payload = {}) {
+  const value = { ...payload };
   const msg = {
     type: APP_PROTOCOL.resumeAck,
-    reason: payload.reason || null,
-    sentPages: !!payload.sentPages,
-    sentStatus: !!payload.sentStatus,
-    sentApprovals: parseNonNegativeInteger(payload.sentApprovals) ?? 0,
-    pagesRevision: parseNonNegativeRevision(payload.pagesRevision),
-    statusRevision: parseNonNegativeRevision(payload.statusRevision),
+    reason: value.reason || null,
+    sentPages: !!value.sentPages,
+    sentEntries: !!value.sentEntries,
+    sentStatus: !!value.sentStatus,
+    sentApprovals: parseNonNegativeInteger(value.sentApprovals) ?? 0,
+    pagesRevision: parseNonNegativeRevision(value.pagesRevision),
+    entriesRevision: parseNonNegativeRevision(value.entriesRevision),
+    lastSeq: parseOptionalInteger(value.lastSeq),
+    statusRevision: parseNonNegativeRevision(value.statusRevision),
   };
   for (const key of [
     "workerEpoch",
@@ -266,22 +278,22 @@ function formatResumeAck(payload = {}) {
     "cachedPagesRevision",
     "cachedStatusRevision",
   ]) {
-    const parsed = parseNonNegativeRevision(payload[key]);
+    const parsed = parseNonNegativeRevision(value[key]);
     if (parsed !== null) msg[key] = parsed;
   }
   for (const key of ["workerRestarted", "mainStale", "resumeProvisional"]) {
-    if (payload[key] !== undefined) msg[key] = !!payload[key];
+    if (value[key] !== undefined) msg[key] = !!value[key];
   }
-  const cacheState = normalizeCacheState(payload.cacheState);
+  const cacheState = normalizeCacheState(value.cacheState);
   if (cacheState) msg.cacheState = cacheState;
   const workerOnlyPendingRequestIds = normalizeRequestIdList(
-    payload.workerOnlyPendingRequestIds,
+    value.workerOnlyPendingRequestIds,
   );
   if (workerOnlyPendingRequestIds) {
     msg.workerOnlyPendingRequestIds = workerOnlyPendingRequestIds;
   }
   const unresolvedWorkerPendingRequestIds = normalizeRequestIdList(
-    payload.unresolvedWorkerPendingRequestIds,
+    value.unresolvedWorkerPendingRequestIds,
   );
   if (unresolvedWorkerPendingRequestIds) {
     msg.unresolvedWorkerPendingRequestIds = unresolvedWorkerPendingRequestIds;

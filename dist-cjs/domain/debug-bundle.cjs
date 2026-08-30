@@ -107,6 +107,17 @@ function buildArtifacts(events, dumpResult, appliedQuery, opts, ringCapped) {
 
   files.set("README.md", renderBundleReadme(summary));
 
+  if (
+    opts.connectionHealthDocument &&
+    typeof opts.connectionHealthDocument === "object" &&
+    !Array.isArray(opts.connectionHealthDocument)
+  ) {
+    files.set(
+      "connection-health.json",
+      JSON.stringify(opts.connectionHealthDocument, null, 2) + "\n",
+    );
+  }
+
   const contentNames = [...files.keys()].filter((n) => n !== "metadata.json").sort();
   const concat = contentNames.map((n) => files.get(n)).join("");
   const contentSha256 = sha256Hex(strToU8(concat));

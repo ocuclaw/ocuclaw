@@ -106,6 +106,50 @@ def is_cancelling_slash(message: str) -> bool:
     return command in CANCELLING_SLASH_COMMANDS
 
 
+# The platform update command is refused for glasses sessions (P19). Running
+# it pulls Hermes past the baseline this bundle is certified against, in
+# place, with no proof the new tree still satisfies the Backend Adapter and
+# SessionDB contract — the wearer would lose a working assistant to a silent
+# pull. The one sanctioned transition is the supervised upgrade contract
+# (explicit restart, health re-verification, roll-forward-only recovery),
+# which is NOT this command.
+UPDATE_COMMANDS = ("update",)
+
+
+def is_platform_update_command(message: str) -> bool:
+    """True when the message's leading token is the platform update command.
+
+    The token is normalized the way hermes normalizes it, because anything
+    hermes accepts as ``/update`` must be refused here first. Hermes's
+    ``MessageEvent.get_command()`` strips leading whitespace, takes the first
+    whitespace-delimited token, lowercases it, and drops an ``@botname``
+    suffix; ``resolve_command()`` then lowercases again. So ``/UPDATE`` and
+    ``/update@ocuclaw`` both resolve to canonical ``update``.
+
+    Normalizing less than hermes does is what makes this a real gap rather
+    than a style point: an unrefused variant falls through to hermes's own
+    gate, which answers refused platforms with "run ``hermes update`` from
+    the terminal" — the exact instruction P19 exists to keep off the glasses.
+    The registry gate still blocks the update itself, so what leaks is the
+    wording, not the destructive act.
+    """
+    text = (message or "").strip()
+    token = text.split(None, 1)[0] if text else ""
+    if not token.startswith("/"):
+        return False
+    name = token[1:].casefold().split("@", 1)[0]
+    return name in UPDATE_COMMANDS
+
+
+def wall_clock_ms() -> int:
+    """Wall-clock milliseconds — the clock ``originAtMs`` is expressed in.
+
+    The ledger's own ``now`` is monotonic (durations, staleness); an origin
+    stamp has to be comparable against timestamps the consumer already holds.
+    """
+    return int(time.time() * 1000)
+
+
 @dataclass
 class DispatchRecord:
     run_id: str
@@ -129,6 +173,18 @@ class DispatchRecord:
     current_text: str = ""
     current_committed: bool = True  # nothing open yet
     stream_chunks: int = 0
+    # Wall-clock ms at which the CURRENT message was first sent — its ORIGIN
+    # (#1619). Hermes flushes an assistant message lazily on the next send(),
+    # so a tool-progress line commits after the tool output it introduces;
+    # the consumer re-splices it here. ``previous_origin_ms`` carries the same
+    # stamp for the message a fresh send just flushed.
+    current_origin_ms: Optional[int] = None
+    previous_origin_ms: Optional[int] = None
+    # The platform message id of the message a fresh send just flushed
+    # (#1691). Same shape and same reason as ``previous_origin_ms``: the
+    # commit that flush emits belongs to the PREVIOUS message, so it must
+    # carry the previous message's id, not the id this send just minted.
+    previous_message_id: Optional[str] = None
     # Media-carrying dispatch (drives the head-slot media-merge mirror).
     has_media: bool = False
     # Busy dispatches hermes merged into this head pending slot (photo/media
@@ -280,9 +336,16 @@ class DispatchLedger:
                 if record.current_message_id is not None and not record.current_committed
                 else None
             )
+            record.previous_origin_ms = (
+                record.current_origin_ms if previous is not None else None
+            )
+            record.previous_message_id = (
+                record.current_message_id if previous is not None else None
+            )
             record.current_message_id = message_id
             record.current_text = text
             record.current_committed = False
+            record.current_origin_ms = wall_clock_ms()
             record.stream_chunks += 1
             self._touch_record_locked(record)
             return record, previous, False
@@ -663,8 +726,24 @@ def lifecycle_terminal_activity(
     }
 
 
-def streaming_event(record: DispatchRecord, text: str) -> Dict[str, Any]:
-    return {
+def streaming_event(
+    record: DispatchRecord,
+    text: str,
+    *,
+    message_kind: Optional[str] = None,
+) -> Dict[str, Any]:
+    """One overlay paint of an assistant message's text-so-far.
+
+    ``message_kind`` carries the SAME routing tag the eventual commit will
+    carry, and it has to travel here too. Hermes commits an assistant message
+    lazily — on a host with ``display.platforms.ocuclaw.tool_progress: false``
+    there is no next ``send()`` until the turn's reply, so a progress note
+    written before a 12-second tool is not committed for those 12 seconds.
+    Routing only at commit time therefore leaves the note painted on the
+    display for the whole tool no matter which routing the wearer chose, and
+    all three ``agentProgressNotes`` settings look identical while it is up.
+    """
+    event: Dict[str, Any] = {
         "runId": record.run_id,
         "sessionKey": record.public_key,
         # CUMULATIVE by construction: the StreamConsumer hands the adapter the
@@ -673,27 +752,142 @@ def streaming_event(record: DispatchRecord, text: str) -> Dict[str, Any]:
         "rawAssistantChars": len(text),
         "firstGatewayChunk": record.stream_chunks <= 1,
     }
+    if message_kind:
+        event["messageKind"] = message_kind
+    if record.current_message_id:
+        event["messageId"] = record.current_message_id
+    return event
 
 
-def message_commit_event(record: DispatchRecord, text: str) -> Dict[str, Any]:
-    return {
+def message_commit_event(
+    record: DispatchRecord,
+    text: str,
+    *,
+    turn_active: bool = False,
+    message_kind: Optional[str] = None,
+    origin_at_ms: Optional[int] = None,
+    message_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """One committed assistant message.
+
+    ``turn_active`` marks a commit that lands while the run is still open (a
+    segment break, or a fresh send flushing the previous uncommitted message).
+    Without it the consumer treats every runId-carrying commit as the end of
+    the turn and tears the turn down mid-flight — status line blanked, thinking
+    finalized — on any agent that writes more than one message per turn.
+
+    ``message_kind`` is ROUTING only (``"narration"`` = a mid-turn sentence the
+    agent wrote to the wearer, not part of its answer). It never decides turn
+    lifecycle: an adapter running against a host with no narration hook emits
+    the same commits untagged, and those turns must still behave.
+
+    ``origin_at_ms`` is ORDERING only (#1619): wall-clock milliseconds at which
+    the model produced this text, which for a narration commit is nowhere near
+    when hermes committed it — hermes flushes an assistant message lazily on
+    the next ``send()``, so on a tool turn the note commits after the tool
+    progress line it announces. The consumer places the note at this position
+    instead of at the end. Absent on every commit that is not narration.
+
+    ``message_id`` is IDENTITY (#1691): the adapter-minted platform message id
+    of THIS message — the same token hermes was handed back as
+    ``SendResult.message_id`` and the same token ``DispatchLedger.note_edit``
+    binds edits to. The Node consumer reads it as ``data.id`` and stamps the
+    display entry ``idSource:"server"``. Without it every hermes assistant
+    commit is ``derived``, and ONE derived entry drops the whole session to
+    the legacy flattened-Pages fallback (#1685/#1690). It is deliberately NOT
+    the hermes SessionDB row id: that id is minted by hermes' own persistence
+    lane after this send returns and is unknowable at commit time — see
+    PROTOCOL.md "Message identity on commits" for why the live and rehydrated
+    namespaces are allowed to differ.
+    """
+    event: Dict[str, Any] = {
         "sessionKey": record.public_key,
         "runId": record.run_id,
         "role": "assistant",
         "content": [{"type": "text", "text": text}],
     }
+    if message_id:
+        event["id"] = str(message_id)
+    if turn_active:
+        event["turnActive"] = True
+    if message_kind:
+        event["messageKind"] = message_kind
+    if isinstance(origin_at_ms, int) and origin_at_ms > 0:
+        event["originAtMs"] = origin_at_ms
+    return event
+
+
+def message_retag_event(
+    record: DispatchRecord,
+    text: str,
+    *,
+    message_kind: str = "narration",
+    origin_at_ms: Optional[int] = None,
+    message_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Correct the kind of an ALREADY-COMMITTED message.
+
+    Rides the existing ``message`` event with ``retag:true`` because the
+    child's bridge event names are frozen — and because a retag is a
+    correction to a message, not a new lane. It carries no ``content``: the
+    commit it corrects already delivered that.
+
+    ``message_id`` (#1691) names the commit being corrected outright, so the
+    consumer no longer has to guess. ``text`` (whitespace-normalized) stays on
+    the wire as the FALLBACK match: a retag can name a message whose commit
+    this adapter never minted an id for (a pre-#1691 host, or a commit that
+    landed through a path with no ledger record), and the mid-reveal prefix
+    upgrade is a text operation regardless — the retag carries the finished
+    sentence the truncated commit is a prefix of.
+
+    ``origin_at_ms`` rides along for the same reason it rides the commit: a
+    retag that keeps the message (notes → conversation) must also move it back
+    to where it belongs on the page (#1619).
+    """
+    event: Dict[str, Any] = {
+        "retag": True,
+        "sessionKey": record.public_key,
+        "runId": record.run_id,
+        "messageKind": message_kind,
+        "text": " ".join(str(text or "").split()),
+    }
+    if message_id:
+        event["id"] = str(message_id)
+    if isinstance(origin_at_ms, int) and origin_at_ms > 0:
+        event["originAtMs"] = origin_at_ms
+    return event
 
 
 def uncorrelated_message_event(
-    session_identity: Dict[str, Any], text: str
+    session_identity: Dict[str, Any],
+    text: str,
+    *,
+    message_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Delivery with no ledger record (cron deliver='origin', foreign-origin
-    turns): the main-lane consumer reads runId null-tolerantly."""
-    return {
+    turns): the main-lane consumer reads runId null-tolerantly.
+
+    It carries ``originAtMs`` = NOW, which never moves this message (its origin
+    IS its commit position) but gives the consumer something to sort a later
+    lazily-flushed commit against. Without it a tool OUTPUT — which arrives on
+    this path — is an unstamped wall the tool-progress line cannot be spliced
+    past, and the turn keeps reading note -> output -> command (#1619).
+
+    It carries ``message_id`` for the same reason a correlated commit does
+    (#1691): these messages are real conversation entries, and ONE of them
+    without an id is enough to drop the whole session off ledgerV1. There is
+    no dispatch record here, so the caller passes the id it minted for this
+    send (or mints a fresh one).
+    """
+    event: Dict[str, Any] = {
         "sessionIdentity": dict(session_identity),
         "role": "assistant",
         "content": [{"type": "text", "text": text}],
+        "originAtMs": wall_clock_ms(),
     }
+    if message_id:
+        event["id"] = str(message_id)
+    return event
 
 
 def status_activity(
@@ -742,6 +936,7 @@ def agent_end_hook_frame(
     *,
     public_key: Optional[str] = None,
     agent_id: Optional[str] = None,
+    run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     ctx: Dict[str, Any] = {}
     if public_key:
@@ -750,6 +945,12 @@ def agent_end_hook_frame(
         ctx["sessionIdentity"] = dict(session_identity)
     if agent_id:
         ctx["agentId"] = agent_id
+    # run_id is OPTIONAL — back-compat with older children that never sent
+    # it. When present, it lets readAgentRunId report the exact
+    # runIdSource "host_hook" instead of falling back to the relay-side
+    # run tracker (#1525).
+    if run_id:
+        ctx["runId"] = run_id
     event: Dict[str, Any] = {}
     if messages is not None:
         event["messages"] = messages

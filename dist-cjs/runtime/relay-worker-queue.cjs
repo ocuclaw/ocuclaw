@@ -1,4 +1,4 @@
-const { formatSendAck, formatWorkerOperationReceived, formatWorkerQueueTimeoutAck, formatWorkerRestartUncertainAck, normalizeRequestId, } = require("./relay-worker-protocol.cjs");
+const { formatSendAck, formatWorkerOperationReceived, formatWorkerQueueTimeoutAck, formatWorkerRestartUncertainAck, normalizeRequestId } = require("./relay-worker-protocol.cjs");
 
 const DEFAULT_MAX_ENTRIES = 32;
 const DEFAULT_TTL_MS = 30_000;

@@ -1,4 +1,5 @@
 const { normalizeEvenAiRoutingMode } = require("../even-ai/even-ai-settings-store.cjs");
+const { DEFAULT_STAGE_GRACE_MS, MIN_STAGE_GRACE_MS, MAX_STAGE_GRACE_MS } = require("../tools/glasses-ui-limits.cjs");
 
 const OPENCLAW_BUNDLE_DEFAULT_WS_PORT = 9000;
 const HERMES_FRESH_INSTALL_WS_PORT_CANDIDATES = Object.freeze([
@@ -165,7 +166,15 @@ function resolveGlassesUiLive(value) {
       : [],
 
     llmEnabled: parseBool(raw.llmEnabled, false),
-    maxConcurrentSurfacesPerHost: parseIntOrDefault(raw.maxConcurrentSurfacesPerHost, 4),
+
+    maxConcurrentSurfacesPerHost: clampInt(raw.maxConcurrentSurfacesPerHost, 1, 64, 4),
+
+    stageGraceMs: clampInt(
+      raw.stageGraceMs,
+      MIN_STAGE_GRACE_MS,
+      MAX_STAGE_GRACE_MS,
+      DEFAULT_STAGE_GRACE_MS,
+    ),
   };
 }
 
@@ -277,4 +286,4 @@ function createRuntimeConfig(opts = {}) {
   };
 }
 
-module.exports = { createRuntimeConfig, HERMES_BUNDLE_DEFAULT_WS_PORT, HERMES_FRESH_INSTALL_WS_PORT_CANDIDATES };
+module.exports = { createRuntimeConfig, HERMES_BUNDLE_DEFAULT_WS_PORT, HERMES_FRESH_INSTALL_WS_PORT_CANDIDATES, DEFAULT_STAGE_GRACE_MS, MIN_STAGE_GRACE_MS, MAX_STAGE_GRACE_MS };

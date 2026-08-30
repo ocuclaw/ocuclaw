@@ -9,6 +9,8 @@ in a worker thread via ``asyncio.to_thread``.
 from __future__ import annotations
 
 import asyncio
+import inspect
+import math
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -23,6 +25,7 @@ GW_METHOD_AGENT_IDENTITY = "gw.agent.identity"
 GW_METHOD_PROFILES_LIST = "gw.profiles.list"
 GW_METHOD_PROFILES_SOUL = "gw.profiles.soul"
 GW_METHOD_SKILLS_STATUS = "gw.skills.status"
+GW_METHOD_COMMANDS_LIST = "gw.commands.list"
 
 DEFAULT_NAMESPACE = "main"
 DEFAULT_PROFILE = "default"
@@ -31,6 +34,32 @@ ROUTABLE_USAGE_PROVIDERS: Tuple[str, ...] = (
     "openai-codex",
     "openrouter",
 )
+CODEX_SESSION_WINDOW_MAX_SECONDS = (5 * 60 * 60) + 60
+
+
+def _usage_window_label(
+    provider: str,
+    label: str,
+    *,
+    fetched_at: Optional[float],
+    reset_at: Optional[float],
+) -> str:
+    """Correct an upstream Codex label only when the reset proves it is wrong.
+
+    Hermes currently names Codex's ``primary_window`` "Session", but the Codex
+    backend can put a seven-day-only allowance in that slot. A reset more than
+    five hours away cannot belong to the five-hour session window, so expose it
+    as weekly. Shorter/unknown windows keep Hermes's label rather than guessing.
+    """
+    if (
+        provider == "openai-codex"
+        and label.strip().lower() in {"session", "current session"}
+        and fetched_at is not None
+        and reset_at is not None
+        and reset_at - fetched_at > CODEX_SESSION_WINDOW_MAX_SECONDS
+    ):
+        return "Weekly"
+    return label
 
 
 def profile_for_namespace(ns: Any) -> str:
@@ -50,7 +79,8 @@ def load_profile_routing_snapshot() -> Tuple[bool, Dict[str, Path]]:
     try:
         from gateway.config import load_gateway_config
 
-        multiplex = bool(load_gateway_config().multiplex_profiles)
+        gateway_config = load_gateway_config()
+        multiplex = bool(gateway_config.multiplex_profiles)
     except Exception:  # noqa: BLE001
         return False, {}
     if not multiplex:
@@ -59,7 +89,14 @@ def load_profile_routing_snapshot() -> Tuple[bool, Dict[str, Path]]:
     try:
         from hermes_cli.profiles import profiles_to_serve
 
-        rows = profiles_to_serve(multiplex=True)
+        kwargs: Dict[str, Any] = {"multiplex": True}
+        if "profile_allowlist" in inspect.signature(profiles_to_serve).parameters:
+            kwargs["profile_allowlist"] = getattr(
+                gateway_config,
+                "multiplex_profile_allowlist",
+                None,
+            )
+        rows = profiles_to_serve(**kwargs)
         return True, {
             namespace_for_profile(name): Path(home)
             for name, home in rows
@@ -115,6 +152,29 @@ def _timestamp(value: Any) -> Optional[float]:
         return None
 
 
+# OcuClaw-lane suppressions for gw.commands.list. Both are gateway_only=True,
+# so hermes_cli.commands._is_gateway_available lets them through, but neither
+# is addressable from the phone composer: /start acks a platform START ping
+# and /topic configures Telegram DM topic sessions. Editorial, not structural
+# — keep the set tiny, and do NOT grow it into a second filter.
+_LANE_HIDDEN_COMMANDS = frozenset({"start", "topic"})
+
+# Fill these WITHOUT a trailing space (hermes's TUI picker convention, kept
+# here for byte-parity). Hermes tokenizes with ``split(maxsplit=1)``, so this
+# is cosmetic, not correctness. ``skin`` is deliberately absent: it is
+# cli_only and never reaches this lane.
+_PICKER_NO_TRAILING_SPACE = frozenset({"model", "personality"})
+
+
+def _slug(raw: Any) -> str:
+    """The literal wire token for a command name.
+
+    Pre-slugified server-side so the palette's inserted text can never be
+    rewritten downstream by ``translateHermesSkillSlash``.
+    """
+    return str(raw or "").strip().lstrip("/").replace("_", "-").lower()
+
+
 class GwRpc:
     """Link RPC handlers for the W07 gateway read plane."""
 
@@ -141,6 +201,7 @@ class GwRpc:
             GW_METHOD_PROFILES_LIST: self.profiles_list,
             GW_METHOD_PROFILES_SOUL: self.profiles_soul,
             GW_METHOD_SKILLS_STATUS: self.skills_status,
+            GW_METHOD_COMMANDS_LIST: self.commands_list,
         }
 
     async def list_models(self, params: Any) -> Dict[str, Any]:
@@ -166,6 +227,9 @@ class GwRpc:
 
     async def skills_status(self, params: Any) -> Dict[str, Any]:
         return await asyncio.to_thread(self._sync_skills_status, params)
+
+    async def commands_list(self, params: Any) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._sync_commands_list, params)
 
     def _sync_list_models(self, _params: Any) -> Dict[str, Any]:
         try:
@@ -306,11 +370,20 @@ class GwRpc:
         providers: List[Dict[str, Any]] = []
         fetched_times: List[float] = []
         for provider in self._usage_candidates():
+            provider_config = PROVIDER_REGISTRY.get(provider)
+            display_name = _clean_str(getattr(provider_config, "name", None))
+            provider_row: Dict[str, Any] = {
+                "provider": provider,
+                "displayName": display_name or provider.title(),
+                "windows": [],
+            }
             try:
                 snapshot = fetch_account_usage(provider)
             except Exception:  # noqa: BLE001
-                continue
-            if snapshot is None or not bool(getattr(snapshot, "available", False)):
+                snapshot = None
+            if snapshot is None:
+                provider_row["unavailableReason"] = "Usage data is unavailable."
+                providers.append(provider_row)
                 continue
             fetched_at = _timestamp(getattr(snapshot, "fetched_at", None))
             if fetched_at is not None:
@@ -318,23 +391,35 @@ class GwRpc:
             windows = []
             for window in getattr(snapshot, "windows", ()) or ():
                 label = str(getattr(window, "label", "") or "")
-                row: Dict[str, Any] = {"label": label}
                 used_percent = getattr(window, "used_percent", None)
-                if used_percent is not None:
-                    row["usedPercent"] = float(used_percent)
+                try:
+                    numeric_percent = float(used_percent)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(numeric_percent):
+                    continue
+                row: Dict[str, Any] = {
+                    "usedPercent": numeric_percent,
+                }
                 reset_at = _timestamp(getattr(window, "reset_at", None))
+                row["label"] = _usage_window_label(
+                    provider,
+                    label,
+                    fetched_at=fetched_at,
+                    reset_at=reset_at,
+                )
                 if reset_at is not None:
                     row["resetAt"] = reset_at
                 windows.append(row)
-            provider_config = PROVIDER_REGISTRY.get(provider)
-            display_name = _clean_str(getattr(provider_config, "name", None))
-            providers.append(
-                {
-                    "provider": provider,
-                    "displayName": display_name or provider.title(),
-                    "windows": windows,
-                }
+            provider_row["windows"] = windows
+            unavailable_reason = _clean_str(
+                getattr(snapshot, "unavailable_reason", None)
             )
+            if not windows:
+                provider_row["unavailableReason"] = unavailable_reason or (
+                    "Percentage limits are unavailable for this account."
+                )
+            providers.append(provider_row)
         return {
             "updatedAt": max(fetched_times) if fetched_times else time.time(),
             "providers": providers,
@@ -411,6 +496,9 @@ class GwRpc:
                 "name": profile_name,
                 "isDefault": bool(getattr(profile, "is_default")),
             }
+            display_name = _clean_str(getattr(profile, "display_name", None))
+            if display_name:
+                row["displayName"] = display_name
             model = getattr(profile, "model", None)
             if model:
                 row["model"] = model
@@ -468,3 +556,101 @@ class GwRpc:
                 }
             )
         return {"skills": rows}
+
+    def _sync_commands_list(self, _params: Any) -> Dict[str, Any]:
+        """Gateway-available slash commands, pre-slugified.
+
+        The predicate is hermes's OWN gateway lens —
+        ``_is_gateway_available(cmd, _resolve_config_gates())`` — not the TUI's
+        ``commands.catalog`` filter, which drops ``gateway_only`` commands
+        because it serves the CLI. The phone IS a gateway surface, so
+        ``gateway_only`` rows (/pause, /approve, /deny, /commands, /restart,
+        /platform, /sethome) are exactly the ones we can run. ``busy_policy``
+        is carried as display state and never filters: filtering on it would
+        make the palette flicker as turns start and end.
+
+        Skills are NOT included — they ride ``gw.skills.status`` and merge
+        client-side.
+        """
+        try:
+            from hermes_cli.commands import (
+                COMMAND_REGISTRY,
+                _is_gateway_available,
+                _iter_plugin_command_entries,
+                _resolve_config_gates,
+            )
+        except Exception:  # noqa: BLE001 - older/absent hermes => empty catalog
+            return {"commands": []}
+
+        try:
+            # Hoisted once per call, never per command.
+            overrides = _resolve_config_gates()
+        except Exception:  # noqa: BLE001 - config read failure => gates closed
+            overrides = set()
+
+        rows: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+
+        for cmd in COMMAND_REGISTRY:
+            if getattr(cmd, "name", None) in _LANE_HIDDEN_COMMANDS:
+                continue
+            try:
+                if not _is_gateway_available(cmd, overrides):
+                    continue
+            except Exception:  # noqa: BLE001 - a malformed row is not a lane outage
+                continue
+            name = _slug(getattr(cmd, "name", None))
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            args_hint = str(getattr(cmd, "args_hint", "") or "").strip()
+            row: Dict[str, Any] = {
+                "name": name,
+                "description": str(getattr(cmd, "description", "") or ""),
+                "category": str(getattr(cmd, "category", "") or ""),
+                "source": "builtin",
+                "instantSend": args_hint == "",
+                "noTrailingSpace": name in _PICKER_NO_TRAILING_SPACE,
+                "busyPolicy": str(getattr(cmd, "busy_policy", "") or "reject"),
+            }
+            aliases = [
+                alias
+                for alias in (
+                    _slug(raw) for raw in (getattr(cmd, "aliases", ()) or ())
+                )
+                if alias and alias != name
+            ]
+            if aliases:
+                row["aliases"] = aliases
+            if args_hint:
+                row["argsHint"] = args_hint
+            subcommands = getattr(cmd, "subcommands", ()) or ()
+            if subcommands:
+                row["subcommands"] = [str(sub) for sub in subcommands]
+            rows.append(row)
+
+        try:
+            plugin_entries = _iter_plugin_command_entries()
+        except Exception:  # noqa: BLE001 - plugin discovery is best-effort
+            plugin_entries = []
+        for raw_name, description, plugin_args_hint in plugin_entries or ():
+            name = _slug(raw_name)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            hint = str(plugin_args_hint or "").strip()
+            plugin_row: Dict[str, Any] = {
+                "name": name,
+                "description": str(description or ""),
+                "category": "",
+                "source": "plugin",
+                "instantSend": hint == "",
+                "noTrailingSpace": False,
+                "busyPolicy": "reject",
+            }
+            if hint:
+                plugin_row["argsHint"] = hint
+            rows.append(plugin_row)
+
+        rows.sort(key=lambda entry: entry["name"])
+        return {"commands": rows}

@@ -12,6 +12,7 @@ const DEFAULT_DEBUG_CATEGORIES = Object.freeze([
   "sdk.frames",
   "sdk.results",
   "sdk.events",
+  "sdk.events.menu",
   "sdk.events.summary",
   "sdk.events.raw",
   "app.timeline",
@@ -21,6 +22,7 @@ const DEFAULT_DEBUG_CATEGORIES = Object.freeze([
   "probe.runtime.bridge",
   "probe.runtime.bridge_timing",
   "probe.perf.conversation_upgrade",
+  "probe.perf.streaming_timing",
   "app.state.diff",
   "render.ownership",
   "render.virtual_pager",
@@ -33,9 +35,11 @@ const DEFAULT_DEBUG_CATEGORIES = Object.freeze([
   "probe.webview.trace",
   "session.timeline",
   "approvals.timeline",
+  "liveui.library.events",
   "approvals.state",
   "voice.timeline",
   "voice.transport",
+  "voice.ptt",
   "voice.waveform",
   "evenai",
   "audio.pipeline",
@@ -44,6 +48,10 @@ const DEFAULT_DEBUG_CATEGORIES = Object.freeze([
   "workflow.profile",
   "workflow.run",
   "hermes.link",
+
+  "activity.status",
+
+  "thinking.stream",
 ]);
 
 const DEBUG_CATEGORY_ALIASES = Object.freeze({
@@ -59,9 +67,11 @@ const DEBUG_CATEGORY_ALIASES = Object.freeze({
   "voice.timeline": Object.freeze([
     "voice.timeline",
     "voice.transport",
+    "voice.ptt",
   ]),
   "sdk.events": Object.freeze([
     "sdk.events",
+    "sdk.events.menu",
     "sdk.events.summary",
     "sdk.events.raw",
   ]),

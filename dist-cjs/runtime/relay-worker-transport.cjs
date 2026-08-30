@@ -1,12 +1,13 @@
 const http = require("node:http");
 const { monitorEventLoopDelay } = require("node:perf_hooks");
 const WebSocketModule = require("ws");
-const { APP_PROTOCOL, WORKER_FEATURES, estimateJsonByteLength, formatProtocolHelloAck, formatResumeAck, formatSendAck, normalizeRequestId, parseMessageType, parseNonNegativeRevision, } = require("./relay-worker-protocol.cjs");
+const { APP_PROTOCOL, WORKER_FEATURES, estimateJsonByteLength, formatProtocolHelloAck, formatResumeAck, formatSendAck, normalizeRequestId, parseMessageType, parseNonNegativeRevision } = require("./relay-worker-protocol.cjs");
 const { createWorkerMessageSendQueue } = require("./relay-worker-queue.cjs");
 const { createRelayWorkerHealthMonitor } = require("./relay-worker-health.cjs");
 const { createApprovalReplayCache } = require("./relay-worker-approval-replay-cache.cjs");
 const { createRelayClientNudgeController } = require("./relay-client-nudge-controller.cjs");
 const { constantTimeEqual } = require("../domain/constant-time-equal.cjs");
+const { PAIRING_CONTROL_MAX_REQUEST_BODY_BYTES, PAIRING_MAX_REQUEST_BODY_BYTES, isPairingControlPath, isPairingEndpointPath } = require("../domain/pairing/pairing-endpoint-address.cjs");
 const { activeBackendDisplayName } = require("../gateway/backend-contract.cjs");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
 
@@ -96,9 +97,12 @@ function createRelayWorkerTransport(options = {}) {
   const pendingHttp = new Map();
   const cache = {
     pages: null,
+    entries: null,
     status: null,
     debugConfig: null,
     pagesRevision: null,
+    entriesRevision: null,
+    lastSeq: -1,
     statusRevision: null,
     lastMainFrameAtMs: null,
     lastMainStatusAtMs: null,
@@ -129,7 +133,7 @@ function createRelayWorkerTransport(options = {}) {
         return;
       }
     }
-    broadcastApp(frame, { afterCoalescable: true });
+    broadcastApp(frame, { afterCoalescable: true, knownType: type });
   }
 
   function emitDebug(event, severity, data) {
@@ -149,7 +153,7 @@ function createRelayWorkerTransport(options = {}) {
   }
 
   function cacheState() {
-    if (!cache.pages && !cache.status && !cache.debugConfig) return "empty";
+    if (!cache.pages && !cache.entries && !cache.status && !cache.debugConfig) return "empty";
     if (isMainStale()) return "stale";
     return "fresh";
   }
@@ -157,15 +161,19 @@ function createRelayWorkerTransport(options = {}) {
   function applyInitialCache(initialCache) {
     if (!initialCache || typeof initialCache !== "object") return;
     if (typeof initialCache.pages === "string") cache.pages = initialCache.pages;
+    if (typeof initialCache.entries === "string") cache.entries = initialCache.entries;
     if (typeof initialCache.status === "string") cache.status = initialCache.status;
     if (typeof initialCache.debugConfig === "string") cache.debugConfig = initialCache.debugConfig;
     const pagesRevision = parseNonNegativeRevision(initialCache.pagesRevision);
+    const entriesRevision = parseNonNegativeRevision(initialCache.entriesRevision);
     const statusRevision = parseNonNegativeRevision(initialCache.statusRevision);
     if (pagesRevision !== null) cache.pagesRevision = pagesRevision;
+    if (entriesRevision !== null) cache.entriesRevision = entriesRevision;
+    if (Number.isFinite(Number(initialCache.lastSeq))) cache.lastSeq = Math.floor(Number(initialCache.lastSeq));
     if (statusRevision !== null) cache.statusRevision = statusRevision;
     if (Number.isFinite(Number(initialCache.lastMainFrameAtMs))) {
       cache.lastMainFrameAtMs = Math.floor(Number(initialCache.lastMainFrameAtMs));
-    } else if (cache.pages || cache.status || cache.debugConfig) {
+    } else if (cache.pages || cache.entries || cache.status || cache.debugConfig) {
       cache.lastMainFrameAtMs = now();
     }
     if (Number.isFinite(Number(initialCache.lastMainStatusAtMs))) {
@@ -276,6 +284,7 @@ function createRelayWorkerTransport(options = {}) {
       }
     } else if (
       type === APP_PROTOCOL.pages ||
+      type === APP_PROTOCOL.entries ||
       type === APP_PROTOCOL.status ||
       type === APP_PROTOCOL.debugConfigSnapshot
     ) {
@@ -345,9 +354,23 @@ function createRelayWorkerTransport(options = {}) {
   }
 
   function broadcastApp(frame, options = {}) {
+    const type = options.knownType !== undefined
+      ? options.knownType
+      : parseMessageType(frame);
+    const hasLedgerClient = type === APP_PROTOCOL.pages && [...protocolState.values()].some(
+      (state) => state.clientKind === "app" &&
+        Array.isArray(state.clientCapabilities) &&
+        state.clientCapabilities.includes("ledgerV1"),
+    );
+    const suppressPagesForLedgerClients = hasLedgerClient && parseFrame(frame)?.ledgerV1 === true;
     for (const [clientId, ws] of clients) {
       if (ws.readyState !== WebSocket.OPEN) continue;
-      if ((protocolState.get(clientId) || {}).clientKind !== "app") continue;
+      const state = protocolState.get(clientId) || {};
+      if (state.clientKind !== "app") continue;
+      const supportsLedgerV1 = Array.isArray(state.clientCapabilities) &&
+        state.clientCapabilities.includes("ledgerV1");
+      if (type === APP_PROTOCOL.entries && !supportsLedgerV1) continue;
+      if (type === APP_PROTOCOL.pages && suppressPagesForLedgerClients && supportsLedgerV1) continue;
       enqueueFrame(clientId, frame, options);
     }
   }
@@ -358,9 +381,22 @@ function createRelayWorkerTransport(options = {}) {
       : null;
     const workerOnlyPendingRequestIds = normalizeStringList(parsed.workerOnlyPendingRequestIds);
     let sentPages = false;
+    let sentEntries = false;
     let sentStatus = false;
 
-    if (cache.pages) {
+    const state = protocolState.get(clientId) || {};
+    const supportsLedgerV1 = Array.isArray(state.clientCapabilities) &&
+      state.clientCapabilities.includes("ledgerV1");
+    const entriesLaneActive = supportsLedgerV1 && !!cache.entries;
+    const pagesLaneActive = !entriesLaneActive && !!cache.pages;
+    if (entriesLaneActive) {
+      const clientEntriesRevision = parseNonNegativeRevision(parsed.entriesRevision);
+      const hasEntriesState = parsed.hasEntriesState === true;
+      if (!hasEntriesState || clientEntriesRevision !== cache.entriesRevision) {
+        enqueueFrame(clientId, cache.entries);
+        sentEntries = true;
+      }
+    } else if (pagesLaneActive) {
       const clientPagesRevision = parseNonNegativeRevision(parsed.pagesRevision);
       const hasPagesState = parsed.hasPagesState === true;
       if (!hasPagesState || clientPagesRevision !== cache.pagesRevision) {
@@ -387,9 +423,12 @@ function createRelayWorkerTransport(options = {}) {
     const ack = formatResumeAck({
       reason: "resume",
       sentPages,
+      sentEntries,
       sentStatus,
       sentApprovals,
-      pagesRevision: cache.pagesRevision,
+      pagesRevision: pagesLaneActive ? cache.pagesRevision : null,
+      entriesRevision: entriesLaneActive ? cache.entriesRevision : null,
+      lastSeq: entriesLaneActive ? cache.lastSeq : null,
       statusRevision: cache.statusRevision,
       workerEpoch: manifest.workerEpoch,
       previousWorkerEpoch,
@@ -444,7 +483,7 @@ function createRelayWorkerTransport(options = {}) {
     if (state.clientKind === "app" && nudgeController) {
       nudgeController.addClient(clientId);
     }
-    postToMain({
+    const identified = {
       kind: "client.identified",
       clientId,
       clientKind: state.clientKind,
@@ -458,7 +497,17 @@ function createRelayWorkerTransport(options = {}) {
           : null,
       workerEpoch: manifest.workerEpoch,
       connectedAtMs: now(),
-    });
+    };
+
+    const pairingExchangeId =
+      typeof parsed.pairingExchangeId === "string" ? parsed.pairingExchangeId : "";
+    const pairingConfirmation =
+      typeof parsed.pairingConfirmation === "string" ? parsed.pairingConfirmation : "";
+    if (pairingExchangeId && pairingConfirmation) {
+      identified.pairingExchangeId = pairingExchangeId;
+      identified.pairingConfirmation = pairingConfirmation;
+    }
+    postToMain(identified);
     enqueueFrame(clientId, formatProtocolHelloAck({
       protocolVersion: "v2",
       supportedProtocolVersions: manifest.supportedProtocolVersions,
@@ -703,13 +752,19 @@ function createRelayWorkerTransport(options = {}) {
       return;
     }
 
+    const maxBodyBytes = isPairingEndpointPath(url.pathname)
+      ? PAIRING_MAX_REQUEST_BODY_BYTES
+      : isPairingControlPath(url.pathname)
+        ? PAIRING_CONTROL_MAX_REQUEST_BODY_BYTES
+        : manifest.rpc.httpMaxBodyBytes;
+
     const chunks = [];
     let total = 0;
     let tooLarge = false;
     req.on("data", (chunk) => {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       total += buffer.length;
-      if (total > manifest.rpc.httpMaxBodyBytes) {
+      if (total > maxBodyBytes) {
         tooLarge = true;
         return;
       }
@@ -818,6 +873,7 @@ function createRelayWorkerTransport(options = {}) {
         type === APP_PROTOCOL.messageSendAck ||
         type === APP_PROTOCOL.operationReceived ||
         type === APP_PROTOCOL.pages ||
+        type === APP_PROTOCOL.entries ||
         type === APP_PROTOCOL.status ||
         type === APP_PROTOCOL.debugConfigSnapshot ||
         type === APP_PROTOCOL.approvalRequest ||
@@ -857,6 +913,21 @@ function createRelayWorkerTransport(options = {}) {
         cache.pages = message.frame;
         const frameRevision = parseNonNegativeRevision(parsedFrame && parsedFrame.revision);
         if (frameRevision !== null) cache.pagesRevision = frameRevision;
+        if (parsedFrame?.ledgerV1 !== true) {
+          cache.entries = null;
+          cache.entriesRevision = 0;
+          cache.lastSeq = -1;
+        }
+      }
+      if (type === APP_PROTOCOL.entries) {
+        cache.entries = message.frame;
+        const frameRevision = parseNonNegativeRevision(parsedFrame && parsedFrame.entriesRevision);
+        if (frameRevision !== null) cache.entriesRevision = frameRevision;
+        const rawLastSeq = parsedFrame?.lastSeq;
+        cache.lastSeq = rawLastSeq !== null && rawLastSeq !== undefined &&
+          Number.isFinite(Number(rawLastSeq))
+          ? Math.floor(Number(rawLastSeq))
+          : -1;
       }
       if (type === APP_PROTOCOL.status) {
         cache.status = message.frame;
@@ -867,8 +938,10 @@ function createRelayWorkerTransport(options = {}) {
       if (type === APP_PROTOCOL.debugConfigSnapshot) cache.debugConfig = message.frame;
       if (message.revisions) {
         const pagesRevision = parseNonNegativeRevision(message.revisions.pagesRevision);
+        const entriesRevision = parseNonNegativeRevision(message.revisions.entriesRevision);
         const statusRevision = parseNonNegativeRevision(message.revisions.statusRevision);
         if (pagesRevision !== null) cache.pagesRevision = pagesRevision;
+        if (entriesRevision !== null) cache.entriesRevision = entriesRevision;
         if (statusRevision !== null) cache.statusRevision = statusRevision;
       }
       cache.lastMainFrameAtMs = now();

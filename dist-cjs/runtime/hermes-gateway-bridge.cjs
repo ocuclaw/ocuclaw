@@ -3,18 +3,42 @@ const os = require("node:os");
 const path = require("node:path");
 const { METHOD_NOT_FOUND_CODE } = require("../gateway/backend-contract.cjs");
 const { buildAgentRequestParams } = require("../gateway/gateway-bridge.cjs");
-const { DEFAULT_HERMES_NAMESPACE, deriveHermesPublicKey, isHermesSessionKey, mintedHermesSessionKey, parseHermesPublicKey, } = require("./hermes-session-keys.cjs");
+const { DEFAULT_HERMES_NAMESPACE, deriveHermesPublicKey, isForeignHermesSessionKey, isHermesSessionKey, mintedHermesSessionKey, parseHermesPublicKey } = require("./hermes-session-keys.cjs");
 const { normalizeHermesActivityToolPayload } = require("./hermes-activity-tool-shim.cjs");
 
 const LINK_DB_METHODS = Object.freeze({
   sessionsList: "db.sessions.list",
+  sessionsSearch: "db.sessions.search",
   resolveKey: "db.sessions.resolveKey",
   setTitle: "db.sessions.setTitle",
+  setRead: "db.sessions.setRead",
+  setHidden: "db.sessions.setHidden",
   deleteSession: "db.sessions.delete",
   chatHistory: "db.chat.history",
   describeSession: "db.sessions.describe",
   compactionInfo: "db.sessions.compactionInfo",
 });
+
+const HERMES_FEATURE_TOKEN_SESSION_READ_STATE = "session_read_state";
+
+function normalizeHermesFeatureTokenSet(raw) {
+  const source = Array.isArray(raw)
+    ? raw
+    : typeof raw === "string"
+      ? raw.split(",")
+      : [];
+  const tokens = new Set();
+  for (const entry of source) {
+    if (typeof entry !== "string") continue;
+    const token = entry.trim().toLowerCase();
+    if (token) tokens.add(token);
+  }
+  return tokens;
+}
+
+const LINK_DB_READ_TIMEOUT_MS = 30_000;
+
+const DB_READ_TIMEOUT = Object.freeze({ timeoutMs: LINK_DB_READ_TIMEOUT_MS });
 
 const LINK_BACKEND_EVENT_METHOD = "backend.event";
 
@@ -29,6 +53,7 @@ const LINK_GW_METHODS = Object.freeze({
   profilesList: "gw.profiles.list",
   profilesSoul: "gw.profiles.soul",
   skillsStatus: "gw.skills.status",
+  commandsList: "gw.commands.list",
 });
 
 const LINK_FOREIGN_METHODS = Object.freeze({
@@ -36,9 +61,17 @@ const LINK_FOREIGN_METHODS = Object.freeze({
 });
 
 const LINK_APPROVAL_RESOLVE_METHOD = "approval.resolve";
+const LINK_CLARIFY_RESOLVE_METHOD = "clarify.resolve";
+const LINK_CLARIFY_AWAIT_TEXT_METHOD = "clarify.await_text";
 const LINK_SESSION_METHODS = Object.freeze({
   abort: "sessions.abort",
   steer: "sessions.steer",
+  optionsApply: "sessions.options.apply",
+});
+
+const LINK_PROFILE_METHODS = Object.freeze({
+  optionsGet: "profile.options.get",
+  optionsApply: "profile.options.apply",
 });
 
 const LINK_ATTACHMENT_INLINE_MAX_CHARS = 262144;
@@ -178,6 +211,13 @@ const THINKING_TO_HERMES_LEVEL = Object.freeze({
   xhigh: "xhigh",
   max: "max",
   ultra: "ultra",
+});
+
+const HERMES_COMMAND_CATEGORY = Object.freeze({
+  Session: "session",
+  Configuration: "options",
+  Info: "status",
+  "Tools & Skills": "tools",
 });
 
 const REASONING_DISPLAY_TO_HERMES_COMMANDS = Object.freeze({
@@ -367,11 +407,21 @@ function mapListRow(row) {
   const derived = deriveHermesPublicKey(row);
   if (!derived) return null;
   const lastActiveSeconds = toFiniteNumber(row.lastActive);
+
+  const activityDescription = cleanNonEmptyString(row.lastActivityDescription);
+
+  const unread = typeof row.unread === "boolean" ? row.unread : null;
+  const hidden = typeof row.hidden === "boolean" ? row.hidden : null;
   const mapped = {
     key: derived.key,
 
     updatedAt:
       lastActiveSeconds === null ? 0 : Math.floor(lastActiveSeconds * 1000),
+    ...(activityDescription
+      ? { lastActivityDescription: activityDescription }
+      : {}),
+    ...(unread === null ? {} : { unread }),
+    ...(hidden === null ? {} : { hidden }),
   };
   if (typeof row.preview === "string" && row.preview) {
     mapped.preview = row.preview;
@@ -388,6 +438,49 @@ function mapListRow(row) {
   return mapped;
 }
 
+const COMPACTION_SUMMARY_OPENERS = Object.freeze([
+
+  "[CONTEXT COMPACTION — REFERENCE ONLY]",
+
+  "[CONTEXT SUMMARY]:",
+]);
+
+const MERGED_SUMMARY_DELIMITER =
+  "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]";
+
+function contentTextForSummaryClassification(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts = [];
+  for (const block of content) {
+    if (block && block.type === "text" && typeof block.text === "string") {
+      parts.push(block.text);
+    }
+  }
+  return parts.join("\n\n");
+}
+
+function startsWithSummaryOpener(text) {
+  for (const opener of COMPACTION_SUMMARY_OPENERS) {
+    if (text.startsWith(opener)) return true;
+  }
+  return false;
+}
+
+function classifyCompactionSummary(content) {
+  const text = contentTextForSummaryClassification(content).replace(/^\s+/, "");
+  if (!text) return null;
+
+  const at = text.indexOf(MERGED_SUMMARY_DELIMITER);
+  if (at >= 0) {
+    const after = text
+      .slice(at + MERGED_SUMMARY_DELIMITER.length)
+      .replace(/^\s+/, "");
+    return startsWithSummaryOpener(after) ? "merged" : null;
+  }
+  return startsWithSummaryOpener(text) ? "standalone" : null;
+}
+
 function shapeConversationMessages(rawMessages, limit) {
   const messages = [];
   const source = Array.isArray(rawMessages) ? rawMessages : [];
@@ -396,21 +489,78 @@ function shapeConversationMessages(rawMessages, limit) {
     const role = typeof msg.role === "string" ? msg.role : "";
     if (role !== "user" && role !== "assistant") continue;
     const content = msg.content;
+    const summaryKind = classifyCompactionSummary(content);
+    const summaryAnnotation = summaryKind
+      ? { compactionSummary: summaryKind }
+      : {};
     if (typeof content === "string") {
       if (!content) continue;
-      messages.push({ role, content });
+      messages.push({
+        ...shapeConversationEntry(msg, role, content),
+        ...summaryAnnotation,
+      });
     } else if (Array.isArray(content)) {
       const blocks = content.filter(
         (block) => block && typeof block === "object",
       );
       if (blocks.length === 0) continue;
-      messages.push({ role, content: blocks });
+      messages.push({
+        ...shapeConversationEntry(msg, role, blocks),
+        ...summaryAnnotation,
+      });
     }
 
   }
   const max =
     Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : null;
   return max !== null && messages.length > max ? messages.slice(-max) : messages;
+}
+
+function shapeConversationEntry(
+  msg,
+  role,
+  content,
+) {
+  const shaped = { role, content };
+  if (typeof msg.id === "string" || typeof msg.id === "number") {
+    Object.assign(shaped, { id: msg.id });
+  }
+  if (typeof msg.timestamp === "string" || typeof msg.timestamp === "number") {
+    const timestampSeconds = Number(msg.timestamp);
+    if (Number.isFinite(timestampSeconds)) {
+      Object.assign(shaped, { timestamp: Math.floor(timestampSeconds * 1000) });
+    }
+  }
+  if (
+    typeof msg.platform_message_id === "string" ||
+    typeof msg.platform_message_id === "number"
+  ) {
+    Object.assign(shaped, { platform_message_id: msg.platform_message_id });
+  }
+  return shaped;
+}
+
+function splitSearchSnippet(rawSnippet, query) {
+  const snippet = typeof rawSnippet === "string" ? rawSnippet : "";
+  const open = snippet.indexOf(">>>");
+  const close = open >= 0 ? snippet.indexOf("<<<", open + 3) : -1;
+  if (open >= 0 && close >= open + 3) {
+    return {
+      before: snippet.slice(0, open).replaceAll(">>>", "").replaceAll("<<<", ""),
+      match: snippet.slice(open + 3, close),
+      after: snippet.slice(close + 3).replaceAll(">>>", "").replaceAll("<<<", ""),
+    };
+  }
+  const needle = typeof query === "string" ? query.trim() : "";
+  const index = needle ? snippet.toLowerCase().indexOf(needle.toLowerCase()) : -1;
+  if (index >= 0) {
+    return {
+      before: snippet.slice(0, index),
+      match: snippet.slice(index, index + needle.length),
+      after: snippet.slice(index + needle.length),
+    };
+  }
+  return { before: "", match: snippet, after: "" };
 }
 
 function createHermesGatewayBridge(opts) {
@@ -431,6 +581,15 @@ function createHermesGatewayBridge(opts) {
     opts && opts.attachmentTransport && typeof opts.attachmentTransport.prepare === "function"
       ? opts.attachmentTransport
       : createDefaultAttachmentTransport();
+
+  const hermesFeatureTokens = normalizeHermesFeatureTokenSet(
+    opts && opts.featureTokens !== undefined
+      ? opts.featureTokens
+
+      : process.env.OCUCLAW_HERMES_FEATURES,
+  );
+  const sessionReadStateSupported = () =>
+    hermesFeatureTokens.has(HERMES_FEATURE_TOKEN_SESSION_READ_STATE);
 
   function prepareAttachments(params, linkParams) {
     if (params && Array.isArray(params.attachments) && params.attachments.length > 0) {
@@ -574,6 +733,38 @@ function createHermesGatewayBridge(opts) {
       return ack;
     },
 
+    async "clarify.resolve"(params) {
+      const id = cleanNonEmptyString(params && params.id);
+      const response = cleanNonEmptyString(params && params.response);
+      if (!id) throw new Error("clarify.resolve requires id");
+      if (!response) throw new Error("clarify.resolve requires response");
+      const result = await link.request(LINK_CLARIFY_RESOLVE_METHOD, { id, response });
+      const status = cleanNonEmptyString(result && result.status);
+      if (status && status !== "accepted") {
+        const reason =
+          cleanNonEmptyString(result && result.reason) ||
+          cleanNonEmptyString(result && result.error) ||
+          status;
+        throw new Error(`clarify resolve ${reason}`);
+      }
+      return result;
+    },
+
+    async "clarify.await_text"(params) {
+      const id = cleanNonEmptyString(params && params.id);
+      if (!id) throw new Error("clarify.await_text requires id");
+      const result = await link.request(LINK_CLARIFY_AWAIT_TEXT_METHOD, { id });
+      const status = cleanNonEmptyString(result && result.status);
+      if (status && status !== "accepted") {
+        const reason =
+          cleanNonEmptyString(result && result.reason) ||
+          cleanNonEmptyString(result && result.error) ||
+          status;
+        throw new Error(`clarify await text ${reason}`);
+      }
+      return result;
+    },
+
     async "models.list"() {
 
       const result = await link.request(LINK_GW_METHODS.modelsList, {});
@@ -641,6 +832,8 @@ function createHermesGatewayBridge(opts) {
         const mapped = { provider, windows: [] };
         const displayName = cleanNonEmptyString(providerRow.displayName);
         if (displayName) mapped.displayName = displayName;
+        const unavailableReason = cleanNonEmptyString(providerRow.unavailableReason);
+        if (unavailableReason) Object.assign(mapped, { unavailableReason });
         const windows = Array.isArray(providerRow.windows)
           ? providerRow.windows
           : [];
@@ -648,9 +841,8 @@ function createHermesGatewayBridge(opts) {
           if (!window || typeof window !== "object") continue;
           if (typeof window.label !== "string") continue;
           const shaped = { label: alignUsageWindowLabel(window.label) };
-          if (Number.isFinite(window.usedPercent)) {
-            shaped.usedPercent = window.usedPercent;
-          }
+          if (!Number.isFinite(window.usedPercent)) continue;
+          shaped.usedPercent = window.usedPercent;
           if (Number.isFinite(window.resetAt)) {
             shaped.resetAt = Math.floor(window.resetAt * 1000);
           }
@@ -715,7 +907,8 @@ function createHermesGatewayBridge(opts) {
         if (!profile || typeof profile !== "object") continue;
         const name = cleanNonEmptyString(profile.name);
         if (!name) continue;
-        const row = { id: name, name };
+        const displayName = cleanNonEmptyString(profile.displayName);
+        const row = { id: name, name: displayName || name };
         const model = cleanNonEmptyString(profile.model);
         if (model) {
           const provider = cleanNonEmptyString(profile.provider);
@@ -768,6 +961,69 @@ function createHermesGatewayBridge(opts) {
       return { skills };
     },
 
+    async "commands.list"() {
+
+      const result = await link.request(LINK_GW_METHODS.commandsList, {});
+      const rawRows =
+        result && Array.isArray(result.commands) ? result.commands : [];
+      const commands = [];
+      for (const row of rawRows) {
+        if (!row || typeof row !== "object") continue;
+        const name = cleanNonEmptyString(row.name);
+        if (!name) continue;
+        const argsHint = cleanNonEmptyString(row.argsHint);
+
+        const textAliases = [];
+        if (Array.isArray(row.aliases)) {
+          for (const raw of row.aliases) {
+            const alias = cleanNonEmptyString(raw);
+            if (!alias || alias === name) continue;
+            const slashed = `/${alias}`;
+            if (!textAliases.includes(slashed)) textAliases.push(slashed);
+          }
+        }
+        const entry = {
+          name,
+          nativeName: name,
+          textAliases,
+          description:
+            typeof row.description === "string" ? row.description : "",
+          source: row.source === "plugin" ? "plugin" : "native",
+          scope: "text",
+          acceptsArgs: Boolean(argsHint),
+          noTrailingSpace: row.noTrailingSpace === true,
+          availability: row.busyPolicy === "reject" ? "busy-blocked" : "ready",
+        };
+        const category = cleanNonEmptyString(row.category);
+        const mapped =
+          category && hasOwn(HERMES_COMMAND_CATEGORY, category)
+            ? HERMES_COMMAND_CATEGORY[category]
+            : null;
+        if (mapped) entry.category = mapped;
+        if (argsHint) entry.argsHint = argsHint;
+
+        const choices = Array.isArray(row.subcommands)
+          ? row.subcommands
+              .map((raw) => cleanNonEmptyString(raw))
+              .filter((value) => value !== null)
+              .map((value) => ({ value, label: value }))
+          : [];
+        if (choices.length) {
+          entry.args = [
+            {
+              name: "subcommand",
+              description: "",
+              type: "string",
+              required: false,
+              choices,
+            },
+          ];
+        }
+        commands.push(entry);
+      }
+      return { commands };
+    },
+
     async "sessions.compact"(params) {
 
       const ack = await dispatchTurn({
@@ -783,6 +1039,9 @@ function createHermesGatewayBridge(opts) {
     async "sessions.copy"(params) {
       const sourceKey = cleanNonEmptyString(params && params.key);
       if (!sourceKey) throw new Error("sessions.copy requires key");
+      if (!isForeignHermesSessionKey(sourceKey)) {
+        throw new Error("sessions.copy requires a foreign Hermes source key");
+      }
       const targetKey =
         cleanNonEmptyString(
           (params && params.targetKey) || (params && params.sessionKey),
@@ -824,7 +1083,7 @@ function createHermesGatewayBridge(opts) {
         }
       }
 
-      const result = await link.request(LINK_DB_METHODS.sessionsList, linkParams);
+      const result = await link.request(LINK_DB_METHODS.sessionsList, linkParams, DB_READ_TIMEOUT);
       const rawRows =
         result && Array.isArray(result.sessions) ? result.sessions : [];
       const sessions = [];
@@ -833,6 +1092,36 @@ function createHermesGatewayBridge(opts) {
         if (mapped) sessions.push(mapped);
       }
       return { sessions };
+    },
+
+    async "sessions.search"(params) {
+      const query =
+        params && typeof params.query === "string" ? params.query.trim() : "";
+      if (!query) throw new Error("sessions.search requires a query");
+      const linkParams = { query };
+      const limit = toFiniteNumber(params && params.limit);
+      if (limit !== null && limit > 0) linkParams.limit = Math.floor(limit);
+      const result = await link.request(LINK_DB_METHODS.sessionsSearch, linkParams, DB_READ_TIMEOUT);
+      const rawMatches =
+        result && Array.isArray(result.matches) ? result.matches : [];
+      const snippets = [];
+      for (const raw of rawMatches) {
+        const session = mapListRow(raw && raw.session);
+        if (!session) continue;
+        snippets.push({
+          sessionKey: session.key,
+          role: typeof raw.role === "string" ? raw.role : "",
+          updatedAtMs: session.updatedAt || 0,
+          ...splitSearchSnippet(raw.snippet, query),
+        });
+      }
+      return {
+        snippets,
+        truncated: !!(result && result.truncated),
+        unavailable: !!(result && result.available === false),
+        unavailableReason:
+          result && typeof result.reason === "string" ? result.reason : null,
+      };
     },
 
     async "sessions.resolve"(params) {
@@ -846,31 +1135,73 @@ function createHermesGatewayBridge(opts) {
       const result = await link.request(LINK_DB_METHODS.resolveKey, {
         key,
         ...(ns ? { ns } : {}),
-      });
+      }, DB_READ_TIMEOUT);
       const derived = deriveHermesPublicKey(result && result.row);
       if (!derived) throw new Error(`no such session: ${key}`);
       return { key: derived.key };
     },
 
     async "sessions.patch"(params) {
+
+      const hasRead = hasOwn(params, "read");
+      const hasHidden = hasOwn(params, "hidden");
+      if (hasRead || hasHidden) {
+        if (!sessionReadStateSupported()) {
+
+          throw methodNotFoundError(
+            hasRead ? LINK_DB_METHODS.setRead : LINK_DB_METHODS.setHidden,
+          );
+        }
+
+        const identity = keyToIdentity(params && params.key);
+        let result = { ok: true };
+        if (hasRead) {
+          result = await link.request(LINK_DB_METHODS.setRead, {
+            identity,
+            read: params.read !== false,
+          });
+        }
+        if (hasHidden) {
+          result = await link.request(LINK_DB_METHODS.setHidden, {
+            identity,
+            hidden: params.hidden === true,
+          });
+        }
+        return result;
+      }
       if (params && Object.prototype.hasOwnProperty.call(params, "label")) {
 
+        keyToIdentity(params.key);
+        const target = keyToMintedTarget(
+          params.key,
+          "key",
+          "foreign hermes session keys cannot be renamed (only OcuClaw-minted sessions may be renamed)",
+        );
         const label =
           typeof params.label === "string" && params.label.trim()
             ? params.label.trim()
             : null;
         return link.request(LINK_DB_METHODS.setTitle, {
-          identity: keyToIdentity(params.key),
+          identity: target.target,
           title: label,
         });
       }
 
+      const target = keyToMintedTarget(
+        params && params.key,
+        "key",
+        "foreign hermes session keys cannot be configured (only OcuClaw-minted sessions may be configured)",
+      );
+      const options = {
+        confirm_model_selection: !!(params && params.confirmModelSelection === true),
+        initial: !!(params && params.initial === true),
+      };
       const commands = [];
       if (hasOwn(params, "model") || hasOwn(params, "modelProvider")) {
         const modelText =
           params && params.model != null ? String(params.model).trim() : "";
         if (!modelText) {
-          commands.push("/model reset --session");
+          Reflect.set(options, "model", "");
         } else {
           let provider = null;
           let id = modelText;
@@ -886,10 +1217,14 @@ function createHermesGatewayBridge(opts) {
               ? params.modelProvider.trim()
               : "";
           if (explicitProvider) provider = explicitProvider;
-          let command = `/model ${id}`;
-          if (provider) command += ` --provider ${provider}`;
-          command += params.oneTurn === true ? " --once" : " --session";
-          commands.push(command);
+          if (params.oneTurn === true) {
+            let command = `/model ${id}`;
+            if (provider) command += ` --provider ${provider}`;
+            commands.push(`${command} --once`);
+          } else {
+            Reflect.set(options, "model", id);
+            if (provider) Reflect.set(options, "provider", provider);
+          }
         }
       }
       if (hasOwn(params, "thinkingLevel")) {
@@ -898,14 +1233,20 @@ function createHermesGatewayBridge(opts) {
             ? String(params.thinkingLevel).trim().toLowerCase()
             : "";
         if (!raw) {
-          commands.push("/reasoning reset");
+          Reflect.set(options, "reasoning_effort", "");
         } else {
           const hermesLevel = THINKING_TO_HERMES_LEVEL[raw];
           if (!hermesLevel) {
             throw new Error(`unsupported thinking level: ${raw}`);
           }
-          commands.push(`/reasoning ${hermesLevel}`);
+          Reflect.set(options, "reasoning_effort", hermesLevel);
         }
+      }
+      if (hasOwn(params, "fastMode")) {
+        if (typeof params.fastMode !== "boolean") {
+          throw new Error("fastMode must be a boolean");
+        }
+        Reflect.set(options, "fast", params.fastMode);
       }
       if (hasOwn(params, "reasoningLevel")) {
         const raw =
@@ -918,6 +1259,20 @@ function createHermesGatewayBridge(opts) {
         }
         commands.push(...displayCommands);
       }
+      let structured = null;
+      if (Object.keys(options).some((key) => !["confirm_model_selection", "initial"].includes(key))) {
+        structured = await link.request(LINK_SESSION_METHODS.optionsApply, {
+          sessionKey: target.publicKey,
+          target: target.target,
+          options,
+        });
+        if (!structured || structured.status !== "accepted") {
+          throw new Error(
+            (structured && structured.error) ||
+              `structured session options ${structured && structured.status ? structured.status : "failed"}`,
+          );
+        }
+      }
       const results = [];
       for (const command of commands) {
         const ack = await dispatchTurn({
@@ -929,7 +1284,15 @@ function createHermesGatewayBridge(opts) {
         }
         results.push(ack);
       }
-      return { ok: true, commands, results };
+      return {
+        ok: true,
+        commands,
+        results,
+        structured,
+        ...(structured && structured.effective
+          ? { applied: structured.effective }
+          : {}),
+      };
     },
 
     async "sessions.delete"(params) {
@@ -951,44 +1314,55 @@ function createHermesGatewayBridge(opts) {
       };
 
       if (limit !== null && limit > 0) linkParams.limit = Math.floor(limit);
-      const result = await link.request(LINK_DB_METHODS.chatHistory, linkParams);
+      const result = await link.request(LINK_DB_METHODS.chatHistory, linkParams, DB_READ_TIMEOUT);
+      const messages = shapeConversationMessages(
+        result && result.messages,
+        limit === null ? undefined : limit,
+      );
+
+      const rawTotal = result ? result.total : undefined;
+      const total = rawTotal == null ? null : toFiniteNumber(rawTotal);
       return {
-        messages: shapeConversationMessages(
-          result && result.messages,
-          limit === null ? undefined : limit,
-        ),
+        messages,
+        ...(total !== null && total >= 0 ? { total: Math.floor(total) } : {}),
       };
     },
 
     async "sessions.describe"(params) {
       const result = await link.request(LINK_DB_METHODS.describeSession, {
         identity: keyToIdentity(params && params.key),
-      });
-      const tokens = (result && result.tokens) || {};
+      }, DB_READ_TIMEOUT);
 
-      const lastTurn = toFiniteNumber(result && result.lastMessageTokenCount);
-      let totalTokens;
-      if (lastTurn !== null && lastTurn > 0) {
-        totalTokens = Math.floor(lastTurn);
-      } else {
-        totalTokens = ["input", "output", "cacheRead", "cacheWrite", "reasoning"]
-          .map((field) => toFiniteNumber(tokens[field]) || 0)
-          .reduce((acc, value) => acc + Math.max(0, Math.floor(value)), 0);
-      }
+      const rawLastTurn = result && result.lastMessageTokenCount;
+      const lastTurn =
+        typeof rawLastTurn === "number" && Number.isFinite(rawLastTurn)
+          ? rawLastTurn
+          : null;
+      const contextTokensKnown = lastTurn !== null && lastTurn >= 0;
+      const totalTokens = contextTokensKnown ? Math.floor(lastTurn) : 0;
 
-      return { session: { totalTokens, contextTokens: 0 } };
+      const rawCost = result ? result.costUsd : undefined;
+      const costUsd = rawCost == null ? null : toFiniteNumber(rawCost);
+      return {
+        session: {
+          totalTokens,
+          contextTokens: 0,
+          contextTokensKnown,
+          ...(costUsd !== null && costUsd >= 0 ? { costUsd } : {}),
+        },
+      };
     },
 
     async "sessions.compaction.list"(params) {
       const result = await link.request(LINK_DB_METHODS.compactionInfo, {
         identity: keyToIdentity(params && params.key),
-      });
+      }, DB_READ_TIMEOUT);
       const hops = toFiniteNumber(result && result.hops);
       const count = hops !== null && hops > 0 ? Math.floor(hops) : 0;
 
       const checkpoints = [];
       for (let i = 0; i < count; i += 1) checkpoints.push({});
-      return { checkpoints };
+      return { checkpoints, metric: "hops" };
     },
   };
 
@@ -1113,4 +1487,4 @@ function createHermesGatewayBridge(opts) {
   return { bridge, dispatchBackendEvent };
 }
 
-module.exports = { LINK_DB_METHODS, LINK_BACKEND_EVENT_METHOD, LINK_DISPATCH_METHOD, LINK_GW_METHODS, LINK_FOREIGN_METHODS, LINK_APPROVAL_RESOLVE_METHOD, LINK_SESSION_METHODS, LINK_ATTACHMENT_INLINE_MAX_CHARS, DENIED_SESSION_SOURCES, alignUsageWindowLabel, normalizeBackendEventPayload, translateHermesSkillSlash, createHermesGatewayBridge };
+module.exports = { LINK_DB_METHODS, LINK_DB_READ_TIMEOUT_MS, LINK_BACKEND_EVENT_METHOD, LINK_DISPATCH_METHOD, LINK_GW_METHODS, LINK_FOREIGN_METHODS, LINK_APPROVAL_RESOLVE_METHOD, LINK_CLARIFY_RESOLVE_METHOD, LINK_CLARIFY_AWAIT_TEXT_METHOD, LINK_SESSION_METHODS, LINK_PROFILE_METHODS, LINK_ATTACHMENT_INLINE_MAX_CHARS, DENIED_SESSION_SOURCES, alignUsageWindowLabel, normalizeBackendEventPayload, translateHermesSkillSlash, createHermesGatewayBridge, COMPACTION_SUMMARY_OPENERS, MERGED_SUMMARY_DELIMITER, classifyCompactionSummary };

@@ -25,6 +25,8 @@ function toFiniteNumber(value, fallback) {
 }
 
 function normalizeWindow(window, index) {
+  const usedPercent = toFiniteNumber(window && window.usedPercent, null);
+  if (usedPercent === null) return null;
   const normalizedKey = normalizeWindowKey(window && window.label, index);
   const label =
     typeof window?.label === "string" && window.label.trim()
@@ -34,7 +36,7 @@ function normalizeWindow(window, index) {
   return {
     key: normalizedKey.key,
     label,
-    usedPercent: toFiniteNumber(window && window.usedPercent, 0),
+    usedPercent,
     resetAtMs: toFiniteNumber(window && window.resetAt, null),
     sortOrder: normalizedKey.sortOrder,
   };
@@ -98,7 +100,9 @@ function selectProviderUsageSnapshot(summary, opts = {}) {
     return null;
   }
 
-  const windows = (Array.isArray(match.windows) ? match.windows : []).map(normalizeWindow);
+  const windows = (Array.isArray(match.windows) ? match.windows : [])
+    .map(normalizeWindow)
+    .filter(Boolean);
   const limitingWindow = selectLimitingWindow(windows);
   const dedupedWindows = [];
   const keyToIndex = new Map();
@@ -119,6 +123,15 @@ function selectProviderUsageSnapshot(summary, opts = {}) {
 
   const provider = typeof match.provider === "string" ? match.provider.trim() : match.provider;
 
+  const unavailableReason =
+    typeof match.unavailableReason === "string" && match.unavailableReason.trim()
+      ? match.unavailableReason.trim()
+      : typeof match.error === "string" && match.error.trim()
+        ? match.error.trim()
+        : limitingWindow
+          ? null
+          : "Percentage limits are unavailable for this provider.";
+
   return {
     sessionKey: typeof opts.sessionKey === "string" ? opts.sessionKey : null,
     provider,
@@ -130,6 +143,7 @@ function selectProviderUsageSnapshot(summary, opts = {}) {
     stale: opts.stale === true,
     limitingWindowKey: limitingWindow ? limitingWindow.key : null,
     windows: dedupedWindows,
+    ...(unavailableReason ? { unavailableReason } : {}),
   };
 }
 

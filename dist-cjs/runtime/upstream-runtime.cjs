@@ -1,5 +1,5 @@
 const { createHash } = require("node:crypto");
-const { buildRateLimitInfoFromSnapshot, selectProviderUsageSnapshot, } = require("./provider-usage-select.cjs");
+const { buildRateLimitInfoFromSnapshot, selectProviderUsageSnapshot } = require("./provider-usage-select.cjs");
 const { stripAllTaggedSpans } = require("../domain/tagged-span-strip.cjs");
 const { parseTaggedSpans } = require("../domain/tagged-span-parser.cjs");
 const { EMOJI_TAG_FAMILY_CONFIG } = require("../domain/neural-emoji-reactor-tag-config.cjs");
@@ -9,6 +9,8 @@ const { createSessionContextService } = require("./session-context-service.cjs")
 const { DISTILLER_SESSION_PREFIX } = require("./session-title-distiller-helpers.cjs");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
 const { reasoningCeilingForModel } = require("./capability-snapshot.cjs");
+const { getActiveBackendKind } = require("../gateway/backend-contract.cjs");
+const { relaySessionKeyFor } = require("./openclaw-session-key.cjs");
 
 const DEFAULT_MODEL_PROVIDER = "anthropic";
 const DEFAULT_MODEL_ID = "claude-opus-4-6";
@@ -16,6 +18,41 @@ const POOL_OUTCOME_FRESHNESS_MS = 10 * 60 * 1000;
 const TITLE_DISTILLER_RUN_ID_PREFIX = "ocuclaw-title-";
 const TITLE_DISTILLER_SESSION_MARKER = ":title-distiller:";
 const THINKING_FINALIZE_RETENTION_MS = 5 * 60 * 1000;
+const LEDGER_COMMIT_HISTORY_GRACE_MS = 1_000;
+const AGENT_PROGRESS_NOTES_DEFAULT = "conversation";
+
+const AGENT_PROGRESS_NOTES_LEGACY_STATUS = "status";
+
+function normalizeAgentProgressNotes(value) {
+  const normalized =
+    typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (normalized === "off") return "off";
+  if (normalized === "conversation") return "conversation";
+  if (normalized === AGENT_PROGRESS_NOTES_LEGACY_STATUS) return "conversation";
+  return AGENT_PROGRESS_NOTES_DEFAULT;
+}
+
+function normalizeOriginAtMs(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
+    : null;
+}
+
+function isNarrationCommit(data) {
+  const kind =
+    data && typeof data.messageKind === "string"
+      ? data.messageKind.trim().toLowerCase()
+      : "";
+  return kind === "narration";
+}
+
+function isToolProgressCommit(data) {
+  const kind =
+    data && typeof data.messageKind === "string"
+      ? data.messageKind.trim().toLowerCase()
+      : "";
+  return kind === "tool_progress";
+}
 
 const STREAMING_REBROADCAST_THROTTLE_MS = 33;
 
@@ -332,6 +369,208 @@ function skillsCatalogRowsEqual(left, right) {
   return true;
 }
 
+const COMMAND_CATALOG_TTL_MS = 60_000;
+
+const COMMAND_CATALOG_MAX_ENTRIES = 300;
+const COMMAND_DESCRIPTION_MAX_CHARS = 160;
+const COMMAND_MAX_ALIASES = 8;
+const COMMAND_ARGS_HINT_MAX_CHARS = 60;
+const COMMAND_SNAPSHOT_MAX_BYTES = 256 * 1024;
+
+const COMMAND_EXECUTES_BY_BACKEND = new Map([
+  ["openclaw", "all"],
+  ["hermes", "all"],
+]);
+
+const COMMAND_INTERCEPTED_EXECUTABLE = new Set(["new", "reset"]);
+
+const COMMAND_TIER_ESSENTIAL = new Set([
+  "new", "reset", "stop", "compact", "compress", "model", "think", "thinking",
+  "status", "skill", "agents", "help", "commands", "usage", "queue", "background",
+]);
+
+const COMMAND_TIER_POWER = new Set([
+  "bash", "exec", "config", "mcp", "plugins", "debug", "login", "crestodian",
+  "allowlist", "acp", "activation", "send", "restart", "yolo", "approvals",
+  "egress", "platform", "update", "rollback", "reload-mcp", "reload-skills",
+  "curator", "topup", "insights", "diagnostics", "trace", "trajectory",
+  "export-trajectory",
+]);
+
+const COMMAND_DESTRUCTIVE = new Set([
+  "bash", "exec", "reset", "new", "compact", "compress",
+  "rollback", "undo", "restart", "yolo", "update", "pause", "delete",
+]);
+
+function normalizeCommandName(raw) {
+  return String(raw == null ? "" : raw)
+    .trim()
+    .replace(/^\/+/, "")
+    .replace(/_/g, "-")
+    .toLowerCase();
+}
+
+function commandTierFor(normalizedName, category) {
+  if (COMMAND_TIER_POWER.has(normalizedName)) return "power";
+  if (COMMAND_TIER_ESSENTIAL.has(normalizedName)) return "essential";
+  if (category === "management") return "power";
+  return "standard";
+}
+
+function commandExecutesFor(backendKind) {
+  return COMMAND_EXECUTES_BY_BACKEND.get(backendKind) || "intercepted-only";
+}
+
+function clampCommandDescription(raw) {
+  const text = String(raw == null ? "" : raw)
+    .replace(/\s*[\r\n]+\s*/g, " ")
+    .trim();
+  return text.length > COMMAND_DESCRIPTION_MAX_CHARS
+    ? text.slice(0, COMMAND_DESCRIPTION_MAX_CHARS)
+    : text;
+}
+
+function normalizeCommandArg(arg) {
+  const name = typeof arg.name === "string" ? arg.name.trim() : "";
+  if (!name) return null;
+  const choices = Array.isArray(arg.choices)
+    ? arg.choices
+        .map((choice) =>
+          typeof choice === "string"
+            ? choice
+            : choice && typeof choice === "object" && typeof choice.value === "string"
+              ? choice.value
+              : "",
+        )
+        .filter(Boolean)
+    : [];
+  const out = { name, required: arg.required === true, dynamic: arg.dynamic === true };
+  if (typeof arg.description === "string" && arg.description.trim()) {
+    Object.assign(out, { description: arg.description.trim() });
+  }
+  if (typeof arg.type === "string" && arg.type) Object.assign(out, { type: arg.type });
+  if (choices.length) Object.assign(out, { choices });
+  return out;
+}
+
+function deriveCommandArgsHint(args) {
+  if (!Array.isArray(args) || !args.length) return "";
+  const parts = [];
+  for (const arg of args) {
+    if (!arg || typeof arg !== "object") continue;
+    const name = typeof arg.name === "string" ? arg.name.trim() : "";
+    if (!name) continue;
+    parts.push(arg.required === true ? `<${name}>` : `[${name}]`);
+  }
+  return parts.join(" ");
+}
+
+function normalizeCommandCatalogRows(rows, backendKind, executes) {
+  if (!Array.isArray(rows)) return [];
+  const out = [];
+  const seen = new Set();
+  const executesAll = executes === "all";
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const name = String(row.name == null ? "" : row.name)
+      .trim()
+      .replace(/^\/+/, "")
+      .trim();
+    if (!name) continue;
+    const key = normalizeCommandName(name);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+
+    const category =
+      typeof row.category === "string" && row.category.trim()
+        ? row.category.trim()
+        : "";
+    const acceptsArgs = row.acceptsArgs === true;
+    const entry = {
+      name,
+      description: clampCommandDescription(row.description),
+      source:
+        row.source === "skill" || row.source === "plugin" ? row.source : "native",
+      instantSend: acceptsArgs === false,
+      noTrailingSpace: row.noTrailingSpace === true,
+      tier: commandTierFor(key, category),
+      destructive: COMMAND_DESTRUCTIVE.has(key),
+      availability: row.availability === "busy-blocked" ? "busy-blocked" : "ready",
+      executable: executesAll ? true : COMMAND_INTERCEPTED_EXECUTABLE.has(key),
+    };
+    if (category) Object.assign(entry, { category });
+
+    const aliases = [];
+    const aliasSeen = new Set([key]);
+    const rawAliases = Array.isArray(row.textAliases)
+      ? row.textAliases
+      : Array.isArray(row.aliases)
+        ? row.aliases
+        : [];
+    for (const rawAlias of rawAliases) {
+      const alias = String(rawAlias == null ? "" : rawAlias)
+        .trim()
+        .replace(/^\/+/, "")
+        .trim();
+      if (!alias) continue;
+      const aliasKey = normalizeCommandName(alias);
+      if (!aliasKey || aliasSeen.has(aliasKey)) continue;
+      aliasSeen.add(aliasKey);
+      aliases.push(alias);
+      if (aliases.length >= COMMAND_MAX_ALIASES) break;
+    }
+    if (aliases.length) Object.assign(entry, { aliases });
+
+    const args = Array.isArray(row.args)
+      ? row.args
+          .filter((arg) => arg && typeof arg === "object")
+          .map(normalizeCommandArg)
+          .filter(Boolean)
+      : [];
+    const argsHintRaw =
+      typeof row.argsHint === "string" && row.argsHint.trim()
+        ? row.argsHint.trim()
+        : deriveCommandArgsHint(args);
+    if (argsHintRaw) {
+      Object.assign(entry, {
+        argsHint:
+          argsHintRaw.length > COMMAND_ARGS_HINT_MAX_CHARS
+            ? argsHintRaw.slice(0, COMMAND_ARGS_HINT_MAX_CHARS)
+            : argsHintRaw,
+      });
+    }
+    if (args.length) Object.assign(entry, { args });
+
+    out.push(entry);
+    if (out.length >= COMMAND_CATALOG_MAX_ENTRIES) break;
+  }
+
+  if (JSON.stringify(out).length > COMMAND_SNAPSHOT_MAX_BYTES) {
+    for (const entry of out) Reflect.deleteProperty(entry, "args");
+  }
+  return out;
+}
+
+function commandCatalogRowsEqual(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right)) return false;
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i += 1) {
+    const a = left[i] || {};
+    const b = right[i] || {};
+    if (
+      a.name !== b.name ||
+      a.description !== b.description ||
+      a.tier !== b.tier ||
+      a.instantSend !== b.instantSend ||
+      a.argsHint !== b.argsHint ||
+      a.executable !== b.executable
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function isMethodNotFoundError(err, message) {
   if (err && typeof err === "object") {
     const code = err.code ?? (err.error && err.error.code);
@@ -567,6 +806,43 @@ function createUpstreamRuntime(opts = {}) {
   const emitDebug = typeof opts.emitDebug === "function" ? opts.emitDebug : () => {};
   const operationRegistry = opts.operationRegistry || null;
   const now = typeof opts.now === "function" ? opts.now : () => Date.now();
+
+  function normalizeGatewaySessionEvent(data) {
+    if (getActiveBackendKind() === "hermes") return data;
+    if (
+      !data ||
+      typeof data !== "object" ||
+      Array.isArray(data) ||
+      Object.getPrototypeOf(data) !== Object.prototype
+    ) {
+      return data;
+    }
+    let normalized = data;
+    const normalizeField = (field) => {
+      if (typeof normalized[field] !== "string") return;
+      const relayKey = relaySessionKeyFor(normalized[field]);
+      if (relayKey === normalized[field]) return;
+      if (normalized === data) normalized = { ...data };
+      normalized[field] = relayKey;
+    };
+    normalizeField("sessionKey");
+    normalizeField("_activeRunSessionKey");
+    for (const nestedField of ["request", "context"]) {
+      const nested = normalized[nestedField];
+      if (!nested || typeof nested !== "object" || Array.isArray(nested)) continue;
+      const relayKey = relaySessionKeyFor(nested.sessionKey);
+      if (!relayKey || relayKey === nested.sessionKey) continue;
+      if (normalized === data) normalized = { ...data };
+      normalized[nestedField] = { ...nested, sessionKey: relayKey };
+    }
+    return normalized;
+  }
+
+  function onGatewayEvent(eventName, listener) {
+    return gatewayBridge.on(eventName, (data) =>
+      listener(normalizeGatewaySessionEvent(data)),
+    );
+  }
   const broadcastPages =
     typeof opts.broadcastPages === "function" ? opts.broadcastPages : () => {};
   const broadcastStatus =
@@ -582,6 +858,10 @@ function createUpstreamRuntime(opts = {}) {
   const broadcastSkillsCatalog =
     typeof opts.broadcastSkillsCatalog === "function"
       ? opts.broadcastSkillsCatalog
+      : () => {};
+  const broadcastCommandCatalog =
+    typeof opts.broadcastCommandCatalog === "function"
+      ? opts.broadcastCommandCatalog
       : () => {};
   const broadcastAgentsCatalog =
     typeof opts.broadcastAgentsCatalog === "function"
@@ -599,6 +879,46 @@ function createUpstreamRuntime(opts = {}) {
     typeof opts.getServer === "function" ? opts.getServer : () => null;
   const getVoiceRuntime =
     typeof opts.getVoiceRuntime === "function" ? opts.getVoiceRuntime : () => null;
+
+  const getAgentProgressNotes =
+    typeof opts.getAgentProgressNotes === "function"
+      ? opts.getAgentProgressNotes
+      : () => AGENT_PROGRESS_NOTES_DEFAULT;
+
+  const onClarify = typeof opts.onClarify === "function" ? opts.onClarify : () => false;
+
+  const onQuestion = typeof opts.onQuestion === "function" ? opts.onQuestion : () => false;
+  const onQuestionResolved =
+
+    typeof opts.onQuestionResolved === "function" ? opts.onQuestionResolved : () => false;
+  const observeTaskToolUse =
+
+    typeof opts.observeTaskToolUse === "function" ? opts.observeTaskToolUse : () => false;
+  const observeTaskApproval =
+
+    typeof opts.observeTaskApproval === "function" ? opts.observeTaskApproval : () => false;
+  const taskApprovalRequests = new Map();
+  const TASK_APPROVAL_REQUEST_MAX = 500;
+
+  function rememberTaskApproval(data) {
+    const request = data && data.request && typeof data.request === "object" ? data.request : {};
+    const id = data && typeof data.id === "string" ? data.id.trim() : "";
+    const sessionKey = typeof request.sessionKey === "string" ? request.sessionKey.trim() : "";
+    const pluginApproval =
+      (data && data.approvalKind === "plugin") || id.startsWith("plugin:");
+    const toolName =
+      (typeof request.toolName === "string" && request.toolName.trim()) ||
+      (data && typeof data.toolName === "string" && data.toolName.trim()) ||
+      (pluginApproval ? "" : "exec");
+    if (!id || !sessionKey || !toolName) return;
+    taskApprovalRequests.delete(id);
+    taskApprovalRequests.set(id, { sessionKey, toolName });
+    while (taskApprovalRequests.size > TASK_APPROVAL_REQUEST_MAX) {
+      const oldest = taskApprovalRequests.keys().next();
+      if (oldest.done) break;
+      taskApprovalRequests.delete(oldest.value);
+    }
+  }
 
   const gatewayUrl = typeof opts.gatewayUrl === "string" ? opts.gatewayUrl : null;
   const gatewayToken = typeof opts.gatewayToken === "string" ? opts.gatewayToken : null;
@@ -762,6 +1082,14 @@ function createUpstreamRuntime(opts = {}) {
 
   let inFlightSkillsCatalogFetch = null;
 
+  let cachedCommandCatalog = null;
+  let cachedCommandCatalogFetchedAt = 0;
+  let cachedCommandCatalogStale = true;
+
+  let commandCatalogUnsupported = false;
+
+  let inFlightCommandCatalogFetch = null;
+
   let cachedAgentsCatalog = null;
   let cachedAgentsCatalogFetchedAt = 0;
   let cachedAgentsCatalogStale = true;
@@ -788,6 +1116,7 @@ function createUpstreamRuntime(opts = {}) {
 
   let activeTyping = null;
   let bootstrapRefreshTimer = null;
+  let ledgerCommitFallbackTimer = 0;
   let bootstrapRefreshNonce = 0;
 
   const workspaceIdentityFallbackCache = new Map();
@@ -840,6 +1169,18 @@ function createUpstreamRuntime(opts = {}) {
     bootstrapRefreshTimer = null;
   }
 
+  function clearLedgerCommitFallbackTimer() {
+    if (!ledgerCommitFallbackTimer) return;
+    clearTimeout(ledgerCommitFallbackTimer);
+    ledgerCommitFallbackTimer = 0;
+  }
+
+  function flushLedgerCommitFallback() {
+    if (!ledgerCommitFallbackTimer) return;
+    clearLedgerCommitFallbackTimer();
+    broadcastPages();
+  }
+
   function onConnectedStateEstablished(trigger) {
     refreshModelCatalog(true).then((snapshot) => {
       emitDebug(
@@ -853,6 +1194,8 @@ function createUpstreamRuntime(opts = {}) {
           trigger,
         }),
       );
+
+      sessionContextService.refreshActiveSessionContext().catch(() => {});
     });
     refreshSkillsCatalog(true).then((snapshot) => {
       emitDebug(
@@ -863,6 +1206,21 @@ function createUpstreamRuntime(opts = {}) {
         () => ({
           count: Array.isArray(snapshot.skills) ? snapshot.skills.length : 0,
           stale: !!snapshot.stale,
+          trigger,
+        }),
+      );
+    });
+    refreshCommandCatalog(true).then((snapshot) => {
+      emitDebug(
+        "relay.session",
+        "command_catalog_prefetched",
+        "info",
+        { sessionKey: sessionService.ensureSessionKey() },
+        () => ({
+          count: Array.isArray(snapshot.commands) ? snapshot.commands.length : 0,
+          stale: !!snapshot.stale,
+          unsupported: !!snapshot.unsupported,
+          backendKind: snapshot.backendKind,
           trigger,
         }),
       );
@@ -916,6 +1274,7 @@ function createUpstreamRuntime(opts = {}) {
       clearTyping("upstream_disconnected");
       inFlightModelsCatalogFetch = null;
       inFlightSkillsCatalogFetch = null;
+      inFlightCommandCatalogFetch = null;
       inFlightAgentsCatalogFetch = null;
       inFlightProviderUsageFetch = null;
 
@@ -925,6 +1284,9 @@ function createUpstreamRuntime(opts = {}) {
       workspaceIdentityFallbackCache.clear();
       inFlightWorkspaceIdentityFetches.clear();
       cachedSkillsCatalogStale = true;
+      cachedCommandCatalogStale = true;
+
+      commandCatalogUnsupported = false;
       cachedAgentsCatalogStale = true;
 
       agentsListUnsupported = false;
@@ -1168,6 +1530,37 @@ function createUpstreamRuntime(opts = {}) {
     }, retryDelayMs);
   }
 
+  async function refreshActiveSessionIdentity(trigger, attempt = 0) {
+
+    const refreshNonce = ++bootstrapRefreshNonce;
+    clearBootstrapRefreshTimer();
+    const sessionKey = sessionService.ensureSessionKey();
+    try {
+      const identity = await gatewayBridge.request("agent.identity.get", {
+        sessionKey,
+      });
+      if (refreshNonce !== bootstrapRefreshNonce) return;
+      applyAgentIdentity(identity, `${trigger}_session_identity`);
+      return;
+    } catch (err) {
+      if (refreshNonce !== bootstrapRefreshNonce) return;
+      if (attempt >= 4) {
+        logger.warn(
+          `[relay] Active-session identity refresh failed after ${trigger}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return;
+      }
+    }
+
+    const retryDelayMs = Math.min(250 * (attempt + 1), 1000);
+    bootstrapRefreshTimer = setTimeout(() => {
+      bootstrapRefreshTimer = null;
+      refreshActiveSessionIdentity(trigger, attempt + 1).catch((err) => {
+        logger.warn(`[relay] Active-session identity retry failed: ${err.message}`);
+      });
+    }, retryDelayMs);
+  }
+
   function flushPendingStreamingText() {
     if (!pendingStreaming) return;
     const queuedStreaming = pendingStreaming;
@@ -1206,11 +1599,17 @@ function createUpstreamRuntime(opts = {}) {
       );
       const emojiSpans = spansByFamily.emoji || [];
       const paceSpans = spansByFamily.pace || [];
+      const runPipeline = runId ? upstreamRunPipeline.get(runId) : null;
+      const streamSeq = runPipeline
+        ? (runPipeline.streamingSeq = (runPipeline.streamingSeq || 0) + 1)
+        : null;
       server.broadcast(
-        handler.formatStreaming(text, emojiSpans, paceSpans),
+        handler.formatStreaming(text, emojiSpans, paceSpans, {
+          runId,
+          seq: streamSeq,
+        }),
       );
       const now = Date.now();
-      const runPipeline = runId ? upstreamRunPipeline.get(runId) : null;
       const firstRelayBroadcast = runPipeline
         ? !runPipeline.firstRelayBroadcastAt
         : queuedStreaming.flushReason === "first_immediate";
@@ -1297,6 +1696,33 @@ function createUpstreamRuntime(opts = {}) {
     return skillsCatalogSnapshot(cachedSkillsCatalogFetchedAt);
   }
 
+  function commandCatalogSnapshot(nowMs) {
+    const currentNow = Number.isFinite(nowMs) ? nowMs : now();
+    const hasCache = Array.isArray(cachedCommandCatalog);
+    const backendKind = getActiveBackendKind();
+    const expired =
+      hasCache && currentNow - cachedCommandCatalogFetchedAt > COMMAND_CATALOG_TTL_MS;
+    return {
+      commands: hasCache ? cachedCommandCatalog : [],
+      fetchedAtMs: hasCache ? cachedCommandCatalogFetchedAt : currentNow,
+      stale: commandCatalogUnsupported
+        ? false
+        : !hasCache || cachedCommandCatalogStale || expired,
+      unsupported: commandCatalogUnsupported,
+      backendKind,
+      executes: commandExecutesFor(backendKind),
+    };
+  }
+
+  function cacheCommandCatalog(commands, fetchedAtMs, stale) {
+    cachedCommandCatalog = Array.isArray(commands) ? commands : [];
+    cachedCommandCatalogFetchedAt = Number.isFinite(fetchedAtMs)
+      ? Math.floor(fetchedAtMs)
+      : now();
+    cachedCommandCatalogStale = !!stale;
+    return commandCatalogSnapshot(cachedCommandCatalogFetchedAt);
+  }
+
   function agentsCatalogSnapshot(nowMs) {
     const currentNow = Number.isFinite(nowMs) ? nowMs : now();
     const hasCache = Array.isArray(cachedAgentsCatalog);
@@ -1378,7 +1804,7 @@ function createUpstreamRuntime(opts = {}) {
     };
   }
 
-  function emptyProviderUsageSnapshot(nowMs, stale = true) {
+  function emptyProviderUsageSnapshot(nowMs, stale = true, unavailableReason = "") {
     const { sessionKey, provider } = activeProviderContext();
     const fallbackFetchedAtMs = Number.isFinite(nowMs) ? Math.floor(nowMs) : now();
     return {
@@ -1393,6 +1819,9 @@ function createUpstreamRuntime(opts = {}) {
       totalProfileCount: cachedAuthProfileCounts.has(provider)
         ? cachedAuthProfileCounts.get(provider)
         : null,
+      ...(typeof unavailableReason === "string" && unavailableReason.trim()
+        ? { unavailableReason: unavailableReason.trim() }
+        : {}),
     };
   }
 
@@ -1418,7 +1847,13 @@ function createUpstreamRuntime(opts = {}) {
       stale: cacheState.stale,
     });
     if (!projected) {
-      return emptyProviderUsageSnapshot(cacheState.fetchedAtMs, cacheState.stale);
+      return emptyProviderUsageSnapshot(
+        cacheState.fetchedAtMs,
+        cacheState.stale,
+        provider && !cacheState.stale
+          ? "Usage limits are unavailable for this provider."
+          : "",
+      );
     }
     return {
       ...projected,
@@ -1621,6 +2056,82 @@ function createUpstreamRuntime(opts = {}) {
     });
   }
 
+  async function refreshCommandCatalog(force) {
+    const snapshot = commandCatalogSnapshot();
+    if (commandCatalogUnsupported) {
+      return snapshot;
+    }
+    if (!force && !snapshot.stale) {
+      return snapshot;
+    }
+    if (inFlightCommandCatalogFetch) {
+      return inFlightCommandCatalogFetch;
+    }
+    if (!openclawConnected) {
+      return snapshot;
+    }
+
+    inFlightCommandCatalogFetch = gatewayBridge
+      .request("commands.list", { scope: "text", includeArgs: true })
+      .then((result) => {
+        const rawRows =
+          result && Array.isArray(result.commands) ? result.commands : [];
+        const backendKind = getActiveBackendKind();
+        const commands = normalizeCommandCatalogRows(
+          rawRows,
+          backendKind,
+          commandExecutesFor(backendKind),
+        );
+        if (rawRows.length > COMMAND_CATALOG_MAX_ENTRIES) {
+          emitDebug(
+            "relay.session",
+            "command_catalog_truncated",
+            "warn",
+            { sessionKey: sessionService.ensureSessionKey() },
+            () => ({ received: rawRows.length, kept: commands.length }),
+          );
+        }
+        const changed = !commandCatalogRowsEqual(cachedCommandCatalog, commands);
+        const fresh = cacheCommandCatalog(commands, Date.now(), false);
+        if (changed) {
+          broadcastCommandCatalog(fresh);
+        }
+        return fresh;
+      })
+      .catch((err) => {
+        const message = err && err.message ? err.message : String(err);
+
+        if (isMethodNotFoundError(err, message)) {
+          commandCatalogUnsupported = true;
+          emitDebug(
+            "relay.session",
+            "command_catalog_unsupported",
+            "info",
+            { sessionKey: sessionService.ensureSessionKey() },
+            () => ({ message, backendKind: getActiveBackendKind() }),
+          );
+          return cacheCommandCatalog([], now(), false);
+        }
+        emitDebug(
+          "relay.session",
+          "command_catalog_refresh_failed",
+          "warn",
+          { sessionKey: sessionService.ensureSessionKey() },
+          () => ({ message, hadCache: Array.isArray(cachedCommandCatalog) }),
+        );
+
+        if (Array.isArray(cachedCommandCatalog)) {
+          cachedCommandCatalogStale = true;
+          return commandCatalogSnapshot();
+        }
+        return cacheCommandCatalog([], now(), true);
+      });
+
+    return inFlightCommandCatalogFetch.finally(() => {
+      inFlightCommandCatalogFetch = null;
+    });
+  }
+
   async function refreshAgentsCatalog(force) {
     const snapshot = agentsCatalogSnapshot();
     if (agentsListUnsupported) {
@@ -1705,6 +2216,7 @@ function createUpstreamRuntime(opts = {}) {
       firstGatewayChars: null,
       firstRelayBroadcastAt: null,
       firstRelayBroadcastChars: null,
+      streamingSeq: 0,
     });
   }
 
@@ -1720,6 +2232,14 @@ function createUpstreamRuntime(opts = {}) {
     const snapshot = skillsCatalogSnapshot();
     if (snapshot.stale && openclawConnected) {
       return refreshSkillsCatalog(true);
+    }
+    return snapshot;
+  }
+
+  async function getCommandCatalogSnapshot() {
+    const snapshot = commandCatalogSnapshot();
+    if (snapshot.stale && !commandCatalogUnsupported && openclawConnected) {
+      return refreshCommandCatalog(true);
     }
     return snapshot;
   }
@@ -1763,10 +2283,17 @@ function createUpstreamRuntime(opts = {}) {
   function handleSessionChanged(trigger) {
     if (!openclawConnected) {
       cachedSkillsCatalogStale = true;
+      cachedCommandCatalogStale = true;
       return;
     }
+    refreshActiveSessionIdentity(trigger).catch((err) => {
+      logger.warn(`[relay] Agent identity refresh failed after ${trigger}: ${err.message}`);
+    });
     refreshSkillsCatalog(true).catch((err) => {
       logger.warn(`[relay] Skills catalog refresh failed after ${trigger}: ${err.message}`);
+    });
+    refreshCommandCatalog(true).catch((err) => {
+      logger.warn(`[relay] Command catalog refresh failed after ${trigger}: ${err.message}`);
     });
   }
 
@@ -1825,6 +2352,26 @@ function createUpstreamRuntime(opts = {}) {
       if (!provider || !model) return null;
       return modelRefKey(provider, model);
     },
+    getActiveModelContextWindow: () => {
+      const config = getCurrentSessionModelConfigSnapshot();
+      const models = modelCatalogSnapshot(now()).models;
+      if (!config || models.length === 0) return 0;
+      const provider = normalizeProviderId(config.modelProvider);
+      const model = typeof config.model === "string" ? config.model.trim() : "";
+      if (!provider || !model) return 0;
+      for (const candidate of models) {
+        if (
+          candidate &&
+          normalizeProviderId(candidate.provider) === provider &&
+          candidate.id === model &&
+          Number.isFinite(candidate.contextWindow) &&
+          candidate.contextWindow > 0
+        ) {
+          return Math.floor(candidate.contextWindow);
+        }
+      }
+      return 0;
+    },
     getRunActive: () => !!cachedRunActiveSessionKey,
     nowMs: () => Date.now(),
     broadcast: (frame) => {
@@ -1833,8 +2380,9 @@ function createUpstreamRuntime(opts = {}) {
     },
   });
 
-  gatewayBridge.on("history", (data) => {
+  onGatewayEvent("history", (data) => {
     if (!sessionService.isCurrentSession(data.sessionKey)) return;
+    clearLedgerCommitFallbackTimer();
     emitDebug(
       "openclaw.history",
       "history",
@@ -1851,11 +2399,11 @@ function createUpstreamRuntime(opts = {}) {
             : msg,
         )
       : data.messages;
-    conversationState.hydrate(sanitizedMessages, agentIdentity.name);
+    conversationState.hydrate(sanitizedMessages, agentIdentity.name, data.sessionKey);
     broadcastPages();
   });
 
-  gatewayBridge.on("thinkingDebug", (data) => {
+  onGatewayEvent("thinkingDebug", (data) => {
     if (!sessionService.isCurrentSession(data.sessionKey)) return;
     emitDebug(
       "openclaw.history",
@@ -1908,10 +2456,93 @@ function createUpstreamRuntime(opts = {}) {
     });
   }
 
-  gatewayBridge.on("message", (data) => {
+  function broadcastStreamClear(runId, sessionKey, reason) {
+    const server = getServer();
+    if (!server || typeof server.broadcast !== "function") return;
+    server.broadcast(
+      handler.formatStreamClear({
+        runId: runId || null,
+        sessionKey: sessionKey || sessionService.ensureSessionKey(),
+        reason,
+      }),
+    );
+  }
+
+  function handleNarrationRetag(data) {
+    if (!data || typeof data !== "object") return;
     if (!sessionService.isCurrentSession(data.sessionKey)) return;
+    if (!isNarrationCommit(data)) return;
     const runId = data.runId || null;
-    if (runId) {
+    const retagMessageId = data.id ?? data.messageId;
+    const removed = conversationState.removeLastAssistantMessageMatching(
+      runId,
+      typeof data.text === "string" ? data.text : "",
+      retagMessageId,
+    );
+    emitDebug(
+      "openclaw.message",
+      "narration_retag",
+      "info",
+      {
+        sessionKey: data.sessionKey || sessionService.ensureSessionKey(),
+        runId,
+      },
+      () => ({ removed, textChars: typeof data.text === "string" ? data.text.length : 0 }),
+    );
+    if (removed) {
+      broadcastPages();
+
+      broadcastStreamClear(runId, data.sessionKey, "narration_retagged");
+    }
+  }
+
+  onGatewayEvent("message.retag", handleNarrationRetag);
+
+  onGatewayEvent("message", (data) => {
+    if (!sessionService.isCurrentSession(data.sessionKey)) return;
+    if (data && data.retag === true) {
+      handleNarrationRetag(data);
+      return;
+    }
+    const runId = data.runId || null;
+
+    const turnActive = data.turnActive === true;
+    const dropToolProgressPage =
+      typeof data.messageKind === "string" &&
+      data.messageKind.trim().toLowerCase() === "tool_progress";
+    if (dropToolProgressPage) {
+
+      emitDebug(
+        "openclaw.message",
+        "tool_progress_page_dropped",
+        "info",
+        {
+          sessionKey: data.sessionKey || sessionService.ensureSessionKey(),
+          runId,
+        },
+        () => ({
+          messageId: data.id ?? data.messageId ?? null,
+          turnActive: data.turnActive === true,
+          textChars: fullMessageText(data.content).length,
+        }),
+      );
+      return;
+    }
+
+    const dropNarrationPage = isNarrationCommit(data);
+    if (runId && turnActive) {
+      clearStreamingThrottleTimer();
+      flushPendingStreamingText();
+    }
+    if (runId && !turnActive) {
+
+      if (typeof sessionService.markSessionRead === "function") {
+        Promise.resolve(
+          sessionService.markSessionRead(
+            data.sessionKey || sessionService.peekSessionKey(),
+          ),
+        ).catch(() => {});
+      }
       stopTypingForRun(runId, "assistant_message_committed");
 
       clearStreamingThrottleTimer();
@@ -1932,7 +2563,8 @@ function createUpstreamRuntime(opts = {}) {
         activityId: `run-complete-synth-${runId}`,
       });
     }
-    const runPipeline = runId ? upstreamRunPipeline.get(runId) : null;
+
+    const runPipeline = runId && !turnActive ? upstreamRunPipeline.get(runId) : null;
     if (runPipeline) {
       const completedAt = Date.now();
       if (operationRegistry && typeof operationRegistry.markRunPhase === "function") {
@@ -1971,6 +2603,12 @@ function createUpstreamRuntime(opts = {}) {
       () => ({
         role: data.role || null,
         contentBlocks: Array.isArray(data.content) ? data.content.length : 0,
+
+        messageKind:
+          data && typeof data.messageKind === "string" ? data.messageKind : null,
+        turnActive: data && data.turnActive === true,
+        notes: normalizeAgentProgressNotes(getAgentProgressNotes()),
+        pageDropped: dropNarrationPage,
       }),
     );
 
@@ -1978,17 +2616,90 @@ function createUpstreamRuntime(opts = {}) {
       data.role === "assistant"
         ? sanitizeAssistantContentBlocks(data.content)
         : data.content;
-    conversationState.addMessage(data.role, sanitizedContent);
+    const messageMetadata = {
+      id: data.id ?? data.messageId,
+      runId: data.runId,
+      clientSendId: data.clientSendId ?? data.sendId,
+      rev: data.rev,
+    };
+    if (dropNarrationPage) {
+
+      emitDebug(
+        "openclaw.message",
+        "narration_page_dropped",
+        "info",
+        {
+          sessionKey: data.sessionKey || sessionService.ensureSessionKey(),
+          runId,
+        },
+        () => ({
+          notes: normalizeAgentProgressNotes(getAgentProgressNotes()),
+          textChars: fullMessageText(sanitizedContent).length,
+        }),
+      );
+      broadcastStreamClear(runId, data.sessionKey, "narration_dropped");
+      return;
+    }
+
+    const commitOriginAtMs = normalizeOriginAtMs(data.originAtMs);
+    if (
+      isNarrationCommit(data) ||
+      (data.role === "assistant" && commitOriginAtMs !== null)
+    ) {
+
+      const reordered = conversationState.addAssistantMessageAtOrigin(
+        sanitizedContent,
+        commitOriginAtMs,
+        null,
+        messageMetadata,
+      );
+      emitDebug(
+        "openclaw.message",
+        "narration_page_ordered",
+        "info",
+        {
+          sessionKey: data.sessionKey || sessionService.ensureSessionKey(),
+          runId,
+        },
+        () => ({
+          originAtMs: commitOriginAtMs,
+          narration: isNarrationCommit(data),
+          committedAtMs: Date.now(),
+          reordered,
+          textChars: fullMessageText(sanitizedContent).length,
+        }),
+      );
+    } else {
+      conversationState.addMessage(data.role, sanitizedContent, null, messageMetadata);
+    }
     if (data.role === "assistant") {
       emitDebug(
         "openclaw.message",
         "agent_message",
         "info",
         { sessionKey: data.sessionKey || sessionService.ensureSessionKey() },
-        () => ({ text: fullMessageText(sanitizedContent), runId: data.runId || null }),
+        () => ({
+          text: fullMessageText(sanitizedContent),
+          runId: data.runId || null,
+
+          pageOrder: (conversationState.getPages() || [])
+            .map((page) => (page && typeof page.content === "string" ? page.content : ""))
+            .join("\n\n")
+            .split("\n\n")
+            .slice(-12)
+            .map((line) => line.slice(0, 44)),
+        }),
       );
     }
-    broadcastPages();
+    const preservedLedgerLane = broadcastPages({ preserveLedgerLane: data.role === "assistant" });
+    if (data.role === "assistant" && preservedLedgerLane) {
+      clearLedgerCommitFallbackTimer();
+      ledgerCommitFallbackTimer = setTimeout(() => {
+        ledgerCommitFallbackTimer = 0;
+
+        broadcastPages();
+      }, LEDGER_COMMIT_HISTORY_GRACE_MS);
+    }
 
     sessionContextService.refreshActiveSessionContext().catch(() => {});
 
@@ -1999,6 +2710,14 @@ function createUpstreamRuntime(opts = {}) {
   });
 
   function ingestActivityFrame(data) {
+    data = normalizeGatewaySessionEvent(data);
+    const taskSessionKey =
+      data && typeof data._activeRunSessionKey === "string" && data._activeRunSessionKey.trim()
+        ? data._activeRunSessionKey
+        : data && data.sessionKey;
+    if (data && typeof data.tool === "string") {
+      observeTaskToolUse({ sessionKey: taskSessionKey, toolName: data.tool });
+    }
     if (!sessionService.isCurrentSession(data.sessionKey)) return;
     const runId = data.runId || null;
     const origin = data.origin || null;
@@ -2131,14 +2850,28 @@ function createUpstreamRuntime(opts = {}) {
         : null;
     const sessionKey = resolveThinkingFrameSessionKey(runId, explicitSessionKey);
     if (!sessionKey) return null;
+
+    const rawSeq = source.seq;
+    const seq =
+      typeof rawSeq === "number" && Number.isInteger(rawSeq) && rawSeq >= 0
+        ? rawSeq
+        : null;
     const frame = {
       phase,
       sessionKey,
       runId,
+      ...(seq === null ? {} : { seq }),
     };
     if (phase === "update") {
       frame.text = typeof source.text === "string" ? source.text : "";
       if (typeof source.delta === "string") frame.delta = source.delta;
+      if (typeof source.presentation === "string") {
+
+        Object.assign(frame, { presentation: source.presentation });
+      }
+      if (typeof source.progressNoteId === "string" && source.progressNoteId.trim()) {
+        Object.assign(frame, { progressNoteId: source.progressNoteId.trim() });
+      }
       if (typeof source.summary === "string") frame.summary = source.summary;
       if (typeof source.thinkingSummarySource === "string") {
         frame.thinkingSummarySource = source.thinkingSummarySource;
@@ -2152,6 +2885,8 @@ function createUpstreamRuntime(opts = {}) {
     }
     return frame;
   }
+
+  const emitThinkingStreamDebug = emitDebug.bind(null, "thinking.stream");
 
   function broadcastThinkingUpdate(data) {
     const frame = normalizeThinkingFrame(data, "update");
@@ -2167,14 +2902,51 @@ function createUpstreamRuntime(opts = {}) {
           textChars: data && typeof data.text === "string" ? data.text.length : 0,
         }),
       );
+      emitThinkingStreamDebug(
+        "thinking_update_dropped",
+        "debug",
+        { sessionKey: null, runId: (data && data.runId) || null },
+        () => ({
+          reason: "unknown_sessionless_run",
+          source: data && typeof data.source === "string" ? data.source : null,
+          seq: data && Number.isInteger(data.seq) ? data.seq : null,
+          textLen: data && typeof data.text === "string" ? data.text.length : 0,
+        }),
+      );
       return;
     }
-    if (!sessionService.isCurrentSession(frame.sessionKey)) return;
-    if (!frame.text) return;
+
+    const streamRow = {
+      source: typeof data.source === "string" ? data.source : null,
+      seq: Number.isInteger(data.seq) ? data.seq : null,
+      textLen: typeof data.text === "string" ? data.text.length : 0,
+      deltaLen: typeof data.delta === "string" ? data.delta.length : 0,
+    };
+    const ctx = { sessionKey: frame.sessionKey, runId: frame.runId };
+    if (!sessionService.isCurrentSession(frame.sessionKey)) {
+      emitThinkingStreamDebug("thinking_update_dropped", "debug", ctx, () => ({
+        reason: "not_current_session",
+        ...streamRow,
+      }));
+      return;
+    }
+    if (!frame.text) {
+      emitThinkingStreamDebug("thinking_update_dropped", "debug", ctx, () => ({
+        reason: "empty_text",
+        ...streamRow,
+      }));
+      return;
+    }
     if (frame.runId) {
       const finalizedReason = finalizedThinkingRuns.get(frame.runId);
       if (finalizedReason) {
-        if (finalizedReason !== "response_started") return;
+        if (finalizedReason !== "response_started") {
+          emitThinkingStreamDebug("thinking_update_dropped", "debug", ctx, () => ({
+            reason: `finalized_${finalizedReason}`,
+            ...streamRow,
+          }));
+          return;
+        }
         forgetFinalizedThinkingRun(frame.runId);
       }
       activeThinkingRuns.add(frame.runId);
@@ -2183,9 +2955,13 @@ function createUpstreamRuntime(opts = {}) {
     if (server) {
       server.broadcast(handler.formatThinkingUpdate(frame));
     }
+    emitThinkingStreamDebug("thinking_update", "debug", ctx, () => ({
+      reason: server ? null : "no_client_server",
+      ...streamRow,
+    }));
   }
 
-  function broadcastThinkingFinalize(runId, sessionKey, reason) {
+  function broadcastThinkingFinalize(runId, sessionKey, reason, seq = null) {
     if (typeof runId !== "string" || !runId.trim()) return false;
     const normalizedRunId = runId.trim();
     const frame = normalizeThinkingFrame(
@@ -2193,6 +2969,7 @@ function createUpstreamRuntime(opts = {}) {
         runId: normalizedRunId,
         sessionKey,
         reason,
+        seq,
       },
       "finalize",
     );
@@ -2207,18 +2984,56 @@ function createUpstreamRuntime(opts = {}) {
           phase: "finalize",
         }),
       );
+      emitThinkingStreamDebug(
+        "thinking_finalize_dropped",
+        "debug",
+        { sessionKey: null, runId: normalizedRunId },
+        () => ({
+          reason: "unknown_sessionless_run",
+          finalizeReason: typeof reason === "string" ? reason : null,
+          seq: Number.isInteger(seq) ? seq : null,
+        }),
+      );
       return false;
     }
-    if (!sessionService.isCurrentSession(frame.sessionKey)) return false;
+
+    const finalizeRow = {
+      finalizeReason: typeof reason === "string" && reason ? reason : "finalize",
+      seq: Number.isInteger(seq) ? seq : null,
+    };
+    const ctx = { sessionKey: frame.sessionKey, runId: normalizedRunId };
+    if (!sessionService.isCurrentSession(frame.sessionKey)) {
+      emitThinkingStreamDebug("thinking_finalize_dropped", "debug", ctx, () => ({
+        reason: "not_current_session",
+        ...finalizeRow,
+      }));
+      return false;
+    }
     const finalizedReason = finalizedThinkingRuns.get(normalizedRunId);
     const canHardenSoftFinalize =
       finalizedReason === "response_started" && frame.reason !== "response_started";
-    if (!activeThinkingRuns.has(normalizedRunId) && !canHardenSoftFinalize) return false;
-    if (finalizedReason && !canHardenSoftFinalize) return false;
+    if (!activeThinkingRuns.has(normalizedRunId) && !canHardenSoftFinalize) {
+      emitThinkingStreamDebug("thinking_finalize_dropped", "debug", ctx, () => ({
+        reason: "no_open_pane",
+        ...finalizeRow,
+      }));
+      return false;
+    }
+    if (finalizedReason && !canHardenSoftFinalize) {
+      emitThinkingStreamDebug("thinking_finalize_dropped", "debug", ctx, () => ({
+        reason: `already_finalized_${finalizedReason}`,
+        ...finalizeRow,
+      }));
+      return false;
+    }
     const server = getServer();
     if (server) {
       server.broadcast(handler.formatThinkingFinalize(frame));
     }
+    emitThinkingStreamDebug("thinking_finalize", "debug", ctx, () => ({
+      reason: server ? null : "no_client_server",
+      ...finalizeRow,
+    }));
     rememberFinalizedThinkingRun(normalizedRunId, frame.reason);
     activeThinkingRuns.delete(normalizedRunId);
     return true;
@@ -2256,7 +3071,7 @@ function createUpstreamRuntime(opts = {}) {
     finalizedThinkingRunTimers.clear();
   }
 
-  gatewayBridge.on("thinking", (data) => {
+  onGatewayEvent("thinking", (data) => {
     const phase =
       data && typeof data.phase === "string" && data.phase.trim()
         ? data.phase.trim()
@@ -2266,13 +3081,14 @@ function createUpstreamRuntime(opts = {}) {
         data && data.runId,
         data && data.sessionKey,
         data && data.reason,
+        data && data.seq,
       );
       return;
     }
     broadcastThinkingUpdate(data);
   });
 
-  gatewayBridge.on("streaming", (data) => {
+  onGatewayEvent("streaming", (data) => {
     if (isTitleDistillerStreamingEvent(data)) {
       const runId = data && data.runId ? data.runId : null;
       const sessionKey = data && data.sessionKey ? data.sessionKey : sessionService.ensureSessionKey();
@@ -2363,6 +3179,46 @@ function createUpstreamRuntime(opts = {}) {
         );
       }
     }
+
+    if (isToolProgressCommit(data)) {
+      emitDebug(
+        "openclaw.message",
+        "tool_progress_stream_withheld",
+        "info",
+        { sessionKey, runId },
+        () => ({
+          textChars: typeof data.text === "string" ? data.text.length : 0,
+        }),
+      );
+      return;
+    }
+
+    if (isNarrationCommit(data)) {
+      const notes = normalizeAgentProgressNotes(getAgentProgressNotes());
+      if (notes === "conversation") {
+        broadcastThinkingUpdate({
+          runId,
+          sessionKey,
+          text: typeof data.text === "string" ? data.text : "",
+          delta: typeof data.text === "string" ? data.text : "",
+          presentation: "progress_note",
+          progressNoteId:
+            typeof data.messageId === "string" ? data.messageId : undefined,
+          source: "hermes.narration",
+        });
+      }
+      emitDebug(
+        "openclaw.message",
+        "narration_stream_withheld",
+        "info",
+        { sessionKey, runId },
+        () => ({
+          notes,
+          textChars: typeof data.text === "string" ? data.text.length : 0,
+        }),
+      );
+      return;
+    }
     const prefix = `${agentIdentity.name || "Agent"}: `;
 
     pendingStreaming = {
@@ -2408,15 +3264,16 @@ function createUpstreamRuntime(opts = {}) {
     }
   });
 
-  gatewayBridge.on("status", (statusString) => {
+  onGatewayEvent("status", (statusString) => {
+    if (statusString !== "connected") flushLedgerCommitFallback();
     applyConnectedStatus(statusString === "connected", "status_event");
   });
 
-  gatewayBridge.on("agentIdentity", (data) => {
+  onGatewayEvent("agentIdentity", (data) => {
     applyAgentIdentity(data, "agent_identity_event");
   });
 
-  gatewayBridge.on("connected", () => {
+  onGatewayEvent("connected", () => {
     refreshUpstreamBootstrap("connected_event").catch((err) => {
       logger.warn(`[relay] Upstream connected bootstrap failed: ${err.message}`);
     });
@@ -2424,7 +3281,7 @@ function createUpstreamRuntime(opts = {}) {
     sessionContextService.refreshActiveSessionContext().catch(() => {});
   });
 
-  gatewayBridge.on("timing", (rawEvent) => {
+  onGatewayEvent("timing", (rawEvent) => {
     const timing = normalizeGatewayTimingEvent(rawEvent);
     emitDebug(
       timing.category,
@@ -2435,7 +3292,7 @@ function createUpstreamRuntime(opts = {}) {
     );
   });
 
-  gatewayBridge.on("protocol", (data) => {
+  onGatewayEvent("protocol", (data) => {
     emitDebug(
       "relay.protocol",
       "protocol_frame",
@@ -2456,7 +3313,8 @@ function createUpstreamRuntime(opts = {}) {
     }
   });
 
-  gatewayBridge.on("approval", (data) => {
+  onGatewayEvent("approval", (data) => {
+    rememberTaskApproval(data);
     emitDebug(
       "approvals.timeline",
       "approval_requested",
@@ -2492,7 +3350,18 @@ function createUpstreamRuntime(opts = {}) {
     }
   });
 
-  gatewayBridge.on("approvalResolved", (data) => {
+  onGatewayEvent("approvalResolved", (data) => {
+    const approvalId = data && typeof data.id === "string" ? data.id.trim() : "";
+    const correlated = approvalId ? taskApprovalRequests.get(approvalId) : null;
+    const outcome = data && typeof data.decision === "string" ? data.decision : "";
+    if (correlated && outcome) {
+      observeTaskApproval({
+        sessionKey: correlated.sessionKey,
+        toolName: correlated.toolName,
+        outcome,
+      });
+    }
+    if (approvalId) taskApprovalRequests.delete(approvalId);
     emitDebug(
       "approvals.timeline",
       "approval_resolved",
@@ -2509,7 +3378,49 @@ function createUpstreamRuntime(opts = {}) {
     }
   });
 
-  gatewayBridge.on("error", (err) => {
+  onGatewayEvent("clarify", (data) => {
+    emitDebug(
+      "glasses.lifecycle",
+      "clarify_requested",
+      "info",
+      {
+        sessionKey:
+          data && data.sessionKey
+            ? data.sessionKey
+            : sessionService.ensureSessionKey(),
+      },
+      () => ({
+        clarifyId: data && data.id ? data.id : null,
+        optionCount: data && Array.isArray(data.choices) ? data.choices.length : 0,
+      }),
+    );
+    onClarify(data);
+  });
+
+  onGatewayEvent("question", (data) => {
+    emitDebug(
+      "glasses.lifecycle",
+      "question_requested",
+      "info",
+      {
+        sessionKey:
+          data && data.sessionKey
+            ? data.sessionKey
+            : sessionService.ensureSessionKey(),
+      },
+      () => ({
+        questionId: data && data.id ? data.id : null,
+        questionCount: data && Array.isArray(data.questions) ? data.questions.length : 0,
+      }),
+    );
+    onQuestion(data);
+  });
+
+  onGatewayEvent("questionResolved", (data) => {
+    onQuestionResolved(data);
+  });
+
+  onGatewayEvent("error", (err) => {
     logger.error(`[relay] Upstream error: ${err.message}`);
     emitDebug(
       "relay.transport",
@@ -2520,7 +3431,7 @@ function createUpstreamRuntime(opts = {}) {
     );
   });
 
-  gatewayBridge.on("connectFailed", (info) => {
+  onGatewayEvent("connectFailed", (info) => {
 
     emitDebug(
       "relay.transport",
@@ -2549,6 +3460,8 @@ function createUpstreamRuntime(opts = {}) {
     getAgentDisplayName,
     getProviderUsageSnapshot,
     getSkillsCatalogSnapshot,
+    getCommandCatalogSnapshot,
+    refreshCommandCatalog,
     handleCurrentSessionModelConfigChanged,
     handleCurrentSessionModelConfigCleared,
     handleSessionChanged,
@@ -2560,12 +3473,14 @@ function createUpstreamRuntime(opts = {}) {
     stop() {
       clearStreamingThrottleTimer();
       clearBootstrapRefreshTimer();
+      clearLedgerCommitFallbackTimer();
       bootstrapRefreshNonce += 1;
       pendingStreaming = null;
       activeTyping = null;
       clearThinkingRunState();
       inFlightModelsCatalogFetch = null;
       inFlightSkillsCatalogFetch = null;
+      inFlightCommandCatalogFetch = null;
       inFlightAgentsCatalogFetch = null;
       upstreamRunPipeline.clear();
     },

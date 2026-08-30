@@ -17,6 +17,7 @@ const SCOPES = [
   "operator.read",
   "operator.write",
   "operator.approvals",
+  "operator.questions",
   "operator.admin",
 ];
 const MIN_PROTOCOL_VERSION = 3;
@@ -702,6 +703,19 @@ function extractThinkingPayload(raw) {
   };
 }
 
+function sliceFromLastClosedBoldSegment(raw) {
+  if (typeof raw !== "string" || !raw) return null;
+  const pattern = /\*\*[\s\S]+?\*\*/g;
+  let lastIndex = -1;
+  let match = pattern.exec(raw);
+  while (match) {
+    lastIndex = match.index;
+    match = pattern.exec(raw);
+  }
+  if (lastIndex < 0) return null;
+  return raw.slice(lastIndex);
+}
+
 function extractHistoryTimestampMs(rawMessage) {
   if (!isObject(rawMessage)) return null;
   const ts = rawMessage.timestamp;
@@ -725,6 +739,28 @@ function normalizeSessionKey(rawSessionKey) {
   return trimmed || null;
 }
 
+const CHAT_COMMAND_RUN_TTL_MS = 10 * 60 * 1000;
+const CHAT_COMMAND_RUN_MAX = 32;
+
+function extractChatMessageText(message) {
+  if (!message || typeof message !== "object") return "";
+  const content = Array.isArray(message.content) ? message.content : [];
+  const parts = [];
+  for (const block of content) {
+    if (
+      block &&
+      typeof block === "object" &&
+      block.type === "text" &&
+      typeof block.text === "string" &&
+      block.text
+    ) {
+      parts.push(block.text);
+    }
+  }
+  if (parts.length > 0) return parts.join("");
+  return typeof message.text === "string" ? message.text : "";
+}
+
 function hashThinkingKey(seed) {
   return crypto.createHash("sha1").update(seed).digest("hex").slice(0, 16);
 }
@@ -740,6 +776,16 @@ function thinkingFrameDedupeKey(runId, extracted) {
   return `${normalizedRunId}:detail:${hashThinkingKey(detail)}`;
 }
 
+function clampThinkingFrameText(rawText) {
+  const text = typeof rawText === "string" ? rawText : "";
+  if (text.length <= THINKING_FRAME_MAX_CHARS) return text;
+  const keep = Math.max(
+    0,
+    THINKING_FRAME_MAX_CHARS - THINKING_FRAME_TRUNCATION_PREFIX.length,
+  );
+  return `${THINKING_FRAME_TRUNCATION_PREFIX}${text.slice(-keep)}`;
+}
+
 function appendThinkingFrameText(previousText, nextText) {
   const previous = typeof previousText === "string" ? previousText.trim() : "";
   const next = typeof nextText === "string" ? nextText.trim() : "";
@@ -749,15 +795,21 @@ function appendThinkingFrameText(previousText, nextText) {
   else if (next.startsWith(previous)) text = next;
   else if (previous.includes(next)) text = previous;
   else text = `${previous}\n${next}`;
-  if (text.length <= THINKING_FRAME_MAX_CHARS) return text;
-  const keep = Math.max(
-    0,
-    THINKING_FRAME_MAX_CHARS - THINKING_FRAME_TRUNCATION_PREFIX.length,
-  );
-  return `${THINKING_FRAME_TRUNCATION_PREFIX}${text.slice(-keep)}`;
+  return clampThinkingFrameText(text);
+}
+
+function joinThinkingSegments(baseText, nextText) {
+  const base = typeof baseText === "string" ? baseText.trim() : "";
+  const next = typeof nextText === "string" ? nextText.trim() : "";
+  if (!base) return next;
+  if (!next) return base;
+  return `${base}\n${next}`;
 }
 
 class OpenClawClient extends EventEmitter {
+
+  _thinkingStreamSegments;
+
   constructor(opts = {}) {
     super();
     this._logger = normalizeLogger(opts.logger);
@@ -796,6 +848,8 @@ class OpenClawClient extends EventEmitter {
     this._activeRunGeneration = 0;
     this._runTextBuffer = "";
 
+    this._chatCommandRuns = new Map();
+
     this._agentIdentity = null;
 
     this._lastSeq = null;
@@ -808,6 +862,10 @@ class OpenClawClient extends EventEmitter {
     this._seenThinkingSummaryIds = new Set();
     this._seenThinkingFrameIds = new Set();
     this._thinkingFrameBuffers = new Map();
+
+    this._thinkingStreamSegments = new Map();
+
+    this._liveThinkingRunIds = new Set();
   }
 
   setLogger(logger) {
@@ -911,6 +969,13 @@ class OpenClawClient extends EventEmitter {
     });
     this.emit("protocol", { direction: "out", frame });
     ws.send(raw);
+
+    if (method === "chat.send") {
+      this._registerChatCommandRun(params);
+      promise.catch(() => {
+        this._forgetChatCommandRun(params);
+      });
+    }
     return promise;
   }
 
@@ -978,6 +1043,8 @@ class OpenClawClient extends EventEmitter {
     this._seenThinkingSummaryIds.clear();
     this._seenThinkingFrameIds.clear();
     this._thinkingFrameBuffers.clear();
+    this._thinkingStreamSegments.clear();
+    this._liveThinkingRunIds.clear();
     return this._activeRunGeneration;
   }
 
@@ -992,7 +1059,85 @@ class OpenClawClient extends EventEmitter {
     this._seenThinkingSummaryIds.clear();
     this._seenThinkingFrameIds.clear();
     this._thinkingFrameBuffers.clear();
+    this._thinkingStreamSegments.clear();
+    this._liveThinkingRunIds.clear();
     return this._activeRunGeneration;
+  }
+
+  _registerChatCommandRun(params) {
+    const runId = normalizeRunId(params && params.idempotencyKey);
+    if (!runId) return;
+
+    const cutoffMs = Date.now() - CHAT_COMMAND_RUN_TTL_MS;
+    for (const [key, entry] of this._chatCommandRuns) {
+      if (entry.startedAtMs <= cutoffMs) this._chatCommandRuns.delete(key);
+    }
+    while (this._chatCommandRuns.size >= CHAT_COMMAND_RUN_MAX) {
+      const oldest = this._chatCommandRuns.keys().next();
+      if (oldest.done) break;
+      this._chatCommandRuns.delete(oldest.value);
+    }
+    this._chatCommandRuns.set(runId, {
+      sessionKey: normalizeSessionKey(params && params.sessionKey) || "main",
+      startedAtMs: Date.now(),
+      agentOwned: false,
+    });
+  }
+
+  _forgetChatCommandRun(params) {
+    const runId = normalizeRunId(params && params.idempotencyKey);
+    if (runId) this._chatCommandRuns.delete(runId);
+  }
+
+  _commitChatCommandRun(commit) {
+    this.emit("message", {
+      runId: commit.runId,
+      role: "assistant",
+      content: [{ type: "text", text: commit.text }],
+      sessionKey: commit.sessionKey,
+    });
+    this.emit("activity", {
+      state: "idle",
+      sessionKey: commit.sessionKey,
+      runId: commit.runId,
+      origin: "lifecycle",
+      phase: "end",
+    });
+    this._logger.info(
+      `[openclaw] Gateway command run ended: ${commit.runId} (${commit.text.length} chars)`,
+    );
+  }
+
+  _handleChatEvent(payload) {
+    if (!payload || typeof payload !== "object") return;
+    const runId = normalizeRunId(payload.runId);
+    if (!runId) return;
+    const entry = this._chatCommandRuns.get(runId);
+    if (!entry) return;
+    const state = typeof payload.state === "string" ? payload.state : "";
+
+    if (state !== "final" && state !== "error") {
+      if (state === "aborted") this._chatCommandRuns.delete(runId);
+      return;
+    }
+    this._chatCommandRuns.delete(runId);
+
+    if (entry.agentOwned) return;
+    const text = extractChatMessageText(payload.message);
+
+    if (!text) return;
+    const commit = {
+      runId,
+      sessionKey:
+        normalizeSessionKey(payload.sessionKey) || entry.sessionKey || null,
+      text,
+    };
+
+    if (!this._historyResolved) {
+      this._eventQueue.push({ chatCommit: commit });
+      return;
+    }
+    this._commitChatCommandRun(commit);
   }
 
   _isActiveRunContextCurrent(context) {
@@ -1035,6 +1180,8 @@ class OpenClawClient extends EventEmitter {
     this._lastTick = null;
     this._historyResolved = false;
     this._eventQueue = [];
+
+    this._chatCommandRuns.clear();
     this._invalidateActiveRun();
 
     const ws = new WebSocket(url, { maxPayload: 25 * 1024 * 1024 });
@@ -1250,6 +1397,23 @@ class OpenClawClient extends EventEmitter {
       return;
     }
 
+    if (evt.event === "question.requested") {
+
+      this.emit("question", evt.payload);
+      return;
+    }
+
+    if (evt.event === "question.resolved") {
+
+      this.emit("questionResolved", evt.payload);
+      return;
+    }
+
+    if (evt.event === "chat") {
+      this._handleChatEvent(evt.payload);
+      return;
+    }
+
     if (evt.event === "agent") {
       const payload = evt.payload || {};
       const data = payload.data || {};
@@ -1286,6 +1450,9 @@ class OpenClawClient extends EventEmitter {
     if (!payload) return;
 
     const { runId, stream, data } = payload;
+
+    const chatCommandEntry = this._chatCommandRuns.get(normalizeRunId(runId));
+    if (chatCommandEntry) chatCommandEntry.agentOwned = true;
     if (!stream || !data) return;
 
     switch (stream) {
@@ -1297,6 +1464,9 @@ class OpenClawClient extends EventEmitter {
         break;
       case "tool":
         this._handleToolEvent(runId, data);
+        break;
+      case "thinking":
+        this._handleThinkingStreamEvent(runId, data);
         break;
       case "error":
         this._logger.error(`[openclaw] Agent error: ${JSON.stringify(data)}`);
@@ -1386,12 +1556,15 @@ class OpenClawClient extends EventEmitter {
 
         if (gapDuringRun) {
           this._logger.info("[openclaw] Gap detected during run, re-fetching history");
-          this._fetchHistory(completedSessionKey || "main").catch((err) => {
-            this._logger.error(
-              `[openclaw] Post-gap history fetch failed: ${err.message}`
-            );
-          });
         }
+        const historyGuardOwner = this;
+        this._fetchHistory(completedSessionKey || "main", {
+          idleRunGeneration: historyGuardOwner._activeRunGeneration,
+        }).catch((err) => {
+          this._logger.error(
+            `[openclaw] Post-commit history fetch failed: ${err.message}`
+          );
+        });
         break;
       }
 
@@ -1455,7 +1628,11 @@ class OpenClawClient extends EventEmitter {
   }
 
   _handleToolEvent(runId, data) {
-    if (data.phase !== "start" || !data.name) return;
+    if (!data || !data.name) return;
+    const rawPhase = typeof data.phase === "string" ? data.phase.trim().toLowerCase() : "";
+    if (rawPhase !== "start" && rawPhase !== "update" && rawPhase !== "result") return;
+    const isToolStart = rawPhase === "start";
+    const isToolEnd = rawPhase === "result";
 
     const args = isObject(data.args) ? data.args : null;
     const pathFromData =
@@ -1471,7 +1648,8 @@ class OpenClawClient extends EventEmitter {
       sessionKey: this._activeRunSessionKey,
       runId: runId || this._activeRunId || null,
       origin: "tool",
-      phase: "start",
+      phase: isToolStart ? "start" : "update",
+      toolPhase: isToolEnd ? "end" : "start",
     };
 
     if (args) activity.args = args;
@@ -1483,6 +1661,9 @@ class OpenClawClient extends EventEmitter {
     }
     if (Number.isFinite(data.seq)) {
       activity.seq = Math.floor(data.seq);
+    }
+    if (isToolEnd && data.isError === true) {
+      activity.isError = true;
     }
 
     this.emit("activity", activity);
@@ -1535,6 +1716,8 @@ class OpenClawClient extends EventEmitter {
       sessionKey: normalizeSessionKey(this._activeRunSessionKey),
     };
     if (!runContext.runId || !runContext.sessionKey) return;
+
+    if (this._liveThinkingRunIds.has(runContext.runId)) return;
     if (this._historyActivityPollInFlightGeneration === runContext.generation) return;
 
     this._historyActivityPollInFlightGeneration = runContext.generation;
@@ -1612,19 +1795,77 @@ class OpenClawClient extends EventEmitter {
     }
   }
 
-  _emitThinkingActivityFromPayload(runId, sessionKey, rawPayload, source = "unknown") {
+  _handleThinkingStreamEvent(runId, data) {
+    if (!isObject(data)) return;
+
+    const normalizedRunId =
+      normalizeRunId(runId) || normalizeRunId(this._activeRunId);
+    const segmentKey = normalizedRunId || "__global__";
+
+    const gatewayText =
+      typeof data.text === "string" && data.text.trim() ? data.text : null;
+    const gatewayDelta = typeof data.delta === "string" && data.delta ? data.delta : null;
+
+    const state = this._thinkingStreamSegments.get(segmentKey) || { raw: "", base: "" };
+    if (gatewayText) {
+      if (!state.raw || gatewayText.startsWith(state.raw)) {
+
+        state.raw = gatewayText;
+      } else if (state.raw.startsWith(gatewayText)) {
+
+      } else {
+
+        state.base = joinThinkingSegments(state.base, state.raw);
+        state.raw = gatewayText;
+      }
+    } else if (gatewayDelta) {
+
+      state.raw = `${state.raw}${gatewayDelta}`;
+    } else {
+      return;
+    }
+    this._thinkingStreamSegments.set(segmentKey, state);
+
+    const cumulativeRaw = joinThinkingSegments(state.base, state.raw);
+    if (!cumulativeRaw.trim()) return;
+
+    if (normalizedRunId) {
+      this._liveThinkingRunIds.add(normalizedRunId);
+    }
+
+    const payload = {
+      thinking: sliceFromLastClosedBoldSegment(cumulativeRaw) || cumulativeRaw,
+    };
+    if (data.thinkingSignature) payload.thinkingSignature = data.thinkingSignature;
+    this._emitThinkingActivityFromPayload(
+      normalizedRunId,
+      this._activeRunSessionKey,
+      payload,
+      "thinking_stream",
+      { frameText: cumulativeRaw },
+    );
+  }
+
+  _emitThinkingActivityFromPayload(runId, sessionKey, rawPayload, source = "unknown", options = {}) {
     const extracted = extractThinkingPayload(rawPayload);
     if (!extracted) return;
 
     const normalizedRunId = normalizeRunId(runId) || normalizeRunId(this._activeRunId);
     const normalizedSessionKey = sessionKey || this._activeRunSessionKey || null;
-    const frameDedupeKey = thinkingFrameDedupeKey(normalizedRunId, extracted);
+
+    const authoritativeFrameText = normalizeThinkingText(
+      options && typeof options.frameText === "string" ? options.frameText : null,
+    );
+    const frameDedupeKey = authoritativeFrameText
+      ? `${normalizedRunId || "run"}:frame:${hashThinkingKey(authoritativeFrameText)}`
+      : thinkingFrameDedupeKey(normalizedRunId, extracted);
     if (!frameDedupeKey || !this._seenThinkingFrameIds.has(frameDedupeKey)) {
       const emittedFrame = this._emitThinkingFrameUpdate(
         normalizedRunId,
         normalizedSessionKey,
         extracted,
         source,
+        authoritativeFrameText,
       );
       if (emittedFrame && frameDedupeKey) {
         this._seenThinkingFrameIds.add(frameDedupeKey);
@@ -1672,16 +1913,18 @@ class OpenClawClient extends EventEmitter {
     });
   }
 
-  _emitThinkingFrameUpdate(runId, sessionKey, extracted, source) {
+  _emitThinkingFrameUpdate(runId, sessionKey, extracted, source, authoritativeText = null) {
     const normalizedRunId = normalizeRunId(runId);
     const normalizedSessionKey = normalizeSessionKey(sessionKey);
     const detail = normalizeThinkingText(extracted && extracted.detail);
-    if (!detail) return false;
+    const authoritative = normalizeThinkingText(authoritativeText);
+    if (!authoritative && !detail) return false;
     const bufferKey = normalizedRunId || "__global__";
-    const text = appendThinkingFrameText(
-      this._thinkingFrameBuffers.get(bufferKey),
-      detail,
-    );
+    const previous = this._thinkingFrameBuffers.get(bufferKey) || "";
+
+    const text = authoritative
+      ? clampThinkingFrameText(authoritative)
+      : appendThinkingFrameText(previous, detail);
     if (!text) return false;
     this._thinkingFrameBuffers.set(bufferKey, text);
     this.emit("thinking", {
@@ -1689,7 +1932,10 @@ class OpenClawClient extends EventEmitter {
       sessionKey: normalizedSessionKey,
       runId: normalizedRunId,
       text,
-      delta: detail,
+
+      delta: authoritative
+        ? (text.startsWith(previous) ? text.slice(previous.length) : text)
+        : detail,
       summary: extracted.label,
       thinkingSummarySource: extracted.thinkingSummarySource,
       thinkingSignatureId: extracted.signatureId || null,
@@ -1839,11 +2085,28 @@ class OpenClawClient extends EventEmitter {
     this._drainEventQueue();
   }
 
-  async _fetchHistory(sessionKey) {
+  async _fetchHistory(sessionKey, options = {}) {
     const result = await this.request("chat.history", {
       sessionKey,
       limit: 200,
     });
+
+    if (Number.isFinite(options.idleRunGeneration)) {
+      const historyResult = result;
+      const historyGuardOwner = this;
+      const responseSessionKey =
+        normalizeSessionKey(historyResult && historyResult.sessionKey) || normalizeSessionKey(sessionKey);
+      const stalePostCommitHydrate =
+        historyGuardOwner._activeRunGeneration !== options.idleRunGeneration ||
+        Boolean(normalizeRunId(historyGuardOwner._activeRunId)) ||
+        responseSessionKey !== normalizeSessionKey(sessionKey);
+      if (stalePostCommitHydrate) {
+        historyGuardOwner._logger.debug(
+          `[openclaw] Dropped stale post-commit history for session ${sessionKey}`
+        );
+        return result;
+      }
+    }
 
     const messages = result && Array.isArray(result.messages) ? result.messages : [];
     this._logger.info(`[openclaw] Chat history loaded: ${messages.length} messages`);
@@ -1860,6 +2123,11 @@ class OpenClawClient extends EventEmitter {
     const queue = this._eventQueue;
     this._eventQueue = [];
     for (const evt of queue) {
+
+      if (evt && evt.chatCommit) {
+        this._commitChatCommandRun(evt.chatCommit);
+        continue;
+      }
       this._handleAgentEvent(evt.payload, evt.capturedCommit);
     }
   }

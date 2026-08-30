@@ -1,0 +1,247 @@
+.oc-shell {
+  --oc-good: #42d392;
+  --oc-bad: #ff6b6b;
+  --oc-unknown: #f5c451;
+  --oc-border: color-mix(in srgb, currentColor 18%, transparent);
+  display: grid;
+  gap: 18px;
+  margin: 0 auto;
+  max-width: 1180px;
+  padding: 28px 24px 52px;
+}
+
+.oc-header,
+.oc-section,
+.oc-action,
+.oc-details,
+.oc-no-action,
+.oc-error,
+.oc-loading {
+  border: 1px solid var(--oc-border);
+  border-radius: 14px;
+  padding: 20px;
+}
+
+.oc-header {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: 1fr auto;
+}
+
+.oc-header h1,
+.oc-section h2,
+.oc-section h3,
+.oc-action h3 {
+  margin: 0;
+}
+
+.oc-kicker,
+.oc-section-head span {
+  font-size: 0.72rem;
+  font-weight: 750;
+  letter-spacing: 0.13em;
+  opacity: 0.68;
+  text-transform: uppercase;
+}
+
+.oc-readonly {
+  align-self: start;
+  border: 2px solid currentColor;
+  border-radius: 999px;
+  font-size: 0.76rem;
+  font-weight: 850;
+  letter-spacing: 0.12em;
+  padding: 7px 11px;
+}
+
+.oc-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  grid-column: 1 / -1;
+  opacity: 0.78;
+}
+
+.oc-outcome p {
+  font-size: clamp(1.2rem, 2.5vw, 1.85rem);
+  line-height: 1.35;
+  margin: 0;
+  max-width: 48ch;
+}
+
+.oc-section-head {
+  align-items: baseline;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.oc-path {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, 1fr);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.oc-leg {
+  align-items: center;
+  border: 1px solid var(--oc-border);
+  border-radius: 11px;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: auto 1fr;
+  min-width: 0;
+  padding: 14px;
+  position: relative;
+}
+
+.oc-leg:not(:last-child)::after {
+  content: "→";
+  font-size: 1.25rem;
+  opacity: 0.5;
+  position: absolute;
+  right: -15px;
+  z-index: 1;
+}
+
+.oc-leg small {
+  display: block;
+  line-height: 1.35;
+  margin-top: 4px;
+  opacity: 0.68;
+}
+
+.oc-leg-number {
+  align-items: center;
+  border: 1px solid var(--oc-border);
+  border-radius: 50%;
+  display: flex;
+  height: 28px;
+  justify-content: center;
+  width: 28px;
+}
+
+.oc-state {
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 750;
+  grid-column: 1 / -1;
+  justify-self: start;
+  padding: 4px 8px;
+  text-transform: uppercase;
+}
+
+.oc-state-good { color: var(--oc-good); }
+.oc-state-bad { color: var(--oc-bad); }
+.oc-state-unknown { color: var(--oc-unknown); }
+
+.oc-primary {
+  align-items: start;
+  display: flex;
+  gap: 18px;
+  justify-content: space-between;
+}
+
+.oc-primary p,
+.oc-action p,
+.oc-truth p,
+.oc-checkpoint p {
+  margin-bottom: 0;
+}
+
+.oc-age {
+  border: 1px solid var(--oc-border);
+  border-radius: 8px;
+  flex: none;
+  padding: 8px 10px;
+}
+
+.oc-action {
+  border-color: var(--oc-unknown);
+  display: grid;
+  gap: 12px;
+}
+
+.oc-action code,
+.oc-checkpoint code,
+.oc-address code,
+.oc-teardown code {
+  border: 1px solid var(--oc-border);
+  border-radius: 8px;
+  display: block;
+  overflow-wrap: anywhere;
+  padding: 10px;
+}
+
+.oc-action button {
+  cursor: pointer;
+  justify-self: start;
+  padding: 9px 16px;
+}
+
+.oc-teardown {
+  display: grid;
+  gap: 7px;
+}
+
+.oc-wide-grid {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.65fr);
+}
+
+.oc-truths {
+  display: grid;
+  gap: 10px;
+}
+
+.oc-truth {
+  border: 1px solid var(--oc-border);
+  border-radius: 11px;
+  padding: 14px;
+}
+
+.oc-truth .oc-state {
+  margin-top: 8px;
+}
+
+.oc-checkpoint,
+.oc-address {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.oc-details summary {
+  cursor: pointer;
+  font-weight: 720;
+}
+
+.oc-provenance {
+  display: grid;
+  gap: 8px 16px;
+  grid-template-columns: minmax(140px, 0.35fr) 1fr;
+  margin-top: 18px;
+}
+
+.oc-provenance dt { opacity: 0.68; }
+.oc-provenance dd { margin: 0; overflow-wrap: anywhere; }
+.oc-support { display: grid; gap: 8px; margin-bottom: 0; }
+
+@media (max-width: 780px) {
+  .oc-shell { padding: 18px 14px 36px; }
+  .oc-header { grid-template-columns: 1fr; }
+  .oc-readonly { justify-self: start; }
+  .oc-path { grid-template-columns: 1fr; }
+  .oc-leg:not(:last-child)::after { bottom: -18px; left: 50%; right: auto; transform: rotate(90deg); }
+  .oc-wide-grid { grid-template-columns: 1fr; }
+  .oc-primary { display: grid; }
+  .oc-age { justify-self: start; }
+  .oc-section-head { align-items: start; display: grid; }
+  .oc-provenance { grid-template-columns: 1fr; }
+  .oc-provenance dd { margin-bottom: 8px; }
+}

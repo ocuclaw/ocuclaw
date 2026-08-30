@@ -2,13 +2,14 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { stripAllTaggedSpans } = require("../domain/tagged-span-strip.cjs");
 const { isEvenAiSessionKey: matchesEvenAiSessionKeyGrammar } = require("../domain/even-ai-session-keys.cjs");
-const { activeBackendDisplayName, getActiveBackendKind, } = require("../gateway/backend-contract.cjs");
+const { activeBackendDisplayName, getActiveBackendKind } = require("../gateway/backend-contract.cjs");
 const { createDisplayToggleTracker } = require("./display-toggle-states.cjs");
 const { decideTitleWrite, isUserOrigin } = require("./session-title-record.cjs");
 const { createDistillerBudget } = require("./session-title-distiller-budget.cjs");
 const { isEtSessionKey } = require("./even-terminal/session-key.cjs");
-const { isForeignHermesSessionKey } = require("./hermes-session-keys.cjs");
+const { DEFAULT_HERMES_NAMESPACE, isForeignHermesSessionKey, isHermesSessionKey, parseHermesPublicKey } = require("./hermes-session-keys.cjs");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
+const { gatewaySessionKeyFor } = require("./openclaw-session-key.cjs");
 
 const SESSION_FIRST_USER_CACHE_FILE = "session-first-user-cache.json";
 const SESSION_TITLE_CACHE_FILE = "session-title-cache.json";
@@ -36,6 +37,31 @@ function createUnsupportedSessionKeyError(sessionKey, currentSessionKey = null) 
   err.sessionKey = sessionKey;
   err.currentSessionKey = currentSessionKey;
   return err;
+}
+
+function createSupersededSessionSwitchError(sessionKey, currentSessionKey = null) {
+  const err = new Error("session switch superseded");
+  err.name = "SupersededSessionSwitchError";
+  err.code = "session_switch_superseded";
+  err.reason = "session_switch_superseded";
+  err.sessionKey = sessionKey;
+  err.currentSessionKey = currentSessionKey;
+  return err;
+}
+
+function isSupersededSessionSwitchError(err) {
+  if (!err) return false;
+  return (
+    err.reason === "session_switch_superseded" ||
+    err.code === "session_switch_superseded"
+  );
+}
+
+function caughtMessage(err) {
+  return err && err.message ? err.message : String(err);
+}
+function caughtCode(err) {
+  return err && err.code ? err.code : null;
 }
 
 function normalizeStateDir(stateDir) {
@@ -74,6 +100,14 @@ function deriveAgentIdFromFullKey(fullKey) {
   return match ? match[1] : "";
 }
 
+function deriveHermesProfileIdFromPublicKey(sessionKey) {
+  const parsed = parseHermesPublicKey(sessionKey);
+  if (!parsed) return "";
+  return parsed.namespace === DEFAULT_HERMES_NAMESPACE
+    ? "default"
+    : parsed.namespace;
+}
+
 function sanitizeAssistantContentBlocks(content) {
   if (typeof content === "string") {
     return stripAllTaggedSpans(content);
@@ -84,6 +118,65 @@ function sanitizeAssistantContentBlocks(content) {
       ? { ...block, text: stripAllTaggedSpans(block.text) }
       : block,
   );
+}
+
+function stableChatHistoryRowId(message) {
+  if (!message || typeof message !== "object") return null;
+  const messageId = stableIdentityScalar(message.messageId);
+  if (messageId !== null) {
+    return { field: "messageId", value: messageId };
+  }
+  const id = stableIdentityScalar(message.id);
+  if (id !== null) {
+    return { field: "id", value: id };
+  }
+  const metadata = message.__openclaw;
+  const nestedId = metadata && typeof metadata === "object"
+    ? stableIdentityScalar(metadata.id)
+    : null;
+  if (nestedId !== null) {
+    return { field: "__openclaw.id", value: nestedId };
+  }
+  return null;
+}
+
+function stableIdentityScalar(value) {
+  if (typeof value === "string" && value.trim()) return value;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return null;
+}
+
+function summarizeChatHistoryIdentity(messages) {
+  const rows = Array.isArray(messages) ? messages : [];
+  const conversationalRows = rows.filter(
+    (message) =>
+      message &&
+      (message.role === "user" || message.role === "assistant"),
+  );
+  const fieldCounts = {};
+  let rowsWithStableId = 0;
+  for (const row of conversationalRows) {
+    const identity = stableChatHistoryRowId(row);
+    if (!identity) continue;
+    rowsWithStableId += 1;
+    fieldCounts[identity.field] = (fieldCounts[identity.field] || 0) + 1;
+  }
+  const rowsMissingStableId = conversationalRows.length - rowsWithStableId;
+  const verdict =
+    conversationalRows.length === 0
+      ? "inconclusive_empty"
+      : rowsMissingStableId === 0
+        ? "native"
+        : "derived_fallback";
+  return {
+    rowCount: rows.length,
+    conversationalRowCount: conversationalRows.length,
+    rowsWithStableId,
+    rowsMissingStableId,
+    idFields: Object.keys(fieldCounts).sort(),
+    idFieldCounts: fieldCounts,
+    verdict,
+  };
 }
 
 function createSessionService(opts = {}) {
@@ -107,6 +200,12 @@ function createSessionService(opts = {}) {
       : typeof opts.getOpenclawConnected === "function"
         ? opts.getOpenclawConnected
       : () => false;
+
+  const sessionReadStateSupportedOpt = opts.sessionReadStateSupported;
+  const sessionReadStateSupported =
+    typeof sessionReadStateSupportedOpt === "function"
+      ? sessionReadStateSupportedOpt
+      : () => sessionReadStateSupportedOpt === true;
   const onSessionStateReset =
     typeof opts.onSessionStateReset === "function"
       ? opts.onSessionStateReset
@@ -132,7 +231,12 @@ function createSessionService(opts = {}) {
 
   let currentSessionKey = null;
 
+  let sessionSelectionGeneration = 0;
+
   let pendingSessionListKey = null;
+
+  let unmaterializedDraftSessionKey = null;
+  const inFlightDraftSessionSendCounts = new Map();
   let lastGeneratedSessionTimestamp = 0;
   const DEFAULT_SESSION_KEY_PREFIX =
     typeof opts.defaultSessionKeyPrefix === "string" &&
@@ -393,7 +497,7 @@ function createSessionService(opts = {}) {
       fastMode: !!(row && row.fastMode === true),
       elevatedLevel: normalizeElevatedLevel(row && row.elevatedLevel),
 
-      agentId: sessionAgentOverrideId(sessionKey),
+      agentId: sessionAgentSelectorId(sessionKey),
     };
   }
 
@@ -520,7 +624,7 @@ function createSessionService(opts = {}) {
           ? normalizeElevatedLevel(patch.elevatedLevel)
           : base.elevatedLevel,
 
-      agentId: sessionAgentOverrideId(sessionKey),
+      agentId: sessionAgentSelectorId(sessionKey),
     };
     sessionModelConfigCache.set(sessionKey, config);
     return config;
@@ -581,7 +685,11 @@ function createSessionService(opts = {}) {
     return getSessionModelConfig(ensureSessionKey());
   }
 
-  async function setSessionModelConfig(sessionKey = ensureSessionKey(), patch) {
+  async function setSessionModelConfig(
+    sessionKey = ensureSessionKey(),
+    patch,
+    options = {},
+  ) {
     const hasHostPatch = isHostSessionModelPatch(patch);
 
     if (!hasHostPatch) {
@@ -606,7 +714,14 @@ function createSessionService(opts = {}) {
         canonicalKey = row.key.trim();
       }
     }
-    const request = { key: canonicalKey };
+    const request = gatewaySessionPatchRequest(sessionKey, { key: canonicalKey });
+    if (
+      getActiveBackendKind() === "hermes" &&
+      options &&
+      Reflect.get(options, "initial") === true
+    ) {
+      Reflect.set(request, "initial", true);
+    }
     if (patch && typeof patch.modelRef === "string") {
       const requestedModel = patch.modelRef.trim() ? patch.modelRef : null;
       Object.assign(request, { model: requestedModel });
@@ -763,6 +878,8 @@ function createSessionService(opts = {}) {
             pinnedAtMs: pinMeta.pinnedAtMs,
             agentId: agentFields.agentId,
             agentName: agentFields.agentName,
+            activityDescription: rowActivityDescription(row),
+            ...rowViewStateFields(row),
           };
         }),
       );
@@ -810,6 +927,18 @@ function createSessionService(opts = {}) {
     return inFlightSessionsFetch.finally(() => {
       inFlightSessionsFetch = null;
     });
+  }
+
+  function rowActivityDescription(row) {
+    const value = row && row.lastActivityDescription;
+    return typeof value === "string" && value.trim() ? value.trim() : null;
+  }
+
+  function rowViewStateFields(row) {
+    const fields = {};
+    if (row && typeof row.unread === "boolean") fields.unread = row.unread;
+    if (row && typeof row.hidden === "boolean") fields.hidden = row.hidden;
+    return fields;
   }
 
   async function getSessionsByExactKeys(sessionKeys) {
@@ -880,6 +1009,8 @@ function createSessionService(opts = {}) {
         pinnedAtMs: pinMeta.pinnedAtMs,
         agentId: agentFields.agentId,
         agentName: agentFields.agentName,
+        activityDescription: rowActivityDescription(row),
+        ...rowViewStateFields(row),
       });
     }
 
@@ -889,6 +1020,9 @@ function createSessionService(opts = {}) {
   async function copyForeignSession(sourceKey) {
     if (typeof sourceKey !== "string" || !sourceKey.trim()) {
       throw new Error("copyForeignSession requires a session key");
+    }
+    if (!isForeignHermesSessionKey(sourceKey)) {
+      throw new Error("copyForeignSession requires a foreign Hermes session key");
     }
     if (!isUpstreamConnected()) {
       throw new Error("gateway not connected");
@@ -998,6 +1132,8 @@ function createSessionService(opts = {}) {
       const role =
         msg && typeof msg.role === "string" ? msg.role.toLowerCase() : "";
       if (role !== "user") continue;
+
+      if (msg.compactionSummary) continue;
       const text = extractMessageText(msg.content);
       if (isSyntheticSessionStarter(text)) continue;
       if (text) return text;
@@ -1080,6 +1216,8 @@ function createSessionService(opts = {}) {
       const parsed = JSON.parse(raw);
       const out = new Map();
       for (const [key, value] of Object.entries(parsed ?? {})) {
+
+        if (isForeignHermesSessionKey(key)) continue;
         if (
           value &&
           typeof value === "object" &&
@@ -1177,6 +1315,14 @@ function createSessionService(opts = {}) {
       : "";
   }
 
+  function sessionAgentSelectorId(sessionKey) {
+    if (getActiveBackendKind() === "hermes") {
+      const profileId = deriveHermesProfileIdFromPublicKey(sessionKey);
+      if (profileId) return profileId;
+    }
+    return sessionAgentOverrideId(sessionKey);
+  }
+
   function getSessionAgentId(sessionKey, fullKey) {
     const explicit = explicitSessionAgentId(sessionKey, fullKey);
     if (explicit) {
@@ -1186,6 +1332,27 @@ function createSessionService(opts = {}) {
     return typeof fallback === "string" && fallback.trim()
       ? fallback.trim()
       : "";
+  }
+
+  function gatewaySessionPatchRequest(sessionKey, request) {
+    if (
+      getActiveBackendKind() === "hermes" ||
+      !request ||
+      typeof request !== "object"
+    ) {
+      return request;
+    }
+    const candidateKey =
+      typeof request.key === "string" && request.key.trim()
+        ? request.key.trim()
+        : sessionKey;
+    const shortKey = extractShortKey(sessionKey || candidateKey);
+    const agentId = getSessionAgentId(shortKey, candidateKey);
+    const scopedKey = gatewaySessionKeyFor(candidateKey, agentId);
+    if (!agentId || scopedKey === candidateKey) {
+      return request;
+    }
+    return { ...request, key: scopedKey, agentId };
   }
 
   function hasExplicitSessionAgent(sessionKey, fullKey) {
@@ -1208,17 +1375,18 @@ function createSessionService(opts = {}) {
   }
 
   function setSessionPinned(kind, sessionKey, pinned) {
-    if (!sessionKey || (kind !== "ocuclaw" && kind !== "evenai")) {
+    if (
+      !sessionKey ||
+      isForeignHermesSessionKey(sessionKey) ||
+      (kind !== "ocuclaw" && kind !== "evenai")
+    ) {
       return { ok: false, reason: "invalid" };
     }
     if (pinned) {
       const countForKind = countPinnedForKind(kind);
       const already = sessionPinByKey.get(sessionKey)?.pinned === true;
-      const bypassesOwnSessionCap =
-        kind === "ocuclaw" && isForeignHermesSessionKey(sessionKey);
       if (
         !already &&
-        !bypassesOwnSessionCap &&
         countForKind >= PIN_CAP_PER_KIND
       ) {
         return { ok: false, reason: "cap" };
@@ -1232,10 +1400,106 @@ function createSessionService(opts = {}) {
     return { ok: true };
   }
 
+  const lastReadStampAtMsByKey = new Map();
+
+  const READ_STAMP_SKIP_MS = 1000;
+  const READ_STAMP_KEY_CAP = 200;
+
+  function canWriteSessionReadState(sessionKey) {
+    if (typeof sessionKey !== "string" || !sessionKey.trim()) return false;
+    if (!isHermesSessionKey(sessionKey)) return false;
+    if (!sessionReadStateSupported()) return false;
+    return isUpstreamConnected();
+  }
+
+  async function markSessionRead(sessionKey) {
+    const key = typeof sessionKey === "string" ? sessionKey.trim() : "";
+    if (!canWriteSessionReadState(key)) {
+      return { ok: false, code: "session_read_state_unsupported" };
+    }
+    const nowMs = Date.now();
+    const lastMs = lastReadStampAtMsByKey.get(key);
+    if (typeof lastMs === "number" && nowMs - lastMs < READ_STAMP_SKIP_MS) {
+      return { ok: true, skipped: true };
+    }
+    lastReadStampAtMsByKey.set(key, nowMs);
+    if (lastReadStampAtMsByKey.size > READ_STAMP_KEY_CAP) {
+      const oldest = lastReadStampAtMsByKey.keys().next();
+      if (!oldest.done) lastReadStampAtMsByKey.delete(oldest.value);
+    }
+    try {
+      await gatewayBridge.request(
+        "sessions.patch",
+        gatewaySessionPatchRequest(key, { key, read: true }),
+      );
+    } catch (err) {
+
+      lastReadStampAtMsByKey.delete(key);
+      emitDebug(
+        "relay.session",
+        "session_read_stamp_failed",
+        "debug",
+        { sessionKey: key },
+        () => ({ message: err && err.message ? err.message : String(err) }),
+      );
+      return { ok: false, code: "session_read_stamp_failed" };
+    }
+    invalidateSessionsCache();
+    return { ok: true };
+  }
+
+  async function setSessionHidden(sessionKey, hidden) {
+    const key = typeof sessionKey === "string" ? sessionKey.trim() : "";
+    if (!key || !isHermesSessionKey(key)) {
+      return { ok: false, code: "session_not_hideable" };
+    }
+    if (!sessionReadStateSupported()) {
+      return { ok: false, code: "session_read_state_unsupported" };
+    }
+    if (!isUpstreamConnected()) {
+      return { ok: false, code: "backend_disconnected" };
+    }
+    const canonicalKey = await resolveSessionCanonicalKey(key);
+    let patched;
+    try {
+      patched = await gatewayBridge.request(
+        "sessions.patch",
+        gatewaySessionPatchRequest(key, {
+          key: canonicalKey,
+          hidden: hidden === true,
+        }),
+      );
+    } catch (err) {
+      emitDebug(
+        "relay.session",
+        "session_hidden_update_failed",
+        "warn",
+        { sessionKey: key },
+        () => ({ message: err && err.message ? err.message : String(err) }),
+      );
+      return { ok: false, code: "session_hidden_update_failed" };
+    }
+    if (patched && patched.ok === false) {
+      return {
+        ok: false,
+        code:
+          typeof patched.code === "string"
+            ? patched.code
+            : "session_hidden_update_failed",
+      };
+    }
+    invalidateSessionsCache();
+    return { ok: true };
+  }
+
   async function deleteSessions(kind, sessionKeys) {
     const deleted = [];
     const failed = [];
     for (const key of sessionKeys) {
+      if (isForeignHermesSessionKey(key)) {
+        failed.push({ key, reason: "foreign_session_read_only" });
+        continue;
+      }
       try {
         await deleteSingleSession(kind, key);
         sessionPinByKey.delete(key);
@@ -1263,6 +1527,33 @@ function createSessionService(opts = {}) {
       return etTranscriptSearchProvider(query, searchOpts);
     }
     const maxSnippets = 50;
+    const isHermesRuntime = DEFAULT_SESSION_KEY_PREFIX
+      .trim()
+      .toLowerCase()
+      .startsWith("hermes:");
+    if (kind === "ocuclaw" && isHermesRuntime) {
+      const result = await gatewayBridge.request("sessions.search", {
+        query,
+        limit: maxSnippets,
+      });
+      const snippets = (result && Array.isArray(result.snippets))
+        ? result.snippets.filter((snippet) => (
+          snippet &&
+          typeof snippet.sessionKey === "string" &&
+          hasSupportedSessionKeyPrefix(snippet.sessionKey) &&
+          !isEvenAiSessionKey(snippet.sessionKey)
+        ))
+        : [];
+      return {
+        snippets,
+        truncated: !!(result && result.truncated),
+        unavailable: !!(result && result.unavailable),
+        unavailableReason:
+          result && typeof result.unavailableReason === "string"
+            ? result.unavailableReason
+            : null,
+      };
+    }
     const contextChars = 60;
     const sessions = await getTranscriptSearchSessions(kind).catch(() => []);
     const snippets = [];
@@ -1315,7 +1606,7 @@ function createSessionService(opts = {}) {
         });
       }
     }
-    return { snippets, truncated };
+    return { snippets, truncated, unavailable: false };
   }
 
   async function getTranscriptSearchSessions(kind) {
@@ -1602,7 +1893,8 @@ function createSessionService(opts = {}) {
       () => ({ sessionKey, title: trimmed, replaced, userSet: !!nextUserSet, origin }),
     );
 
-    if (!isUpstreamConnected()) {
+    const skipUpstreamMirror = opts && opts.skipUpstreamMirror === true;
+    if (!skipUpstreamMirror && !isUpstreamConnected()) {
       emitDebug(
         "relay.session",
         "session_title_upstream_mirror_skipped",
@@ -1611,14 +1903,17 @@ function createSessionService(opts = {}) {
         () => ({ reason: "upstream_disconnected", origin }),
       );
     }
-    if (isUpstreamConnected()) {
+    if (!skipUpstreamMirror && isUpstreamConnected()) {
       resolveSessionCanonicalKey(sessionKey)
         .then((canonicalKey) =>
 
-          gatewayBridge.request("sessions.patch", {
-            key: canonicalKey,
-            label: trimmed,
-          }),
+          gatewayBridge.request(
+            "sessions.patch",
+            gatewaySessionPatchRequest(sessionKey, {
+              key: canonicalKey,
+              label: trimmed,
+            }),
+          ),
         )
         .catch((err) => {
           emitDebug(
@@ -1631,6 +1926,49 @@ function createSessionService(opts = {}) {
         });
     }
     return { ok: true, replaced, userSet: !!nextUserSet };
+  }
+
+  async function setUserSessionTitle(sessionKey, title) {
+    if (!isHermesSessionKey(sessionKey)) {
+      return setSessionTitle(sessionKey, title, { userSet: true });
+    }
+    if (isForeignHermesSessionKey(sessionKey)) {
+      return { ok: false, code: "session_not_renamable" };
+    }
+    if (typeof title !== "string" || !title.trim()) {
+      return { ok: false, code: "invalid_title" };
+    }
+    const trimmed = title.trim();
+    const decision = decideTitleWrite(
+      sessionTitleByKey.get(sessionKey),
+      "user_tool",
+    );
+    if (!decision.allowed) {
+      return { ok: false, code: decision.code };
+    }
+    if (!isUpstreamConnected()) {
+      throw new Error("Hermes backend is disconnected");
+    }
+    const canonicalKey = await resolveSessionCanonicalKey(sessionKey);
+    const patched = await gatewayBridge.request(
+      "sessions.patch",
+      gatewaySessionPatchRequest(sessionKey, {
+        key: canonicalKey,
+        label: trimmed,
+      }),
+    );
+    if (patched && patched.ok === false) {
+      return {
+        ok: false,
+        code: typeof patched.code === "string"
+          ? patched.code
+          : "session_title_update_failed",
+      };
+    }
+    return setSessionTitle(sessionKey, trimmed, {
+      userSet: true,
+      skipUpstreamMirror: true,
+    });
   }
 
   function isSessionUserLocked(sessionKey) {
@@ -1691,7 +2029,13 @@ function createSessionService(opts = {}) {
     if (isUpstreamConnected()) {
       resolveSessionCanonicalKey(sessionKey)
         .then((canonicalKey) =>
-          gatewayBridge.request("sessions.patch", { key: canonicalKey, label: null }),
+          gatewayBridge.request(
+            "sessions.patch",
+            gatewaySessionPatchRequest(sessionKey, {
+              key: canonicalKey,
+              label: null,
+            }),
+          ),
         )
         .catch((err) => {
           emitDebug(
@@ -1856,8 +2200,10 @@ function createSessionService(opts = {}) {
     if (
       typeof sessionKey === "string" &&
       sessionKey.length > 0 &&
-      !hasSupportedSessionKeyPrefix(sessionKey) &&
-      !isEtSessionKey(sessionKey)
+      (
+        isForeignHermesSessionKey(sessionKey) ||
+        (!hasSupportedSessionKeyPrefix(sessionKey) && !isEtSessionKey(sessionKey))
+      )
     ) {
       emitDebug(
         "relay.session",
@@ -1872,6 +2218,10 @@ function createSessionService(opts = {}) {
       );
       throw createUnsupportedSessionKeyError(sessionKey, currentSessionKey);
     }
+
+    const generation = ++sessionSelectionGeneration;
+    const stillCurrent = () => generation === sessionSelectionGeneration;
+
     const markPendingSessionList =
       opts.markPendingSessionList === true &&
       hasSupportedSessionKeyPrefix(sessionKey);
@@ -1879,6 +2229,7 @@ function createSessionService(opts = {}) {
     if (onSessionStateReset) {
       onSessionStateReset();
     }
+    discardDraftSession("session_switch");
     pendingSessionListKey = markPendingSessionList ? sessionKey : null;
     currentSessionKey = sessionKey;
     emitDebug(
@@ -1891,16 +2242,40 @@ function createSessionService(opts = {}) {
         markPendingSessionList,
       }),
     );
-    conversationState.clear();
+    conversationState.clear(sessionKey);
+
+    let outcome = null;
 
     if (isEtSessionKey(sessionKey) && etHistoryProvider) {
       try {
         const rows = await etHistoryProvider(sessionKey);
 
         const etAgentName = /^et:codex:/.test(sessionKey) ? "Codex" : "Claude";
-        conversationState.hydrate(Array.isArray(rows) ? rows : [], etAgentName);
+        outcome = {
+          hydrate: true,
+          rows: Array.isArray(rows) ? rows : [],
+          agentName: etAgentName,
+          truncatedHead: false,
+        };
       } catch (err) {
-        logger.error(`[relay] et history load failed: ${err.message}`);
+        emitDebug(
+          "relay.session",
+          "session_history_load_failed",
+          "warn",
+          { sessionKey, lane: "et" },
+          () => ({
+            sessionKey,
+            lane: "et",
+            message: caughtMessage(err),
+            code: caughtCode(err),
+          }),
+        );
+        outcome = {
+          hydrate: true,
+          rows: [],
+          agentName: /^et:codex:/.test(sessionKey) ? "Codex" : "Claude",
+          failed: true,
+        };
       }
     } else if (isUpstreamConnected()) {
       try {
@@ -1917,12 +2292,67 @@ function createSessionService(opts = {}) {
                 : msg,
             )
           : messages;
-        conversationState.hydrate(sanitized, getAgentName());
-      } catch (err) {
-        logger.error(
-          `[relay] Failed to load session history: ${err.message}`,
+        const identityPreflight = summarizeChatHistoryIdentity(sanitized);
+        emitDebug(
+          "relay.session",
+          "chat_history_identity_preflight",
+          identityPreflight.verdict === "native" ? "info" : "warn",
+          { sessionKey },
+          () => ({
+            sessionKey,
+            backend: getActiveBackendKind(),
+            ...identityPreflight,
+          }),
         );
+
+        const historyTotal =
+          result && Number.isFinite(result.total) ? Math.floor(result.total) : null;
+        outcome = {
+          hydrate: true,
+          rows: sanitized,
+          agentName: getAgentName(),
+          truncatedHead: historyTotal !== null && historyTotal > sanitized.length,
+        };
+      } catch (err) {
+
+        emitDebug(
+          "relay.session",
+          "session_history_load_failed",
+          "warn",
+          { sessionKey, lane: "hermes" },
+          () => ({
+            sessionKey,
+            lane: "hermes",
+            message: caughtMessage(err),
+            code: caughtCode(err),
+          }),
+        );
+        outcome = { hydrate: true, rows: [], agentName: getAgentName(), failed: true };
       }
+    }
+
+    if (!stillCurrent()) {
+      emitDebug(
+        "relay.session",
+        "switch_session_superseded",
+        "debug",
+        { sessionKey },
+        () => ({
+          sessionKey,
+          generation,
+          currentGeneration: sessionSelectionGeneration,
+          currentSessionKey,
+        }),
+      );
+      throw createSupersededSessionSwitchError(sessionKey, currentSessionKey);
+    }
+
+    if (outcome && outcome.hydrate) {
+
+      conversationState.hydrate(outcome.rows, outcome.agentName, sessionKey, {
+        truncatedHead: outcome.truncatedHead === true,
+        historyUnavailable: outcome.failed === true,
+      });
     }
 
     const pages = conversationState.getPages();
@@ -1937,17 +2367,23 @@ function createSessionService(opts = {}) {
 
   async function newSession(opts = {}) {
     const sendResetCommand = Reflect.get(opts, "sendResetCommand") !== false;
+    const materializeImmediately =
+      Reflect.get(opts, "materializeImmediately") !== false;
     const hasAgentRef = Reflect.has(opts, "agentRef");
     const { sessionKey, agentRef } = mintSessionKey({
       agentRef: hasAgentRef ? Reflect.get(opts, "agentRef") : "",
       inheritAppBinding: !hasAgentRef,
     });
+
+    sessionSelectionGeneration += 1;
     invalidateSessionsCache();
     if (onSessionStateReset) {
       onSessionStateReset();
     }
+    discardDraftSession("superseded");
     currentSessionKey = sessionKey;
-    pendingSessionListKey = sessionKey;
+    pendingSessionListKey = materializeImmediately ? sessionKey : null;
+    unmaterializedDraftSessionKey = materializeImmediately ? null : sessionKey;
     pendingInitialConfigSessionKeys.add(sessionKey);
     emitDebug(
       "relay.session",
@@ -1957,10 +2393,20 @@ function createSessionService(opts = {}) {
       () => ({
         sessionKey,
         sendResetCommand,
+        materialized: materializeImmediately,
         agentRef: agentRef || null,
       }),
     );
-    conversationState.clear();
+    if (!materializeImmediately) {
+      emitDebug(
+        "relay.session",
+        "draft_created",
+        "info",
+        { sessionKey },
+        () => ({ materialized: false }),
+      );
+    }
+    conversationState.clear(sessionKey, true);
     conversationState.setAgentName(getAgentName() || "Agent");
     const pages = conversationState.getPages();
     if (onPagesChanged) {
@@ -1970,13 +2416,84 @@ function createSessionService(opts = {}) {
       onStatusChanged();
     }
     if (sendResetCommand && isUpstreamConnected()) {
+      const resetAgentId =
+        getActiveBackendKind() === "hermes"
+          ? ""
+          : getSessionAgentId(sessionKey, undefined);
+      const resetGatewayKey = resetAgentId
+        ? gatewaySessionKeyFor(sessionKey, resetAgentId)
+        : sessionKey;
       gatewayBridge
-        .sendMessage(`/new ${activeNewSessionGreetingPrompt()}`, sessionKey)
+        .sendMessage(
+          `/new ${activeNewSessionGreetingPrompt()}`,
+          sessionKey,
+          null,
+          resetGatewayKey !== sessionKey ? { agentId: resetAgentId } : undefined,
+        )
         .catch((err) => {
           logger.error(`[relay] Failed to send /new for new session: ${err.message}`);
         });
     }
     return { sessionKey, pages };
+  }
+
+  function materializeDraftSession(sessionKey) {
+    if (
+      !sessionKey ||
+      (unmaterializedDraftSessionKey !== sessionKey &&
+        !inFlightDraftSessionSendCounts.has(sessionKey))
+    ) return false;
+    if (unmaterializedDraftSessionKey === sessionKey) {
+      unmaterializedDraftSessionKey = null;
+    }
+    inFlightDraftSessionSendCounts.delete(sessionKey);
+    pendingSessionListKey = sessionKey;
+    invalidateSessionsCache();
+    emitDebug(
+      "relay.session",
+      "draft_materialized",
+      "info",
+      { sessionKey },
+      () => ({ trigger: "first_user_message_accepted" }),
+    );
+    return true;
+  }
+
+  function isDraftSession(sessionKey) {
+    return !!sessionKey && unmaterializedDraftSessionKey === sessionKey;
+  }
+
+  function markDraftSessionInFlight(sessionKey) {
+    if (!isDraftSession(sessionKey)) return false;
+    inFlightDraftSessionSendCounts.set(
+      sessionKey,
+      (inFlightDraftSessionSendCounts.get(sessionKey) || 0) + 1,
+    );
+    return true;
+  }
+
+  function releaseDraftSessionSend(sessionKey) {
+    const count = inFlightDraftSessionSendCounts.get(sessionKey) || 0;
+    if (count <= 1) return inFlightDraftSessionSendCounts.delete(sessionKey);
+    inFlightDraftSessionSendCounts.set(sessionKey, count - 1);
+    return true;
+  }
+
+  function discardDraftSession(reason = "discarded") {
+    if (!unmaterializedDraftSessionKey) return false;
+    const sessionKey = unmaterializedDraftSessionKey;
+    unmaterializedDraftSessionKey = null;
+    if (inFlightDraftSessionSendCounts.has(sessionKey)) {
+      return true;
+    }
+    emitDebug(
+      "relay.session",
+      "draft_discarded",
+      "info",
+      { sessionKey },
+      () => ({ reason }),
+    );
+    return true;
   }
 
   function normalizeSessionKeyForCompare(rawKey) {
@@ -2016,6 +2533,11 @@ function createSessionService(opts = {}) {
     primeSessionModelConfig,
     hasPendingInitialConfig,
     clearPendingInitialConfig,
+    materializeDraftSession,
+    isDraftSession,
+    markDraftSessionInFlight,
+    releaseDraftSessionSend,
+    discardDraftSession,
     getSessions,
     copyForeignSession,
     getSessionTitle,
@@ -2035,10 +2557,13 @@ function createSessionService(opts = {}) {
     clearSessionTitle,
     clearLogicalSessionState,
     setSessionTitle,
+    setUserSessionTitle,
     switchToSession,
     newSession,
     isCurrentSession,
     setSessionPinned,
+    setSessionHidden,
+    markSessionRead,
     getSessionPin,
     getSessionAgentId,
     setSessionAgentId,
@@ -2050,4 +2575,4 @@ function createSessionService(opts = {}) {
   };
 }
 
-module.exports = { activeNewSessionGreetingPrompt, createSessionService, HERMES_NEW_SESSION_GREETING_PROMPT, NEW_SESSION_GREETING_PROMPT };
+module.exports = { activeNewSessionGreetingPrompt, createSessionService, createSupersededSessionSwitchError, isSupersededSessionSwitchError, HERMES_NEW_SESSION_GREETING_PROMPT, NEW_SESSION_GREETING_PROMPT, summarizeChatHistoryIdentity };

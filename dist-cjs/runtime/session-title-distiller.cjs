@@ -1,5 +1,5 @@
 const nodePath = require("node:path");
-const { isDistillerSessionKey, sanitizeTitle, buildExcerpt, buildDistillerAgentParams, internalTranscriptFilename, DISTILLER_SESSION_PREFIX, EXCERPT_FENCE, EXCERPT_FENCE_END, extractAssistantTitleFromMessages, splitModelRef, } = require("./session-title-distiller-helpers.cjs");
+const { isDistillerSessionKey, sanitizeTitle, buildExcerpt, buildDistillerAgentParams, internalTranscriptFilename, DISTILLER_SESSION_PREFIX, EXCERPT_FENCE, EXCERPT_FENCE_END, extractAssistantTitleFromMessages, splitModelRef } = require("./session-title-distiller-helpers.cjs");
 const { isUserOrigin } = require("./session-title-record.cjs");
 
 const PROMPT_INSTRUCTION =

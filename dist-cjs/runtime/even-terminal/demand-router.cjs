@@ -1,4 +1,4 @@
-const { buildDemandSurface, frameQuestionTexts, parseSessionKey, QUESTION_DEADLINE_SEC, PERMISSION_DEADLINE_SEC, } = require("./demand-surface.cjs");
+const { buildDemandSurface, frameQuestionTexts, parseSessionKey, QUESTION_DEADLINE_SEC, PERMISSION_DEADLINE_SEC } = require("./demand-surface.cjs");
 
 const UNANSWERED = "skip";
 
@@ -36,6 +36,9 @@ function createDemandRouter(deps) {
   const now = typeof opts.now === "function" ? opts.now : () => Date.now();
   const onError = typeof opts.onError === "function" ? opts.onError : () => {};
   const onFlush = typeof opts.onFlush === "function" ? opts.onFlush : () => {};
+  const schedule = typeof opts.schedule === "function" ? opts.schedule : setTimeout;
+  const cancelScheduled =
+    typeof opts.cancelScheduled === "function" ? opts.cancelScheduled : clearTimeout;
 
   const bySession = new Map();
 
@@ -122,6 +125,92 @@ function createDemandRouter(deps) {
     if (!entry) return;
     for (const id of entry.surfaceIds) bySurface.delete(id);
     if (bySession.get(entry.sessionKey) === entry) bySession.delete(entry.sessionKey);
+    if (entry.timer) {
+      cancelScheduled(entry.timer);
+      entry.timer = null;
+    }
+  }
+
+  function deliverExternalDecision(entry, choice, reason) {
+    if (!entry || entry.producer !== "external" || typeof entry.onDecision !== "function") {
+      return;
+    }
+    Promise.resolve(entry.onDecision({ choice, reason })).catch((error) => {
+      onError({
+        reason: "external_decision_failed",
+        surfaceId: entry.surfaceId,
+        sessionKey: entry.sessionKey,
+        error,
+      });
+    });
+  }
+
+  function retireEntry(
+    entry,
+    reason,
+    notify,
+    cancelExternal = true,
+  ) {
+    if (!entry || entry.locked) return false;
+    entry.locked = true;
+    forget(entry);
+    if (notify) dismiss({ surfaceId: entry.surfaceId, sessionKey: entry.sessionKey, reason });
+    if (cancelExternal) deliverExternalDecision(entry, "cancel", reason);
+    return true;
+  }
+
+  function retireProducerConflicts(incomingProducer, sessionKey) {
+    for (const entry of Array.from(bySession.values())) {
+      if (
+        incomingProducer === "external" ||
+        entry.producer === "external" ||
+        entry.sessionKey === sessionKey
+      ) {
+
+        retireEntry(entry, "superseded", false, true);
+      }
+    }
+  }
+
+  function presentDecision(params = {}) {
+    const surface = params && params.surface;
+    const surfaceId = surface && typeof surface.surfaceId === "string" ? surface.surfaceId : "";
+    const sessionKey = surface && typeof surface.sessionKey === "string" ? surface.sessionKey : "";
+    const options = surface && Array.isArray(surface.options) ? surface.options : [];
+    if (!surfaceId || !sessionKey || !surface.question || options.length === 0) return false;
+
+    retireProducerConflicts("external", sessionKey);
+    const expiresAtMs = Number(params.expiresAtMs);
+    const entry = {
+      producer: "external",
+      surfaceId,
+      surfaceIds: [surfaceId],
+      sessionKey,
+      options,
+      locked: false,
+      timer: null,
+      onDecision: typeof params.onDecision === "function" ? params.onDecision : null,
+    };
+    bySession.set(sessionKey, entry);
+    bySurface.set(surfaceId, entry);
+    if (Number.isFinite(expiresAtMs)) {
+      const ttlMs = Math.max(1, expiresAtMs - now());
+      entry.timer = schedule(() => {
+        retireEntry(entry, "timeout", true, true);
+      }, ttlMs);
+    }
+    inject({
+      ...surface,
+      payload: surface,
+      meta: {
+        kind: surface.kind || "permission",
+        sessionKey,
+        stepIndex: 0,
+        stepCount: 0,
+      },
+      options,
+    });
+    return true;
   }
 
   function stepDeadlineSec(entry) {
@@ -186,8 +275,7 @@ function createDemandRouter(deps) {
   function retire(sessionKey, reason, notify) {
     const entry = bySession.get(sessionKey);
     if (!entry) return null;
-    forget(entry);
-    if (notify) dismiss({ surfaceId: entry.surfaceId, sessionKey, reason });
+    retireEntry(entry, reason, notify, true);
     return entry;
   }
 
@@ -199,7 +287,7 @@ function createDemandRouter(deps) {
     const surface = buildDemandSurface(ev, null);
     if (surface) {
 
-      retire(sessionKey, "superseded", false);
+      retireProducerConflicts("even-terminal", sessionKey);
       const deadlineMs = Number(surface.payload.deadlineSec) * 1000;
 
       const answerable = surface.meta.answerableIndexes;
@@ -215,6 +303,7 @@ function createDemandRouter(deps) {
             }
           : null;
       const entry = {
+        producer: "even-terminal",
         surfaceId: surface.surfaceId,
         sessionKey,
         options: surface.options,
@@ -260,6 +349,25 @@ function createDemandRouter(deps) {
     const entry = surfaceId ? bySurface.get(surfaceId) : null;
 
     if (!entry || entry.locked) return false;
+
+    if (entry.producer === "external") {
+      if (result.result === "dismissed") {
+        retireEntry(entry, "dismissed", false, true);
+        return true;
+      }
+      if (result.result !== "selected" || surfaceId !== entry.surfaceId) return false;
+      const index = Number(result.selectedIndex);
+      if (!Number.isInteger(index) || index < 0 || index >= entry.options.length) {
+        onError({ reason: "index_out_of_range", surfaceId, index });
+        return false;
+      }
+      const choice = entry.options[index] && entry.options[index].key;
+      if (typeof choice !== "string" || !choice) return false;
+      entry.locked = true;
+      forget(entry);
+      deliverExternalDecision(entry, choice, "selected");
+      return true;
+    }
 
     if (result.result === "dismissed") {
 
@@ -339,12 +447,28 @@ function createDemandRouter(deps) {
     }
   }
 
+  function forgetExternal(reason) {
+    for (const entry of Array.from(bySession.values())) {
+      if (entry.producer === "external") {
+        retireEntry(entry, reason || "display_changed", true, true);
+      }
+    }
+  }
+
   function activeSurfaceId(sessionKey) {
     const entry = bySession.get(sessionKey);
     return entry ? entry.surfaceId : "";
   }
 
-  return { handleClassified, handleOutcome, forgetSession, forgetAll, activeSurfaceId };
+  return {
+    handleClassified,
+    handleOutcome,
+    presentDecision,
+    forgetSession,
+    forgetAll,
+    forgetExternal,
+    activeSurfaceId,
+  };
 }
 
 module.exports = { createDemandRouter };

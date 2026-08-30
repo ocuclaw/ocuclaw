@@ -1,172 +1,318 @@
-# Finish setting up OcuClaw
+# Launch OcuClaw on Hermes release `v2026.8.27`
 
-These commands use the official Hermes 0.19 CLI. Do not edit Hermes
-configuration files or secret files by hand.
+This launch card is for OcuClaw train `2.0.2` and Setup Assistant guide
+`1.3.17-hermes`. Those identities are independent of the Hermes package version
+(`0.20.6`) and certified source commit.
 
-## 1. Enable the plugin
+The Relay Credential is host-managed: initial plugin bootstrap generates it
+once on a provably fresh profile, stores it through Hermes's atomic `.env`
+contract, and never reveals, returns, exports, imports, or asks for it. Hermes
+masked prompts remain only for optional Soniox and Even AI credentials.
 
-```bash
-hermes plugins enable ocuclaw
-```
+## Install and update
 
-## 2. Store the relay token
+<!-- ocuclaw:install-block:start -->
+OcuClaw needs Hermes `>=0.20.0,<0.21.0`; the certified baseline is Hermes
+`0.20.6`.
 
-Replace the placeholder with the same token entered in the OcuClaw app relay
-server token field. Do not paste the real value into chat or diagnostics.
-
-```bash
-hermes config set OCUCLAW_RELAY_TOKEN "YOUR-RELAY-TOKEN"
-```
-
-The relay token is required. Hermes stores environment-key settings through
-its secret-aware configuration lane, and the environment value takes precedence
-over any legacy dotted token setting.
-
-## 3. Add optional service secrets
-
-Only run the command for a service you intend to use. Never use an empty value.
-
-Soniox speech-to-text:
+**Terminal first.** This is the supported path and the one every beta build is
+tested on:
 
 ```bash
-hermes config set OCUCLAW_SONIOX_API_KEY "YOUR-SONIOX-API-KEY"
-```
-
-Even AI:
-
-```bash
-hermes config set OCUCLAW_EVEN_AI_TOKEN "YOUR-EVEN-AI-TOKEN"
-```
-
-These exact environment-key names override legacy dotted secret settings. The
-plugin manifest intentionally prompts only for `OCUCLAW_RELAY_TOKEN`; the two
-optional secrets do not gate plugin loading.
-
-## 4. Set non-secret options
-
-The relay defaults are sufficient for most testers. The Hermes beta ships
-Even Terminal ON through an explicit non-secret setting because the runtime
-default remains off. Use dotted keys only for non-secret platform settings:
-
-```bash
-hermes config set platforms.ocuclaw.enabled true
-hermes config set platforms.ocuclaw.extra.wsPort 47801
-hermes config set platforms.ocuclaw.extra.evenTerminalEnabled true
-hermes config set display.platforms.ocuclaw.tool_progress off
-```
-
-The last setting keeps Hermes' conversational tool-progress bubbles out of the
-OcuClaw transcript. OcuClaw receives tool lifecycle activity through its
-structured glasses HUD instead. On Hermes 0.19, `off` is stored as a boolean,
-so the official readback below reports `false`; that is the expected value.
-
-If Even AI is enabled, choose its non-secret behavior separately:
-
-```bash
-hermes config set platforms.ocuclaw.extra.evenAiEnabled true
-hermes config set platforms.ocuclaw.extra.evenAiSystemPrompt "Answer briefly for the Even G2 HUD"
-hermes config set platforms.ocuclaw.extra.evenAiRoutingMode active
-```
-
-Inspect non-secret settings without reading secrets back:
-
-```bash
-hermes config get platforms.ocuclaw.enabled
-hermes config get platforms.ocuclaw.extra.wsPort
-hermes config get platforms.ocuclaw.extra.evenTerminalEnabled
-hermes config get display.platforms.ocuclaw.tool_progress
-hermes config get platforms.ocuclaw.extra.evenAiEnabled
-hermes config get platforms.ocuclaw.extra.evenAiRoutingMode
-```
-
-Continue only when the tool-progress readback is `false`. If an operator has
-enabled Hermes' config-gated `/verbose` command, using `/verbose` on OcuClaw
-can change this per-platform setting; reapply the `off` command before beta
-validation.
-
-Do not set `platforms.ocuclaw.extra.wsBind`. The relay must stay on loopback;
-use Tailscale Serve for the authenticated phone route at `:8446`.
-
-## 5. Restart Hermes
-
-```bash
+hermes plugins install ocuclaw/ocuclaw --enable
+hermes config set display.interface tui   # the pairing panel lives in the TUI
 hermes gateway restart
 ```
 
-## 6. Link the bundled setup assistant
+Then, in bare `hermes` or in Hermes Desktop:
 
-On macOS or Linux, run this exact idempotent command:
+```text
+/ocuclaw-setup
+```
+
+`hermes plugins install` prints that restart instruction and stops there — it
+never restarts the gateway for you. Until the gateway restarts, OcuClaw is
+installed but not loaded, and nothing about the glasses works yet.
+
+**Never install with `--ref`.** A ref-pinned install is recorded as
+`pinned: true`, and `hermes plugins update ocuclaw` then refuses to move it
+forward at all; the only way out is another explicit
+`--force --ref <40-character SHA>` install. Take the published tip —
+`hermes plugins install ocuclaw/ocuclaw --enable`, nothing more.
+
+**Hermes Desktop second.** Opening
+
+```text
+hermes://plugin/install?repo=ocuclaw/ocuclaw
+```
+
+installs the same bundle through the Desktop install modal, enabled by default.
+Desktop picks up the OcuClaw presenter immediately, but the agent half still
+only enters the gateway on the gateway's next start — so a Desktop install
+leaves two follow-ups, and the OcuClaw setup card in the Hermes Desktop title
+bar walks you through both:
+
+1. The card explains the pending restart and offers **Restart gateway**. Click
+   it, or run `hermes gateway restart` in a terminal — either works. The card
+   reads the gateway's own reported platforms rather than its own web route, so
+   it advances only once the gateway has genuinely loaded OcuClaw.
+2. The card then reads **Pair your glasses**. Run `/ocuclaw-setup` and finish
+   pairing. The card retires on the durable pairing receipt and stays gone,
+   including across a Desktop relaunch.
+
+**Update.** In `hermes plugins update ocuclaw`, `ocuclaw` is the **plugin id** —
+the `name:` field in `plugin.yaml` — and not the `ocuclaw/ocuclaw` repository
+name. Update resolves the directory of that name under `~/.hermes/plugins`; it
+never looks at the repository the plugin came from:
 
 ```bash
-ln -sfn ~/.hermes/plugins/ocuclaw/skills/ocuclaw-assist-hermes ~/.hermes/skills/ocuclaw-assist-hermes
+hermes plugins update ocuclaw
+hermes gateway restart
 ```
 
-Confirm Hermes indexes it:
+Unlike install, `hermes plugins update` does **not** print the restart
+instruction, and it does not restart the gateway. The new code loads on the next
+gateway start and not a moment sooner, so restart it yourself — then run
+`/ocuclaw-setup` and let it re-verify health.
+<!-- ocuclaw:install-block:end -->
+
+The TUI setting keeps the supported terminal pairing panel available. Local
+Hermes Desktop has the same direct-human pairing ceremony through its OcuClaw
+runtime presenter in that Hermes home. The classic `hermes --cli` interface remains useful for general chat
+and recovery, but hands pairing to TUI or Desktop.
+
+The setup assistant checks the non-secret state and guides installation,
+recovery, secure phone pairing, and the Hermes Welcome Round Trip. The plugin
+owns both the bundle and its skill, so an install needs no skill symlink or
+copied skill folder.
+
+If an established profile reports that its Relay Credential is missing or
+unreadable, setup stops instead of silently replacing it and disconnecting
+phones. Follow `/ocuclaw-setup` guided recovery; do not use the fresh-install
+path as a replacement or edit the profile files. The locally confirmed
+all-device reset can proceed from this established-missing state; its receipt
+records prior-credential rejection as `not_applicable`, while replacement
+acceptance and the explicit Hermes gateway restart remain mandatory.
+
+For a suspected lost or compromised phone, `/ocuclaw-setup` owns the locally
+confirmed **Reset relay credential** action. It is an all-device reset;
+per-device revocation is future work. The assistant warns that every phone
+disconnects, then checkpoints this interactive-only host command:
 
 ```bash
-hermes skills list --source local --enabled-only
+hermes ocuclaw reset-relay-credential
 ```
 
-On Windows, use a normal PowerShell copy; it does not require administrator
-mode or Developer Mode:
+## The Managed Serve Route
 
-```powershell
-$source = Join-Path $HOME ".hermes\plugins\ocuclaw\skills\ocuclaw-assist-hermes"
-$target = Join-Path $HOME ".hermes\skills\ocuclaw-assist-hermes"
-Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue
-Copy-Item $source $target -Recurse -Force
-```
-
-After an update, repeat the Windows copy commands so the local copy receives
-the refreshed guide.
-
-## Remove the assistant or uninstall OcuClaw
-
-Removing the POSIX link does not delete the bundled source:
+The relay listens on loopback only. Your phone reaches it over one Tailscale
+Serve route, which you apply yourself — OcuClaw never changes your Tailscale
+configuration. Classify the current state and get the exact command for this
+host with:
 
 ```bash
-unlink ~/.hermes/skills/ocuclaw-assist-hermes
+hermes ocuclaw doctor
 ```
 
-On Windows, remove only the copied skill directory:
+Run the fully substituted command `doctor` prints. Do not reconstruct it from
+a hostname, port, or example. Tailscale — not OcuClaw — decides who may change
+Serve configuration: where the Tailscale daemon runs as a system service
+(Linux, and macOS installs that do the same) its control socket is root-owned,
+so an unprivileged shell is refused. If refused, rerun the exact printed
+command, unchanged, with your platform's usual administrator elevation — or
+set Tailscale's `--operator` to your own account once, after which Serve
+changes need no elevation. OcuClaw itself never elevates: the command it
+prints carries no elevation prefix; you supply whatever privilege Tailscale
+requires on this host.
 
-```powershell
-Remove-Item (Join-Path $HOME ".hermes\skills\ocuclaw-assist-hermes") -Recurse -Force
+If `doctor` reports the route as `wrong`, something else already occupies that
+port. Check what it belongs to before replacing it — in particular, `:8444` is
+the OpenClaw app relay, not OcuClaw's, and the two lanes must never be mixed.
+
+There is one OcuClaw-managed `:8446` route per host, shared by that gateway's
+Hermes profiles. A sibling gateway reports the conflict and never replaces the
+route.
+
+## Pair and finish
+
+Stay in `/ocuclaw-setup`. Once `doctor` has verified the route, the assistant
+opens a direct, model-bypassing pairing panel in the current Hermes TUI or
+Desktop window. It advances automatically from the canonical QR to
+the four-word comparison and defaults the local decision to **No**. Approve
+only when all four words match. **Manual** uses the private address plus a
+short-lived pairing code shown in the same panel. Neither initiation asks for
+a reusable credential in the phone app. If setup reaches pairing in
+`hermes --cli`, it immediately gives a one-time TUI/Desktop handoff; reopening
+`/ocuclaw-setup` there resumes the saved checkpoint.
+
+Pairing alone is not Hermes Core Setup Completion. The assistant first warns
+about the welcome screen and double-tap, then the user sends a message from the
+phone app and confirms its reply on the G2. That arms a resumable one-hour
+First-Run Proof Attempt. The assistant pushes `hermes_welcome` for 60 seconds;
+only a returned double-tap dismissal commits durable proof and triggers the
+completion announcement.
+
+One failed dismissal gets one retry. After a second failure, setup reports the
+split truth—phone-to-G2 worked, G2-to-agent remains unconfirmed—keeps a warning,
+and points to the built-in **Report a bug** feature without claiming completion. Soniox and Even
+AI are offered only afterward and never alter completion. Later outages never
+erase durable proof.
+
+## Check connection health from the terminal
+
+Two commands render the same Connection Health Snapshot the setup assistant
+reads, without needing a chat session:
+
+```bash
+hermes ocuclaw status     # passive: local facts only, always exits 0
+hermes ocuclaw doctor     # bounded active checks, exits non-zero on problems
 ```
 
-To disable OcuClaw without uninstalling it:
+Both accept `--json` and print the versioned snapshot document on stdout for
+scripting. Neither ever prints a secret — configuration secrets appear as
+presence booleans only.
+
+The report keeps three independent truths separate, and they do not imply each
+other:
+
+- **Hermes Setup State** — durable installation and configuration.
+- **Current Connection Health** — right now, across four legs: the Hermes
+  gateway, the OcuClaw relay, the tailnet route, and the phone app.
+- **Hermes First-Run Proof** — whether a phone-origin turn was ever confirmed
+  on G2. Outages never erase it.
+
+`unknown` on a leg means nothing observed it, not that it is broken — a
+gateway that has never run makes every connection leg unknown while setup
+state stays fully readable. `doctor` exits `0` only when setup is
+`configured` and all four legs are `healthy`, `1` for any other valid
+snapshot, and `2` when the profile cannot be resolved safely or no snapshot
+could be generated at all. `status` always exits `0` when it produced a
+snapshot: it reports, it does not judge.
+
+`doctor` reports only what it verified on this run: it never reuses an earlier
+run's route evidence. Serve state is `ready`, `absent`, `wrong`, or `unknown`;
+configuration shape alone remains advisory until the bounded reachability and
+relay checks succeed.
+
+For optional read-only detail, open the **OcuClaw** tab at `/ocuclaw` in the
+Hermes dashboard. It is optional detail, never a fallback dependency: start
+guided recovery with `/ocuclaw-setup` even when the dashboard is unavailable.
+
+### Live reasoning on the glasses
+
+`/ocuclaw-setup` offers this step and waits for your yes; it is also this pair
+of commands:
+
+```bash
+hermes config set plugins.stream_reasoning_deltas true
+hermes gateway restart
+```
+
+The agent's reasoning then reaches the glasses as it is written instead of in
+whole pieces. The key is Hermes' own and gateway-wide — it changes how Hermes
+calls the model for every surface on this gateway, not just OcuClaw — and it
+does nothing at all below Hermes 0.20.5, which has no reasoning-delta hooks.
+
+### OcuClaw look for Hermes Desktop
+
+`/ocuclaw-setup` offers this at the end and waits for your yes. Hermes Desktop
+then lists **OcuClaw** under Settings > Appearance > Theme — observation-deck
+black with the Even G2 lens green, dark in both modes — and switches to it on
+its own (Hermes 0.20.6+; on 0.20.0 pick it there by hand). Say no and the
+theme is still listed for later. Disabling or uninstalling OcuClaw returns
+Desktop to its default skin.
+
+## Update policy
+
+The two update commands are in [Install and update](#install-and-update) at the
+top of this card. What they are permitted to do: take a newer published version
+in place through the accepted host-side upgrade contract. The platform `/update`
+command is refused from Hermes sessions. There is no remove-and-reinstall step
+and no downgrade.
+
+Existing Hermes configuration, sessions, and environment values remain in the
+profile; the setup assistant reports their presence without displaying their
+values.
+
+An update never turns a key on for you. If `plugins.stream_reasoning_deltas`
+is still unset — `/ocuclaw-setup` says so and offers it — this is the same
+pair of commands as on a fresh install:
+
+```bash
+hermes config set plugins.stream_reasoning_deltas true
+hermes gateway restart
+```
+
+Same honesty as above: the key is Hermes' own and gateway-wide, and it has no
+effect below Hermes 0.20.5.
+
+## Disable or fully uninstall
+
+To disable OcuClaw while retaining the installed plugin:
 
 ```bash
 hermes plugins disable ocuclaw
 hermes gateway restart
 ```
 
-For a full uninstall, first run the POSIX or Windows assistant-removal command
-above for this host. Then list all default-profile cron jobs, remove every
-OcuClaw job by the ID Hermes prints, disable the plugin, remove its checkout,
-and restart the gateway:
+The plugin-owned `/ocuclaw-setup` bundle cannot run while OcuClaw is disabled.
+Re-enable that retained install with `hermes plugins enable ocuclaw`, run
+`hermes gateway restart`, and then invoke `/ocuclaw-setup` again.
+
+For a full uninstall, first re-enable a retained disabled install with
+`hermes plugins enable ocuclaw --no-allow-tool-override`; the plugin-owned
+command cannot register while disabled. Obtain and run any permitted Managed
+Serve Route teardown as described below. Then stop the gateway so its live
+child cannot recreate state during removal, run the plugin-owned uninstall,
+and start Hermes again:
 
 ```bash
-hermes cron list --all
-hermes cron remove <OCUCLAW-JOB-ID>
-hermes plugins disable ocuclaw
-hermes plugins remove ocuclaw
-hermes gateway restart
+hermes gateway stop
+hermes ocuclaw uninstall
+hermes gateway start
+hermes gateway status
 ```
 
-Repeat `hermes cron remove` for each OcuClaw job. If the settings are no longer
-needed, remove them through the CLI rather than editing configuration files,
-then restart once more to apply that cleanup:
+The uninstall command asks for confirmation and prints a receipt covering each
+removal, deliberate preservation, the route decision, and final absence checks.
+Use `hermes ocuclaw uninstall --yes --json` for a machine-readable, already
+confirmed run. It preserves the shared Hermes session database. The
+plugin-owned CLI, setup tool, and skill are unavailable after it succeeds.
+The final receipt also verifies that Hermes removed its own plugin-install
+provenance entry; OcuClaw never edits that host-owned sidecar directly.
+If only final checkout deletion is incomplete, fix the reported filesystem
+problem and run the receipt's exact interpreter-level recovery command. That
+command targets only the atomically renamed OcuClaw tombstone and does not
+depend on Hermes registration or plugin metadata.
+For safety, the command refuses without mutation when `extra.stateDir` points
+outside the dedicated default `$HERMES_HOME/ocuclaw` directory; configuration
+alone is not ownership proof for recursively removing an arbitrary path.
+The receipt's secret check covers the profile `.env` entries OcuClaw owns.
+Shell-, service-, or administrator-supplied environment values are not mutated;
+their key names are reported separately for cleanup at their owning source.
+
+### Remove the Tailscale Serve route
+
+The uninstall command does not edit Tailscale configuration. Before removing
+the plugin, run `hermes ocuclaw doctor`. Only while the host-scoped Managed Serve
+Route receipt and live route still agree does it print this narrow teardown:
 
 ```bash
-hermes config unset OCUCLAW_RELAY_TOKEN
-hermes config unset OCUCLAW_SONIOX_API_KEY
-hermes config unset OCUCLAW_EVEN_AI_TOKEN
-hermes config unset platforms.ocuclaw
-hermes config unset display.platforms.ocuclaw
-hermes gateway restart
+tailscale serve --tls-terminated-tcp=8446 off
 ```
 
-For guided setup or recovery, ask Hermes `help me set up OcuClaw` or
-`help me fix OcuClaw`. If the assistant cannot resolve the problem, use
-**Send** in the OcuClaw app or ask in the OcuClaw Discord community.
+Run the teardown only when `doctor` prints it. It removes only OcuClaw's
+`:8446` route; never use a host-wide Serve reset or remove unrelated routes
+such as the OpenClaw app relay on `:8444`.
+
+The route is host-wide. One OcuClaw-managed route serves this machine, and
+your Hermes profiles share it — removing it disconnects all of them, so remove
+it only when you are finished with OcuClaw on this machine.
+
+If a second Hermes gateway is installed on the same host, the first one to
+apply the route owns it. The other reports what it found and never prints a
+command that would replace it.
+
+If `doctor` does not print a teardown, it could no longer prove the route on
+that port is the one it recorded. Inspect `tailscale serve status` and decide
+for yourself; OcuClaw will not offer to remove a route it cannot identify.

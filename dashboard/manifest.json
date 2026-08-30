@@ -1,0 +1,11 @@
+{
+  "name": "ocuclaw",
+  "label": "OcuClaw",
+  "description": "Guided recovery and secure Desktop pairing for OcuClaw on Hermes.",
+  "icon": "Eye",
+  "version": "2.0.2",
+  "tab": { "path": "/ocuclaw", "position": "end" },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

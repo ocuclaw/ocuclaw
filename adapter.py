@@ -21,9 +21,18 @@ Non-secret config rides the platform block in the hermes ``config.yaml``::
           terminateGraceS: 5
           linkDebugStderr: false
 
-Secrets are set through ``hermes config set OCUCLAW_*`` and stored in
-``~/.hermes/.env``.  The env-enablement bridge maps those values onto the
-runtime keys; legacy yaml secret keys remain readable but lose to env.
+The Relay Credential and optional user-supplied secrets are stored in the
+Hermes-managed secret env file, ``$HERMES_HOME/.env`` — the served profile's
+own home, never a fixed path, because profiles are isolated homes.  This
+module never opens that file itself: writes go through Hermes's own
+``save_env_value``; reads use the process environment and Hermes's
+``get_env_value``.  Initial plugin bootstrap generates the first Relay
+Credential on a provably fresh profile without displaying or returning it. A
+present Relay Credential is host-managed and can be replaced only by the
+locally confirmed all-device reset. The env-enablement bridge maps stored
+values onto runtime keys. That env file is the only supported secret source:
+no diagnostic, status, or setup surface reads a secret out of
+``config.yaml``.
 
 ``linkDebugStderr`` is the general child-verbosity gate.  At ``false``, only
 child warn/error output reaches stderr; handshake/boot/connect receipts are
@@ -38,17 +47,21 @@ from __future__ import annotations
 import asyncio
 import base64
 import concurrent.futures
+import importlib.util
 import json
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
+from .cli import register_cli_commands
 from .control_link import (
     HERMES_BUNDLE_DEFAULT_WS_BIND,
     HERMES_BUNDLE_DEFAULT_WS_PORT,
@@ -72,9 +85,11 @@ from .dispatch import (
     DispatchLedger,
     agent_end_hook_frame,
     is_cancelling_slash,
+    is_platform_update_command,
     lifecycle_start_activity,
     lifecycle_terminal_activity,
     message_commit_event,
+    message_retag_event,
     parse_ocuclaw_session_key,
     normalize_session_reset_command,
     status_activity,
@@ -82,11 +97,49 @@ from .dispatch import (
     strip_stream_cursor,
     uncorrelated_message_event,
 )
+from .first_run import (
+    PhoneTurnCandidateGate,
+    WELCOME_SURFACE,
+    arm_first_run_proof_from_candidate,
+    inspect_attempt,
+    is_welcome_surface,
+    record_phone_turn_candidate,
+    record_welcome_outcome,
+    wait_for_first_run_terminal,
+    wait_for_phone_turn_candidate,
+)
 from .models_rpc import (
     GwRpc,
     load_profile_routing_snapshot,
     namespace_for_profile,
     profile_for_namespace,
+)
+from .pairing_completion import record_pairing_completion
+from .presence import (
+    PRESENCE_DIRTY_METHOD,
+    PRESENCE_SNAPSHOT_METHOD,
+    PULL_TIMEOUT_S,
+    PresenceLinkUnavailableError,
+    PresencePump,
+)
+from .relay_credential import (
+    BOOTSTRAP_ESTABLISHED_MISSING,
+    BOOTSTRAP_FAILED,
+    BOOTSTRAP_MANAGED_MISSING,
+    BOOTSTRAP_UNAVAILABLE,
+    MANAGED_CREDENTIAL_REQUIRED_MESSAGE,
+    bootstrap_relay_credential,
+    is_managed_profile,
+    is_profile_established,
+)
+from .receipts import (
+    ReceiptUnavailableError,
+    fingerprint_home,
+    read_app_presence,
+    read_first_run_proof,
+    read_gateway_state,
+    resolve_receipt_home,
+    write_app_presence,
 )
 from .session_rpc import (
     DEFAULT_SESSION_NAMESPACE,
@@ -94,12 +147,38 @@ from .session_rpc import (
     OCUCLAW_PLATFORM_SEGMENT,
     ProfileSessionRpc,
     default_state_db_path,
+    session_read_state_supported,
 )
+from . import serve
+from . import health as health_collect
+from .desktop_pairing import (
+    THEME_REQUEST_CONFIG_KEY as DESKTOP_THEME_CONFIG_KEY,
+    plugin_owned as desktop_plugin_owned,
+    plugin_path as desktop_plugin_path,
+    read_desktop_theme_request,
+    reconcile_pairing_plugin,
+)
+from .setup_bootstrap import reconcile_setup_bundle
+from .tui_pairing import reconcile_pairing_widget
+from .snapshot import (
+    OBSERVATION_PASSIVE,
+    TRISTATE_UNKNOWN,
+    blank_facts,
+    derive_legacy_setup_status,
+    derive_snapshot,
+    error_envelope,
+)
+from .snapshot import now_iso as snapshot_now_iso
 
 logger = logging.getLogger(__name__)
 
 PLATFORM_NAME = "ocuclaw"
 PLATFORM_LABEL = "OcuClaw"
+# Levels hermes' own display_config._normalise() keeps for
+# display.platforms.<platform>.tool_progress. Anything else is rejected here
+# rather than silently coerced to "all" downstream.
+TOOL_PROGRESS_LEVELS = frozenset({"off", "new", "all", "verbose", "log"})
+PAIRING_COMPLETED_METHOD = "pairing.completed"
 OCUCLAW_RELAY_TOKEN_ENV = "OCUCLAW_RELAY_TOKEN"
 OCUCLAW_SONIOX_API_KEY_ENV = "OCUCLAW_SONIOX_API_KEY"
 OCUCLAW_EVEN_AI_TOKEN_ENV = "OCUCLAW_EVEN_AI_TOKEN"
@@ -108,17 +187,33 @@ _SECRET_ENV_TO_ADAPTER_KEY = {
     OCUCLAW_SONIOX_API_KEY_ENV: "sonioxApiKey",
     OCUCLAW_EVEN_AI_TOKEN_ENV: "evenAiToken",
 }
-# Documented plugin authorization lane (hermes developer guide "Adding a
-# Platform Adapter"): the gateway consults these envs in
-# _is_user_authorized for EVERY profile, so they are the multiplex-safe
-# way to authorize glasses turns on secondary profiles. The adapter's
-# authorization_is_upstream property still covers the default profile,
-# but the gateway's profile-scoped adapter lookup deliberately fails
-# closed for stamped secondary profiles (upstream
-# test_multiplex_profile_authz.py), so without one of these envs every
-# secondary-profile turn is dropped as unauthorized.
+# Optional Hermes-native allowlist names declared at platform registration.
+# Ordinary OcuClaw turns use the stronger relay-token gate and retain the live
+# adapter as transport provenance, so these are not required for multiplexing.
 OCUCLAW_ALLOWED_USERS_ENV = "OCUCLAW_ALLOWED_USERS"
 OCUCLAW_ALLOW_ALL_USERS_ENV = "OCUCLAW_ALLOW_ALL_USERS"
+
+
+def _is_hermes_home_channel_onboarding_notice(text: str) -> bool:
+    """Keep Hermes's platform setup nudge out of OcuClaw conversations."""
+    normalized = str(text or "").strip()
+    return (
+        normalized.startswith("📬 No home channel is set for Ocuclaw.")
+        and "Type /sethome to make this chat your home channel" in normalized
+    )
+
+# Hermes-specific config ingress totality for
+# platforms.ocuclaw.extra.evenAiRoutingMode. This is the canonical set ONLY:
+# the four historical aliases the already-public shared parser still accepts
+# (`dedicated`, `new`, `dedicated_shadow`, `new_shadow`) are rejected here so
+# an explicit Hermes value can never fall through to shared normalization and
+# land the operator on a mode they did not write. Shared/client parsing is
+# deliberately untouched — extensions/ocuclaw/src/even-ai/
+# even-ai-settings-store.ts, composeApp .../app/AppEvenAiSettings.kt, and the
+# setEvenAiSettings protocol ingress all keep the aliases and their tests.
+EVEN_AI_ROUTING_MODES = ("active", "background", "background_new")
+DEFAULT_EVEN_AI_ROUTING_MODE = "active"
+
 REGISTERED_HOOK_NAMES = (
     "on_session_end",
     "post_approval_response",
@@ -128,20 +223,479 @@ REGISTERED_HOOK_NAMES = (
     "pre_llm_call",
 )
 
-# Supported hermes range for this bundle build. The public SessionDB surface
-# this adapter consumes was verified at anchor 3ef6bbd2 (tag v2026.7.20 /
-# hermes 0.19.0); minor bumps are expected to churn the plugin ABI, so the
-# gate is a hard [min, max).
-SUPPORTED_HERMES_MIN = (0, 19, 0)
-SUPPORTED_HERMES_MAX_EXCLUSIVE = (0, 20, 0)
+# Optional (post-0.20.0) hermes hooks. `register_hook` WARNS and stores an
+# unknown name instead of raising (hermes_cli/plugins.py _register_hook), so
+# exception-based detection is impossible: the only honest probe is the
+# platform's own hook vocabulary plus the module that dispatches the stream
+# hooks. None of these exist at the 0.20.0 floor (v2026.8.3
+# hermes_cli/plugins.py VALID_HOOKS), all four exist at v2026.8.19.
+INTERIM_HOOK_NAME = "on_interim_message"
+STREAM_HOOK_NAMES = ("on_stream_start", "on_stream_delta", "on_stream_end")
+STREAM_HOOKS_MODULE = "agent.plugin_stream_hooks"
+# Declared in plugin.yaml, registered ONLY where the host's hook vocabulary
+# has them. The manifest states what this build may use; the probe decides
+# what it actually wires.
+CONDITIONAL_HOOK_NAMES = (INTERIM_HOOK_NAME,) + STREAM_HOOK_NAMES
+STREAM_REASONING_DELTAS_CONFIG_PATH = ("plugins", "stream_reasoning_deltas")
+
+# Feature tokens advertised to the Node child (and from there to the client's
+# capability snapshot). A token means "this adapter build actually registered
+# the producing hook on THIS host" — never "the host could support it".
+# A token means "this adapter build actually registered the producing hook on
+# THIS host" — or, for a non-hook lane, "this adapter WILL SERVE the advertised
+# lane on this host". `session_read_state` is the second kind: it registers no
+# hook, it feature-detects the running hermes's sessions schema + primitives
+# and then serves `db.sessions.setRead`/`setHidden` and the `unread`/`hidden`
+# row keys off them.
+FEATURE_TOKEN_INTERIM_HOOK = "interim_hook"
+FEATURE_TOKEN_STREAM_HOOKS = "stream_hooks"
+FEATURE_TOKEN_SESSION_READ_STATE = "session_read_state"
+OCUCLAW_HERMES_FEATURES_ENV = "OCUCLAW_HERMES_FEATURES"
+
+# Set once by register(); read by _setup_status() and the child env builder.
+STREAM_HOOKS_AVAILABLE = False
+INTERIM_HOOK_AVAILABLE = False
+_REGISTERED_OPTIONAL_FEATURES: Tuple[str, ...] = ()
+
+
+def _valid_hook_names() -> frozenset:
+    """The hermes hook vocabulary, or an empty set off-platform."""
+    try:
+        from hermes_cli.plugins import VALID_HOOKS
+
+        return frozenset(str(name) for name in VALID_HOOKS)
+    except Exception:  # noqa: BLE001 - probing must never break plugin load
+        return frozenset()
+
+
+def _stream_hooks_module_present() -> bool:
+    """True when the hermes stream-hook dispatcher module exists.
+
+    ``find_spec`` (never ``import``) keeps the probe side-effect-free: the
+    module registers process-wide state when imported.
+    """
+    try:
+        return importlib.util.find_spec(STREAM_HOOKS_MODULE) is not None
+    except Exception:  # noqa: BLE001 - a broken parent package is "absent"
+        return False
+
+
+def _probe_optional_hook_support() -> Tuple[bool, bool]:
+    """``(stream_hooks_available, interim_hook_available)`` for this host."""
+    names = _valid_hook_names()
+    interim = INTERIM_HOOK_NAME in names
+    stream = (
+        _stream_hooks_module_present()
+        and interim
+        and all(name in names for name in STREAM_HOOK_NAMES)
+    )
+    return stream, interim
+
+
+def _stream_reasoning_deltas_configured() -> bool:
+    """``plugins.stream_reasoning_deltas`` as written in config.yaml.
+
+    Read ONCE, at registration. Upstream's own
+    ``stream_reasoning_deltas_enabled()`` re-reads config on every call, which
+    is not a per-delta budget.
+    """
+    config, readable = _setup_raw_config()
+    if not readable:
+        return False
+    node: Any = config
+    for key in STREAM_REASONING_DELTAS_CONFIG_PATH:
+        if not isinstance(node, dict):
+            return False
+        node = node.get(key)
+    return node is True
+
+
+# What `/ocuclaw-setup` should do about `plugins.stream_reasoning_deltas` on
+# THIS host. The key is hermes' own and gateway-wide, so the assistant offers
+# it and the operator answers; nothing here ever writes on its own.
+STREAM_DELTAS_OFFER_ENABLED = "already_enabled"
+STREAM_DELTAS_OFFER_AVAILABLE = "offer"
+STREAM_DELTAS_OFFER_INERT = "inert"
+STREAM_DELTAS_OFFER_UNKNOWN = "unknown"
+STREAM_DELTAS_RESTART_NOTE = (
+    "plugins.stream_reasoning_deltas: true is saved. Hermes reads it when it "
+    "builds its plugin hook set, so it takes effect only after the gateway "
+    "restarts."
+)
+STREAM_DELTAS_INERT_NOTE = (
+    "This Hermes has no reasoning-delta hooks (they arrive in 0.20.5), so the "
+    "key would sit inert. Reasoning still arrives, in whole pieces."
+)
+STREAM_DELTAS_SCOPE_NOTE = (
+    "plugins.stream_reasoning_deltas is a gateway-wide Hermes key: it changes "
+    "how Hermes calls the model for every surface on this gateway, not just "
+    "OcuClaw."
+)
+
+
+def _stream_reasoning_deltas_offer(
+    *,
+    configured: bool,
+    hooks_available: bool,
+    config_readable: bool,
+) -> str:
+    """What `/ocuclaw-setup` should DO about the opt-in on this host.
+
+    Three honest outcomes, and the offer is only one of them: the key is
+    gateway-wide, so an inert host must be told the key would do nothing
+    rather than nudged into setting it anyway.
+    """
+    if not config_readable:
+        return STREAM_DELTAS_OFFER_UNKNOWN
+    if configured:
+        return STREAM_DELTAS_OFFER_ENABLED
+    if not hooks_available:
+        return STREAM_DELTAS_OFFER_INERT
+    return STREAM_DELTAS_OFFER_AVAILABLE
+
+
+def _enable_stream_reasoning_deltas() -> Dict[str, Any]:
+    """Write ``plugins.stream_reasoning_deltas: true`` into config.yaml.
+
+    Same mechanism the profile-options lane uses for
+    ``display.platforms.ocuclaw.tool_progress``: hermes' own
+    ``read_user_config_raw`` + ``atomic_config_write``, so an operator's
+    comments and unrelated keys survive and a crashed write can never leave a
+    half-config behind. UNLIKE tool_progress, hermes reads this key once when
+    it builds the plugin hook set, so the write is inert until a restart.
+    """
+    try:
+        from hermes_cli.config import (
+            atomic_config_write,
+            get_config_path,
+            read_user_config_raw,
+        )
+    except Exception:  # noqa: BLE001 - off-platform / broken host
+        logger.exception("[ocuclaw] hermes config writer unavailable")
+        return {
+            "applied": False,
+            "reason": "config_unwritable",
+            "restartRequired": False,
+            "message": "Hermes' configuration writer is unavailable here.",
+        }
+
+    try:
+        config_path = Path(get_config_path())
+        raw_cfg = read_user_config_raw(config_path)
+        if not isinstance(raw_cfg, dict):
+            raw_cfg = {}
+        plugins_cfg = raw_cfg.setdefault("plugins", {})
+        if not isinstance(plugins_cfg, dict):
+            plugins_cfg = {}
+            raw_cfg["plugins"] = plugins_cfg
+        if plugins_cfg.get("stream_reasoning_deltas") is True:
+            return {
+                "applied": False,
+                "reason": "already_enabled",
+                "restartRequired": False,
+                "configPath": str(config_path),
+                "message": (
+                    "plugins.stream_reasoning_deltas was already true; nothing "
+                    "was written."
+                ),
+            }
+        plugins_cfg["stream_reasoning_deltas"] = True
+        atomic_config_write(config_path, raw_cfg)
+    except Exception:  # noqa: BLE001 - never raise through an agent turn
+        logger.exception("[ocuclaw] stream_reasoning_deltas write failed")
+        return {
+            "applied": False,
+            "reason": "config_unwritable",
+            "restartRequired": False,
+            "message": "Hermes' configuration could not be written safely.",
+        }
+
+    return {
+        "applied": True,
+        "reason": "written",
+        "restartRequired": True,
+        "configPath": str(config_path),
+        "message": STREAM_DELTAS_RESTART_NOTE,
+    }
+
+
+# The OcuClaw look for Hermes Desktop. The theme itself is always contributed
+# by the Desktop plugin (it lists in Settings > Appearance regardless); what
+# `/ocuclaw-setup` offers is APPLYING it, and the answer is a UTC stamp under
+# `platforms.ocuclaw.extra.desktopThemeRequestedAt` — inside the namespace
+# uninstall already strips — that the plugin file re-renders around.
+DESKTOP_THEME_NAME = "ocuclaw"
+DESKTOP_THEME_OFFER_ENABLED = "already_enabled"
+DESKTOP_THEME_OFFER_AVAILABLE = "offer"
+DESKTOP_THEME_OFFER_UNAVAILABLE = "unavailable"
+DESKTOP_THEME_OFFER_UNKNOWN = "unknown"
+# requestTheme() — the door that applies a theme from outside React — arrived
+# in Hermes 0.20.6. Below that the theme is listed but must be picked by hand.
+DESKTOP_THEME_AUTOSELECT_MIN = (0, 20, 6)
+DESKTOP_THEME_SCOPE_NOTE = (
+    "The OcuClaw look changes only how Hermes Desktop paints for this profile; "
+    "the built-in themes stay one click away in Settings > Appearance, and "
+    "disabling or uninstalling OcuClaw returns Desktop to its default skin."
+)
+DESKTOP_THEME_PICK_MANUALLY_NOTE = (
+    "This Hermes Desktop cannot be switched from a plugin (that arrives in "
+    "0.20.6), so the OcuClaw theme is listed but not applied: pick it in "
+    "Settings > Appearance > Theme."
+)
+
+
+def _desktop_theme_offer(
+    *,
+    requested: bool,
+    plugin_present: bool,
+    config_readable: bool,
+) -> str:
+    """What `/ocuclaw-setup` should DO about the OcuClaw look on this host."""
+    if not config_readable:
+        return DESKTOP_THEME_OFFER_UNKNOWN
+    if requested:
+        return DESKTOP_THEME_OFFER_ENABLED
+    if not plugin_present:
+        return DESKTOP_THEME_OFFER_UNAVAILABLE
+    return DESKTOP_THEME_OFFER_AVAILABLE
+
+
+def _desktop_theme_autoselect_supported(version: Optional[str] = None) -> bool:
+    parsed = parse_version(version if version is not None else _hermes_version())
+    return parsed is not None and parsed >= DESKTOP_THEME_AUTOSELECT_MIN
+
+
+def _desktop_plugin_presence() -> Tuple[Optional[str], bool]:
+    """(path, present) for the OcuClaw-owned Desktop plugin file."""
+    try:
+        home = resolve_receipt_home()
+    except Exception:  # noqa: BLE001 - presence is advisory
+        home = None
+    if home is None:
+        return None, False
+    path = desktop_plugin_path(home)
+    try:
+        present = path.exists() and desktop_plugin_owned(path)
+    except OSError:
+        present = False
+    return str(path), bool(present)
+
+
+def _desktop_theme_status(raw_config: Dict[str, Any], config_readable: bool) -> Dict[str, Any]:
+    requested_at = read_desktop_theme_request(raw_config) if config_readable else ""
+    path, present = _desktop_plugin_presence()
+    return {
+        "name": DESKTOP_THEME_NAME,
+        "requestedAt": requested_at or None,
+        "requested": bool(requested_at),
+        "pluginPath": path,
+        "pluginPresent": present,
+        "autoSelectSupported": _desktop_theme_autoselect_supported(),
+        "offer": _desktop_theme_offer(
+            requested=bool(requested_at),
+            plugin_present=present,
+            config_readable=config_readable,
+        ),
+    }
+
+
+def _enable_desktop_theme() -> Dict[str, Any]:
+    """Record the operator's yes and re-render the Desktop plugin around it.
+
+    Two writes, both through owned doors: the stamp goes into config.yaml via
+    hermes' own atomic writer (same as the stream-deltas opt-in), then the
+    Desktop plugin file is reconciled with that stamp so Hermes Desktop
+    hot-reloads it and applies the theme without a restart.
+    """
+    try:
+        from hermes_cli.config import (
+            atomic_config_write,
+            get_config_path,
+            read_user_config_raw,
+        )
+    except Exception:  # noqa: BLE001 - off-platform / broken host
+        logger.exception("[ocuclaw] hermes config writer unavailable")
+        return {
+            "applied": False,
+            "reason": "config_unwritable",
+            "restartRequired": False,
+            "message": "Hermes' configuration writer is unavailable here.",
+        }
+
+    requested_at = (
+        datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    )
+    try:
+        config_path = Path(get_config_path())
+        raw_cfg = read_user_config_raw(config_path)
+        if not isinstance(raw_cfg, dict):
+            raw_cfg = {}
+        node = raw_cfg
+        for key in ("platforms", "ocuclaw", "extra"):
+            child = node.get(key)
+            if not isinstance(child, dict):
+                child = {}
+                node[key] = child
+            node = child
+        node[DESKTOP_THEME_CONFIG_KEY] = requested_at
+        atomic_config_write(config_path, raw_cfg)
+    except Exception:  # noqa: BLE001 - never raise through an agent turn
+        logger.exception("[ocuclaw] desktop theme request write failed")
+        return {
+            "applied": False,
+            "reason": "config_unwritable",
+            "restartRequired": False,
+            "message": "Hermes' configuration could not be written safely.",
+        }
+
+    try:
+        reconcile = reconcile_pairing_plugin(theme_request=requested_at)
+    except Exception as exc:  # noqa: BLE001 - the stamp is saved; say what failed
+        reconcile = {"status": "error", "reason": f"desktop_plugin_reconcile_failed: {exc}"}
+    auto_select = _desktop_theme_autoselect_supported()
+    rendered = reconcile.get("status") in {"created", "updated", "unchanged"}
+    if rendered and auto_select:
+        message = (
+            "OcuClaw theme requested. Hermes Desktop reloads the OcuClaw plugin "
+            "on its own and switches to the theme; no restart needed."
+        )
+    elif rendered:
+        message = DESKTOP_THEME_PICK_MANUALLY_NOTE
+    else:
+        message = (
+            "The request is saved, but the Desktop plugin file could not be "
+            "re-rendered, so Hermes Desktop has not switched yet."
+        )
+    return {
+        "applied": rendered,
+        "reason": "written" if rendered else str(reconcile.get("reason") or "desktop_plugin_unavailable"),
+        "requestedAt": requested_at,
+        "configPath": str(config_path),
+        "pluginReconcile": reconcile,
+        "autoSelect": bool(rendered and auto_select),
+        "restartRequired": False,
+        "message": message,
+    }
+
+
+def _hermes_feature_tokens() -> Tuple[str, ...]:
+    """Feature tokens for the child env — registration truth, not capability."""
+    return _REGISTERED_OPTIONAL_FEATURES
+
+# Supported Hermes range for this bundle build. The complete Backend Adapter
+# admission and SessionDB contract is certified against this exact upstream
+# release. In-minor patches remain admissible, but the release watcher creates
+# an immediate recertification obligation for every first-seen 0.20.x patch.
+CERTIFIED_HERMES_VERSION = "0.20.6"
+CERTIFIED_HERMES_TAG = "v2026.8.27"
+CERTIFIED_HERMES_COMMIT = "5fc308a70719a83cccdbba4c0e39c23f5a8239d5"
+SUPPORTED_HERMES_MIN = (0, 20, 0)
+SUPPORTED_HERMES_MAX_EXCLUSIVE = (0, 21, 0)
 
 BUNDLE_DIR = Path(__file__).resolve().parent
 DEFAULT_RUNTIME_ENTRY = BUNDLE_DIR / "dist-cjs" / "runtime" / "hermes-runtime-entry.cjs"
+SETUP_SKILL_NAME = "ocuclaw-assist-hermes"
+SETUP_SKILL_PATH = BUNDLE_DIR / "skills" / SETUP_SKILL_NAME / "SKILL.md"
+SETUP_SKILL_DESCRIPTION = (
+    "Guided OcuClaw setup, update, diagnostics, and troubleshooting for Hermes."
+)
+SETUP_TOOL_NAME = "ocuclaw_setup"
+# Hermes 0.20.x interactive sessions resolve the `hermes-cli` composite when
+# they snapshot model tools. Registering this alongside the narrower `skills`
+# surface leaves it out of that snapshot even though direct registry dispatch
+# still works, so the loaded setup skill cannot call its companion tool.
+SETUP_TOOLSET = "hermes-cli"
+SETUP_TOOL_DESCRIPTION = (
+    "Inspect OcuClaw setup, run the local human pairing ceremony, wait for the "
+    "phone-origin proof turn and welcome dismissal, and load focused guidance "
+    "without revealing secrets. Two optional operations write — "
+    "enable_stream_reasoning_deltas and enable_desktop_theme — and only with "
+    "confirm: true after the operator has said yes."
+)
+SETUP_GUIDE_VERSION = "2026-08-30 (1.3.17-hermes)"
+SETUP_SKILL_LOAD_POINTER = (
+    "If the OcuClaw Setup Assistant skill is not loaded in this conversation, "
+    "load it via `/ocuclaw-setup` before mutating anything."
+)
+SETUP_REFERENCE_FILES = {
+    "fresh_install": ("fresh-install.md", "Fresh install"),
+    "credential_reset": ("relay-credential-reset.md", "Reset relay credential"),
+    "update": ("update.md", "Update OcuClaw"),
+    "troubleshooting": ("troubleshooting.md", "Troubleshooting"),
+    "quick_reference": ("quick-reference.md", "Quick reference"),
+    "wrap_feedback": ("wrap-feedback.md", "Wrap and feedback"),
+}
+SETUP_STREAM_DELTAS_OPERATION = "enable_stream_reasoning_deltas"
+SETUP_DESKTOP_THEME_OPERATION = "enable_desktop_theme"
+SETUP_WRITING_OPERATIONS = (
+    SETUP_STREAM_DELTAS_OPERATION,
+    SETUP_DESKTOP_THEME_OPERATION,
+)
+SETUP_READ_ONLY_OPERATIONS = ("status", "doctor", *SETUP_REFERENCE_FILES.keys())
+SETUP_INTERACTIVE_OPERATIONS = (
+    "pair_phone",
+    "wait_phone_origin",
+    "arm_first_run_proof",
+    "welcome_round_trip",
+)
+SETUP_OPERATIONS = (
+    "status",
+    "doctor",
+    *SETUP_INTERACTIVE_OPERATIONS,
+    *SETUP_REFERENCE_FILES.keys(),
+    *SETUP_WRITING_OPERATIONS,
+)
+SETUP_TOOL_SCHEMA = {
+    "name": SETUP_TOOL_NAME,
+    "description": SETUP_TOOL_DESCRIPTION,
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": list(SETUP_OPERATIONS),
+                "description": (
+                    "Setup operation. pair_phone opens the direct, model-bypassing "
+                    "Hermes TUI or Desktop QR and four-word ceremony; "
+                    "wait_phone_origin blocks for a completed phone turn; "
+                    "welcome_round_trip blocks for the managed welcome dismissal. "
+                    "All other operations are read-only except "
+                    f"{SETUP_STREAM_DELTAS_OPERATION} and "
+                    f"{SETUP_DESKTOP_THEME_OPERATION} (applies the OcuClaw "
+                    "look to Hermes Desktop)."
+                ),
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": (
+                    "Required true for "
+                    f"{SETUP_STREAM_DELTAS_OPERATION} and "
+                    f"{SETUP_DESKTOP_THEME_OPERATION}. Ask the operator "
+                    "first — the stream key is gateway-wide, the theme "
+                    "repaints their Desktop. Ignored by every read-only "
+                    "operation."
+                ),
+            },
+            "phoneCandidateId": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": (
+                    "Opaque candidate binding returned by wait_phone_origin. "
+                    "Pass it unchanged to welcome_round_trip; never show it "
+                    "to the user."
+                ),
+            },
+        },
+        "required": ["operation"],
+        "additionalProperties": False,
+    },
+}
+_LAST_SETUP_BUNDLE_REPORT: Dict[str, Any] = {"status": "unknown"}
 
 # History pushes + agent_end transcripts are tail-sliced server-side so a long
 # session never risks the 1 MiB link frame cap (same bound as chat.history).
 HISTORY_PUSH_LIMIT = 200
-# Hermes 0.19 drains StreamConsumer on its own task, so on_session_end can beat
+# Hermes 0.20 drains StreamConsumer on its own task, so on_session_end can beat
 # the trailing cumulative finalize edit. Keep the open record addressable for a
 # short bounded interval; provider-abort paths still close deterministically.
 STREAM_FINALIZE_GRACE_SECONDS = 1.5
@@ -187,7 +741,7 @@ TOOL_ACTIVITY_OMITTED_ARG_KEYS = {
     "source",
     "text",
 }
-TOOL_ACTIVITY_SECRET_ARG_KEY_MARKERS = (
+SECRET_KEY_MARKERS = (
     "apikey",
     "authorization",
     "bearer",
@@ -198,8 +752,9 @@ TOOL_ACTIVITY_SECRET_ARG_KEY_MARKERS = (
     "secret",
     "token",
 )
-TOOL_ACTIVITY_URL_RE = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s\"'<>]+")
-TOOL_ACTIVITY_URL_SECRET_KEY_EXACT = {
+TOOL_ACTIVITY_SECRET_ARG_KEY_MARKERS = SECRET_KEY_MARKERS
+URL_RE = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s\"'<>]+")
+URL_SECRET_KEY_EXACT = {
     "auth",
     "code",
     "key",
@@ -209,12 +764,67 @@ TOOL_ACTIVITY_URL_SECRET_KEY_EXACT = {
     "pwd",
     "sig",
 }
-TOOL_ACTIVITY_URL_SECRET_KEY_MARKERS = TOOL_ACTIVITY_SECRET_ARG_KEY_MARKERS + (
-    "signature",
-)
+URL_SECRET_KEY_MARKERS = SECRET_KEY_MARKERS + ("signature",)
+REDACTED_PLACEHOLDER = "[redacted]"
 THINKING_FRAME_MAX_CHARS = 8000
 THINKING_FRAME_TRUNCATION_SUFFIX = "...[truncated]"
 THINKING_FRAME_TRUNCATION_PREFIX = "[truncated]..."
+
+# Status-bar headline budget. The client caps again at 120/64 chars depending
+# on verbosity; 80 is the wire ceiling so a headline is never a prose slab.
+THINKING_HEADLINE_MAX_CHARS = 80
+# Mirror of the Node bold extractor (activity-status-adapter.ts
+# extractFirstBoldThinkingSegment): first CLOSED, non-greedy `**...**` span.
+THINKING_BOLD_SPAN_RE = re.compile(r"\*\*(.+?)\*\*", re.S)
+# Markdown noise a one-line headline must not carry onto the HUD.
+THINKING_HEADLINE_STRIP_RE = re.compile(r"[*_`~]+")
+THINKING_HEADLINE_LEADER_RE = re.compile(r"^\s*(?:[#>\-+]+|\d+[.)])\s*")
+# OpenRouter's unified reasoning array (agent_runtime_helpers.py folds these
+# into one reasoning blob upstream; the typed entry is the only place a
+# provider-authored SUMMARY survives as its own item).
+REASONING_SUMMARY_DETAIL_TYPE = "reasoning.summary"
+
+# Narration (the agent's own mid-turn sentences) routing tag.
+MESSAGE_KIND_NARRATION = "narration"
+MESSAGE_KIND_TOOL_PROGRESS = "tool_progress"
+# How many recent commits per run stay matchable for a late retag. Narration
+# lands in the first sentences of a turn; an unbounded ledger would be a leak.
+NARRATION_COMMIT_MEMORY = 16
+# How many origin stamps stay remembered per run (#1619). One per narration
+# sentence; the same bound as the commit ledger, for the same reason.
+NARRATION_ORIGIN_MEMORY = 16
+# Hermes' StreamConsumer marks a commentary send with this metadata key
+# (0.20.5+). It is a SECOND narration signal, independent of the hook, and
+# both feed the same normalized-text set.
+INTERIM_SEND_METADATA_KEY = "_interim_send"
+
+# Tier-2 reasoning-delta coalescer. 250 ms sits above the client's 150 ms
+# status-refresh floor and the ~81 ms BT round trip; the client's own 90 ms/
+# 80 ms stream coalescer absorbs the rest, so there is no second timer
+# downstream. NOTE the plugin hook worker has NO timer of its own — it only
+# runs when an item is dequeued — so "250 ms since the last flush" can fire no
+# earlier than the NEXT delta, and the tail waits for the next delta or
+# on_stream_end. That is a bounded, tested latency, not a stall.
+STREAM_FLUSH_INTERVAL_S = 0.25
+STREAM_FLUSH_CHARS = 200
+STREAM_PARAGRAPH_BREAK = "\n\n"
+STREAM_DELTA_KIND_REASONING = "reasoning"
+# Content deltas. Never forwarded (the streaming transport already renders
+# them) but they are the ONLY signal for when the model produced the text of
+# an interim message: the first one of a model call is that message's ORIGIN
+# time, which is what orders a progress note on the page (#1619). Upstream
+# spells this kind literally `"text"` (run_agent.py, on_stream_delta enqueue).
+STREAM_DELTA_KIND_TEXT = "text"
+THINKING_SOURCE_STREAM_DELTA = "hermes.on_stream_delta"
+THINKING_SOURCE_POST_API_REQUEST = "hermes.post_api_request"
+# on_stream_end closes ONE model call, and a hermes turn makes many. The
+# client hard-finalizes a run's thinking pane on any reason except
+# "response_started" and then DROPS every later update for that run — so a
+# literal "stream_end" here would black-hole the reasoning of every iteration
+# after the first. "response_started" is the soft finalize the pane reopens
+# from, which is exactly the per-call boundary this is. The run's hard
+# finalize already happens downstream at assistant-message commit.
+STREAM_END_FINALIZE_REASON = "response_started"
 
 # connect() gates on the child's explicit runtime.ready receipt (relay bound)
 # whenever a relay boot is expected (relayToken set) — a bind failure must
@@ -223,8 +833,15 @@ RUNTIME_READY_TIMEOUT_S = 30.0
 
 FOREIGN_COPY_METHOD = "foreign.sessions.copy"
 APPROVAL_RESOLVE_METHOD = "approval.resolve"
+SLASH_CONFIRM_PRESENT_METHOD = "slash.confirm.present"
+SLASH_CONFIRM_RESOLVE_METHOD = "slash.confirm.resolve"
+CLARIFY_RESOLVE_METHOD = "clarify.resolve"
+CLARIFY_AWAIT_TEXT_METHOD = "clarify.await_text"
 SESSION_ABORT_METHOD = "sessions.abort"
 SESSION_STEER_METHOD = "sessions.steer"
+SESSION_OPTIONS_APPLY_METHOD = "sessions.options.apply"
+PROFILE_OPTIONS_GET_METHOD = "profile.options.get"
+PROFILE_OPTIONS_APPLY_METHOD = "profile.options.apply"
 MULTIPLEX_DISABLED_ERROR = (
     "Hermes multiplex profile routing is disabled; only the main namespace "
     "is available."
@@ -239,6 +856,112 @@ CROSS_PROFILE_COPY_ERROR = (
 SECONDARY_PORT_BINDING_ERROR = (
     "ocuclaw is a port-binding platform; configure it only on the default profile"
 )
+# Wearer-facing refusal for the platform update command (P19). Plain
+# language, no jargon, and terse enough for the 576x288 glasses display: it
+# says what did not happen, why, and that nothing broke. The certified
+# baseline is never replaced by an unproven tree behind the wearer's back;
+# the supervised upgrade contract is the only sanctioned transition.
+UPDATE_COMMAND_REFUSAL = (
+    "Update is turned off here. Updating Hermes from your glasses would "
+    "replace the version OcuClaw is tested against, and your assistant "
+    "could stop working with no way back. Nothing was changed. OcuClaw "
+    "upgrades arrive through its own supervised upgrade, which checks that "
+    "everything still works before it keeps the new version."
+)
+
+
+def _url_key_is_secret(key: Any) -> bool:
+    """True when a URL query/fragment key names a credential-bearing value."""
+    marker_key = "".join(ch for ch in str(key or "").lower() if ch.isalnum())
+    return marker_key in URL_SECRET_KEY_EXACT or any(
+        marker in marker_key for marker in URL_SECRET_KEY_MARKERS
+    )
+
+
+def _url_path_segment_is_secret(segment: Any) -> bool:
+    """True when a URL path segment looks like an embedded credential.
+
+    Named secret markers win outright; otherwise a long mixed alphanumeric
+    segment (webhook ids, opaque tokens) is treated as secret-bearing.
+    """
+    raw = str(segment or "")
+    marker_key = "".join(ch for ch in raw.lower() if ch.isalnum())
+    if not marker_key:
+        return False
+    if _url_key_is_secret(marker_key):
+        return True
+    has_alpha = any(ch.isalpha() for ch in marker_key)
+    has_digit = any(ch.isdigit() for ch in marker_key)
+    if len(marker_key) >= 9 and raw[:1].isalpha() and has_digit:
+        return True
+    return len(marker_key) >= 16 and has_alpha and has_digit
+
+
+def _redact_url_query(query: str) -> str:
+    if not query:
+        return ""
+    redacted = []
+    for part in query.split("&"):
+        if not part:
+            redacted.append(part)
+            continue
+        key, separator, _value = part.partition("=")
+        if _url_key_is_secret(key):
+            redacted.append(f"{key}{separator}{REDACTED_PLACEHOLDER}")
+        else:
+            redacted.append(part)
+    return "&".join(redacted)
+
+
+def _redact_url_path(path: str) -> str:
+    if not path:
+        return ""
+    return "/".join(
+        REDACTED_PLACEHOLDER if _url_path_segment_is_secret(segment) else segment
+        for segment in path.split("/")
+    )
+
+
+def redact_urls_in_text(text: Any) -> str:
+    """Redact credentials carried by any URL embedded in ``text``.
+
+    The single shared URL redactor for every rendered OcuClaw diagnostic
+    surface (tool activity, setup/doctor evidence, logs, support payloads).
+    Userinfo, secret-named query/fragment parameters, and credential-shaped
+    path segments become ``[redacted]``; URL structure and every non-URL
+    character of the text are preserved so the reader keeps the context they
+    need to diagnose. Non-string input is coerced; ``None`` becomes ``""``.
+    """
+    if text is None:
+        return ""
+    value = text if isinstance(text, str) else str(text)
+    if "://" not in value:
+        return value
+
+    def replace(match: Any) -> str:
+        raw = str(match.group(0) or "")
+        trailing = ""
+        while raw and raw[-1] in ".,);":
+            trailing = raw[-1] + trailing
+            raw = raw[:-1]
+        try:
+            parts = urlsplit(raw)
+        except Exception:  # noqa: BLE001 - redaction must never raise
+            return raw + trailing
+        netloc = parts.netloc
+        if "@" in netloc:
+            netloc = REDACTED_PLACEHOLDER + "@" + netloc.rsplit("@", 1)[1]
+        path = _redact_url_path(parts.path)
+        query = _redact_url_query(parts.query)
+        fragment = parts.fragment
+        if fragment:
+            if "=" in fragment or "&" in fragment:
+                fragment = _redact_url_query(fragment)
+            elif _url_key_is_secret(fragment):
+                fragment = REDACTED_PLACEHOLDER
+        return urlunsplit((parts.scheme, netloc, path, query, fragment)) + trailing
+
+    return URL_RE.sub(replace, value)
 
 
 class AmbiguousOutboundNamespaceError(RuntimeError):
@@ -256,10 +979,22 @@ LIVEUI_PROMPT_ACK_METHOD = "liveui.promptAck"
 LIVEUI_LLM_AUTH_METHOD = "liveui.llmAuth"
 LIVEUI_LLM_RECIPE_METHOD = "liveui.llmRecipe"
 LIVEUI_TOOL_NAME = "render_glasses_ui"
-LIVEUI_TOOLSET = "plugin_ocuclaw"
+LIVEUI_STATE_METHOD = "liveui.uiState"
+LIVEUI_STATE_TOOL_NAME = "get_glasses_ui_state"
+LIVEUI_TEMPLATE_METHOD = "liveui.templates"
+LIVEUI_TEMPLATE_TOOL_NAME = "manage_liveui_templates"
+LIVEUI_TASK_METHOD = "liveui.tasks"
+LIVEUI_TASK_TOOL_NAME = "manage_liveui_tasks"
+LIVEUI_TOOLSET = "ocuclaw"
+HERMES_HOME_CHANNEL_NOTICE = (
+    "📬 No home channel is set for Ocuclaw. A home channel is where Hermes "
+    "delivers cron job results and cross-platform messages.\n\n"
+    "Type /sethome to make this chat your home channel, or ignore to skip."
+)
 LIVEUI_DEFAULT_RENDER_TIMEOUT_MS = 30 * 60 * 1000
 LIVEUI_RENDER_LINK_MARGIN_S = 60.0
 LIVEUI_PROMPT_LINK_TIMEOUT_S = 2.0
+FIRST_RUN_WELCOME_POLL_SECONDS = 1.0
 
 # Adapter instances the module-level hermes hook handlers route into (hooks
 # are registered ONCE at plugin load; adapters are constructed per platform
@@ -269,6 +1004,9 @@ _POST_APPROVAL_RESPONSE_HOOK_AVAILABLE = False
 _PLUGIN_CONTEXT: Any = None
 _LIVEUI_REGISTER_TOOL: Any = None
 _LIVEUI_TOOL_REGISTERED = False
+_LIVEUI_STATE_TOOL_REGISTERED = False
+_LIVEUI_TEMPLATE_TOOL_REGISTERED = False
+_LIVEUI_TASK_TOOL_REGISTERED = False
 _LIVEUI_LOCK = threading.RLock()
 
 
@@ -355,6 +1093,43 @@ def _on_post_api_request_hook(**kwargs: Any) -> None:
             logger.exception("[ocuclaw] post_api_request reasoning glue failed")
 
 
+def _on_interim_message_hook(**kwargs: Any) -> None:
+    """Hermes ``on_interim_message`` observer (0.20.5+). The agent's own
+    mid-turn narration sentences, before the final reply."""
+    for adapter in list(_ADAPTERS):
+        try:
+            adapter.handle_interim_message(kwargs)
+        except Exception:  # noqa: BLE001 — a hook raise must never break turns
+            logger.exception("[ocuclaw] on_interim_message narration glue failed")
+
+
+def _on_stream_start_hook(**kwargs: Any) -> None:
+    """Hermes ``on_stream_start`` observer (0.20.5+, opt-in)."""
+    for adapter in list(_ADAPTERS):
+        try:
+            adapter.handle_stream_start(kwargs)
+        except Exception:  # noqa: BLE001 — a hook raise must never break turns
+            logger.exception("[ocuclaw] on_stream_start glue failed")
+
+
+def _on_stream_delta_hook(**kwargs: Any) -> None:
+    """Hermes ``on_stream_delta`` observer (0.20.5+, opt-in)."""
+    for adapter in list(_ADAPTERS):
+        try:
+            adapter.handle_stream_delta(kwargs)
+        except Exception:  # noqa: BLE001 — a hook raise must never break turns
+            logger.exception("[ocuclaw] on_stream_delta glue failed")
+
+
+def _on_stream_end_hook(**kwargs: Any) -> None:
+    """Hermes ``on_stream_end`` observer (0.20.5+, opt-in)."""
+    for adapter in list(_ADAPTERS):
+        try:
+            adapter.handle_stream_end(kwargs)
+        except Exception:  # noqa: BLE001 — a hook raise must never break turns
+            logger.exception("[ocuclaw] on_stream_end glue failed")
+
+
 def _on_pre_llm_call_hook(**kwargs: Any) -> Optional[Dict[str, str]]:
     """Hermes ``pre_llm_call`` observer. Injects liveui voicemail/channel-2
     context into the current turn's USER message only."""
@@ -376,58 +1151,243 @@ def _connected_adapter() -> Any:
     raise RuntimeError("OcuClaw liveui runtime is not connected")
 
 
+def _current_hermes_session_key() -> str:
+    """Task-local Hermes session identity, absent outside an agent turn."""
+
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:  # noqa: BLE001 - setup remains available outside gateway turns
+        return ""
+    return str(get_session_env("HERMES_SESSION_KEY", "") or "").strip()
+
+
+_HOST_SETUP_INTERFACES = frozenset({"local", "cli", "tui", "desktop"})
+
+
+def _current_hermes_interface() -> str:
+    """Return the live Hermes surface identity for the current agent turn."""
+
+    session_key = _current_hermes_session_key()
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:  # noqa: BLE001 - legacy key parsing remains fail-closed
+        get_session_env = None
+    if callable(get_session_env):
+        platform = str(
+            get_session_env("HERMES_SESSION_PLATFORM", "") or ""
+        ).strip().lower()
+        source = str(
+            get_session_env("HERMES_SESSION_SOURCE", "") or ""
+        ).strip().lower()
+        if platform:
+            return platform
+        if source:
+            return source
+    parts = session_key.split(":")
+    return parts[2].strip().lower() if len(parts) >= 3 else ""
+
+
+def _host_setup_session_available() -> bool:
+    """Keep the setup tool on local Hermes interfaces only.
+
+    A missing identity is the classic CLI/early TUI case. Any identified
+    session must name one of Hermes's local interface platforms or sources;
+    messaging, cron, and OcuClaw phone sessions fail closed. Native Hermes
+    0.20.x host keys are opaque IDs, with their interface identity carried
+    separately in ``HERMES_SESSION_SOURCE``.
+    """
+
+    session_key = _current_hermes_session_key()
+    interface = _current_hermes_interface()
+    if interface:
+        return interface in _HOST_SETUP_INTERFACES
+    return not session_key
+
+
 def _liveui_tool_handler(args: Dict[str, Any], **_kwargs: Any) -> str:
-    adapter = _connected_adapter()
+    try:
+        adapter = _connected_adapter()
+    except RuntimeError as exc:
+        if not is_welcome_surface(args):
+            raise
+        session_key = _current_hermes_session_key()
+        if not session_key or parse_ocuclaw_session_key(session_key) is None:
+            raise
+        proof = record_welcome_outcome(
+            "error",
+            hermes_release=CERTIFIED_HERMES_TAG,
+            hermes_package_version=_hermes_version() or None,
+            ocuclaw_version=_ocuclaw_version(),
+            session_key=session_key,
+        )
+        return json.dumps(
+            {"error": str(exc), "firstRunProof": proof},
+            ensure_ascii=False,
+        )
     return adapter.handle_liveui_tool_call(args)
 
 
-def _liveui_descriptor_from_hello(hello: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _liveui_state_tool_handler(args: Dict[str, Any], **_kwargs: Any) -> str:
+    adapter = _connected_adapter()
+    return adapter.handle_liveui_state_tool_call(args)
+
+
+def _liveui_template_tool_handler(args: Dict[str, Any], **_kwargs: Any) -> str:
+    adapter = _connected_adapter()
+    return adapter.handle_liveui_template_tool_call(args)
+
+
+def _liveui_task_tool_handler(args: Dict[str, Any], **_kwargs: Any) -> str:
+    adapter = _connected_adapter()
+    return adapter.handle_liveui_task_tool_call(args)
+
+
+def _liveui_descriptor_from_hello(
+    hello: Dict[str, Any], tool_name: str = LIVEUI_TOOL_NAME
+) -> Optional[Dict[str, Any]]:
     liveui = hello.get("liveui") if isinstance(hello, dict) else None
     if not isinstance(liveui, dict):
         return None
     tools = liveui.get("tools")
     if isinstance(tools, list):
         for item in tools:
-            if isinstance(item, dict) and item.get("name") == LIVEUI_TOOL_NAME:
+            if isinstance(item, dict) and item.get("name") == tool_name:
                 return item
-    direct = liveui.get(LIVEUI_TOOL_NAME)
+    direct = liveui.get(tool_name)
     return direct if isinstance(direct, dict) else None
 
 
-def _register_liveui_tool_from_hello(hello: Dict[str, Any]) -> None:
-    descriptor = _liveui_descriptor_from_hello(hello)
+def _register_liveui_descriptor_from_hello(
+    hello: Dict[str, Any],
+    *,
+    tool_name: str,
+    handler: Any,
+    log_label: str,
+) -> bool:
+    descriptor = _liveui_descriptor_from_hello(hello, tool_name)
     if not descriptor:
-        logger.warning("[ocuclaw] liveui descriptor missing from runtime hello")
-        return
+        logger.warning(
+            "[ocuclaw] %s descriptor missing from runtime hello", log_label
+        )
+        return False
     schema = descriptor.get("schema")
     if not isinstance(schema, dict):
-        logger.warning("[ocuclaw] liveui descriptor has no schema; tool not registered")
-        return
-    name = str(descriptor.get("name") or LIVEUI_TOOL_NAME)
-    if name != LIVEUI_TOOL_NAME:
-        logger.warning("[ocuclaw] unexpected liveui tool name %r; tool not registered", name)
-        return
-    description = str(descriptor.get("description") or schema.get("description") or "")
-    toolset = str(descriptor.get("toolset") or LIVEUI_TOOLSET)
-    global _LIVEUI_TOOL_REGISTERED
-    with _LIVEUI_LOCK:
-        if _LIVEUI_TOOL_REGISTERED:
-            return
-        register_tool = _LIVEUI_REGISTER_TOOL
-        if not callable(register_tool):
-            logger.warning("[ocuclaw] ctx.register_tool unavailable; liveui degraded")
-            return
-        register_tool(
-            name=LIVEUI_TOOL_NAME,
-            toolset=toolset,
-            schema=schema,
-            handler=_liveui_tool_handler,
-            check_fn=check_ocuclaw_requirements,
-            is_async=False,
-            description=description,
+        logger.warning(
+            "[ocuclaw] %s descriptor has no schema; tool not registered", log_label
         )
-        _LIVEUI_TOOL_REGISTERED = True
-        logger.info("[ocuclaw] liveui tool registered from runtime descriptor")
+        return False
+    name = str(descriptor.get("name") or tool_name)
+    if name != tool_name:
+        logger.warning(
+            "[ocuclaw] unexpected %s tool name %r; tool not registered",
+            log_label,
+            name,
+        )
+        return False
+    description = str(descriptor.get("description") or schema.get("description") or "")
+    descriptor_toolset = str(descriptor.get("toolset") or "")
+    if descriptor_toolset and descriptor_toolset != LIVEUI_TOOLSET:
+        logger.warning(
+            "[ocuclaw] ignoring %s descriptor toolset %r; using platform toolset %r",
+            log_label,
+            descriptor_toolset,
+            LIVEUI_TOOLSET,
+        )
+    register_tool = _LIVEUI_REGISTER_TOOL
+    if not callable(register_tool):
+        logger.warning("[ocuclaw] ctx.register_tool unavailable; liveui degraded")
+        return False
+    register_tool(
+        name=tool_name,
+        toolset=LIVEUI_TOOLSET,
+        schema=schema,
+        handler=handler,
+        check_fn=check_ocuclaw_requirements,
+        is_async=False,
+        description=description,
+    )
+    logger.info("[ocuclaw] %s tool registered from runtime descriptor", log_label)
+    return True
+
+
+def _warn_unregistered_liveui_descriptors(hello: Dict[str, Any]) -> None:
+    liveui = hello.get("liveui") if isinstance(hello, dict) else None
+    if not isinstance(liveui, dict):
+        return
+    tools = liveui.get("tools")
+    descriptors = (
+        [item for item in tools if isinstance(item, dict)]
+        if isinstance(tools, list)
+        else []
+    )
+    if not descriptors:
+        descriptors = [
+            liveui[name]
+            for name in (
+                LIVEUI_TOOL_NAME,
+                LIVEUI_STATE_TOOL_NAME,
+                LIVEUI_TEMPLATE_TOOL_NAME,
+                LIVEUI_TASK_TOOL_NAME,
+            )
+            if isinstance(liveui.get(name), dict)
+        ]
+    registrations = {
+        LIVEUI_TOOL_NAME: _LIVEUI_TOOL_REGISTERED,
+        LIVEUI_STATE_TOOL_NAME: _LIVEUI_STATE_TOOL_REGISTERED,
+        LIVEUI_TEMPLATE_TOOL_NAME: _LIVEUI_TEMPLATE_TOOL_REGISTERED,
+        LIVEUI_TASK_TOOL_NAME: _LIVEUI_TASK_TOOL_REGISTERED,
+    }
+    for descriptor in descriptors:
+        name = str(descriptor.get("name") or "").strip()
+        if name and registrations.get(name, False):
+            continue
+        reason = (
+            "registration did not complete"
+            if name in registrations
+            else "no Hermes adapter registration"
+        )
+        logger.warning(
+            "[ocuclaw] liveui descriptor unregistered: name=%r reason=%s",
+            name or "<missing>",
+            reason if name else "descriptor name missing",
+        )
+
+
+def _register_liveui_tool_from_hello(hello: Dict[str, Any]) -> None:
+    global _LIVEUI_TOOL_REGISTERED, _LIVEUI_STATE_TOOL_REGISTERED
+    global _LIVEUI_TEMPLATE_TOOL_REGISTERED, _LIVEUI_TASK_TOOL_REGISTERED
+    with _LIVEUI_LOCK:
+        if not _LIVEUI_TOOL_REGISTERED:
+            _LIVEUI_TOOL_REGISTERED = _register_liveui_descriptor_from_hello(
+                hello,
+                tool_name=LIVEUI_TOOL_NAME,
+                handler=_liveui_tool_handler,
+                log_label="liveui",
+            )
+        if not _LIVEUI_STATE_TOOL_REGISTERED:
+            _LIVEUI_STATE_TOOL_REGISTERED = _register_liveui_descriptor_from_hello(
+                hello,
+                tool_name=LIVEUI_STATE_TOOL_NAME,
+                handler=_liveui_state_tool_handler,
+                log_label="liveui state",
+            )
+        if not _LIVEUI_TEMPLATE_TOOL_REGISTERED:
+            _LIVEUI_TEMPLATE_TOOL_REGISTERED = (
+                _register_liveui_descriptor_from_hello(
+                    hello,
+                    tool_name=LIVEUI_TEMPLATE_TOOL_NAME,
+                    handler=_liveui_template_tool_handler,
+                    log_label="liveui template",
+                )
+            )
+        if not _LIVEUI_TASK_TOOL_REGISTERED:
+            _LIVEUI_TASK_TOOL_REGISTERED = _register_liveui_descriptor_from_hello(
+                hello,
+                tool_name=LIVEUI_TASK_TOOL_NAME,
+                handler=_liveui_task_tool_handler,
+                log_label="liveui task",
+            )
+        _warn_unregistered_liveui_descriptors(hello)
 
 
 def _liveui_render_link_timeout_s(settings: Dict[str, Any]) -> float:
@@ -507,6 +1467,28 @@ def hermes_version_supported(raw: str) -> bool:
     return SUPPORTED_HERMES_MIN <= parsed < SUPPORTED_HERMES_MAX_EXCLUSIVE
 
 
+def _supported_hermes_range() -> str:
+    minimum = ".".join(map(str, SUPPORTED_HERMES_MIN))
+    maximum = ".".join(map(str, SUPPORTED_HERMES_MAX_EXCLUSIVE))
+    return f">={minimum},<{maximum}"
+
+
+def _unsupported_hermes_message(version: str) -> str:
+    return (
+        f"Hermes {version or 'unknown'} is outside OcuClaw's certified "
+        f"range {_supported_hermes_range()} (baseline "
+        f"{CERTIFIED_HERMES_VERSION}, {CERTIFIED_HERMES_TAG}, "
+        f"{CERTIFIED_HERMES_COMMIT}); the platform remains available for "
+        "setup and diagnosis, but the Backend Adapter and Node child will "
+        "not start"
+    )
+
+
+def _host_version_supported() -> bool:
+    version = _hermes_version()
+    return hermes_version_supported(version)
+
+
 def _find_node() -> Optional[str]:
     try:
         from hermes_constants import find_node_executable
@@ -519,14 +1501,48 @@ def _find_node() -> Optional[str]:
 
 
 def check_ocuclaw_requirements() -> bool:
-    """check_fn: dependencies only (node present). Config-dependent checks
-    (entry file vs runtimeCommand override) live in validate_config."""
+    """Check host admission and the Node dependency.
+
+    Config-dependent checks (entry file vs runtimeCommand override) live in
+    ``validate_config``.
+    """
+    if not _host_version_supported():
+        return False
     return _find_node() is not None
 
 
 def _extra(config: Any) -> Dict[str, Any]:
     extra = getattr(config, "extra", None)
     return extra if isinstance(extra, dict) else {}
+
+
+def resolve_even_ai_routing_mode(extra: Dict[str, Any]) -> str:
+    """Total Hermes-ingress decision for ``extra.evenAiRoutingMode``.
+
+    Every input lands in exactly one of two outcomes — accepted as one of
+    ``EVEN_AI_ROUTING_MODES``, or rejected with ``ValueError``. Absent, null,
+    and blank mean "unset" and take the code default; nothing else is
+    silently rewritten, so no value reaches shared normalization by
+    fall-through.
+    """
+    raw = extra.get("evenAiRoutingMode")
+    if raw is None:
+        return DEFAULT_EVEN_AI_ROUTING_MODE
+    if not isinstance(raw, str):
+        raise ValueError(
+            "platforms.ocuclaw.extra.evenAiRoutingMode must be a string "
+            f"({'|'.join(EVEN_AI_ROUTING_MODES)})"
+        )
+    value = raw.strip().lower()
+    if not value:
+        return DEFAULT_EVEN_AI_ROUTING_MODE
+    if value not in EVEN_AI_ROUTING_MODES:
+        raise ValueError(
+            "platforms.ocuclaw.extra.evenAiRoutingMode must be one of "
+            f"{', '.join(EVEN_AI_ROUTING_MODES)} (got {raw.strip()!r}); "
+            "retired routing aliases are not accepted here"
+        )
+    return value
 
 
 def resolve_adapter_settings(config: Any) -> Dict[str, Any]:
@@ -594,7 +1610,7 @@ def resolve_adapter_settings(config: Any) -> Dict[str, Any]:
         "evenAiRequestTimeoutMs": _int("evenAiRequestTimeoutMs", 60_000),
         "evenAiMaxBodyBytes": _int("evenAiMaxBodyBytes", 65_536),
         "evenAiDedupWindowMs": _int("evenAiDedupWindowMs", 500),
-        "evenAiRoutingMode": str(extra.get("evenAiRoutingMode") or "active").strip(),
+        "evenAiRoutingMode": resolve_even_ai_routing_mode(extra),
         "evenAiDedicatedSessionKey": str(
             extra.get("evenAiDedicatedSessionKey") or ""
         ).strip(),
@@ -636,6 +1652,8 @@ def _child_runtime_config(settings: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def validate_ocuclaw_config(config: Any) -> bool:
+    if not _host_version_supported():
+        return False
     try:
         settings = resolve_adapter_settings(config)
     except ValueError as exc:
@@ -654,11 +1672,13 @@ def validate_ocuclaw_config(config: Any) -> bool:
         # every downstream client; an unset token rejects everyone, so refuse
         # to boot half-configured (same required-token UX as the OpenClaw
         # bundle's plugins.entries.ocuclaw.config.relayToken).
-        logger.warning(
-            "[ocuclaw] platforms.ocuclaw.extra.relayToken is required — set "
-            "it to the token entered in the OcuClaw app's relay server "
-            "token field",
-        )
+        if is_managed_profile():
+            logger.warning("[ocuclaw] %s", MANAGED_CREDENTIAL_REQUIRED_MESSAGE)
+        else:
+            logger.warning(
+                "[ocuclaw] the host-managed Relay Credential is missing — use "
+                "/ocuclaw-setup and its locally confirmed all-device reset",
+            )
         return False
     if settings["evenAiEnabled"] and not settings["evenAiToken"]:
         logger.warning(
@@ -666,47 +1686,20 @@ def validate_ocuclaw_config(config: Any) -> bool:
             "evenAiEnabled is true",
         )
         return False
-    _warn_if_multiplex_authorization_unconfigured()
     return True
 
 
-def _warn_if_multiplex_authorization_unconfigured() -> None:
-    """Loud config check: multiplex without an OcuClaw auth env drops turns.
-
-    Under gateway.multiplex_profiles the authorization adapter lookup fails
-    closed for profile-stamped events (no per-profile ocuclaw adapter exists —
-    this is ONE shared adapter), so secondary-profile turns are only
-    authorized via the documented env allowlist lane. Warn, don't refuse:
-    the default profile keeps working via authorization_is_upstream, and
-    killing the whole platform over a secondary-lane gap would be worse
-    than degraded service.
-    """
-    try:
-        enabled, homes = load_profile_routing_snapshot()
-    except Exception:  # noqa: BLE001 - validation must never crash boot
-        return
-    if not enabled or len(homes) <= 1:
-        return
-    allow_all = os.environ.get(OCUCLAW_ALLOW_ALL_USERS_ENV, "").strip().lower()
-    allowed = os.environ.get(OCUCLAW_ALLOWED_USERS_ENV, "").strip()
-    if allow_all in {"true", "1", "yes"} or allowed:
-        return
-    logger.warning(
-        "[ocuclaw] gateway.multiplex_profiles is ON with %d served profiles "
-        "but neither %s nor %s is set — glasses turns on SECONDARY profiles "
-        "will be dropped as unauthorized (the profile-scoped authorization "
-        "lookup cannot see this shared adapter's upstream trust). Set "
-        "%s=true (the Node relay already token-authenticates every "
-        "downstream client) or list ids in %s.",
-        len(homes),
-        OCUCLAW_ALLOW_ALL_USERS_ENV,
-        OCUCLAW_ALLOWED_USERS_ENV,
-        OCUCLAW_ALLOW_ALL_USERS_ENV,
-        OCUCLAW_ALLOWED_USERS_ENV,
-    )
-
-
 def _is_connected(config: Any) -> bool:
+    # Ownership boundary (#1312): `extra["relayToken"]` is ALSO how Hermes
+    # delivers the `.env` secret — `_env_enablement()` seeds exactly this key
+    # onto the platform extra. At this seam an env-seeded token and a
+    # yaml-authored one are indistinguishable, so dropping the extra read to
+    # make this "env-only" would break the supported `.env` path outright.
+    # Telling them apart means re-reading raw config.yaml and diffing it
+    # against the env layering that Hermes 0.20 owns — a config-contract
+    # change, not a local fix. #1312 removes yaml as a *reported* secret
+    # source; the residual that a pre-existing yaml token still boots while
+    # `_setup_status` reports `relay_token_missing` is tracked as follow-up.
     env_relay_token = os.environ.get(OCUCLAW_RELAY_TOKEN_ENV, "").strip()
     if env_relay_token:
         return True
@@ -724,28 +1717,6 @@ def _env_enablement() -> Optional[Dict[str, str]]:
     return seed or None
 
 
-def _warn_shadowed_yaml_secrets(
-    _yaml_config: Dict[str, Any], platform_config: Dict[str, Any]
-) -> None:
-    """Warn when Hermes will replace legacy yaml secrets with env values."""
-    extra = platform_config.get("extra")
-    if not isinstance(extra, dict):
-        return None
-    shadowed = [
-        f"platforms.ocuclaw.extra.{adapter_key} ({env_name})"
-        for env_name, adapter_key in _SECRET_ENV_TO_ADAPTER_KEY.items()
-        if adapter_key in extra and os.environ.get(env_name, "").strip()
-    ]
-    if shadowed:
-        logger.warning(
-            "[ocuclaw] environment secret(s) override yaml config at %s; "
-            "secret values were not logged. Remove the yaml key(s) and manage "
-            "the secret(s) with `hermes config set <OCUCLAW_* variable> ...`.",
-            ", ".join(shadowed),
-        )
-    return None
-
-
 def _hermes_version() -> str:
     try:
         from hermes_cli import __version__
@@ -755,16 +1726,844 @@ def _hermes_version() -> str:
         return ""
 
 
-def register(ctx: Any) -> None:
-    global _PLUGIN_CONTEXT, _LIVEUI_REGISTER_TOOL
-    _PLUGIN_CONTEXT = ctx
+def setup_ocuclaw_platform() -> None:
+    """Confirm host-managed relay state, then configure optional secrets."""
     version = _hermes_version()
     if not hermes_version_supported(version):
+        print(f"OcuClaw setup: {_unsupported_hermes_message(version)}.")
+        return
+    relay_present = _setup_secret_present(OCUCLAW_RELAY_TOKEN_ENV)
+    if not relay_present:
+        bootstrap_status = bootstrap_relay_credential()
+        relay_present = _setup_secret_present(OCUCLAW_RELAY_TOKEN_ENV)
+        if not relay_present:
+            if bootstrap_status == BOOTSTRAP_MANAGED_MISSING:
+                print(MANAGED_CREDENTIAL_REQUIRED_MESSAGE)
+            elif is_profile_established():
+                print(
+                    "This established profile's Relay Credential is missing or "
+                    "unreadable. OcuClaw stopped setup rather than silently "
+                    "disconnect every paired phone. Use /ocuclaw-setup and its "
+                    "locally confirmed all-device reset."
+                )
+            else:
+                print(
+                    "OcuClaw could not generate the host-managed Relay Credential. "
+                    "There is no credential to enter; use /ocuclaw-setup for "
+                    "guided recovery."
+                )
+            return
+    if relay_present:
+        print(
+            "The Relay Credential is host-managed and was preserved. To replace it, "
+            "use /ocuclaw-setup and its locally confirmed all-device reset."
+        )
+    try:
+        from hermes_cli.cli_output import prompt
+        from hermes_cli.config import save_env_value
+    except Exception:  # noqa: BLE001 - setup must retain its recovery handoff
+        print(
+            "Optional masked credential setup could not be completed; diagnostics "
+            "and Relay Credential recovery remain available."
+        )
+    else:
+        print("Optional Soniox and Even AI credentials use Hermes's masked prompts.")
+        secret_prompts = (
+            (
+                OCUCLAW_SONIOX_API_KEY_ENV,
+                "Soniox API key",
+                "Soniox API key (optional; Enter to skip)",
+            ),
+            (
+                OCUCLAW_EVEN_AI_TOKEN_ENV,
+                "Even AI token",
+                "Even AI token (optional; Enter to skip)",
+            ),
+        )
+        for env_name, label, question in secret_prompts:
+            already_present = _setup_secret_present(env_name)
+            try:
+                if already_present:
+                    print(
+                        f"A configured {label} is present. Enter a replacement "
+                        "or press Enter to keep it."
+                    )
+                else:
+                    print(f"No {label} is configured; this integration is optional.")
+                value = str(prompt(question, password=True) or "").strip()
+                if value:
+                    save_env_value(env_name, value)
+                    print(f"OcuClaw {label} saved through Hermes's .env contract.")
+                elif already_present:
+                    print(f"Existing OcuClaw {label} configuration kept.")
+                else:
+                    print(f"Optional {label} setup skipped.")
+            except Exception:  # noqa: BLE001 - isolate each optional setup lane
+                print(
+                    f"OcuClaw {label} setup could not be completed; continuing "
+                    "with the remaining masked prompts."
+                )
+    print("Restart explicitly with: hermes gateway restart")
+    print("After Hermes restarts, then run /ocuclaw-setup.")
+
+
+def _setup_secret_present(env_name: str) -> bool:
+    try:
+        from hermes_cli.config import get_env_value
+
+        return bool(str(get_env_value(env_name) or "").strip())
+    except Exception:  # noqa: BLE001 - status must remain available fail-soft
+        return bool(os.environ.get(env_name, "").strip())
+
+
+def _secret_presence_inventory() -> Dict[str, bool]:
+    """Presence booleans for the three OcuClaw secrets.
+
+    The only supported store is Hermes's ``.env`` contract (the Hermes-managed
+    secret env file, falling back to the process environment); a secret counts
+    as present when it holds a non-empty value there. The legacy yaml
+    ``platforms.ocuclaw.extra.*`` keys are deliberately not consulted — a yaml
+    key never counts as a configured secret on any surface. Only the boolean
+    crosses this seam — never a value, length, prefix, or mask — so every
+    surface that renders the inventory is secret-free by construction.
+    """
+    return {
+        adapter_key: _setup_secret_present(env_name)
+        for env_name, adapter_key in _SECRET_ENV_TO_ADAPTER_KEY.items()
+    }
+
+
+def _setup_raw_config() -> Tuple[Dict[str, Any], bool]:
+    try:
+        from hermes_cli.config import read_raw_config
+
+        config = read_raw_config()
+        return (config if isinstance(config, dict) else {}), True
+    except Exception:  # noqa: BLE001 - doctor reports unreadable config safely
+        return {}, False
+
+
+def _ocuclaw_version() -> Optional[str]:
+    """The OcuClaw train version, read from the bundle manifest.
+
+    Read rather than duplicated: a second copy of the version in Python is a
+    second thing to forget on a release, and the manifest is the one the
+    publish lane already treats as authoritative.
+    """
+    try:
+        text = (BUNDLE_DIR / "plugin.yaml").read_text(encoding="utf-8")
+    except OSError:  # noqa: BLE001 - a missing manifest degrades, never raises
+        return None
+    match = re.search(r"^version:\s*([^\s#]+)", text, re.MULTILINE)
+    return match.group(1).strip() if match else None
+
+
+def _collect_gateway_facts() -> Dict[str, Any]:
+    """Read Hermes's own profile-scoped ``gateway_state.json``, qualified.
+
+    Per #1277 this receipt is a **coarse last-observed adapter-state
+    snapshot**, not a liveness clock. So the collector separates the two
+    things the old reader conflated: what the receipt *says* (the platform
+    state and when it changed) and whether the process that wrote it is
+    *still the live one* (the independently validated PID/start-time guard).
+    The freshness policy over those facts belongs to the deriver, which is
+    the only place it can be read against the contract.
+    """
+    facts: Dict[str, Any] = {
+        "gatewayLive": None,
+        "gatewayAdapterState": None,
+        "gatewayAdapterEnabled": None,
+        "gatewayAdapterObservedAt": None,
+        "gatewayReceiptUpdatedAt": None,
+        "gatewayReceiptStatus": "missing",
+    }
+    record, status, live = read_gateway_state()
+    facts["gatewayReceiptStatus"] = status
+    if status != "ok" or not isinstance(record, dict):
+        return facts
+
+    updated_at = record.get("updated_at")
+    facts["gatewayReceiptUpdatedAt"] = (
+        updated_at if isinstance(updated_at, str) else None
+    )
+    facts["gatewayLive"] = live
+
+    platforms = record.get("platforms")
+    platform = platforms.get(PLATFORM_NAME) if isinstance(platforms, dict) else None
+    if isinstance(platform, dict):
+        state = platform.get("state")
+        if isinstance(state, str) and state.strip():
+            facts["gatewayAdapterState"] = state.strip()
+        enabled = platform.get("enabled")
+        facts["gatewayAdapterEnabled"] = enabled if isinstance(enabled, bool) else None
+        observed = platform.get("updated_at")
+        facts["gatewayAdapterObservedAt"] = (
+            observed if isinstance(observed, str) else None
+        )
+    return facts
+
+
+def _collect_health_facts(
+    *, observation_mode: str = OBSERVATION_PASSIVE
+) -> Dict[str, Any]:
+    """The impure half of the collect/derive split (#1273 P1).
+
+    Everything that touches config, the filesystem, the process table, or
+    adapter state happens here and nowhere else; the result is a plain dict
+    matching the frozen v1 facts key set. Both derivations downstream —
+    the snapshot and the transitional setup block — are then pure functions
+    of this dict, which is what makes them fixture-testable (test seam 1).
+
+    Passive by construction: no probe, no network call, no mutation. An
+    active observation is the caller's explicit choice (doctor), made by
+    overriding the probe-fed facts after collection.
+    """
+    return health_collect.collect_health_facts(
+        observation_mode=observation_mode,
+        adapters=list(_ADAPTERS),
+        setup_raw_config_fn=_setup_raw_config,
+        hermes_version_fn=_hermes_version,
+        supported_fn=hermes_version_supported,
+        supported_range_fn=_supported_hermes_range,
+        secret_inventory_fn=_secret_presence_inventory,
+        node_fn=_find_node,
+        ocuclaw_version_fn=_ocuclaw_version,
+        profile_name_fn=_profile_name,
+        resolve_home_fn=resolve_receipt_home,
+        read_presence_fn=read_app_presence,
+        read_proof_fn=read_first_run_proof,
+        gateway_facts_fn=_collect_gateway_facts,
+        serve_facts_fn=_collect_serve_facts,
+        runtime_entry=DEFAULT_RUNTIME_ENTRY,
+    )
+
+
+def _collect_serve_facts(
+    extra: Mapping[str, Any], relay_port_valid: bool
+) -> Dict[str, Any]:
+    """Classify this host's Tailscale Serve configuration (#1319).
+
+    Two bounded, read-only `tailscale` reads, classified against the JSON
+    contract captured from two CLI minors. Passive by the collector's
+    definition: it queries the local tailscaled socket the way the rest of
+    collection reads local config files, makes no network call, and cannot
+    mutate Serve — :mod:`serve` builds no mutating argv at all.
+
+    Configuration shape only. `serveReachable` and `serveApplicationReady`
+    are deliberately left where :func:`blank_facts` put them, because a
+    configured route is empirically not a working one (#1275): they belong to
+    doctor's bounded probe, and a passive collector claiming them would be
+    exactly the conflation the tailnet leg exists to prevent.
+    """
+    relay_port: Optional[int] = None
+    if relay_port_valid:
+        try:
+            relay_port = int(extra.get("wsPort", HERMES_BUNDLE_DEFAULT_WS_PORT))
+        except (TypeError, ValueError):  # pragma: no cover - guarded upstream
+            relay_port = None
+
+    try:
+        observed = serve.observe(relay_port=relay_port)
+    except Exception:  # noqa: BLE001 - diagnosis must not become an outage
+        logger.exception("[ocuclaw] serve classification unavailable")
+        return {
+            "serveClassification": TRISTATE_UNKNOWN,
+            "serveConfigured": TRISTATE_UNKNOWN,
+            "serveObservedAt": None,
+            "serveNodeDnsName": None,
+            "serveRelayPort": relay_port,
+            "serveReason": serve.REASON_NOT_READ,
+            "serveReadCode": serve.READ_FAILED,
+        }
+
+    return {
+        "serveClassification": observed.classification,
+        "serveConfigured": observed.configured,
+        # Stamped only because something was actually read. A classification
+        # the reader could not reach carries no observation stamp, and the
+        # deriver reads an unstamped classification as "nobody looked".
+        "serveObservedAt": (
+            snapshot_now_iso() if observed.read_code == serve.READ_OK else None
+        ),
+        "serveNodeDnsName": observed.dns_name,
+        "serveRelayPort": observed.relay_port,
+        "serveReason": observed.reason,
+        "serveReadCode": observed.read_code,
+    }
+
+
+def _profile_name(home: Optional[Path]) -> Optional[str]:
+    """Name the exact profile this home belongs to, without disclosing a path.
+
+    Hermes lays secondary profiles out as ``<root>/profiles/<name>``; anything
+    else is the default profile. The name is rendered, the path never is.
+    """
+    if home is None:
+        return None
+    try:
+        return home.name if home.parent.name == "profiles" else "default"
+    except (OSError, ValueError):  # pragma: no cover - defensive
+        return None
+
+
+def connection_health_snapshot(
+    *, observation_mode: str = OBSERVATION_PASSIVE
+) -> Dict[str, Any]:
+    """Compose one Connection Health Snapshot v1: collect, then derive.
+
+    The composition entrypoint every presenter shares (#1273 P1). Callers
+    that already hold facts — fixtures, the CLI collecting in-process, a
+    doctor run merging probe results — call :func:`derive_snapshot` directly
+    instead of coming through here.
+    """
+    return derive_snapshot(_collect_health_facts(observation_mode=observation_mode))
+
+
+def support_connection_health_document() -> Dict[str, Any]:
+    """Exact passive snapshot or its static, secret-free error document."""
+    try:
+        return connection_health_snapshot()
+    except Exception:  # noqa: BLE001 - support capture must survive diagnosis
+        logger.warning("[ocuclaw] passive support snapshot unavailable")
+        return error_envelope(
+            "snapshot_unavailable",
+            "The passive Connection Health Snapshot could not be generated.",
+        )
+
+
+def _safe_snapshot(facts: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Derive for a surface that must not fail because diagnosis did.
+
+    The setup tool's job is to be reachable when things are broken, so a
+    derivation bug degrades that surface to its legacy block instead of
+    turning a diagnostic into a second outage.
+    """
+    try:
+        return derive_snapshot(facts)
+    except Exception:  # noqa: BLE001 - never raise through an agent turn
+        logger.exception("[ocuclaw] connection health snapshot unavailable")
+        return None
+
+
+def _setup_status(facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The `ocuclaw_setup` status block — now a pure derivation of facts.
+
+    Same output, same ladder, same field names: retiring the mixed ladder is
+    #1318's atomic removal, not this PR's. What changed is that it and the
+    snapshot now read one collector, so the two can no longer disagree about
+    what the host looks like. ``facts`` lets a caller that already collected
+    reuse them rather than observe the host twice in one turn.
+    """
+    status = derive_legacy_setup_status(
+        facts if facts is not None else _collect_health_facts()
+    )
+    raw_config, config_readable = _setup_raw_config()
+    plugins = raw_config.get("plugins")
+    stream_reasoning_deltas_set = (
+        isinstance(plugins, dict)
+        and plugins.get("stream_reasoning_deltas") is True
+    )
+    status["hermesHooks"] = {
+        "interimMessageAvailable": bool(INTERIM_HOOK_AVAILABLE),
+        "streamHooksAvailable": bool(STREAM_HOOKS_AVAILABLE),
+        "streamReasoningDeltas": stream_reasoning_deltas_set,
+        "streamReasoningDeltasOffer": _stream_reasoning_deltas_offer(
+            configured=stream_reasoning_deltas_set,
+            hooks_available=bool(STREAM_HOOKS_AVAILABLE),
+            config_readable=config_readable,
+        ),
+        "registered": list(_hermes_feature_tokens()),
+    }
+    status["desktopTheme"] = _desktop_theme_status(raw_config, config_readable)
+    status["sessionReadState"] = bool(session_read_state_supported())
+    return status
+
+
+def _setup_tool_handler(args: Dict[str, Any], **_kwargs: Any) -> str:
+    try:
+        return _setup_tool_handler_impl(args, **_kwargs)
+    except Exception:  # noqa: BLE001 - never raise through an agent turn
+        operation = str((args or {}).get("operation") or "").strip()
+        logger.exception("[ocuclaw] setup status unavailable")
+        return json.dumps(
+            {
+                "ok": False,
+                "operation": operation or None,
+                "error": {
+                    "code": "status_unavailable",
+                    "message": "OcuClaw setup status could not be inspected safely.",
+                },
+            },
+            sort_keys=True,
+        )
+
+
+def _stream_deltas_operation_receipt(args: Dict[str, Any]) -> Dict[str, Any]:
+    """The one WRITING setup operation, gated on an explicit operator yes.
+
+    Two gates, both structural rather than advisory: the tool refuses without
+    ``confirm: true`` (so a status-shaped drive-by call can never flip a
+    gateway-wide key), and it refuses on a host whose hook vocabulary has no
+    reasoning-delta hooks (so nobody ends up with an inert key they will later
+    have to explain).
+    """
+    operation = SETUP_STREAM_DELTAS_OPERATION
+    if (args or {}).get("confirm") is not True:
+        return {
+            "ok": False,
+            "operation": operation,
+            "status": _setup_status(),
+            "error": {
+                "code": "confirmation_required",
+                "message": (
+                    f"{STREAM_DELTAS_SCOPE_NOTE} Ask the operator, then repeat "
+                    "this call with confirm: true."
+                ),
+            },
+        }
+
+    before = _setup_status()
+    hooks = before.get("hermesHooks")
+    hooks = hooks if isinstance(hooks, dict) else {}
+    if not hooks.get("streamHooksAvailable"):
+        return {
+            "ok": False,
+            "operation": operation,
+            "status": before,
+            "error": {
+                "code": "stream_hooks_unavailable",
+                "message": STREAM_DELTAS_INERT_NOTE,
+            },
+        }
+
+    result = _enable_stream_reasoning_deltas()
+    receipt: Dict[str, Any] = {
+        "ok": result.get("reason") in {"written", "already_enabled"},
+        "operation": operation,
+        "streamReasoningDeltas": result,
+        "status": _setup_status(),
+    }
+    if not receipt["ok"]:
+        receipt["error"] = {
+            "code": str(result.get("reason") or "config_unwritable"),
+            "message": str(result.get("message") or ""),
+        }
+    return receipt
+
+
+def _verified_in_session_pairing_address() -> Tuple[Optional[str], str]:
+    """Actively prove this profile's private route, then derive its address."""
+    try:
+        from . import doctor as doctor_lane
+        from .cli import CLAIM_OWNED, _default_replacement_safe
+
+        facts = _collect_health_facts()
+        if facts.get("profileResolved") is not True:
+            return None, "profile_unresolved"
+        facts, _outcomes = doctor_lane.observe(
+            facts, probed_at=snapshot_now_iso()
+        )
+        snapshot = derive_snapshot(facts)
+        setup = snapshot.get("setup") or {}
+        legs = ((snapshot.get("currentHealth") or {}).get("legs") or {})
+        gateway = legs.get("hermesGateway") or {}
+        relay = legs.get("ocuclawRelay") or {}
+        route = legs.get("tailnetRoute") or {}
+        phone = legs.get("phoneApp") or {}
+        if setup.get("state") != "configured":
+            return None, "setup_not_configured"
+        if gateway.get("state") != "healthy":
+            return None, "gateway_not_healthy"
+        if relay.get("state") != "healthy":
+            return None, "relay_not_healthy"
+        if route.get("classification") != "ready" or not all(
+            route.get(key) == "yes"
+            for key in ("configured", "reachable", "applicationReady")
+        ):
+            return None, "tailnet_route_not_verified"
+        if _default_replacement_safe(facts) != CLAIM_OWNED:
+            return None, "tailnet_route_not_owned"
+        if phone.get("state") == "healthy":
+            return None, "phone_already_connected"
+        dns_name = serve.normalize_dns_name(facts.get("serveNodeDnsName"))
+        if dns_name is None or not dns_name.endswith(".ts.net"):
+            return None, "tailnet_identity_unavailable"
+        address = serve.phone_address(dns_name=dns_name)
+        return (address, "ready") if address else (None, "address_unavailable")
+    except Exception:  # noqa: BLE001 - pairing must fail closed on uncertainty
+        logger.exception("[ocuclaw] in-session pairing address verification failed")
+        return None, "verification_failed"
+
+
+def _run_setup_pairing_action() -> Dict[str, Any]:
+    """Stage the direct-human ceremony on the live supported host surface."""
+    interface = _current_hermes_interface()
+    if interface not in {"tui", "desktop"}:
+        return {
+            "ok": False,
+            "state": "refused",
+            "code": "tui_required",
+            "message": (
+                "Secure in-window pairing requires Hermes TUI or Desktop. Exit "
+                "this classic window, start bare `hermes` without `--cli` or "
+                "open Hermes Desktop, run `/ocuclaw-setup`, and resume this "
+                "pairing checkpoint; completed setup state is preserved."
+            ),
+        }
+    address, reason = _verified_in_session_pairing_address()
+    if address is None:
+        return {
+            "ok": False,
+            "state": "refused",
+            "code": reason,
+            "message": (
+                "The private phone route is not fully verified yet. Run the "
+                "current setup checkpoint, then retry pairing."
+            ),
+        }
+    from .pairing import _control_url
+
+    if interface == "desktop":
+        from .desktop_pairing import run_desktop_pairing
+
+        return run_desktop_pairing(address, control_url=_control_url())
+    from .tui_pairing import run_tui_pairing
+    return run_tui_pairing(
+        address,
+        control_url=_control_url(),
+        owner_tui_pid=os.getppid(),
+    )
+
+
+def _setup_journey(snapshot: Any, attempt: Any) -> Dict[str, str]:
+    snap = snapshot if isinstance(snapshot, dict) else {}
+    setup = snap.get("setup") if isinstance(snap.get("setup"), dict) else {}
+    health = (
+        snap.get("currentHealth")
+        if isinstance(snap.get("currentHealth"), dict)
+        else {}
+    )
+    legs = health.get("legs") if isinstance(health.get("legs"), dict) else {}
+    proof = (
+        snap.get("firstRunProof")
+        if isinstance(snap.get("firstRunProof"), dict)
+        else {}
+    )
+    attempt_state = (
+        str(attempt.get("state") or "") if isinstance(attempt, dict) else ""
+    )
+    if proof.get("state") == "proven" or attempt_state == "committed":
+        checkpoint = "optional-integrations"
+    elif attempt_state == "armed":
+        checkpoint = "welcome-round-trip"
+    elif setup.get("state") != "configured":
+        checkpoint = "prerequisites-and-configuration"
+    elif any(
+        (legs.get(name) or {}).get("state") != "healthy"
+        for name in ("hermesGateway", "ocuclawRelay")
+    ):
+        checkpoint = "restart-and-relay-verification"
+    elif (legs.get("tailnetRoute") or {}).get("classification") != "ready":
+        checkpoint = "tailnet-route"
+    elif (legs.get("phoneApp") or {}).get("state") != "healthy":
+        checkpoint = "secure-phone-pairing"
+    else:
+        checkpoint = "phone-origin-proof"
+    return {
+        "owner": "host",
+        "nextCheckpoint": checkpoint,
+        "phoneRole": "test-message-and-wearer-confirmation-only",
+    }
+
+
+def _desktop_theme_operation_receipt(args: Dict[str, Any]) -> Dict[str, Any]:
+    """The second WRITING setup operation: apply the OcuClaw look on Desktop.
+
+    Same confirm gate as the stream-deltas opt-in, plus one structural refusal:
+    without an OcuClaw-owned Desktop plugin file on disk there is nothing to
+    render the answer into, so the tool says so instead of recording a yes that
+    could never land.
+    """
+    operation = SETUP_DESKTOP_THEME_OPERATION
+    if (args or {}).get("confirm") is not True:
+        return {
+            "ok": False,
+            "operation": operation,
+            "status": _setup_status(),
+            "error": {
+                "code": "confirmation_required",
+                "message": (
+                    f"{DESKTOP_THEME_SCOPE_NOTE} Ask the operator, then repeat "
+                    "this call with confirm: true."
+                ),
+            },
+        }
+
+    before = _setup_status()
+    theme = before.get("desktopTheme")
+    theme = theme if isinstance(theme, dict) else {}
+    if theme.get("offer") == DESKTOP_THEME_OFFER_UNAVAILABLE:
+        return {
+            "ok": False,
+            "operation": operation,
+            "status": before,
+            "error": {
+                "code": "desktop_plugin_unavailable",
+                "message": (
+                    "The OcuClaw Desktop plugin is not installed on this "
+                    "profile, so the theme cannot be applied. Restart the "
+                    "gateway (it installs the plugin) and retry."
+                ),
+            },
+        }
+
+    result = _enable_desktop_theme()
+    receipt: Dict[str, Any] = {
+        "ok": result.get("applied") is True,
+        "operation": operation,
+        "desktopTheme": result,
+        "status": _setup_status(),
+    }
+    if not receipt["ok"]:
+        receipt["error"] = {
+            "code": str(result.get("reason") or "config_unwritable"),
+            "message": str(result.get("message") or ""),
+        }
+    return receipt
+
+
+def _setup_tool_handler_impl(args: Dict[str, Any], **_kwargs: Any) -> str:
+    operation = str((args or {}).get("operation") or "").strip()
+    if operation not in set(SETUP_OPERATIONS):
+        return json.dumps(
+            {
+                "ok": False,
+                "operation": operation or None,
+                "error": {
+                    "code": "unsupported_operation",
+                    "message": "Choose one of the documented setup operations.",
+                },
+            },
+            sort_keys=True,
+        )
+
+    session_key = _current_hermes_session_key()
+    phone_session = parse_ocuclaw_session_key(session_key) is not None
+    if not _host_setup_session_available():
+        return json.dumps(
+            {
+                "ok": False,
+                "operation": operation,
+                "error": {
+                    "code": "host_session_required",
+                    "message": (
+                        "OcuClaw setup stays in the host Hermes conversation. "
+                        "Return there and say 'continue OcuClaw setup' (or "
+                        "start `/ocuclaw-setup` there). The phone/G2 is used "
+                        "only for the test message, display confirmation, and "
+                        "welcome dismissal."
+                    ),
+                },
+            },
+            sort_keys=True,
+        )
+    if operation == SETUP_STREAM_DELTAS_OPERATION:
+        return json.dumps(
+            _stream_deltas_operation_receipt(args or {}), sort_keys=True
+        )
+    if operation == SETUP_DESKTOP_THEME_OPERATION:
+        return json.dumps(
+            _desktop_theme_operation_receipt(args or {}), sort_keys=True
+        )
+    attempt_session_key = session_key if phone_session else None
+    pairing_action = None
+    if operation == "pair_phone":
+        pairing_action = _run_setup_pairing_action()
+    phone_origin_action = None
+    if operation == "wait_phone_origin":
+        phone_origin_action = wait_for_phone_turn_candidate()
+    first_run_action = None
+    if operation in {"arm_first_run_proof", "welcome_round_trip"}:
+        existing_attempt = (
+            inspect_attempt(
+                hermes_release=CERTIFIED_HERMES_TAG,
+                hermes_package_version=_hermes_version() or None,
+                ocuclaw_version=_ocuclaw_version(),
+                session_key=attempt_session_key,
+            )
+            if operation == "welcome_round_trip"
+            else None
+        )
+        if (
+            existing_attempt is not None
+            and existing_attempt.get("state") == "armed"
+            and existing_attempt.get("resumeAllowed") is True
+        ):
+            first_run_action = {**existing_attempt, "armed": True}
+        else:
+            candidate_id = str((args or {}).get("phoneCandidateId") or "").strip()
+            if (
+                len(candidate_id) != 64
+                or any(char not in "0123456789abcdef" for char in candidate_id)
+            ):
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "operation": operation,
+                        "error": {
+                            "code": "phone_candidate_binding_required",
+                            "message": (
+                                "Wait for a new phone-origin turn first, retain its "
+                                "opaque candidate binding, then retry the welcome "
+                                "round trip with that exact binding."
+                            ),
+                        },
+                    },
+                    sort_keys=True,
+                )
+            first_run_action = arm_first_run_proof_from_candidate(
+                hermes_release=CERTIFIED_HERMES_TAG,
+                hermes_package_version=_hermes_version() or None,
+                ocuclaw_version=_ocuclaw_version(),
+                expected_candidate_id=candidate_id,
+            )
+        if str(first_run_action.get("state") or "").startswith("phone_turn_"):
+            return json.dumps(
+                {
+                    "ok": False,
+                    "operation": operation,
+                    "error": {
+                        "code": "phone_turn_required",
+                        "message": (
+                            "Send a message from the OcuClaw phone app, confirm "
+                            "its reply appeared on the Even G2, then continue "
+                            "setup here on the host."
+                        ),
+                        "reason": first_run_action.get("state"),
+                    },
+                },
+                sort_keys=True,
+            )
+        if first_run_action.get("armed") is True:
+            first_run_action["welcomeDelivery"] = (
+                wait_for_first_run_terminal(
+                    hermes_release=CERTIFIED_HERMES_TAG,
+                    hermes_package_version=_hermes_version() or None,
+                    ocuclaw_version=_ocuclaw_version(),
+                )
+                if operation == "welcome_round_trip"
+                else {"state": "queued", "owner": "managed-gateway"}
+            )
+        elif operation == "welcome_round_trip" and first_run_action.get("committed") is True:
+            first_run_action["welcomeDelivery"] = {
+                "state": "committed",
+                "committed": True,
+                "provenAt": first_run_action.get("provenAt"),
+            }
+
+    # One observation of the host, two renderings of it (#1273 P1). The
+    # snapshot rides alongside the legacy block rather than replacing it:
+    # #1318 owns retiring `ok`/`status`/`bundle` atomically, and until then
+    # every consumer that wants v1 truth can already read it here.
+    facts = _collect_health_facts()
+    operation_ok = pairing_action.get("ok") is True if pairing_action else True
+    if phone_origin_action is not None:
+        operation_ok = phone_origin_action.get("received") is True
+    if operation == "arm_first_run_proof" and first_run_action is not None:
+        operation_ok = (
+            first_run_action.get("armed") is True
+            or first_run_action.get("committed") is True
+        )
+    if operation == "welcome_round_trip" and first_run_action is not None:
+        operation_ok = first_run_action.get("welcomeDelivery", {}).get("committed") is True
+    receipt: Dict[str, Any] = {
+        "ok": operation_ok,
+        "operation": operation,
+        "status": _setup_status(facts),
+    }
+    snapshot_v1 = _safe_snapshot(facts)
+    if snapshot_v1 is not None:
+        receipt["snapshot"] = snapshot_v1
+    if operation in {
+        "status",
+        "fresh_install",
+        "pair_phone",
+        "wait_phone_origin",
+        "arm_first_run_proof",
+        "welcome_round_trip",
+    }:
+        receipt["contract"] = {
+            "guideVersion": SETUP_GUIDE_VERSION,
+            "skillLoad": SETUP_SKILL_LOAD_POINTER,
+        }
+        receipt["firstRunProofAttempt"] = inspect_attempt(
+            hermes_release=CERTIFIED_HERMES_TAG,
+            hermes_package_version=_hermes_version() or None,
+            ocuclaw_version=_ocuclaw_version(),
+            session_key=attempt_session_key,
+        )
+        receipt["journey"] = _setup_journey(
+            snapshot_v1,
+            receipt["firstRunProofAttempt"],
+        )
+    if first_run_action is not None:
+        receipt["firstRunProofAction"] = first_run_action
+    if pairing_action is not None:
+        receipt["pairingAction"] = pairing_action
+    if phone_origin_action is not None:
+        receipt["phoneOriginAction"] = phone_origin_action
+    if operation == "doctor":
+        receipt["bundle"] = dict(_LAST_SETUP_BUNDLE_REPORT)
+    if operation in SETUP_REFERENCE_FILES:
+        filename, heading = SETUP_REFERENCE_FILES[operation]
+        try:
+            content = (
+                BUNDLE_DIR
+                / "skills"
+                / SETUP_SKILL_NAME
+                / "references"
+                / filename
+            ).read_text(encoding="utf-8")
+        except Exception:  # noqa: BLE001 - never raise through an agent turn
+            logger.exception("[ocuclaw] setup reference unavailable: %s", filename)
+            return json.dumps(
+                {
+                    "ok": False,
+                    "operation": operation,
+                    "status": receipt["status"],
+                    "error": {
+                        "code": "guidance_unavailable",
+                        "message": "The requested bundled setup guidance is unavailable; reinstall OcuClaw.",
+                    },
+                },
+                sort_keys=True,
+            )
+        receipt["guidance"] = {
+            "topic": operation,
+            "heading": heading,
+            "content": content,
+        }
+    return json.dumps(receipt, sort_keys=True)
+
+
+def _admitted_adapter_factory(config: Any):
+    if not _host_version_supported():
+        return None
+    return _build_adapter(config)
+
+
+def _admitted_is_connected(config: Any) -> bool:
+    return _host_version_supported() and _is_connected(config)
+
+
+def register(ctx: Any) -> None:
+    global _LAST_SETUP_BUNDLE_REPORT, _PLUGIN_CONTEXT, _LIVEUI_REGISTER_TOOL
+    _PLUGIN_CONTEXT = ctx
+    version = _hermes_version()
+    if parse_version(version) is None:
         raise RuntimeError(
-            f"ocuclaw plugin supports hermes >={'.'.join(map(str, SUPPORTED_HERMES_MIN))},"
-            f"<{'.'.join(map(str, SUPPORTED_HERMES_MAX_EXCLUSIVE))} — found "
-            f"{version or 'unknown'}; refusing to register (plugin ABI is "
-            "version-sensitive)"
+            "ocuclaw plugin could not read the Hermes version; refusing to "
+            "register against an unknown plugin ABI"
         )
     register_platform = getattr(ctx, "register_platform", None)
     if not callable(register_platform):
@@ -772,34 +2571,159 @@ def register(ctx: Any) -> None:
             "ocuclaw plugin requires ctx.register_platform (hermes "
             f"{version} exposes no platform registration surface)"
         )
-    register_platform(
-        name=PLATFORM_NAME,
-        label=PLATFORM_LABEL,
-        adapter_factory=_build_adapter,
-        check_fn=check_ocuclaw_requirements,
-        validate_config=validate_ocuclaw_config,
-        is_connected=_is_connected,
-        required_env=[OCUCLAW_RELAY_TOKEN_ENV],
-        allowed_users_env=OCUCLAW_ALLOWED_USERS_ENV,
-        allow_all_env=OCUCLAW_ALLOW_ALL_USERS_ENV,
-        install_hint=(
-            "OcuClaw glasses/phone client. Set OCUCLAW_RELAY_TOKEN, enable, "
-            "then pair from the OcuClaw app. Full setup: "
-            "extensions/ocuclaw-hermes/README.md"
-        ),
-        platform_hint=(
+    supported = hermes_version_supported(version)
+    if supported:
+        bootstrap_status = bootstrap_relay_credential()
+        if bootstrap_status == BOOTSTRAP_ESTABLISHED_MISSING:
+            logger.warning(
+                "[ocuclaw] established profile Relay Credential is missing; "
+                "setup must use the locally confirmed all-device reset"
+            )
+        elif bootstrap_status == BOOTSTRAP_MANAGED_MISSING:
+            logger.warning("[ocuclaw] %s", MANAGED_CREDENTIAL_REQUIRED_MESSAGE)
+        elif bootstrap_status in {BOOTSTRAP_FAILED, BOOTSTRAP_UNAVAILABLE}:
+            logger.warning(
+                "[ocuclaw] host-managed Relay Credential bootstrap did not "
+                "complete (%s); relay admission remains closed",
+                bootstrap_status,
+            )
+    platform_kwargs = {
+        "name": PLATFORM_NAME,
+        "label": PLATFORM_LABEL,
+        "adapter_factory": _admitted_adapter_factory,
+        "check_fn": check_ocuclaw_requirements,
+        "validate_config": validate_ocuclaw_config,
+        "setup_fn": setup_ocuclaw_platform,
+        "is_connected": _admitted_is_connected,
+        "allowed_users_env": OCUCLAW_ALLOWED_USERS_ENV,
+        "allow_all_env": OCUCLAW_ALLOW_ALL_USERS_ENV,
+        # Registry-level half of the P19 update refusal: hermes must never
+        # treat ocuclaw as a platform its /update command may run from. The
+        # adapter refuses first with wearer-readable wording; this closes the
+        # gate for any path that reaches hermes without passing through
+        # handle_dispatch.
+        "allow_update_command": False,
+        "platform_hint": (
             "Replies are shown on a 576x288 glasses display. Keep them terse "
             "and display-friendly."
         ),
-        env_enablement_fn=_env_enablement,
-        apply_yaml_config_fn=_warn_shadowed_yaml_secrets,
-    )
+        "env_enablement_fn": _env_enablement,
+    }
+    try:
+        register_platform(**platform_kwargs)
+    except TypeError as exc:
+        if supported:
+            raise
+        raise RuntimeError(_unsupported_hermes_message(version)) from exc
+    register_skill = getattr(ctx, "register_skill", None)
+    setup_skill_registered = False
+    if callable(register_skill):
+        try:
+            register_skill(
+                SETUP_SKILL_NAME,
+                SETUP_SKILL_PATH,
+                SETUP_SKILL_DESCRIPTION,
+            )
+            setup_skill_registered = True
+        except Exception as exc:  # noqa: BLE001 - keep other recovery surfaces
+            logger.warning(
+                "[ocuclaw] setup skill registration failed: %s",
+                exc,
+            )
+    else:
+        logger.warning(
+            "[ocuclaw] ctx.register_skill unavailable — /ocuclaw-setup "
+            "bootstrap is unavailable"
+        )
+    register_tool = getattr(ctx, "register_tool", None)
+    if callable(register_tool):
+        try:
+            register_tool(
+                name=SETUP_TOOL_NAME,
+                toolset=SETUP_TOOLSET,
+                schema=SETUP_TOOL_SCHEMA,
+                handler=_setup_tool_handler,
+                check_fn=_host_setup_session_available,
+                requires_env=None,
+                is_async=False,
+                description=SETUP_TOOL_DESCRIPTION,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep other recovery surfaces
+            logger.warning("[ocuclaw] setup tool registration failed: %s", exc)
+    else:
+        logger.warning("[ocuclaw] ctx.register_tool unavailable — setup tool omitted")
+    # The plugin-owned `hermes ocuclaw` CLI (#1318 plus full uninstall).
+    # Registered on the same side of
+    # the support gate as the setup tool and the recovery platform row,
+    # deliberately: the command whose whole job is to tell a user their host
+    # is unsupported is worthless if an unsupported host is where it stops
+    # being installed. It reads local facts and derives — it registers no
+    # hook, holds no ABI surface beyond `register_cli_command` itself, and
+    # that call is guarded.
+    register_cli_commands(ctx, logger)
+    if setup_skill_registered:
+        try:
+            bundle_report = reconcile_setup_bundle()
+            _LAST_SETUP_BUNDLE_REPORT = (
+                json.loads(json.dumps(dict(bundle_report), default=str))
+                if isinstance(bundle_report, dict)
+                else {"status": "error", "error": "invalid reconciliation receipt"}
+            )
+        except Exception as exc:  # noqa: BLE001 - registration must remain usable
+            _LAST_SETUP_BUNDLE_REPORT = {
+                "status": "error",
+                "error": "bundle reconciliation raised unexpectedly",
+            }
+            logger.warning(
+                "[ocuclaw] /ocuclaw-setup bundle reconciliation failed: %s",
+                exc,
+            )
+    else:
+        _LAST_SETUP_BUNDLE_REPORT = {
+            "status": "unavailable",
+            "reason": "setup-skill-registration-failed",
+        }
+        logger.warning(
+            "[ocuclaw] /ocuclaw-setup bundle reconciliation skipped because "
+            "the qualified setup skill was not registered"
+        )
+    if supported:
+        try:
+            widget_report = reconcile_pairing_widget()
+            if widget_report.get("status") not in {"created", "updated", "unchanged"}:
+                logger.warning(
+                    "[ocuclaw] TUI pairing widget unavailable: %s",
+                    widget_report.get("reason") or widget_report.get("status"),
+                )
+        except Exception as exc:  # noqa: BLE001 - registration stays fail-soft
+            logger.warning("[ocuclaw] TUI pairing widget reconciliation failed: %s", exc)
+        try:
+            desktop_report = reconcile_pairing_plugin()
+            if desktop_report.get("status") not in {"created", "updated", "unchanged"}:
+                logger.warning(
+                    "[ocuclaw] Desktop pairing presenter unavailable: %s",
+                    desktop_report.get("reason") or desktop_report.get("status"),
+                )
+        except Exception as exc:  # noqa: BLE001 - registration stays fail-soft
+            logger.warning("[ocuclaw] Desktop pairing presenter reconciliation failed: %s", exc)
+    if not supported:
+        logger.warning("[ocuclaw] %s", _unsupported_hermes_message(version))
+        # The recovery platform row and diagnostic setup function are the only
+        # certified unsupported-host surface. Do not install turn hooks or a
+        # LiveUI tool against an unverified plugin ABI.
+        return
     # Turn-completion spine (W06): per-turn on_session_end backs the
     # agent_end host hook, terminal activity, and the tail commit. Hooks
     # register once at plugin load; the handler fans out to live adapters.
     global _POST_APPROVAL_RESPONSE_HOOK_AVAILABLE
+    global STREAM_HOOKS_AVAILABLE, INTERIM_HOOK_AVAILABLE
+    global _REGISTERED_OPTIONAL_FEATURES
     register_hook = getattr(ctx, "register_hook", None)
-    register_tool = getattr(ctx, "register_tool", None)
+    # Probe BEFORE registering: hermes stores unknown hook names with a
+    # warning instead of refusing them, so registering blind would spam the
+    # log on every 0.20.0 host and advertise a feature that can never fire.
+    STREAM_HOOKS_AVAILABLE, INTERIM_HOOK_AVAILABLE = _probe_optional_hook_support()
+    _REGISTERED_OPTIONAL_FEATURES = ()
     with _LIVEUI_LOCK:
         _LIVEUI_REGISTER_TOOL = register_tool if callable(register_tool) else None
     if callable(register_hook):
@@ -813,6 +2737,23 @@ def register(ctx: Any) -> None:
         register_hook(REGISTERED_HOOK_NAMES[3], _on_post_tool_call_hook)
         register_hook(REGISTERED_HOOK_NAMES[4], _on_post_api_request_hook)
         register_hook(REGISTERED_HOOK_NAMES[5], _on_pre_llm_call_hook)
+        if INTERIM_HOOK_AVAILABLE:
+            # Transport-neutral: `has_stream_observer_hooks` enumerates only
+            # on_stream_*, so registering this one changes no provider call
+            # shape for any surface on this gateway.
+            register_hook(INTERIM_HOOK_NAME, _on_interim_message_hook)
+            _REGISTERED_OPTIONAL_FEATURES += (FEATURE_TOKEN_INTERIM_HOOK,)
+        # Registering any on_stream_* hook flips hermes's process-wide
+        # `_has_stream_consumers`, which changes the provider call shape for
+        # EVERY surface on this gateway. So it is gated twice: the host must
+        # have the hooks AND the operator must have already opted in with
+        # `plugins.stream_reasoning_deltas: true`. A user who did not opt in
+        # sees no transport change.
+        if STREAM_HOOKS_AVAILABLE and _stream_reasoning_deltas_configured():
+            register_hook(STREAM_HOOK_NAMES[0], _on_stream_start_hook)
+            register_hook(STREAM_HOOK_NAMES[1], _on_stream_delta_hook)
+            register_hook(STREAM_HOOK_NAMES[2], _on_stream_end_hook)
+            _REGISTERED_OPTIONAL_FEATURES += (FEATURE_TOKEN_STREAM_HOOKS,)
         _POST_APPROVAL_RESPONSE_HOOK_AVAILABLE = True
     else:
         _POST_APPROVAL_RESPONSE_HOOK_AVAILABLE = False
@@ -821,7 +2762,35 @@ def register(ctx: Any) -> None:
             "(agent_end/terminal activity/tail commit) is degraded to the "
             "stale-turn janitor"
         )
-    logger.info("[ocuclaw] platform registered (hermes %s)", version)
+    # NOT a hook, and deliberately outside the register_hook block: the
+    # sessions db lane serves read/hidden state off the running hermes's own
+    # schema + SessionDB primitives (session_rpc D1 probe), which touches no
+    # DB and is valid here — registration precedes the child spawn that reads
+    # `_REGISTERED_OPTIONAL_FEATURES` into OCUCLAW_HERMES_FEATURES.
+    if session_read_state_supported():
+        _REGISTERED_OPTIONAL_FEATURES += (FEATURE_TOKEN_SESSION_READ_STATE,)
+    logger.info(
+        "[ocuclaw] platform registered (hermes %s, optional hooks: %s)",
+        version,
+        ",".join(_hermes_feature_tokens()) or "none",
+    )
+
+
+async def _handle_pairing_completed(params: Any) -> Dict[str, Any]:
+    """Idempotently write the Node-minted authenticated completion ID."""
+
+    if not isinstance(params, Mapping) or set(params) != {"completionId"}:
+        return {"ok": False, "error": "invalid_params"}
+    try:
+        await asyncio.to_thread(
+            record_pairing_completion, completion_id=params["completionId"]
+        )
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "invalid_params"}
+    except ReceiptUnavailableError:
+        logger.warning("[ocuclaw] pairing completion receipt unavailable")
+        return {"ok": False, "error": "receipt_unavailable"}
+    return {"ok": True}
 
 
 def _build_adapter(config: Any):
@@ -843,8 +2812,8 @@ def _build_adapter(config: Any):
         MAX_MESSAGE_LENGTH = 60000
 
         def __init__(self, platform_config, platform) -> None:
-            # Hermes 0.19 constructs secondary-profile adapters under a
-            # context-local HERMES_HOME override (run.py:9437). OcuClaw owns
+            # Hermes 0.20 constructs secondary-profile adapters under a
+            # context-local HERMES_HOME override. OcuClaw owns
             # one relay listener, so a second instance must fail before it can
             # spawn the Node child; the gateway logs and skips that adapter.
             _guard_secondary_port_binding_scope()
@@ -859,6 +2828,7 @@ def _build_adapter(config: Any):
             self._ledger = DispatchLedger(
                 stale_turn_seconds=self._settings["staleTurnSeconds"],
             )
+            self._phone_turn_candidate_gate = PhoneTurnCandidateGate()
             self._multiplex_enabled = False
             self._served_profile_homes: Dict[str, Path] = {}
             self._refresh_profile_routing()
@@ -867,6 +2837,12 @@ def _build_adapter(config: Any):
             self._session_rpc = ProfileSessionRpc(
                 default_db_path=default_state_db_path(),
                 routing_provider=self._profile_routing_snapshot,
+                # Hermes injects the public SessionStore after construction
+                # and before connect. Resolve lazily so current prompt-token
+                # reads use that live, persisted authority.
+                session_store_provider=lambda _namespace: getattr(
+                    self, "_session_store", None
+                ),
             )
             # W07 models/status/config read plane (gw.* lanes).
             self._gw_rpc = GwRpc(
@@ -875,7 +2851,11 @@ def _build_adapter(config: Any):
             )
             self._loop: Optional[asyncio.AbstractEventLoop] = None
             self._janitor_task: Optional[asyncio.Task] = None
+            self._first_run_welcome_task: Optional[asyncio.Task] = None
             self._message_seq = 0
+            # Per-process uniqueness for the minted platform message id
+            # (#1691) — see `_next_message_id`.
+            self._message_id_nonce = uuid.uuid4().hex[:8]
             self._stream_tail_lock = threading.RLock()
             self._stream_tail_closures: Dict[Tuple[str, str], Dict[str, Any]] = {}
             self._stream_tail_tasks: Dict[Tuple[str, str], asyncio.Task] = {}
@@ -884,6 +2864,69 @@ def _build_adapter(config: Any):
             self._stream_tail_closing = False
             self._thinking_lock = threading.RLock()
             self._thinking_text_by_run: Dict[str, str] = {}
+            # Per-run monotonic ordering stamp for the tier-2 thinking lane.
+            # It orders THINKING frames only and is deliberately never stamped
+            # onto `activity` frames: `activity.seq` is already an
+            # activityId-scoped staleness guard on both the Node adapter and
+            # the client, and a thinking-only counter would fight it.
+            self._thinking_seq_by_run: Dict[str, int] = {}
+            # Narration tagging is CONTENT-based, never timing-based: the
+            # on_interim_message hook runs on its own worker thread while the
+            # commit is produced by the consumer's asyncio queue, so there is
+            # no ordering guarantee in either direction. Both sides consult
+            # the same normalized-text set under _thinking_lock.
+            self._narration_texts_by_run: Dict[str, set] = {}
+            # normalized narration text -> the sentence AS WRITTEN, so a commit
+            # that landed a mid-reveal prefix can be upgraded to it (#1619).
+            self._narration_raw_by_run: Dict[str, Dict[str, str]] = {}
+            self._committed_texts_by_run: Dict[str, List[str]] = {}
+            # normalized committed text -> the platform message id that commit
+            # carried (#1691), so a retag can name the message outright
+            # instead of asking the consumer to re-find it by text.
+            self._committed_ids_by_run: Dict[str, Dict[str, str]] = {}
+            # Tool progress is identified by lifecycle, never by parsing its
+            # user-facing copy. pre_tool_call arms the next send while that
+            # tool is live; send() binds its minted message id. The run keeps
+            # one arm until claimed so even a very fast command is covered.
+            self._pending_tool_progress_by_run: Dict[str, List[str]] = {}
+            self._tool_progress_message_ids_by_run: Dict[str, set] = {}
+            # #1619 origin time. Hermes commits an interim message LAZILY — the
+            # commit rides the next send(), which on a tool turn is the tool
+            # progress line, so the note reaches the page AFTER the command it
+            # announces. The commit timestamp is therefore useless for
+            # ordering. These two maps carry the honest one:
+            #   _stream_text_origin_by_run: FIFO of "first content delta of a
+            #     model call" wall-clock stamps, i.e. when the model started
+            #     producing that assistant message.
+            #   _narration_origin_by_run: normalized narration text → the
+            #     stamp it claimed, so every carrier of the same sentence
+            #     (hook, `_interim_send` send, commit, retag) reports the SAME
+            #     origin.
+            # Empty on a host without the stream hooks; the note then falls
+            # back to the moment the adapter first learned of it, which is
+            # still the streaming paint, never the lazy commit.
+            self._stream_text_origin_by_run: Dict[str, List[int]] = {}
+            self._narration_origin_by_run: Dict[str, Dict[str, int]] = {}
+            # Reasoning-stream state, keyed (session_id, turn_id): identity is
+            # resolved ONCE per stream (a SessionDB RPC per delta is not a
+            # budget) and the coalescer buffer lives here too.
+            self._stream_contexts: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            # Reconcile epoch per run. post_api_request is authoritative and
+            # runs INLINE on the agent thread, so it can beat deltas that are
+            # still sitting in the plugin hook queue; bumping the epoch fences
+            # those stale deltas out instead of letting them append a fragment
+            # that the authoritative text already contains.
+            self._thinking_epoch_by_run: Dict[str, int] = {}
+            # Exactly what the delta stream appended to the cumulative buffer
+            # since the last reconcile, so post_api_request can REPLACE that
+            # tail with its authoritative text instead of appending a second
+            # copy of the same reasoning.
+            self._stream_appended_by_run: Dict[str, str] = {}
+            # Runs whose thinking pane is open (an update went out, no
+            # finalize yet). Whichever of on_stream_end / post_api_request
+            # arrives first closes it; the other sees an empty set and stays
+            # quiet, so a call never emits two finalizes.
+            self._open_pane_runs: set = set()
             self._background_restore_tasks: set[asyncio.Task] = set()
             self._approval_lock = threading.RLock()
             self._approval_seq = 0
@@ -892,11 +2935,13 @@ def _build_adapter(config: Any):
             self._approval_timers: Dict[str, Any] = {}
             self._approval_expiry_tasks: set[asyncio.Task] = set()
             self._approval_resolve_locks: Dict[str, asyncio.Lock] = {}
+            self._profile_options_locks: Dict[str, asyncio.Lock] = {}
             self._approval_suppressed_responses: Dict[str, List[Dict[str, Any]]] = {}
             self._approval_drain_generation: Dict[str, int] = {}
             self._approval_drained_ids: Dict[str, float] = {}
             self._mirrored_native_entry_ids: Dict[str, set[int]] = {}
             self._approval_resolution_tombstones: Dict[str, List[Dict[str, Any]]] = {}
+            self._slash_confirms_by_id: Dict[str, Dict[str, str]] = {}
             self._approval_response_hook_available = (
                 _POST_APPROVAL_RESPONSE_HOOK_AVAILABLE
             )
@@ -904,6 +2949,8 @@ def _build_adapter(config: Any):
             # Per-connect boot receipt (runtime.ready); _on_child_exit sets
             # it so a dead child wakes the connect() wait immediately.
             self._runtime_ready_event: Optional[asyncio.Event] = None
+            # Owns the OcuClaw app-presence receipt for this connect (#1317).
+            self._presence: Optional[PresencePump] = None
             _ADAPTERS.append(self)
 
         @property
@@ -918,6 +2965,51 @@ def _build_adapter(config: Any):
         @property
         def link_ready(self) -> bool:
             return self._link is not None and self._link.ready
+
+        def _build_presence_pump(self) -> PresencePump:
+            """Bind the pump to this connect's home, link, and epoch.
+
+            The home is resolved once per connect rather than per write: a
+            receipt that changed profile mid-run would be worse than no
+            receipt, and re-resolving on every 30-second tick invites exactly
+            that. Both collaborators are closures over ``self._link`` read at
+            call time, so a link that dies mid-pull surfaces as a failed pull
+            (and an honest null-facts receipt) instead of a stale handle.
+            """
+            home = resolve_receipt_home()
+            fingerprint = fingerprint_home(home)
+
+            async def _pull() -> Any:
+                link = self._link
+                if link is None or not link.ready:
+                    # Typed so the receipt records `link_down` rather than the
+                    # generic `pull_failed`: "the link is gone" and "the relay's
+                    # presence method failed" need different repairs.
+                    raise PresenceLinkUnavailableError("control link not ready")
+                return await link.request(
+                    PRESENCE_SNAPSHOT_METHOD, None, timeout_s=PULL_TIMEOUT_S
+                )
+
+            def _write(body: Dict[str, Any]) -> None:
+                if home is None:
+                    # Resolution failed at connect, so the fingerprint this
+                    # pump stamps is None. Passing that None through would
+                    # ask the writer to resolve a home *now* and publish a
+                    # profile-less record into it — overwriting a valid
+                    # receipt with one that every reader must then reject as
+                    # wrong-profile. No home at connect, no receipt.
+                    raise ReceiptUnavailableError(
+                        "no profile-scoped Hermes home resolved at connect"
+                    )
+                write_app_presence(body, home=home)
+
+            return PresencePump(
+                pull=_pull,
+                write=_write,
+                profile_fingerprint=fingerprint,
+                epoch=int(time.time() * 1000),
+                log=logger,
+            )
 
         async def connect(self, *, is_reconnect: bool = False) -> bool:
             if self._link is not None and self._link.ready:
@@ -940,20 +3032,33 @@ def _build_adapter(config: Any):
                     logger.warning(
                         "[ocuclaw] could not create stateDir %s: %s", state_dir, exc
                     )
+            child_config = _child_runtime_config(
+                {**settings, "stateDir": state_dir}
+            )
+            # The current OcuClaw client intentionally exposes Hermes model,
+            # reasoning, and fast controls as profile-wide settings. Do not
+            # advertise the future session API until the client also owns its
+            # confirmation-required UX and has been recertified against a
+            # public Hermes release containing that API.
+            child_config["sessionOptionsSupported"] = False
             link = LinkProcess(
                 settings["argv"],
                 hello_ack_payload={
                     "hermesVersion": _hermes_version(),
                     "platform": PLATFORM_NAME,
-                    "config": _child_runtime_config(
-                        {**settings, "stateDir": state_dir}
-                    ),
+                    "config": child_config,
                 },
                 handshake_timeout_s=settings["handshakeTimeoutS"],
                 terminate_grace_s=settings["terminateGraceS"],
                 env=default_child_env(
+                    base_env=os.environ,
                     handshake_timeout_s=settings["handshakeTimeoutS"],
                     debug_stderr=settings["linkDebugStderr"],
+                    # Registration truth, not host capability: the child
+                    # turns these into client capability tokens, and a row
+                    # that says "active" for a hook nobody registered is a
+                    # lie the wearer cannot check.
+                    hermes_features=",".join(_hermes_feature_tokens()),
                 ),
                 log=logger,
                 on_exit=self._on_child_exit,
@@ -972,10 +3077,28 @@ def _build_adapter(config: Any):
                 APPROVAL_RESOLVE_METHOD, self.handle_approval_resolve
             )
             link.register_request_handler(
+                SLASH_CONFIRM_RESOLVE_METHOD, self.handle_slash_confirm_resolve
+            )
+            link.register_request_handler(
+                CLARIFY_RESOLVE_METHOD, self.handle_clarify_resolve
+            )
+            link.register_request_handler(
+                CLARIFY_AWAIT_TEXT_METHOD, self.handle_clarify_await_text
+            )
+            link.register_request_handler(
                 SESSION_ABORT_METHOD, self.handle_sessions_abort
             )
             link.register_request_handler(
                 SESSION_STEER_METHOD, self.handle_sessions_steer
+            )
+            link.register_request_handler(
+                SESSION_OPTIONS_APPLY_METHOD, self.handle_sessions_options_apply
+            )
+            link.register_request_handler(
+                PROFILE_OPTIONS_GET_METHOD, self.handle_profile_options_get
+            )
+            link.register_request_handler(
+                PROFILE_OPTIONS_APPLY_METHOD, self.handle_profile_options_apply
             )
             link.register_request_handler(DISPATCH_METHOD, self.handle_dispatch)
             link.register_request_handler(
@@ -992,6 +3115,28 @@ def _build_adapter(config: Any):
                 return {"ok": True}
 
             link.register_request_handler("runtime.ready", _on_runtime_ready)
+
+            async def _on_connection_health_snapshot(_params: Any) -> Dict[str, Any]:
+                """Passive support attachment; never enters doctor's probe lane."""
+                return await asyncio.to_thread(support_connection_health_document)
+
+            link.register_request_handler(
+                "connectionHealth.snapshot", _on_connection_health_snapshot
+            )
+            # Authenticated pairing completion carries only its secret-free
+            # receipt identity and must be registered before the child can emit
+            # it during handshake-adjacent relay startup.
+            link.register_request_handler(
+                PAIRING_COMPLETED_METHOD, _handle_pairing_completed
+            )
+            # The presence lane must be live BEFORE the child can speak: a
+            # phone that is already connected when the relay boots produces a
+            # push during the handshake window, and a `-32601` there would
+            # cost exactly the post-pairing delay this hop exists to remove.
+            self._presence = self._build_presence_pump()
+            link.register_request_handler(
+                PRESENCE_DIRTY_METHOD, self._presence.handle_dirty
+            )
             try:
                 hello = await link.start()
             except LinkError as exc:
@@ -1042,8 +3187,17 @@ def _build_adapter(config: Any):
                     return False
             if self._janitor_task is None or self._janitor_task.done():
                 self._janitor_task = asyncio.create_task(self._janitor_loop())
+            if (
+                self._first_run_welcome_task is None
+                or self._first_run_welcome_task.done()
+            ):
+                self._first_run_welcome_task = asyncio.create_task(
+                    self._first_run_welcome_loop()
+                )
             with self._stream_tail_lock:
                 self._stream_tail_closing = False
+            if self._presence is not None:
+                self._presence.start()
             self._mark_connected()
             logger.info(
                 "[ocuclaw] control link up (pid=%s runtime=%s echo=%s "
@@ -1060,6 +3214,16 @@ def _build_adapter(config: Any):
             if self._janitor_task is not None:
                 self._janitor_task.cancel()
                 self._janitor_task = None
+            if self._first_run_welcome_task is not None:
+                self._first_run_welcome_task.cancel()
+                self._first_run_welcome_task = None
+            # Clean shutdown is one of the receipt's three write triggers: say
+            # so now rather than leaving the last healthy reading to age out
+            # over the next two minutes and read as current in between.
+            presence = self._presence
+            self._presence = None
+            if presence is not None:
+                await presence.stop()
             # Shutdown inside the finalize grace window: commit each retained
             # tail once and emit its terminal lifecycle while the link is
             # still up, instead of silently dropping the turn. The closing
@@ -1083,10 +3247,13 @@ def _build_adapter(config: Any):
                 task.cancel()
             self._error_sweep_tasks.clear()
             self._unregister_all_approval_notifiers()
+            self._slash_confirms_by_id.clear()
             link = self._link
             self._link = None
             with self._thinking_lock:
                 self._thinking_text_by_run.clear()
+                self._thinking_seq_by_run.clear()
+            self._phone_turn_candidate_gate.clear()
             if link is not None:
                 code = await link.terminate()
                 logger.info("[ocuclaw] runtime child stopped (code=%s)", code)
@@ -1097,6 +3264,16 @@ def _build_adapter(config: Any):
         async def send(self, chat_id, content, reply_to=None, metadata=None):
             text = strip_stream_cursor(content)
             message_id = self._next_message_id()
+            if _is_hermes_home_channel_onboarding_notice(text):
+                # OcuClaw owns its session picker and cron delivery routes.
+                # Hermes emits this one-time platform notice as a second
+                # assistant message after the real first answer, which would
+                # replace that answer on the single glasses conversation
+                # surface. Acknowledge delivery without mutating the ledger.
+                logger.info(
+                    "[ocuclaw] suppressed Hermes home-channel onboarding notice"
+                )
+                return SendResult(success=True, message_id=message_id)
             try:
                 ns = self._namespace_for_outbound(metadata, chat_id=chat_id)
             except AmbiguousOutboundNamespaceError as exc:
@@ -1111,7 +3288,11 @@ def _build_adapter(config: Any):
             # slash turns fire no on_session_end — D9).
             slash_head, merged, promoted = self._ledger.pop_slash_head(session_key)
             if slash_head is not None:
-                self._emit_event("message", message_commit_event(slash_head, text))
+                # A slash reply is committed straight off THIS send and never
+                # passes through `note_send`, so the record has no
+                # current_message_id to fall back on — the id this send just
+                # minted is the message's own (#1691).
+                self._emit_message_commit(slash_head, text, message_id=message_id)
                 self._emit_event(
                     "activity",
                     lifecycle_terminal_activity(slash_head, completed=True),
@@ -1128,24 +3309,68 @@ def _build_adapter(config: Any):
             record, uncommitted_previous, ended_run_commit = self._ledger.note_send(
                 session_key, message_id, text
             )
+            if record is not None:
+                self._claim_tool_progress_send(record, message_id)
+            if record is not None and self._send_is_interim_commentary(metadata):
+                # Second narration signal (0.20.5 streaming lane): the
+                # StreamConsumer declares interim intent on the send itself.
+                # Same normalized-text set as the hook, so whichever arrives
+                # first wins and the other is a no-op.
+                self._note_narration_text(record.run_id, text)
             if record is None:
                 # No dispatch record (cron deliver='origin', foreign-origin
                 # turns): the main-lane message consumer reads runId
                 # null-tolerantly.
-                self._emit_event("message", uncorrelated_message_event(identity, text))
+                self._emit_event(
+                    "message",
+                    uncorrelated_message_event(
+                        identity, text, message_id=message_id
+                    ),
+                )
                 return SendResult(success=True, message_id=message_id)
             if ended_run_commit:
-                self._emit_event("message", message_commit_event(record, text))
+                # Grace claim on a run whose on_session_end beat its final
+                # send: `note_send` returned the ended record WITHOUT moving
+                # current_* onto this text, so the record's id still names the
+                # previous message. This send's own id is the right one
+                # (#1691).
+                self._emit_message_commit(record, text, message_id=message_id)
+                self._note_phone_turn_message_commit(record)
                 return SendResult(success=True, message_id=message_id)
             if uncommitted_previous is not None:
                 # Defensive: a fresh send while a message is open commits the
                 # previous one (segment finalize normally did this already).
-                self._emit_event(
-                    "message", message_commit_event(record, uncommitted_previous)
+                # The run is still open by construction here — this send IS the
+                # next message of the same turn — so the commit must not read
+                # as turn end.
+                self._emit_message_commit(
+                    record,
+                    uncommitted_previous,
+                    turn_active=True,
+                    origin_at_ms=getattr(record, "previous_origin_ms", None),
+                    # …and the previous message's IDENTITY for the same
+                    # reason: `note_send` has already moved current_* on to
+                    # THIS send (#1691).
+                    message_id=getattr(record, "previous_message_id", None),
                 )
+                self._note_phone_turn_message_commit(record)
             if self._ledger.take_lifecycle_start(record):
                 self._emit_event("activity", lifecycle_start_activity(record))
-            self._emit_event("streaming", streaming_event(record, text))
+            # Same routing tag the commit will carry. The commit can be many
+            # seconds away (hermes flushes it lazily on the next send), and the
+            # overlay is on the display NOW.
+            self._emit_event(
+                "streaming",
+                streaming_event(
+                    record,
+                    text,
+                    message_kind=self._commit_message_kind(
+                        record,
+                        text,
+                        message_id,
+                    ),
+                ),
+            )
             return SendResult(success=True, message_id=message_id)
 
         async def send_exec_approval(
@@ -1159,12 +3384,13 @@ def _build_adapter(config: Any):
             allow_session: bool = True,
             smart_denied: bool = False,
         ) -> SendResult:
-            version = parse_version(_hermes_version())
-            if version is None or version < (0, 19, 0):
-                # This guard self-retires when H2 flips Hermes to >=0.19.
+            if not hermes_version_supported(_hermes_version()):
                 return SendResult(
                     success=False,
-                    error="approval mirroring requires hermes >= 0.19",
+                    error=(
+                        "approval mirroring requires supported hermes "
+                        f"{_supported_hermes_range()}"
+                    ),
                 )
             entry, delivery = self._handle_gateway_approval(
                 str(session_key),
@@ -1201,6 +3427,209 @@ def _build_adapter(config: Any):
                 self._pop_approval_entry(entry["id"])
                 return SendResult(success=False, error=str(exc))
             return SendResult(success=True, message_id=entry["id"])
+
+        async def send_slash_confirm(
+            self,
+            chat_id: str,
+            title: str,
+            message: str,
+            session_key: str,
+            confirm_id: str,
+            metadata: Optional[dict] = None,
+        ) -> SendResult:
+            link = self._link
+            if link is None or not link.ready:
+                return SendResult(
+                    success=False,
+                    error="structured slash confirmation is unavailable",
+                )
+            try:
+                ns = self._namespace_for_outbound(metadata, chat_id=chat_id)
+                native_session_key = self._session_key_for_chat(chat_id, ns=ns)
+            except AmbiguousOutboundNamespaceError as exc:
+                return SendResult(success=False, error=str(exc))
+            head = self._ledger.head(native_session_key)
+            public_session_key = (
+                head.public_key if head is not None and head.public_key else str(session_key)
+            )
+            try:
+                from tools import slash_confirm as slash_confirm_module
+
+                pending = slash_confirm_module.get_pending(session_key) or {}
+                command = str(pending.get("command") or "")
+                timeout_seconds = int(
+                    getattr(slash_confirm_module, "DEFAULT_TIMEOUT_SECONDS", 300)
+                )
+            except Exception:
+                command = ""
+                timeout_seconds = 300
+            pending_entry = {
+                "nativeSessionKey": str(session_key),
+                "ledgerSessionKey": native_session_key,
+                "publicSessionKey": public_session_key,
+                "chatId": str(chat_id),
+                "command": command,
+            }
+            # Retain before awaiting presentation. A very fast wearer response
+            # may arrive on the control link before request() returns.
+            self._slash_confirms_by_id[str(confirm_id)] = pending_entry
+            try:
+                result = await link.request(
+                    SLASH_CONFIRM_PRESENT_METHOD,
+                    {
+                        "confirmId": str(confirm_id),
+                        "sessionKey": public_session_key,
+                        "title": str(title),
+                        "command": command,
+                        "expiresAtMs": int((time.time() + max(1, timeout_seconds)) * 1000),
+                    },
+                    timeout_s=10.0,
+                )
+            except Exception as exc:  # structured failure preserves Hermes fallback
+                if self._slash_confirms_by_id.get(str(confirm_id)) is pending_entry:
+                    self._slash_confirms_by_id.pop(str(confirm_id), None)
+                return SendResult(success=False, error=str(exc))
+            if not isinstance(result, dict) or result.get("presented") is not True:
+                if self._slash_confirms_by_id.get(str(confirm_id)) is pending_entry:
+                    self._slash_confirms_by_id.pop(str(confirm_id), None)
+                reason = result.get("reason") if isinstance(result, dict) else None
+                return SendResult(
+                    success=False,
+                    error=str(reason or "structured slash confirmation was not presented"),
+                )
+            return SendResult(success=True, message_id=str(confirm_id))
+
+        async def handle_slash_confirm_resolve(self, params: Any) -> Dict[str, Any]:
+            p = params if isinstance(params, dict) else {}
+            confirm_id = str(p.get("confirmId") or "")
+            choice = str(p.get("choice") or "")
+            session_key = str(p.get("sessionKey") or "")
+            if choice not in ("once", "always", "cancel"):
+                return {"status": "rejected", "error": "invalid slash confirmation choice"}
+            entry = self._slash_confirms_by_id.get(confirm_id)
+            if entry is None or entry.get("publicSessionKey") != session_key:
+                return {"status": "ignored", "reason": "slash confirmation is stale"}
+            # Consume before invoking Hermes. Duplicate/late callbacks therefore
+            # cannot execute a destructive command twice.
+            self._slash_confirms_by_id.pop(confirm_id, None)
+            try:
+                from tools import slash_confirm as slash_confirm_module
+
+                result_text = await slash_confirm_module.resolve(
+                    entry["nativeSessionKey"], confirm_id, choice
+                )
+            except Exception as exc:
+                return {"status": "rejected", "error": str(exc)}
+
+            command = entry.get("command", "")
+            is_reset = command in ("new", "reset", "clear")
+            if is_reset:
+                head, merged, promoted = self._ledger.pop_slash_head(
+                    entry["ledgerSessionKey"]
+                )
+                if head is not None:
+                    self._emit_event(
+                        "activity", lifecycle_terminal_activity(head, completed=True)
+                    )
+                for rider in merged:
+                    self._emit_event(
+                        "activity", lifecycle_terminal_activity(rider, completed=True)
+                    )
+                if promoted is not None:
+                    self._emit_event("activity", lifecycle_start_activity(promoted))
+                approved = choice in ("once", "always")
+                return {
+                    "status": "accepted",
+                    "reset": approved,
+                    "sessionKey": entry["publicSessionKey"],
+                    "transientStatus": "Chat reset" if approved else "Reset cancelled",
+                    # The reset receipt is deliberately consumed at this typed
+                    # command boundary, even when Hermes returns an EphemeralReply
+                    # object that its public resolver does not re-expose as text.
+                    "temporaryReplyRemoved": bool(approved),
+                }
+
+            if result_text:
+                await self.send(entry["chatId"], result_text)
+            return {"status": "accepted", "reset": False}
+
+        async def send_clarify(
+            self,
+            chat_id: str,
+            question: str,
+            choices: Optional[list],
+            clarify_id: str,
+            session_key: str,
+            metadata: Optional[Dict[str, Any]] = None,
+        ) -> SendResult:
+            clean_id = str(clarify_id or "").strip()
+            clean_question = str(question or "").strip()
+            clean_choices = [
+                str(choice).strip()
+                for choice in list(choices or [])[:8]
+                if str(choice).strip()
+            ]
+            multi_select = False
+            try:
+                from tools import clarify_gateway as clarify_module
+
+                with clarify_module._lock:
+                    pending = clarify_module._entries.get(clean_id)
+                multi_select = bool(
+                    pending and getattr(pending, "multi_select", False)
+                )
+            except Exception:  # noqa: BLE001 - fallback is the safe path
+                multi_select = False
+            if not clean_id:
+                return SendResult(success=False, error="clarify delivery requires id")
+            if not clean_question:
+                return SendResult(success=False, error="clarify delivery requires question")
+            if not hermes_version_supported(_hermes_version()):
+                return SendResult(
+                    success=False,
+                    error=(
+                        "clarify mirroring requires supported hermes "
+                        f"{_supported_hermes_range()}"
+                    ),
+                )
+            try:
+                from tools.clarify_gateway import get_clarify_timeout
+
+                deadline_s = max(1, int(get_clarify_timeout()))
+            except Exception:  # noqa: BLE001 - retain a bounded glasses request
+                deadline_s = 300
+            public_key = self._public_key_for_native_session(str(session_key))
+            if not public_key:
+                return SendResult(
+                    success=False,
+                    error="clarify delivery requires a public session key",
+                )
+            delivery = self._emit_event(
+                "clarify",
+                {
+                    "id": clean_id,
+                    "sessionKey": public_key,
+                    "question": clean_question,
+                    "choices": clean_choices,
+                    "multiSelect": multi_select,
+                    "allowOther": bool(clean_choices),
+                    "deadlineSec": deadline_s,
+                },
+                swallow_errors=False,
+            )
+            if delivery is None:
+                return SendResult(
+                    success=False,
+                    error="structured clarify delivery is unavailable",
+                )
+            try:
+                if isinstance(delivery, concurrent.futures.Future):
+                    await asyncio.wrap_future(delivery)
+                else:
+                    await delivery
+            except Exception as exc:  # noqa: BLE001 - preserve Hermes text fallback
+                return SendResult(success=False, error=str(exc))
+            return SendResult(success=True, message_id=clean_id)
 
         async def edit_message(
             self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
@@ -1269,7 +3698,14 @@ def _build_adapter(config: Any):
                         pass
                     if task is not None and task is not current_task:
                         task.cancel()
-                self._emit_event("message", message_commit_event(record, text))
+                # A finalize WITHOUT a stashed closure is a mid-turn segment
+                # break (oversize split, StreamConsumer segment boundary): the
+                # run keeps going and no terminal activity / agent_end follows.
+                # A finalize WITH a closure is the run's closing commit.
+                self._emit_message_commit(
+                    record, text, turn_active=closure is None
+                )
+                self._note_phone_turn_message_commit(record)
                 if closure is not None:
                     self._emit_event(
                         "activity",
@@ -1296,10 +3732,18 @@ def _build_adapter(config: Any):
                             closure["messages"],
                             public_key=record.public_key,
                             agent_id=closure["identity"]["ns"],
+                            run_id=record.run_id,
                         )
                     )
             else:
-                self._emit_event("streaming", streaming_event(record, text))
+                self._emit_event(
+                    "streaming",
+                    streaming_event(
+                        record,
+                        text,
+                        message_kind=self._commit_message_kind(record, text),
+                    ),
+                )
             return SendResult(success=True, message_id=message_id)
 
         async def send_or_update_status(
@@ -1421,6 +3865,47 @@ def _build_adapter(config: Any):
                     "runId": run_id,
                     "sessionState": "busy",
                 }
+            # Platform update is refused for sessions (P19): it would pull
+            # Hermes past the certified baseline in place, unproven, with no
+            # roll-back. Refuse BEFORE hermes sees the turn — its own
+            # registry gate (allow_update_command=False) answers with
+            # "run `hermes update` from the terminal", which is exactly the
+            # destructive act being prevented. The wearer gets the refusal as
+            # a normal glasses message; strict-ack consumers get it as the
+            # dispatch error.
+            #
+            # Placement is deliberate: this sits BELOW the idempotent-replay
+            # gate above, so a retry carrying the same idempotencyKey (what
+            # the Node senders actually reuse when an ack is lost) is answered
+            # there and never re-emits this message. Like every sibling
+            # rejection in this function, a refusal is not ledger-recorded —
+            # `_ledger.begin()` runs only on the accept path below. Whether
+            # rejections should join the ledger is a dispatch-contract
+            # question for ALL rejection paths, not something to special-case
+            # here; see the P19 follow-up note rather than adding a second,
+            # runId-keyed dedup rule alongside the idempotencyKey one.
+            if is_platform_update_command(message):
+                self._discard_attachment_spills(attachments)
+                identity = parse_ocuclaw_session_key(session_key) or {
+                    "ns": ns,
+                    "chatId": str(chat_id),
+                }
+                self._emit_event(
+                    "message",
+                    uncorrelated_message_event(
+                        identity,
+                        UPDATE_COMMAND_REFUSAL,
+                        # A refusal is still a conversation entry; an entry
+                        # with no id costs the session ledgerV1 (#1691).
+                        message_id=self._next_message_id(),
+                    ),
+                )
+                return {
+                    "status": "rejected",
+                    "error": UPDATE_COMMAND_REFUSAL,
+                    "runId": run_id,
+                }
+
             session_state = self._read_session_flags(session_key)
 
             # Bypass-cancel policy (D9): hermes serializes /stop,/new,/reset
@@ -1532,12 +4017,25 @@ def _build_adapter(config: Any):
             ).strip()
             if not run_id or not session_key:
                 return
+            outcome_value = str(getattr(outcome, "value", "") or "").lower()
+            completed = outcome_value == "success"
             head, merged, promoted = self._ledger.complete_head_if_run(
                 session_key, run_id
+            )
+            processing_publishes_candidate = (
+                parse_ocuclaw_session_key(session_key) is not None
+                and self._phone_turn_candidate_gate.note_processing(
+                    session_key, run_id, succeeded=completed
+                )
             )
             if head is None:
                 # on_session_end or slash completion already closed this run;
                 # never let a late platform callback consume its successor.
+                if processing_publishes_candidate:
+                    record_phone_turn_candidate(
+                        session_key=session_key,
+                        turn_id=run_id,
+                    )
                 return
             if (
                 head.current_message_id is not None
@@ -1545,11 +4043,13 @@ def _build_adapter(config: Any):
                 and head.current_text
             ):
                 head.current_committed = True
-                self._emit_event(
-                    "message", message_commit_event(head, head.current_text)
+                self._emit_message_commit(head, head.current_text)
+                self._note_phone_turn_message_commit(head)
+            if processing_publishes_candidate:
+                record_phone_turn_candidate(
+                    session_key=session_key,
+                    turn_id=run_id,
                 )
-            outcome_value = str(getattr(outcome, "value", "") or "").lower()
-            completed = outcome_value == "success"
             interrupted = outcome_value == "cancelled"
             code = None if completed or interrupted else "processing_failed"
             for record in [head, *merged]:
@@ -1566,15 +4066,104 @@ def _build_adapter(config: Any):
             if promoted is not None:
                 self._emit_event("activity", lifecycle_start_activity(promoted))
 
+        def _resolve_armed_first_run_session(self) -> Optional[str]:
+            candidate_keys = []
+            # A gateway restart clears the in-memory completion candidate, but
+            # the one-hour Attempt remains resumable. Recover its exact phone
+            # session by matching the receipt's fingerprint against the
+            # profile-scoped Hermes session directory; no raw session key is
+            # persisted in OcuClaw state.
+            try:
+                rows = self._session_rpc._sync_list_sessions({"limit": 500}).get(
+                    "sessions", []
+                )
+            except Exception:  # noqa: BLE001 - caller returns a closed failure
+                rows = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                key = str(row.get("sessionKey") or "")
+                if (
+                    parse_ocuclaw_session_key(key) is not None
+                    and key not in candidate_keys
+                ):
+                    candidate_keys.append(key)
+            for key in candidate_keys:
+                state = inspect_attempt(
+                    hermes_release=CERTIFIED_HERMES_TAG,
+                    hermes_package_version=_hermes_version() or None,
+                    ocuclaw_version=_ocuclaw_version(),
+                    session_key=key,
+                )
+                if state.get("state") == "armed":
+                    return key
+            return None
+
+        async def _deliver_armed_first_run_welcome(self) -> Dict[str, Any]:
+            attempt = inspect_attempt(
+                hermes_release=CERTIFIED_HERMES_TAG,
+                hermes_package_version=_hermes_version() or None,
+                ocuclaw_version=_ocuclaw_version(),
+                session_key=None,
+            )
+            if attempt.get("state") != "armed":
+                return {"state": str(attempt.get("state") or "missing")}
+            session_key = await asyncio.to_thread(
+                self._resolve_armed_first_run_session
+            )
+            if session_key is None:
+                return {"state": "session_unavailable"}
+            link = self._link
+            if link is None or not link.ready:
+                return {"state": "link_unavailable"}
+            call_id = f"first-run-welcome-{uuid.uuid4().hex}"
+            try:
+                result = await link.request(
+                    LIVEUI_RENDER_METHOD,
+                    {
+                        "callId": call_id,
+                        "sessionKey": session_key,
+                        "args": dict(WELCOME_SURFACE),
+                    },
+                    timeout_s=(
+                        float(WELCOME_SURFACE["timeoutMs"]) / 1000.0
+                        + LIVEUI_RENDER_LINK_MARGIN_S
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - failure advances the retry receipt
+                logger.exception("[ocuclaw] first-run welcome delivery failed")
+                outcome = "error"
+            else:
+                outcome = result.get("result") if isinstance(result, dict) else result
+                if isinstance(outcome, dict):
+                    outcome = outcome.get("result")
+            proof = record_welcome_outcome(
+                outcome,
+                hermes_release=CERTIFIED_HERMES_TAG,
+                hermes_package_version=_hermes_version() or None,
+                ocuclaw_version=_ocuclaw_version(),
+                session_key=session_key,
+            )
+            return {"state": "delivered", "firstRunProof": proof}
+
+        async def _first_run_welcome_loop(self) -> None:
+            while True:
+                try:
+                    await self._deliver_armed_first_run_welcome()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - keep the gateway watcher alive
+                    logger.exception("[ocuclaw] first-run welcome watcher failed")
+                await asyncio.sleep(FIRST_RUN_WELCOME_POLL_SECONDS)
+
         # -- W09 approvals + live-session control (ADR-0008) -----------------
 
         def _approval_timeout_seconds(self) -> int:
             try:
                 from tools.approval import _get_approval_timeout
 
-                # Hermes owns the effective default and operator override.
-                # It was 60 seconds in 0.19.0 and became 300 in 0.19.1;
-                # using its accessor also preserves each host's malformed-
+                # Hermes 0.20 owns the effective default and operator override;
+                # using its accessor also preserves the host's malformed-
                 # config fallback instead of pinning either value here.
                 timeout = _get_approval_timeout()
                 return max(0, int(timeout))
@@ -2479,12 +5068,11 @@ def _build_adapter(config: Any):
             )
             return THINKING_FRAME_TRUNCATION_PREFIX + cleaned[-keep:]
 
-        @classmethod
-        def _extract_assistant_reasoning(cls, assistant_message: Any) -> Optional[str]:
-            raw = cls._read_reasoning_field(assistant_message, "reasoning")
+        @staticmethod
+        def _coerce_reasoning_value(raw: Any) -> str:
             if isinstance(raw, str):
-                text = raw.strip()
-            elif isinstance(raw, list):
+                return raw.strip()
+            if isinstance(raw, list):
                 parts: List[str] = []
                 for item in raw:
                     if isinstance(item, str):
@@ -2499,14 +5087,114 @@ def _build_adapter(config: Any):
                         ).strip()
                     if part:
                         parts.append(part)
-                text = "\n".join(parts).strip()
-            else:
-                text = ""
+                return "\n".join(parts).strip()
+            return ""
+
+        @classmethod
+        def _reasoning_detail_entries(cls, assistant_message: Any) -> List[Dict[str, Any]]:
+            """``reasoning_details`` as a list of dicts (OpenRouter unified)."""
+            raw = cls._read_reasoning_field(assistant_message, "reasoning_details")
+            if not isinstance(raw, list):
+                return []
+            entries: List[Dict[str, Any]] = []
+            for item in raw:
+                if isinstance(item, dict):
+                    entries.append(item)
+            return entries
+
+        @staticmethod
+        def _reasoning_detail_text(entry: Dict[str, Any]) -> str:
+            for key in ("summary", "thinking", "content", "text"):
+                value = entry.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            return ""
+
+        @classmethod
+        def _extract_assistant_reasoning(cls, assistant_message: Any) -> Optional[str]:
+            """Every reasoning carrier this provider surface actually uses.
+
+            `reasoning` alone is empty on streamed chat_completions turns —
+            the text lands in `reasoning_content` (provider_data passthrough)
+            or in the `reasoning_details` array — so reading one field means
+            no thinking frame at all on the most common lane.
+            """
+            parts: List[str] = []
+            for field in ("reasoning", "reasoning_content"):
+                text = cls._coerce_reasoning_value(
+                    cls._read_reasoning_field(assistant_message, field)
+                )
+                if text and text not in parts:
+                    parts.append(text)
+            for entry in cls._reasoning_detail_entries(assistant_message):
+                detail_text = cls._reasoning_detail_text(entry)
+                if detail_text and detail_text not in parts:
+                    parts.append(detail_text)
+            text = "\n".join(parts).strip()
             if not text:
                 return None
             if len(text) > THINKING_FRAME_MAX_CHARS:
                 return cls._truncate_thinking_delta(text)
             return text
+
+        @staticmethod
+        def _normalize_thinking_headline(raw: Any) -> Optional[str]:
+            """One markdown-free line, ≤80 chars, or None."""
+            text = str(raw or "").strip()
+            if not text:
+                return None
+            text = THINKING_HEADLINE_LEADER_RE.sub("", text)
+            text = THINKING_HEADLINE_STRIP_RE.sub("", text)
+            text = " ".join(text.split())
+            if not text:
+                return None
+            if len(text) > THINKING_HEADLINE_MAX_CHARS:
+                clipped = text[:THINKING_HEADLINE_MAX_CHARS]
+                boundary = clipped.rfind(" ")
+                text = (clipped[:boundary] if boundary > 0 else clipped).rstrip()
+            return text or None
+
+        @classmethod
+        def _derive_thinking_headline(
+            cls,
+            assistant_message: Any,
+            reasoning: Optional[str],
+            provider: Any = None,
+            model: Any = None,
+        ) -> Tuple[Optional[str], str]:
+            """``(headline, thinkingSummarySource)`` for one model call.
+
+            Order: a CLOSED ``**bold**` span in the reasoning text (the shape
+            gpt-5.x style reasoning writes its own section headers in), then a
+            typed ``reasoning.summary`` detail entry that is genuinely one
+            short line. Everything else is prose and degrades to ``detail`` —
+            which, by the frame split in ``handle_post_api_request``, means the
+            status line says "Thinking..." instead of a truncated slab.
+
+            ``provider``/``model`` are accepted deliberately and never
+            branched on: upstream's own provider discrimination
+            (agent/reasoning_summaries.py) is heuristic, so asserting
+            "this provider emits summaries" would manufacture a headline out
+            of prose. Degrade, never assert.
+            """
+            bold_match = THINKING_BOLD_SPAN_RE.search(str(reasoning or ""))
+            if bold_match:
+                headline = cls._normalize_thinking_headline(bold_match.group(1))
+                if headline:
+                    return headline, "bold"
+            for entry in cls._reasoning_detail_entries(assistant_message):
+                entry_type = str(entry.get("type") or "").strip().lower()
+                if entry_type != REASONING_SUMMARY_DETAIL_TYPE:
+                    continue
+                raw = cls._reasoning_detail_text(entry)
+                if not raw or "\n" in raw:
+                    continue
+                if len(raw) > THINKING_HEADLINE_MAX_CHARS:
+                    continue
+                headline = cls._normalize_thinking_headline(raw)
+                if headline:
+                    return headline, "summary"
+            return None, "detail"
 
         @staticmethod
         def _append_thinking_text(previous: str, next_text: str) -> str:
@@ -2532,12 +5220,714 @@ def _build_adapter(config: Any):
                 self._thinking_text_by_run[run_id] = text
                 return text
 
+        def _next_thinking_seq(self, run_id: Any) -> int:
+            key = str(run_id or "").strip()
+            with self._thinking_lock:
+                seq = self._thinking_seq_by_run.get(key, 0) + 1
+                self._thinking_seq_by_run[key] = seq
+                return seq
+
+        def _extend_thinking_text(self, run_id: str, delta: str) -> str:
+            """Append a raw STREAM chunk (never a cumulative snapshot).
+
+            Deliberately not `_cumulative_thinking_text`: that one joins with a
+            newline and swallows a chunk already contained in the buffer, which
+            is right for whole-reasoning snapshots and wrong for token deltas —
+            it would insert newlines mid-word and drop repeated fragments.
+            """
+            chunk = str(delta or "")
+            if not chunk:
+                return self._thinking_text_by_run.get(run_id, "")
+            with self._thinking_lock:
+                # NOT `_cap_cumulative_thinking_text`: that one strips, which
+                # is right for a whole-reasoning snapshot and wrong mid-stream
+                # — it would eat the trailing space of every chunk and glue
+                # the next one onto the previous word.
+                text = self._cap_stream_thinking_text(
+                    self._thinking_text_by_run.get(run_id, "") + chunk
+                )
+                self._thinking_text_by_run[run_id] = text
+                return text
+
+        @staticmethod
+        def _cap_stream_thinking_text(text: str) -> str:
+            raw = str(text or "")
+            if len(raw) <= THINKING_FRAME_MAX_CHARS:
+                return raw
+            keep = max(
+                0,
+                THINKING_FRAME_MAX_CHARS - len(THINKING_FRAME_TRUNCATION_PREFIX),
+            )
+            return THINKING_FRAME_TRUNCATION_PREFIX + raw[-keep:]
+
+        @staticmethod
+        def _stream_join_separator(previous: str) -> str:
+            """Separator between two model calls' reasoning in one turn."""
+            return (
+                "\n"
+                if previous and not previous.endswith(("\n", " "))
+                else ""
+            )
+
+        def _reset_thinking_text(self, run_id: str, text: str) -> str:
+            """Replace the cumulative buffer with an authoritative snapshot."""
+            with self._thinking_lock:
+                capped = self._cap_cumulative_thinking_text(text)
+                self._thinking_text_by_run[run_id] = capped
+                return capped
+
+        def _reconcile_thinking_text(self, run_id: Any, reasoning: str) -> str:
+            """Authoritative text for one model call.
+
+            When deltas painted this call, REPLACE exactly what they appended
+            rather than appending a second copy of the same reasoning: the
+            snapshot is the same content, differently chunked, so an append
+            would duplicate the tail and a blind reset would erase earlier
+            iterations of the same turn.
+            """
+            key = str(run_id or "").strip()
+            with self._thinking_lock:
+                appended = self._stream_appended_by_run.pop(key, "")
+                buffered = self._thinking_text_by_run.get(key, "")
+                if appended and buffered.endswith(appended):
+                    prefix = buffered[: len(buffered) - len(appended)]
+                    return self._reset_thinking_text(
+                        key,
+                        prefix
+                        + self._stream_join_separator(prefix)
+                        + reasoning,
+                    )
+            return self._cumulative_thinking_text(key, reasoning)
+
+        def _finalize_thinking_pane(self, run_id: Any, session_key: Any) -> bool:
+            """Close an OPEN thinking pane exactly once per model call."""
+            key = str(run_id or "").strip()
+            with self._thinking_lock:
+                if key not in self._open_pane_runs:
+                    return False
+                self._open_pane_runs.discard(key)
+            self._emit_event(
+                "thinking",
+                {
+                    "phase": "finalize",
+                    "runId": run_id,
+                    "sessionKey": session_key,
+                    "reason": STREAM_END_FINALIZE_REASON,
+                    "seq": self._next_thinking_seq(run_id),
+                },
+            )
+            return True
+
+        def _thinking_epoch(self, run_id: Any) -> int:
+            key = str(run_id or "").strip()
+            with self._thinking_lock:
+                return self._thinking_epoch_by_run.get(key, 0)
+
+        def _bump_thinking_epoch(self, run_id: Any) -> int:
+            key = str(run_id or "").strip()
+            with self._thinking_lock:
+                epoch = self._thinking_epoch_by_run.get(key, 0) + 1
+                self._thinking_epoch_by_run[key] = epoch
+                return epoch
+
         def _forget_thinking_run(self, run_id: Any) -> None:
             key = str(run_id or "").strip()
             if not key:
                 return
             with self._thinking_lock:
                 self._thinking_text_by_run.pop(key, None)
+                self._thinking_seq_by_run.pop(key, None)
+                self._narration_texts_by_run.pop(key, None)
+                self._narration_raw_by_run.pop(key, None)
+                self._committed_texts_by_run.pop(key, None)
+                self._committed_ids_by_run.pop(key, None)
+                self._pending_tool_progress_by_run.pop(key, None)
+                self._tool_progress_message_ids_by_run.pop(key, None)
+                self._stream_text_origin_by_run.pop(key, None)
+                self._narration_origin_by_run.pop(key, None)
+                self._thinking_epoch_by_run.pop(key, None)
+                self._stream_appended_by_run.pop(key, None)
+                self._open_pane_runs.discard(key)
+                for stream_key in [
+                    stream_key
+                    for stream_key, entry in self._stream_contexts.items()
+                    if entry.get("runId") == key
+                ]:
+                    self._stream_contexts.pop(stream_key, None)
+
+        @staticmethod
+        def _send_is_interim_commentary(metadata: Any) -> bool:
+            """True for a StreamConsumer commentary send.
+
+            Gated on the narration hook actually being REGISTERED: the tag
+            makes the client drop the page, and dropping it with no
+            `agent_progress_notes` capability advertised would delete the
+            sentence with no row to explain where it went.
+            """
+            if FEATURE_TOKEN_INTERIM_HOOK not in _hermes_feature_tokens():
+                return False
+            return (
+                isinstance(metadata, dict)
+                and metadata.get(INTERIM_SEND_METADATA_KEY) is True
+            )
+
+        @staticmethod
+        def _normalize_narration_text(text: Any) -> str:
+            """Whitespace-insensitive identity for narration matching.
+
+            Since #1691 a commit carries a message id and a retag names it,
+            but text stays the fallback (and the only key for the mid-reveal
+            prefix upgrade). The carriers reflow whitespace, so the text
+            identity has to survive that.
+            """
+            return " ".join(str(text or "").split())
+
+        @staticmethod
+        def _now_ms() -> int:
+            """Wall-clock milliseconds.
+
+            Wall clock, not monotonic, because the consumer compares this
+            against its own `Date.now()` arrival stamps. Adapter and Node
+            runtime share a host (and a container, on a pet), so the two
+            clocks are the same clock.
+            """
+            return int(time.time() * 1000)
+
+        def _note_text_stream_origin(self, entry: Dict[str, Any]) -> None:
+            """Stamp the FIRST content delta of one model call (#1619).
+
+            One stamp per (stream, iteration): `_stream_turn_context` clears
+            the marker when a new iteration re-arms the entry, so a turn with
+            three model calls contributes three stamps in order.
+            """
+            run_id = str(entry.get("runId") or "").strip()
+            if not run_id:
+                return
+            with self._thinking_lock:
+                if entry.get("textOriginStamped"):
+                    return
+                entry["textOriginStamped"] = True
+                stamps = self._stream_text_origin_by_run.setdefault(run_id, [])
+                stamps.append(self._now_ms())
+                if len(stamps) > NARRATION_ORIGIN_MEMORY:
+                    del stamps[:-NARRATION_ORIGIN_MEMORY]
+
+        def _take_text_stream_origin(self, run_id: Any) -> Optional[int]:
+            """Claim the oldest unclaimed model-call origin stamp for a run.
+
+            FIFO because interim messages are produced in the same order as
+            the model calls that wrote them. A stamp that no narration ever
+            claims is dropped with the run.
+            """
+            key = str(run_id or "").strip()
+            if not key:
+                return None
+            with self._thinking_lock:
+                stamps = self._stream_text_origin_by_run.get(key)
+                if not stamps:
+                    return None
+                return stamps.pop(0)
+
+        def _note_narration_text(self, run_id: Any, text: Any) -> bool:
+            """Record a narration sentence. False when already known.
+
+            The first carrier of a sentence also fixes its ORIGIN time, so
+            every later carrier of the same sentence (commit, retag) reports
+            the identical stamp.
+            """
+            key = str(run_id or "").strip()
+            normalized = self._normalize_narration_text(text)
+            if not key or not normalized:
+                return False
+            # One lock span (it is an RLock, so the nested claim below is
+            # fine): two carriers of the SAME sentence racing must not claim
+            # two different origin stamps.
+            with self._thinking_lock:
+                known = self._narration_texts_by_run.setdefault(key, set())
+                if normalized in known:
+                    return False
+                known.add(normalized)
+                raws = self._narration_raw_by_run.setdefault(key, {})
+                raws[normalized] = str(text)
+                if len(raws) > NARRATION_ORIGIN_MEMORY:
+                    for stale in list(raws)[: len(raws) - NARRATION_ORIGIN_MEMORY]:
+                        raws.pop(stale, None)
+                origin = self._take_text_stream_origin(key)
+                if origin is None:
+                    # No stream hooks on this host (or a model call that
+                    # produced no content delta): the honest fallback is NOW —
+                    # the moment the sentence reached the adapter, which is the
+                    # moment it was painted as streaming text, not the lazy
+                    # commit.
+                    origin = self._now_ms()
+                origins = self._narration_origin_by_run.setdefault(key, {})
+                origins[normalized] = origin
+                if len(origins) > NARRATION_ORIGIN_MEMORY:
+                    for stale in list(origins)[: len(origins) - NARRATION_ORIGIN_MEMORY]:
+                        origins.pop(stale, None)
+            return True
+
+        def _narration_origin_ms(self, run_id: Any, text: Any) -> Optional[int]:
+            """The origin stamp of a known narration sentence, or None."""
+            key = str(run_id or "").strip()
+            normalized = self._normalize_narration_text(text)
+            if not key or not normalized:
+                return None
+            with self._thinking_lock:
+                return self._narration_origin_by_run.get(key, {}).get(normalized)
+
+        def _is_narration_text(self, run_id: Any, text: Any) -> bool:
+            key = str(run_id or "").strip()
+            normalized = self._normalize_narration_text(text)
+            if not key or not normalized:
+                return False
+            with self._thinking_lock:
+                return normalized in self._narration_texts_by_run.get(key, ())
+
+        def _note_committed_text(
+            self, run_id: Any, text: Any, message_id: Any = None
+        ) -> None:
+            key = str(run_id or "").strip()
+            normalized = self._normalize_narration_text(text)
+            if not key or not normalized:
+                return
+            with self._thinking_lock:
+                seen = self._committed_texts_by_run.setdefault(key, [])
+                seen.append(normalized)
+                if len(seen) > NARRATION_COMMIT_MEMORY:
+                    del seen[:-NARRATION_COMMIT_MEMORY]
+                ids = self._committed_ids_by_run.setdefault(key, {})
+                if message_id:
+                    # LAST writer wins: a text can be committed twice within a
+                    # run (a flush of the open message, then the run-end tail
+                    # re-committing the same words) and the retag has to name
+                    # the commit the consumer is actually holding.
+                    ids[normalized] = str(message_id)
+                retained = set(seen)
+                for stale in [k for k in ids if k not in retained]:
+                    del ids[stale]
+
+        def _committed_message_id(self, run_id: Any, text: Any) -> Optional[str]:
+            """The message id of the commit a retag is correcting.
+
+            Exact text first, then the mid-reveal prefix case: when the commit
+            beat the interim hook it landed the prefix visible at that
+            instant, so the sentence the retag carries is not what was
+            committed — the longest committed prefix of it is. Mirrors
+            `_committed_prefix_of`'s reading, and returns None when nothing
+            was committed with an id (a pre-#1691 commit path), which leaves
+            the consumer on its text match.
+            """
+            key = str(run_id or "").strip()
+            normalized = self._normalize_narration_text(text)
+            if not key or not normalized:
+                return None
+            with self._thinking_lock:
+                ids = dict(self._committed_ids_by_run.get(key, {}))
+            exact = ids.get(normalized)
+            if exact:
+                return exact
+            best: Optional[str] = None
+            best_len = -1
+            for committed, message_id in ids.items():
+                if committed == normalized or not normalized.startswith(committed):
+                    continue
+                if len(committed) > best_len:
+                    best_len = len(committed)
+                    best = message_id
+            return best
+
+        def _text_was_committed(self, run_id: Any, text: Any) -> bool:
+            key = str(run_id or "").strip()
+            normalized = self._normalize_narration_text(text)
+            if not key or not normalized:
+                return False
+            with self._thinking_lock:
+                return normalized in self._committed_texts_by_run.get(key, ())
+
+        def _narration_full_text_for_prefix(self, run_id: Any, text: Any) -> Optional[str]:
+            """The finished sentence a mid-reveal commit is a prefix OF.
+
+            Hermes reveals an assistant message to the platform at reading
+            speed, and a fresh send() flushes the previous still-open message.
+            A note flushed mid-reveal therefore commits the prefix visible at
+            that instant (`I'm about t`), and nothing downstream ever replaces
+            it. The interim hook already knows the whole sentence, so the
+            commit is upgraded to it here — the one choke point every
+            correlated commit passes through (#1619 residual).
+
+            Shortest candidate wins: with two narration sentences sharing a
+            prefix the nearer one is the honest reading. An exact match is not
+            a prefix hit and returns None.
+            """
+            key = str(run_id or "").strip()
+            normalized = self._normalize_narration_text(text)
+            if not key or not normalized:
+                return None
+            with self._thinking_lock:
+                raws = dict(self._narration_raw_by_run.get(key, {}))
+            best: Optional[str] = None
+            best_key: Optional[str] = None
+            for candidate, raw in raws.items():
+                if candidate == normalized:
+                    return None
+                if not candidate.startswith(normalized):
+                    continue
+                if best_key is None or len(candidate) < len(best_key):
+                    best_key = candidate
+                    best = raw
+            return best
+
+        def _committed_prefix_of(self, run_id: Any, text: Any) -> bool:
+            """True when a COMMITTED text is a strict prefix of ``text``.
+
+            The hook's normal test is "was this exact sentence committed?".
+            When the commit beat the hook AND landed mid-reveal, the page is
+            holding a prefix instead, so the retag (which carries the finished
+            sentence) still has to be emitted — it is the only carrier that
+            can upgrade the page.
+            """
+            key = str(run_id or "").strip()
+            normalized = self._normalize_narration_text(text)
+            if not key or not normalized:
+                return False
+            with self._thinking_lock:
+                seen = list(self._committed_texts_by_run.get(key, ()))
+            return any(
+                committed and committed != normalized and normalized.startswith(committed)
+                for committed in seen
+            )
+
+        def _commit_message_kind(
+            self,
+            record: Any,
+            text: Any,
+            message_id: Any = None,
+        ) -> Optional[str]:
+            """`messageKind` for a commit that is about to be emitted."""
+            if self._is_narration_text(getattr(record, "run_id", None), text):
+                return MESSAGE_KIND_NARRATION
+            key = str(getattr(record, "run_id", None) or "").strip()
+            resolved_id = str(message_id or "").strip()
+            if key and resolved_id:
+                with self._thinking_lock:
+                    if resolved_id in self._tool_progress_message_ids_by_run.get(key, ()):
+                        return MESSAGE_KIND_TOOL_PROGRESS
+            return None
+
+        def _expect_tool_progress_send(self, record: Any, tool_call_id: Any) -> None:
+            key = str(getattr(record, "run_id", None) or "").strip()
+            call_id = str(tool_call_id or "").strip()
+            if not key or not call_id:
+                return
+            with self._thinking_lock:
+                pending = self._pending_tool_progress_by_run.setdefault(key, [])
+                if call_id not in pending:
+                    pending.append(call_id)
+
+        def _tool_progress_enabled_for_record(self, record: Any) -> bool:
+            """Mirror Hermes' per-platform gate before arming the next send."""
+            identity = parse_ocuclaw_session_key(
+                str(getattr(record, "public_key", None) or "")
+            )
+            ns = str((identity or {}).get("ns") or self._namespace)
+            home = self._profile_home_for_options(ns)
+            if home is None:
+                return False
+            try:
+                return bool(
+                    self._read_profile_options_sync(home).get(
+                        "conversationToolProgress"
+                    )
+                )
+            except Exception:  # noqa: BLE001 - a display hint cannot block tools
+                logger.debug("[ocuclaw] tool-progress config read failed", exc_info=True)
+                return False
+
+        def _claim_tool_progress_send(self, record: Any, message_id: Any) -> None:
+            key = str(getattr(record, "run_id", None) or "").strip()
+            resolved_id = str(message_id or "").strip()
+            if not key or not resolved_id:
+                return
+            with self._thinking_lock:
+                pending = self._pending_tool_progress_by_run.get(key)
+                if not pending:
+                    return
+                pending.pop(0)
+                if not pending:
+                    self._pending_tool_progress_by_run.pop(key, None)
+                self._tool_progress_message_ids_by_run.setdefault(key, set()).add(
+                    resolved_id
+                )
+
+        def _emit_message_commit(
+            self,
+            record: Any,
+            text: str,
+            *,
+            turn_active: bool = False,
+            origin_at_ms: Optional[int] = None,
+            message_id: Optional[str] = None,
+        ) -> None:
+            """The single place a correlated assistant commit leaves the
+            adapter, so tagging, identity and commit memory can never drift
+            apart.
+
+            ``message_id`` defaults to the record's CURRENT message — the one
+            every caller but the flush path is committing. The flush path
+            (a fresh send arriving while a message is still open) commits the
+            PREVIOUS message and passes `record.previous_message_id`, exactly
+            as it already passes `previous_origin_ms` (#1691).
+            """
+            upgraded = self._narration_full_text_for_prefix(record.run_id, text)
+            if upgraded is not None:
+                # A note flushed mid-reveal: commit the sentence, not the
+                # prefix that happened to be on the wire.
+                text = upgraded
+            if message_id is None:
+                message_id = getattr(record, "current_message_id", None)
+            self._note_committed_text(record.run_id, text, message_id)
+            message_kind = self._commit_message_kind(record, text, message_id)
+            if message_kind == MESSAGE_KIND_NARRATION:
+                # Narration knows its true origin (first content delta of the
+                # model call that wrote it), which beats the send stamp.
+                origin = self._narration_origin_ms(record.run_id, text)
+            elif origin_at_ms is not None:
+                # A message the ledger FLUSHED because a new send opened:
+                # its stamp is the flushed message's own send, not this one's.
+                origin = origin_at_ms
+            else:
+                # Every commit carries WHERE IT WAS WRITTEN — the wall clock of
+                # its own first send(). Hermes commits lazily (a flush, a
+                # run-end tail), so commit order is not authorship order and
+                # the tool-progress line otherwise lands after the tool OUTPUT
+                # it introduces (#1619). A stamp equal to commit position moves
+                # nothing; it only lets a later lazy commit sort against it.
+                origin = getattr(record, "current_origin_ms", None)
+            self._emit_event(
+                "message",
+                message_commit_event(
+                    record,
+                    text,
+                    turn_active=turn_active,
+                    message_kind=message_kind,
+                    # Every commit carries where it was WRITTEN, because hermes
+                    # flushes messages lazily: a tool-progress line commits
+                    # after the tool output it introduces.
+                    origin_at_ms=origin,
+                    # …and WHICH MESSAGE it is, so the consumer can give the
+                    # entry a server identity instead of a positional one
+                    # (#1691).
+                    message_id=message_id,
+                ),
+            )
+
+        # -- tier-2 reasoning stream (on_stream_*, 0.20.5+, opt-in) ----------
+
+        def _stream_turn_context(
+            self, kwargs: Dict[str, Any]
+        ) -> Optional[Dict[str, Any]]:
+            """Cached identity + coalescer state for one reasoning stream.
+
+            Stream hooks spell the platform ``surface``; the shared turn-context
+            filter reads ``platform``, which they never pass, so its filter is
+            vacuous here and this one is load-bearing.
+            """
+            if str(kwargs.get("surface") or "").strip() != PLATFORM_NAME:
+                return None
+            session_id = str(kwargs.get("session_id") or "").strip()
+            if not session_id:
+                return None
+            stream_key = (session_id, str(kwargs.get("turn_id") or "").strip())
+            try:
+                iteration = int(kwargs.get("iteration") or 0)
+            except (TypeError, ValueError):
+                iteration = 0
+            with self._thinking_lock:
+                entry = self._stream_contexts.get(stream_key)
+            if entry is not None:
+                if iteration > entry["iteration"]:
+                    # A new model call inside the same turn. Re-arm rather than
+                    # trusting on_stream_end to have arrived: the hook queue
+                    # drops OLDEST under load, and a lost end would otherwise
+                    # fence out the rest of the turn's reasoning forever.
+                    self._flush_stream_buffer(entry)
+                    entry["iteration"] = iteration
+                    entry["epoch"] = self._thinking_epoch(entry["runId"])
+                    entry["lastFlush"] = time.monotonic()
+                    # A new model call writes a new assistant message, so it
+                    # gets its own origin stamp (#1619).
+                    entry["textOriginStamped"] = False
+                return entry
+            context = self._turn_activity_context(kwargs, "stream hook")
+            if context is None:
+                return None
+            _, record = context
+            entry = {
+                "key": stream_key,
+                "runId": record.run_id,
+                "sessionKey": record.public_key,
+                "iteration": iteration,
+                "epoch": self._thinking_epoch(record.run_id),
+                "buffer": "",
+                "lastFlush": time.monotonic(),
+                "textOriginStamped": False,
+            }
+            with self._thinking_lock:
+                self._stream_contexts[stream_key] = entry
+            return entry
+
+        def _forget_stream_context(self, entry: Dict[str, Any]) -> None:
+            with self._thinking_lock:
+                self._stream_contexts.pop(entry["key"], None)
+
+        def _flush_stream_buffer(self, entry: Dict[str, Any]) -> bool:
+            now = time.monotonic()
+            with self._thinking_lock:
+                chunk = entry["buffer"]
+                if not chunk:
+                    return False
+                entry["buffer"] = ""
+                entry["lastFlush"] = now
+            run_id = entry["runId"]
+            if self._thinking_epoch(run_id) != entry["epoch"]:
+                # A post_api_request reconcile already set the authoritative
+                # text for this call; this chunk is behind it.
+                return False
+            key = str(run_id or "").strip()
+            with self._thinking_lock:
+                previous = self._stream_appended_by_run.get(key)
+                if previous is None:
+                    # First chunk of a NEW model call. Deltas concatenate raw
+                    # inside a call (they are token fragments), but two calls
+                    # in one turn are two separate stretches of reasoning and
+                    # would otherwise run together mid-word.
+                    chunk = (
+                        self._stream_join_separator(
+                            self._thinking_text_by_run.get(key, "")
+                        )
+                        + chunk
+                    )
+                    previous = ""
+                self._stream_appended_by_run[key] = previous + chunk
+                self._open_pane_runs.add(key)
+            self._emit_event(
+                "thinking",
+                {
+                    "phase": "update",
+                    "runId": run_id,
+                    "sessionKey": entry["sessionKey"],
+                    "text": self._extend_thinking_text(run_id, chunk),
+                    "delta": chunk,
+                    "seq": self._next_thinking_seq(run_id),
+                    "source": THINKING_SOURCE_STREAM_DELTA,
+                },
+            )
+            return True
+
+        def _flush_pending_streams_for_run(self, run_id: Any) -> None:
+            key = str(run_id or "").strip()
+            with self._thinking_lock:
+                pending = [
+                    entry
+                    for entry in self._stream_contexts.values()
+                    if entry.get("runId") == key and entry.get("buffer")
+                ]
+            for entry in pending:
+                self._flush_stream_buffer(entry)
+
+        def handle_stream_start(self, kwargs: Dict[str, Any]) -> None:
+            # Resolving identity here is the whole point: one SessionDB read
+            # per stream instead of one per delta.
+            self._stream_turn_context(kwargs)
+
+        def handle_stream_delta(self, kwargs: Dict[str, Any]) -> None:
+            # FIRST line: content deltas are already rendered by the streaming
+            # transport, so forwarding them here would double-render the reply.
+            kind = str(kwargs.get("kind") or "").strip()
+            if kind != STREAM_DELTA_KIND_REASONING:
+                # …but the FIRST of them is when the model started writing
+                # this assistant message, which is the only honest origin time
+                # for a progress note (#1619). Stamp it and forward nothing.
+                if kind == STREAM_DELTA_KIND_TEXT and str(kwargs.get("delta") or ""):
+                    entry = self._stream_turn_context(kwargs)
+                    if entry is not None and not entry.get("textOriginStamped"):
+                        self._note_text_stream_origin(entry)
+                return
+            delta = str(kwargs.get("delta") or "")
+            if not delta:
+                return
+            entry = self._stream_turn_context(kwargs)
+            if entry is None:
+                return
+            with self._thinking_lock:
+                entry["buffer"] += delta
+                buffer = entry["buffer"]
+                elapsed = time.monotonic() - entry["lastFlush"]
+            if (
+                len(buffer) >= STREAM_FLUSH_CHARS
+                or STREAM_PARAGRAPH_BREAK in buffer
+                or elapsed >= STREAM_FLUSH_INTERVAL_S
+            ):
+                self._flush_stream_buffer(entry)
+
+        def handle_stream_end(self, kwargs: Dict[str, Any]) -> None:
+            entry = self._stream_turn_context(kwargs)
+            if entry is None:
+                return
+            # The tail always flushes here — the hook worker has no timer, so
+            # without this the last chunk would wait for a delta that will
+            # never come.
+            self._flush_stream_buffer(entry)
+            self._forget_stream_context(entry)
+            # Nothing painted for this call means no pane to close, and a
+            # finalize with nothing open would only fence out later updates.
+            self._finalize_thinking_pane(entry["runId"], entry["sessionKey"])
+
+        def handle_interim_message(self, kwargs: Dict[str, Any]) -> None:
+            """`on_interim_message`: the agent's own mid-turn narration."""
+            # Stream hooks spell the platform `surface`, NOT `platform`, so
+            # _turn_activity_context's own filter is vacuous here — an
+            # unfiltered pass would route another surface's narration onto the
+            # glasses.
+            if str(kwargs.get("surface") or "").strip() != PLATFORM_NAME:
+                return
+            text = str(kwargs.get("text") or "").strip()
+            if not text:
+                return
+            context = self._turn_activity_context(kwargs, "on_interim_message hook")
+            if context is None:
+                return
+            _, record = context
+            self._note_narration_text(record.run_id, text)
+            if self._text_was_committed(
+                record.run_id, text
+            ) or self._committed_prefix_of(record.run_id, text):
+                # The commit beat the hook: the page already went downstream
+                # untagged. The retag names that commit by its message id
+                # (#1691) and carries the text as the fallback match — the
+                # mid-reveal prefix upgrade is a text operation either way.
+                # It rides the EXISTING `message` event with `retag:true`
+                # rather than a new event name: the child's BRIDGE_EVENTS list
+                # is frozen, and a retag is a correction to a message, not a
+                # new lane.
+                self._emit_event(
+                    "message",
+                    message_retag_event(
+                        record,
+                        text,
+                        origin_at_ms=self._narration_origin_ms(record.run_id, text),
+                        message_id=self._committed_message_id(record.run_id, text),
+                    ),
+                )
+            # NO status-bar rung. #1619 retired `agentProgressNotes: status`:
+            # with a real model the interim is committed AFTER the tool
+            # activity frame, so the narration rung lost arbitration every
+            # time and `status` was indistinguishable from `off` (zero
+            # `origin:"narration"` frames across 12 real-model dumps). A note
+            # now goes to the conversation — at its ORIGIN position — or
+            # nowhere at all, so this hook's only remaining jobs are tagging
+            # the sentence and correcting a commit that beat it.
 
         @staticmethod
         def _api_request_status_code(kwargs: Dict[str, Any]) -> Optional[int]:
@@ -2667,43 +6057,82 @@ def _build_adapter(config: Any):
                 )
                 if marked is not None:
                     self._schedule_error_terminal_sweep(ERROR_TERMINAL_STALE_TURN_SECONDS)
-            reasoning = self._extract_assistant_reasoning(kwargs.get("assistant_message"))
+            assistant_message = kwargs.get("assistant_message")
+            reasoning = self._extract_assistant_reasoning(assistant_message)
             if not reasoning:
                 return
-            text = self._cumulative_thinking_text(record.run_id, reasoning)
+            headline, source = self._derive_thinking_headline(
+                assistant_message,
+                reasoning,
+                kwargs.get("provider"),
+                kwargs.get("model"),
+            )
+            # RECONCILE. post_api_request is authoritative for this model
+            # call: it runs inline on the agent thread with the complete
+            # reasoning, while coalesced deltas may still be queued. Bumping
+            # the epoch fences those out, and a streamed run REPLACES its
+            # buffer instead of appending, so the run never double-emits the
+            # same reasoning once as deltas and again as a snapshot.
+            # A lost on_stream_end would otherwise strand the tail forever:
+            # the hook worker has no timer, so nothing else would ever flush
+            # it. Flush BEFORE bumping the epoch, or the flush fences itself.
+            self._flush_pending_streams_for_run(record.run_id)
+            self._bump_thinking_epoch(record.run_id)
+            text = self._reconcile_thinking_text(record.run_id, reasoning)
+            # FRAME SPLIT (plan D1). The status-bar frame carries a HEADLINE or
+            # nothing at all: when the source is `detail` it must carry neither
+            # `summary` nor any THINKING_DETAIL_KEYS member, because the Node
+            # resolver honours an explicit source and would otherwise select
+            # the whole reasoning blob verbatim and paint a 120-char prose slab
+            # at summary rank. With no key at all the resolver falls through to
+            # the generic "Thinking..." label. The BODY rides the thinking
+            # frame exclusively.
             activity = {
                 "state": "thinking",
                 "origin": "thinking",
+                "category": "thinking",
                 "phase": "update",
                 "runId": record.run_id,
                 "sessionKey": record.public_key,
-                "summary": reasoning,
-                "thinking": reasoning,
-                "thinkingSummarySource": "detail",
+                "thinkingSummarySource": source,
             }
+            if headline:
+                activity["summary"] = headline
             thinking = {
                 "phase": "update",
                 "runId": record.run_id,
                 "sessionKey": record.public_key,
                 "text": text,
                 "delta": reasoning,
-                "summary": reasoning,
-                "thinkingSummarySource": "detail",
-                "source": "hermes.post_api_request",
+                "seq": self._next_thinking_seq(record.run_id),
+                "thinkingSummarySource": source,
+                "source": THINKING_SOURCE_POST_API_REQUEST,
             }
             self._emit_event("activity", activity)
             self._emit_event("thinking", thinking)
+            # If the pane was live for this call, close it: what comes next
+            # is the answer, not more reasoning. No-op when on_stream_end
+            # already closed it, and when nothing streamed at all.
+            self._finalize_thinking_pane(record.run_id, record.public_key)
 
         def _tool_activity_common(
             self,
             kwargs: Dict[str, Any],
             tool_name: str,
             record: Any,
+            *,
+            tool_phase: str,
         ) -> Dict[str, Any]:
+            # `toolPhase` is the LIVENESS edge and is deliberately separate
+            # from `phase`: the client's between-tools gate needs to know that
+            # a running tool finished, while `phase` keeps its existing
+            # start/update/error meaning (flipping it to "end" would move
+            # terminal-activity-boundary semantics in the Node runtime).
             payload: Dict[str, Any] = {
                 "state": "thinking",
                 "origin": "tool",
                 "phase": "start",
+                "toolPhase": tool_phase,
                 "tool": tool_name,
                 "runId": record.run_id,
                 "sessionKey": record.public_key,
@@ -2778,93 +6207,10 @@ def _build_adapter(config: Any):
 
         def _sanitize_tool_activity_text(self, value: str) -> str:
             redacted = self._redact_native_approval_command(value)
-            redacted = self._redact_tool_activity_urls(redacted)
+            redacted = redact_urls_in_text(redacted)
             if len(redacted) > TOOL_ACTIVITY_MAX_ARG_STRING:
                 return redacted[:TOOL_ACTIVITY_MAX_ARG_STRING] + "...[truncated]"
             return redacted
-
-        @classmethod
-        def _redact_tool_activity_urls(cls, value: str) -> str:
-            def replace(match: Any) -> str:
-                raw = str(match.group(0) or "")
-                trailing = ""
-                while raw and raw[-1] in ".,);":
-                    trailing = raw[-1] + trailing
-                    raw = raw[:-1]
-                try:
-                    parts = urlsplit(raw)
-                except Exception:  # noqa: BLE001
-                    return raw + trailing
-                netloc = parts.netloc
-                if "@" in netloc:
-                    netloc = "[redacted]@" + netloc.rsplit("@", 1)[1]
-                path = cls._redact_tool_activity_url_path(parts.path)
-                query = cls._redact_tool_activity_url_query(parts.query)
-                fragment = parts.fragment
-                if fragment:
-                    if "=" in fragment or "&" in fragment:
-                        fragment = cls._redact_tool_activity_url_query(fragment)
-                    elif cls._tool_activity_url_key_is_secret(fragment):
-                        fragment = "[redacted]"
-                return urlunsplit(
-                    (parts.scheme, netloc, path, query, fragment)
-                ) + trailing
-
-            return TOOL_ACTIVITY_URL_RE.sub(replace, value)
-
-        @classmethod
-        def _redact_tool_activity_url_query(cls, query: str) -> str:
-            if not query:
-                return ""
-            redacted = []
-            for part in query.split("&"):
-                if not part:
-                    redacted.append(part)
-                    continue
-                key, separator, value = part.partition("=")
-                if cls._tool_activity_url_key_is_secret(key):
-                    redacted.append(f"{key}{separator}[redacted]")
-                else:
-                    redacted.append(part)
-            return "&".join(redacted)
-
-        @classmethod
-        def _redact_tool_activity_url_path(cls, path: str) -> str:
-            if not path:
-                return ""
-            parts = []
-            for segment in path.split("/"):
-                if cls._tool_activity_url_path_segment_is_secret(segment):
-                    parts.append("[redacted]")
-                else:
-                    parts.append(segment)
-            return "/".join(parts)
-
-        @classmethod
-        def _tool_activity_url_path_segment_is_secret(cls, segment: str) -> bool:
-            marker_key = "".join(
-                ch for ch in str(segment or "").lower() if ch.isalnum()
-            )
-            if not marker_key:
-                return False
-            if cls._tool_activity_url_key_is_secret(marker_key):
-                return True
-            has_alpha = any(ch.isalpha() for ch in marker_key)
-            has_digit = any(ch.isdigit() for ch in marker_key)
-            if len(marker_key) >= 9 and segment[:1].isalpha() and has_digit:
-                return True
-            return len(marker_key) >= 16 and has_alpha and has_digit
-
-        @staticmethod
-        def _tool_activity_url_key_is_secret(key: str) -> bool:
-            marker_key = "".join(ch for ch in str(key or "").lower() if ch.isalnum())
-            return (
-                marker_key in TOOL_ACTIVITY_URL_SECRET_KEY_EXACT
-                or any(
-                    marker in marker_key
-                    for marker in TOOL_ACTIVITY_URL_SECRET_KEY_MARKERS
-                )
-            )
 
         def _sanitize_tool_activity_arg_value(
             self,
@@ -2920,7 +6266,14 @@ def _build_adapter(config: Any):
             if context is None:
                 return
             _, tool_name, record = context
-            payload = self._tool_activity_common(kwargs, tool_name, record)
+            if (
+                tool_name != "clarify"
+                and self._tool_progress_enabled_for_record(record)
+            ):
+                self._expect_tool_progress_send(record, kwargs.get("tool_call_id"))
+            payload = self._tool_activity_common(
+                kwargs, tool_name, record, tool_phase="start"
+            )
             args = kwargs.get("args")
             if isinstance(args, dict):
                 payload["args"] = self._sanitize_tool_activity_args(args)
@@ -2931,7 +6284,9 @@ def _build_adapter(config: Any):
             if context is None:
                 return
             _, tool_name, record = context
-            payload = self._tool_activity_common(kwargs, tool_name, record)
+            payload = self._tool_activity_common(
+                kwargs, tool_name, record, tool_phase="end"
+            )
             payload["phase"] = "update"
 
             status = str(kwargs.get("status") or "").strip().lower()
@@ -3049,6 +6404,32 @@ def _build_adapter(config: Any):
                 result["warning"] = "allow-always is phone-only"
             return result
 
+        async def handle_clarify_resolve(self, params: Any) -> Dict[str, Any]:
+            p = params if isinstance(params, dict) else {}
+            clarify_id = str(p.get("id") or "").strip()
+            response = str(p.get("response") or "").strip()
+            if not clarify_id:
+                raise ValueError("clarify.resolve requires id")
+            if not response:
+                raise ValueError("clarify.resolve requires response")
+            from tools.clarify_gateway import resolve_gateway_clarify
+
+            resolved = bool(resolve_gateway_clarify(clarify_id, response))
+            if not resolved:
+                return {"status": "ignored", "reason": "clarify not pending"}
+            return {"status": "accepted"}
+
+        async def handle_clarify_await_text(self, params: Any) -> Dict[str, Any]:
+            p = params if isinstance(params, dict) else {}
+            clarify_id = str(p.get("id") or "").strip()
+            if not clarify_id:
+                raise ValueError("clarify.await_text requires id")
+            from tools.clarify_gateway import mark_awaiting_text
+
+            if not mark_awaiting_text(clarify_id):
+                return {"status": "ignored", "reason": "clarify not pending"}
+            return {"status": "accepted"}
+
         async def handle_sessions_abort(self, params: Any) -> Dict[str, Any]:
             p = params if isinstance(params, dict) else {}
             ns, chat_id, error = self._target_chat(p)
@@ -3062,6 +6443,318 @@ def _build_adapter(config: Any):
 
         async def handle_sessions_steer(self, params: Any) -> Dict[str, Any]:
             return await self.handle_dispatch(params)
+
+        async def handle_sessions_options_apply(self, params: Any) -> Dict[str, Any]:
+            """Apply silent host-selected options to this adapter's session."""
+            p = params if isinstance(params, dict) else {}
+            ns, chat_id, error = self._target_chat(p)
+            if error:
+                return {"status": "rejected", "error": error}
+            options = p.get("options")
+            if not isinstance(options, dict):
+                return {
+                    "status": "rejected",
+                    "error": "options must be an object",
+                }
+            runner = getattr(self, "gateway_runner", None)
+            apply_options = getattr(runner, "apply_session_options", None)
+            if not callable(apply_options):
+                return {
+                    "status": "unsupported",
+                    "error": (
+                        "Hermes runtime does not expose structured session options"
+                    ),
+                }
+            event = self._build_message_event(
+                chat_id,
+                "",
+                profile=profile_for_namespace(ns),
+            )
+            try:
+                result = await apply_options(event.source, dict(options))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[ocuclaw] structured session options failed: %s", exc
+                )
+                return {"status": "rejected", "error": str(exc)}
+            return result if isinstance(result, dict) else {
+                "status": "rejected",
+                "error": "Hermes returned an invalid session-options result",
+            }
+
+        def _profile_home_for_options(self, ns: str) -> Optional[Path]:
+            if self._multiplex_enabled:
+                routed = self._served_profile_homes.get(ns)
+                if routed is not None:
+                    return Path(routed)
+            return _hermes_home()
+
+        def _read_profile_options_sync(self, home: Path) -> Dict[str, Any]:
+            from gateway.run import _load_gateway_config, _profile_runtime_scope
+
+            with _profile_runtime_scope(home):
+                cfg = _load_gateway_config(config_path=home / "config.yaml")
+            model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+            if isinstance(model_cfg, str):
+                model = model_cfg.strip()
+                provider = ""
+            elif isinstance(model_cfg, dict):
+                model = str(
+                    model_cfg.get("default") or model_cfg.get("model") or ""
+                ).strip()
+                provider = str(model_cfg.get("provider") or "").strip()
+            else:
+                model = ""
+                provider = ""
+            agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+            agent_cfg = agent_cfg if isinstance(agent_cfg, dict) else {}
+            reasoning = agent_cfg.get("reasoning_effort")
+            if reasoning is False or str(reasoning or "").strip().lower() in {
+                "none",
+                "false",
+                "disabled",
+            }:
+                thinking = "off"
+            else:
+                thinking = str(reasoning or "").strip().lower()
+            service_tier = str(agent_cfg.get("service_tier") or "").strip().lower()
+            # Hermes resolves the tool-progress level per turn off an
+            # mtime-keyed config cache (gateway/run.py `_load_gateway_config` +
+            # `resolve_display_setting`), so echo the RESOLVED level rather
+            # than the raw key — defaults and legacy overrides both feed it.
+            try:
+                from gateway.display_config import resolve_display_setting
+
+                tool_progress = str(
+                    resolve_display_setting(cfg, PLATFORM_NAME, "tool_progress")
+                    or "all"
+                ).strip().lower()
+            except Exception:
+                tool_progress = "all"
+            return {
+                "defaultModel": f"{provider}/{model}" if provider and model else model,
+                "defaultThinking": thinking,
+                "defaultFastMode": service_tier in {"fast", "priority"},
+                "conversationToolProgress": tool_progress != "off",
+            }
+
+        def _apply_profile_options_sync(
+            self,
+            home: Path,
+            options: Dict[str, Any],
+        ) -> Dict[str, Any]:
+            from gateway.run import _load_gateway_config, _profile_runtime_scope
+            from hermes_cli.config import (
+                atomic_config_write,
+                get_compatible_custom_providers,
+                read_user_config_raw,
+            )
+            from hermes_cli.model_selection_guards import combined_selection_warning
+            from hermes_cli.model_switch import switch_model
+            from hermes_cli.models import resolve_fast_mode_overrides
+            from hermes_constants import parse_reasoning_effort
+
+            allowed = {
+                "model",
+                "provider",
+                "reasoning_effort",
+                "fast",
+                "confirm_model_selection",
+                "tool_progress",
+            }
+            unknown = sorted(set(options) - allowed)
+            if unknown:
+                return {
+                    "status": "rejected",
+                    "error": f"unknown profile option(s): {', '.join(unknown)}",
+                }
+
+            config_path = home / "config.yaml"
+            with _profile_runtime_scope(home):
+                cfg = _load_gateway_config(config_path=config_path)
+                model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+                if isinstance(model_cfg, str):
+                    current_model = model_cfg.strip()
+                    current_provider = "openrouter"
+                    current_base_url = ""
+                elif isinstance(model_cfg, dict):
+                    current_model = str(
+                        model_cfg.get("default") or model_cfg.get("model") or ""
+                    ).strip()
+                    current_provider = str(
+                        model_cfg.get("provider") or "openrouter"
+                    ).strip()
+                    current_base_url = str(model_cfg.get("base_url") or "").strip()
+                else:
+                    current_model = ""
+                    current_provider = "openrouter"
+                    current_base_url = ""
+
+                switched = None
+                if "model" in options or "provider" in options:
+                    requested_model = str(options.get("model") or "").strip()
+                    requested_provider = str(options.get("provider") or "").strip()
+                    if not requested_model:
+                        return {
+                            "status": "rejected",
+                            "error": "model is required for a Hermes profile default",
+                        }
+                    switched = switch_model(
+                        raw_input=requested_model,
+                        current_provider=current_provider,
+                        current_model=current_model,
+                        current_base_url=current_base_url,
+                        is_global=True,
+                        explicit_provider=requested_provider,
+                        user_providers=cfg.get("providers") if isinstance(cfg, dict) else None,
+                        custom_providers=get_compatible_custom_providers(cfg),
+                    )
+                    if not switched.success:
+                        return {
+                            "status": "rejected",
+                            "error": switched.error_message or "model selection failed",
+                        }
+                    warning = combined_selection_warning(
+                        switched.new_model,
+                        provider=switched.target_provider,
+                        base_url=switched.base_url,
+                        api_key=switched.api_key,
+                        model_info=switched.model_info,
+                    )
+                    if warning is not None and not bool(
+                        options.get("confirm_model_selection")
+                    ):
+                        return {
+                            "status": "confirmation_required",
+                            "confirmationTitle": warning.title,
+                            "confirmationMessage": warning.message,
+                        }
+
+                if "reasoning_effort" in options:
+                    raw_reasoning = str(options.get("reasoning_effort") or "").strip().lower()
+                    if raw_reasoning and parse_reasoning_effort(raw_reasoning) is None:
+                        return {
+                            "status": "rejected",
+                            "error": f"unsupported reasoning effort: {raw_reasoning}",
+                        }
+
+                if "tool_progress" in options:
+                    raw_tool_progress = str(options.get("tool_progress") or "").strip().lower()
+                    if raw_tool_progress not in TOOL_PROGRESS_LEVELS:
+                        return {
+                            "status": "rejected",
+                            "error": f"unsupported tool progress level: {raw_tool_progress}",
+                        }
+
+                effective_model = switched.new_model if switched is not None else current_model
+                if options.get("fast") is True:
+                    if not effective_model or resolve_fast_mode_overrides(effective_model) is None:
+                        return {
+                            "status": "rejected",
+                            "error": "fast mode is not available for this model",
+                        }
+
+                raw_cfg = read_user_config_raw(config_path)
+                if switched is not None:
+                    raw_model_cfg = raw_cfg.get("model")
+                    if isinstance(raw_model_cfg, str) and raw_model_cfg.strip():
+                        raw_model_cfg = {"default": raw_model_cfg.strip()}
+                    elif not isinstance(raw_model_cfg, dict):
+                        raw_model_cfg = {}
+                    raw_model_cfg["default"] = switched.new_model
+                    raw_model_cfg["provider"] = switched.target_provider
+                    raw_model_cfg.pop("context_length", None)
+                    if switched.base_url:
+                        raw_model_cfg["base_url"] = switched.base_url
+                    elif switched.target_provider != "custom":
+                        raw_model_cfg.pop("base_url", None)
+                    if switched.target_provider == "custom" and switched.api_mode:
+                        raw_model_cfg["api_mode"] = switched.api_mode
+                    elif switched.target_provider != "custom":
+                        raw_model_cfg.pop("api_mode", None)
+                    raw_cfg["model"] = raw_model_cfg
+
+                if "reasoning_effort" in options:
+                    agent_cfg = raw_cfg.setdefault("agent", {})
+                    if not isinstance(agent_cfg, dict):
+                        agent_cfg = {}
+                        raw_cfg["agent"] = agent_cfg
+                    raw_reasoning = str(options.get("reasoning_effort") or "").strip().lower()
+                    if raw_reasoning:
+                        agent_cfg["reasoning_effort"] = raw_reasoning
+                    else:
+                        agent_cfg.pop("reasoning_effort", None)
+
+                if "fast" in options:
+                    agent_cfg = raw_cfg.setdefault("agent", {})
+                    if not isinstance(agent_cfg, dict):
+                        agent_cfg = {}
+                        raw_cfg["agent"] = agent_cfg
+                    agent_cfg["service_tier"] = (
+                        "fast" if options.get("fast") is True else "normal"
+                    )
+
+                if "tool_progress" in options:
+                    # Same shape hermes' own `/verbose` writes and
+                    # `hermes config get display.platforms.ocuclaw.tool_progress`
+                    # reads back. Hermes re-resolves this per turn off an
+                    # mtime-keyed config cache (gateway/run.py
+                    # `_load_gateway_config` + `resolve_display_setting`), so the
+                    # change lands on the NEXT turn with no gateway restart, and
+                    # never disturbs a turn already in flight.
+                    display = raw_cfg.setdefault("display", {})
+                    if not isinstance(display, dict):
+                        display = {}
+                        raw_cfg["display"] = display
+                    platforms = display.setdefault("platforms", {})
+                    if not isinstance(platforms, dict):
+                        platforms = {}
+                        display["platforms"] = platforms
+                    platform_cfg = platforms.setdefault(PLATFORM_NAME, {})
+                    if not isinstance(platform_cfg, dict):
+                        platform_cfg = {}
+                        platforms[PLATFORM_NAME] = platform_cfg
+                    platform_cfg["tool_progress"] = (
+                        str(options.get("tool_progress") or "").strip().lower()
+                    )
+
+                atomic_config_write(config_path, raw_cfg)
+
+            return {
+                "status": "accepted",
+                **self._read_profile_options_sync(home),
+            }
+
+        async def handle_profile_options_get(self, params: Any) -> Dict[str, Any]:
+            p = params if isinstance(params, dict) else {}
+            ns = str(p.get("ns") or self._namespace)
+            route_error = self._namespace_route_error(ns)
+            if route_error is not None:
+                return {"status": "rejected", "error": route_error}
+            home = self._profile_home_for_options(ns)
+            if home is None:
+                return {"status": "rejected", "error": "Hermes profile home is unavailable"}
+            return await asyncio.to_thread(self._read_profile_options_sync, home)
+
+        async def handle_profile_options_apply(self, params: Any) -> Dict[str, Any]:
+            p = params if isinstance(params, dict) else {}
+            ns = str(p.get("ns") or self._namespace)
+            route_error = self._namespace_route_error(ns)
+            if route_error is not None:
+                return {"status": "rejected", "error": route_error}
+            options = p.get("options")
+            if not isinstance(options, dict):
+                return {"status": "rejected", "error": "options must be an object"}
+            home = self._profile_home_for_options(ns)
+            if home is None:
+                return {"status": "rejected", "error": "Hermes profile home is unavailable"}
+            lock = self._profile_options_locks.setdefault(ns, asyncio.Lock())
+            async with lock:
+                return await asyncio.to_thread(
+                    self._apply_profile_options_sync,
+                    home,
+                    dict(options),
+                )
 
         # -- W12 liveui tool/prompt glue --------------------------------------
 
@@ -3119,49 +6812,145 @@ def _build_adapter(config: Any):
                     _send_abort()
                     raise InterruptedError("liveui tool interrupted") from None
 
-        def handle_liveui_tool_call(self, args: Dict[str, Any]) -> str:
-            try:
-                from gateway.session_context import get_session_env
-            except Exception:  # noqa: BLE001
-                get_session_env = lambda _name, default="": default
-            session_key = str(get_session_env("HERMES_SESSION_KEY", "") or "").strip()
+        def _handle_liveui_link_tool_call(
+            self,
+            args: Dict[str, Any],
+            *,
+            tool_name: str,
+            method: str,
+            call_id_prefix: str,
+            render_request: Any,
+        ) -> str:
+            payload = args if isinstance(args, dict) else {}
+            session_key = _current_hermes_session_key()
+            welcome_call = tool_name == LIVEUI_TOOL_NAME and is_welcome_surface(payload)
             if not session_key:
                 return json.dumps(
-                    {"error": "render_glasses_ui requires HERMES_SESSION_KEY"},
+                    {"error": f"{tool_name} requires HERMES_SESSION_KEY"},
                     ensure_ascii=False,
                 )
             identity = parse_ocuclaw_session_key(session_key)
+            if identity is None and welcome_call:
+                resumed_session_key = self._resolve_armed_first_run_session()
+                if resumed_session_key:
+                    session_key = resumed_session_key
+                    identity = parse_ocuclaw_session_key(session_key)
             if identity is None:
                 return json.dumps(
-                    {"error": "render_glasses_ui requires an OcuClaw session"},
+                    {
+                        "error": (
+                            f"{tool_name} requires an OcuClaw session"
+                            if not welcome_call
+                            else "Hermes welcome requires an armed phone-origin turn"
+                        )
+                    },
                     ensure_ascii=False,
                 )
-            call_id = f"liveui-{uuid.uuid4().hex}"
+
+            def _proof_outcome(outcome: Any) -> Dict[str, Any]:
+                return record_welcome_outcome(
+                    outcome,
+                    hermes_release=CERTIFIED_HERMES_TAG,
+                    hermes_package_version=_hermes_version() or None,
+                    ocuclaw_version=_ocuclaw_version(),
+                    session_key=session_key,
+                )
+            call_id = f"{call_id_prefix}{uuid.uuid4().hex}"
+            is_render = bool(render_request(payload))
+            timeout_s = (
+                _liveui_render_link_timeout_s(self._settings) if is_render else 10.0
+            )
+            abort_on_interrupt = None
+            if is_render:
+                abort_on_interrupt = {
+                    "method": LIVEUI_ABORT_METHOD,
+                    "params": {
+                        "callId": call_id,
+                        "sessionKey": session_key,
+                        "reason": "interrupted",
+                    },
+                }
             try:
                 result = self._request_link_threadsafe(
-                    LIVEUI_RENDER_METHOD,
+                    method,
                     {
                         "callId": call_id,
                         "sessionKey": session_key,
-                        "args": args if isinstance(args, dict) else {},
+                        "args": payload,
                     },
-                    timeout_s=_liveui_render_link_timeout_s(self._settings),
-                    abort_on_interrupt={
-                        "method": LIVEUI_ABORT_METHOD,
-                        "params": {
-                            "callId": call_id,
-                            "sessionKey": session_key,
-                            "reason": "interrupted",
-                        },
-                    },
+                    timeout_s=timeout_s,
+                    abort_on_interrupt=abort_on_interrupt,
                 )
             except InterruptedError:
-                return json.dumps({"error": "render_glasses_ui interrupted"})
+                failure = {"error": f"{tool_name} interrupted"}
+                if welcome_call:
+                    failure["firstRunProof"] = _proof_outcome("error")
+                return json.dumps(failure)
             except Exception as exc:  # noqa: BLE001
-                return json.dumps({"error": str(exc)}, ensure_ascii=False)
+                failure = {"error": str(exc)}
+                if welcome_call:
+                    failure["firstRunProof"] = _proof_outcome("error")
+                return json.dumps(failure, ensure_ascii=False)
+            if welcome_call:
+                if isinstance(result, dict) and "result" in result:
+                    outcome = result["result"]
+                    rendered = (
+                        dict(outcome)
+                        if isinstance(outcome, dict)
+                        else {"result": outcome}
+                    )
+                    outcome_name = rendered.get("result")
+                elif isinstance(result, dict):
+                    rendered = dict(result)
+                    outcome_name = None
+                else:
+                    rendered = {"result": result}
+                    outcome_name = result
+                rendered["firstRunProof"] = _proof_outcome(outcome_name)
+                return json.dumps(rendered, ensure_ascii=False)
             if isinstance(result, dict) and "result" in result:
                 return json.dumps(result["result"], ensure_ascii=False)
-            return json.dumps(result if isinstance(result, dict) else {"result": result}, ensure_ascii=False)
+            return json.dumps(
+                result if isinstance(result, dict) else {"result": result},
+                ensure_ascii=False,
+            )
+
+        def handle_liveui_tool_call(self, args: Dict[str, Any]) -> str:
+            return self._handle_liveui_link_tool_call(
+                args,
+                tool_name=LIVEUI_TOOL_NAME,
+                method=LIVEUI_RENDER_METHOD,
+                call_id_prefix="liveui-",
+                render_request=lambda _payload: True,
+            )
+
+        def handle_liveui_state_tool_call(self, args: Dict[str, Any]) -> str:
+            return self._handle_liveui_link_tool_call(
+                args,
+                tool_name=LIVEUI_STATE_TOOL_NAME,
+                method=LIVEUI_STATE_METHOD,
+                call_id_prefix="liveui-state-",
+                render_request=lambda _payload: False,
+            )
+
+        def handle_liveui_template_tool_call(self, args: Dict[str, Any]) -> str:
+            return self._handle_liveui_link_tool_call(
+                args,
+                tool_name=LIVEUI_TEMPLATE_TOOL_NAME,
+                method=LIVEUI_TEMPLATE_METHOD,
+                call_id_prefix="liveui-template-",
+                render_request=lambda payload: str(payload.get("operation") or "")
+                == "render",
+            )
+
+        def handle_liveui_task_tool_call(self, args: Dict[str, Any]) -> str:
+            return self._handle_liveui_link_tool_call(
+                args,
+                tool_name=LIVEUI_TASK_TOOL_NAME,
+                method=LIVEUI_TASK_METHOD,
+                call_id_prefix="liveui-task-",
+                render_request=lambda _payload: False,
+            )
 
         def handle_pre_llm_call(self, _kwargs: Dict[str, Any]) -> Optional[str]:
             try:
@@ -3442,9 +7231,8 @@ def _build_adapter(config: Any):
             ):
                 # Non-finalized tail (streaming off, fresh-final fallback):
                 # commit the last-seen text as the assistant message.
-                self._emit_event(
-                    "message", message_commit_event(head, head.current_text)
-                )
+                self._emit_message_commit(head, head.current_text)
+                self._note_phone_turn_message_commit(head)
             if head is not None:
                 self._emit_event(
                     "activity",
@@ -3478,6 +7266,7 @@ def _build_adapter(config: Any):
                     messages,
                     public_key=public_key,
                     agent_id=identity["ns"],
+                    run_id=head.run_id if head is not None else None,
                 )
             )
             if promoted is not None:
@@ -3596,8 +7385,25 @@ def _build_adapter(config: Any):
             )
 
         def _next_message_id(self) -> str:
+            """Mint the platform message id for one outbound message.
+
+            Two jobs on one token. Hermes uses it to correlate edits back to
+            the send that opened them (``DispatchLedger.note_edit`` binds on
+            strict equality), and since #1691 it is also the LEDGER identity
+            the commit carries downstream, where it becomes the display
+            entry's ``srv:<id>``.
+
+            The second job is why the process nonce is here. A bare
+            ``ocuclaw-<n>`` counter restarts at 1 with the adapter, so after a
+            gateway restart the ids of a still-open session's new messages
+            would collide with the ids its earlier messages already claimed in
+            the consumer's ``seqByAlias`` map — two different messages
+            answering to one sequence number. The nonce makes every id unique
+            for all time at the cost of eight characters, and nothing anywhere
+            parses the shape.
+            """
             self._message_seq += 1
-            return f"ocuclaw-{self._message_seq}"
+            return f"ocuclaw-{self._message_id_nonce}-{self._message_seq}"
 
         def _schedule_stream_tail_fallback(
             self, closure_key: Tuple[str, str]
@@ -3656,9 +7462,8 @@ def _build_adapter(config: Any):
             ):
                 # Provider abort/no trailing finalize: close the last-seen
                 # cumulative text once after the bounded grace period.
-                self._emit_event(
-                    "message", message_commit_event(head, head.current_text)
-                )
+                self._emit_message_commit(head, head.current_text)
+                self._note_phone_turn_message_commit(head)
             self._emit_event(
                 "activity",
                 lifecycle_terminal_activity(
@@ -3684,9 +7489,27 @@ def _build_adapter(config: Any):
                     closure["messages"],
                     public_key=head.public_key,
                     agent_id=closure["identity"]["ns"],
+                    run_id=head.run_id,
                 )
             )
             return True
+
+        def _note_phone_turn_message_commit(self, record: Any) -> None:
+            """Publish a candidate when this commit completes the two-signal gate."""
+
+            if (
+                record is None
+                or record.kind != KIND_TURN
+                or parse_ocuclaw_session_key(record.session_key) is None
+            ):
+                return
+            if self._phone_turn_candidate_gate.note_committed(
+                record.session_key, record.run_id
+            ):
+                record_phone_turn_candidate(
+                    session_key=record.session_key,
+                    turn_id=record.run_id,
+                )
 
         async def _close_session_records(self, session_key: str, *, code: str) -> None:
             await self._drain_session_approvals(session_key)
@@ -3805,17 +7628,23 @@ def _build_adapter(config: Any):
             media_types: Optional[List[str]] = None,
         ):
             from gateway.platforms.base import MessageEvent, MessageType
-            from gateway.session import SessionSource
 
-            source = SessionSource(
-                platform=self.platform,
+            # Use Hermes' source builder rather than constructing SessionSource
+            # directly. Since v0.20.6 the builder retains the live transport
+            # adapter as non-serialized provenance. The gateway uses that
+            # provenance to honor this shared adapter's upstream relay-token
+            # authorization even when a multiplexed turn targets a secondary
+            # profile that has no separate OcuClaw adapter instance.
+            source = self.build_source(
                 chat_id=str(chat_id),
                 chat_name="OcuClaw Glasses",
                 chat_type=OCUCLAW_CHAT_TYPE_SEGMENT,
                 user_id="ocuclaw-wearer",
                 user_name="OcuClaw",
-                profile=profile,
             )
+            # The profile was selected by the authenticated OcuClaw session,
+            # not Hermes' optional chat-route table.
+            source.profile = profile
             media = list(media_urls or [])
             event = MessageEvent(
                 text=text,

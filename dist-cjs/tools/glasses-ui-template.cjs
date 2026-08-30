@@ -120,25 +120,36 @@ function applyFilter(value, filter, data, previous) {
   }
 }
 
-function stringify(value) {
+function stringify(value, opts) {
   if (value === undefined || value === null) return "";
   if (typeof value === "string") return value;
+  if (Array.isArray(value) && opts && typeof opts.arraySeparator === "string") {
+    return value.map((entry) => stringify(entry, opts)).join(opts.arraySeparator);
+  }
   return String(value);
+}
+
+function evaluateExpression(exprSrc, data, previous) {
+  const parts = exprSrc.split("|").map((s) => s.trim());
+  const path = parts[0];
+  let value = resolvePath(path, data, previous);
+  for (let i = 1; i < parts.length; i += 1) {
+    const f = parseFilter(parts[i]);
+    if (!f.ok) return value;
+    value = applyFilter(value, f, data, previous);
+  }
+  return value;
 }
 
 function substituteTemplate(template, data, opts) {
   if (typeof template !== "string") return "";
   const previous = opts && opts.previous ? opts.previous : null;
+  const whole = template.match(/^\{\{([^}]+)\}\}$/);
+  if (whole && opts && opts.preserveWholeValue === true) {
+    return evaluateExpression(whole[1], data, previous);
+  }
   return template.replace(/\{\{([^}]+)\}\}/g, (match, exprSrc) => {
-    const parts = exprSrc.split("|").map((s) => s.trim());
-    const path = parts[0];
-    let value = resolvePath(path, data, previous);
-    for (let i = 1; i < parts.length; i += 1) {
-      const f = parseFilter(parts[i]);
-      if (!f.ok) return stringify(value);
-      value = applyFilter(value, f, data, previous);
-    }
-    return stringify(value);
+    return stringify(evaluateExpression(exprSrc, data, previous), opts);
   });
 }
 

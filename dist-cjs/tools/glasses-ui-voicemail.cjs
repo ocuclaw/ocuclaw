@@ -11,6 +11,8 @@ const RESULT_ENUM = new Set(["selected", "back"]);
 
 const REAP_REASON_ENUM = new Set(["drain_session", "drain_all", "exit", "pop_back"]);
 
+const EVICTION_REASON_ENUM = new Set(["event_log_cap"]);
+
 function coerceInt(value) {
   return Number.isFinite(value) ? Math.floor(value) : null;
 }
@@ -120,8 +122,13 @@ function createGlassesVoicemail(deps = {}) {
 
   function fromDeadLetter(sessionKey, record) {
     const surfaceUuid = sanitizeWakeToken(record && record.surfaceUuid);
-    const reason =
-      record && REAP_REASON_ENUM.has(record.reason) ? `reaped:${record.reason}` : "reaped";
+    const rawReason = record && record.reason;
+    const evicted = EVICTION_REASON_ENUM.has(rawReason);
+    const reason = evicted
+      ? `evicted:${rawReason}`
+      : REAP_REASON_ENUM.has(rawReason)
+        ? `reaped:${rawReason}`
+        : "reaped";
     const staleAfterMs = record && Number.isFinite(record.staleAfterMs) ? record.staleAfterMs : null;
     const events = record && Array.isArray(record.events) ? record.events : [];
     return events.map((ev) => {
@@ -137,7 +144,9 @@ function createGlassesVoicemail(deps = {}) {
         idempotencyKey: `glasses-voicemail:${surfaceUuid}:${eventId === null ? 0 : eventId}`,
         via: reason,
         staleAfterMs,
+
         surfaceLive: false,
+        evicted,
       };
     });
   }
@@ -157,11 +166,20 @@ function createGlassesVoicemail(deps = {}) {
       `idempotencyKey=${entry.idempotencyKey}`,
     ];
     if (stale) parts.push("stale=true");
-    parts.push(
-      entry.surfaceLive
-        ? '(surface may still be live: re-render it with update:"patch" to collect)'
-        : "(surface no longer live: treat the refs as the wearer's parked answer to that surface; re-confirm before acting if stale)",
-    );
+    if (entry.evicted) {
+
+      parts.push(
+        "(surface may still be live, but these events were evicted from its event log by the per-surface cap: " +
+          "this voicemail is their only delivery, so treat the refs as the wearer's parked answer; " +
+          "re-confirm before acting if stale)",
+      );
+    } else {
+      parts.push(
+        entry.surfaceLive
+          ? '(surface may still be live: re-render it with update:"patch" to collect)'
+          : "(surface no longer live: treat the refs as the wearer's parked answer to that surface; re-confirm before acting if stale)",
+      );
+    }
     return parts.join(" ");
   }
 

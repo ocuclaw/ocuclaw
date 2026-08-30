@@ -44,22 +44,89 @@ function createAgentTurnTracker(deps = {}) {
     : DEFAULT_AGENT_TURN_BUSY_DECAY_MS;
   const lastSeenBySession = new Map();
 
+  const runBySession = new Map();
+  const runIdCap = Number.isFinite(deps.runIdCap) ? deps.runIdCap : 64;
+
   function normalizeKey(sessionKey) {
     return sessionKey.replace(/^agent:[^:]+:/, "");
   }
 
-  function markBusy(sessionKey) {
+  function noteRun(sessionKey, runId) {
     if (typeof sessionKey !== "string" || !sessionKey) return;
-    lastSeenBySession.set(normalizeKey(sessionKey), now());
+    if (typeof runId !== "string" || !runId.trim()) return;
+    const key = normalizeKey(sessionKey);
+    const next = runId.trim();
+    const prior = runBySession.get(key);
+    const live = prior ? prior.live : new Map();
+
+    live.set(next, now());
+
+    const overlapLatched = (prior && prior.overlapLatched === true) || live.size > 1;
+    runBySession.set(key, { runId: next, atMs: now(), live, overlapLatched });
+    while (runBySession.size > runIdCap) {
+      const oldest = runBySession.keys().next();
+      if (oldest.done) break;
+      runBySession.delete(oldest.value);
+    }
   }
 
-  function onActivity(sessionKey, phase) {
+  function runIdFor(sessionKey) {
+    if (typeof sessionKey !== "string" || !sessionKey) {
+      return { runId: null, active: false, atMs: null, ambiguous: false };
+    }
+    const entry = runBySession.get(normalizeKey(sessionKey));
+    if (!entry) return { runId: null, active: false, atMs: null, ambiguous: false };
+    return {
+      runId: entry.runId,
+      active: isBusy(sessionKey),
+      atMs: entry.atMs,
+
+      ambiguous: entry.overlapLatched === true || entry.live.size > 1,
+    };
+  }
+
+  function refreshBusy(sessionKey) {
+    const key = normalizeKey(sessionKey);
+    if (!isBusy(sessionKey)) {
+      const entry = runBySession.get(key);
+      if (entry) {
+
+        const at = now();
+        const liveEntries = Array.from(entry.live.entries());
+        for (const [id, lastSeen] of liveEntries) {
+          if (at - lastSeen >= busyDecayMs) entry.live.delete(id);
+        }
+
+        if (entry.live.size === 0) entry.overlapLatched = false;
+      }
+    }
+    lastSeenBySession.set(key, now());
+  }
+
+  function markBusy(sessionKey, runId = null) {
+    if (typeof sessionKey !== "string" || !sessionKey) return;
+    refreshBusy(sessionKey);
+    if (runId) noteRun(sessionKey, runId);
+  }
+
+  function onActivity(sessionKey, phase, runId = null) {
     if (typeof sessionKey !== "string" || !sessionKey) return;
     if (phase === "end") {
-      lastSeenBySession.delete(normalizeKey(sessionKey));
+
+      const key = normalizeKey(sessionKey);
+      lastSeenBySession.delete(key);
+      const entry = runBySession.get(key);
+      if (entry) {
+        const ending = typeof runId === "string" ? runId.trim() : "";
+
+        if (ending) entry.live.delete(ending);
+        else entry.live.clear();
+
+      }
       return;
     }
-    lastSeenBySession.set(normalizeKey(sessionKey), now());
+    refreshBusy(sessionKey);
+    if (runId) noteRun(sessionKey, runId);
   }
 
   function isBusy(sessionKey) {
@@ -74,7 +141,40 @@ function createAgentTurnTracker(deps = {}) {
     return true;
   }
 
-  return { markBusy, onActivity, isBusy };
+  return { markBusy, onActivity, isBusy, noteRun, runIdFor };
+}
+
+function pickHookRunId(source) {
+  if (!source || typeof source !== "object") return null;
+  const raw = source.runId;
+  return typeof raw === "string" && raw.trim() ? raw.trim() : null;
+}
+
+function readAgentRunId(relayLike, sessionKey, hookCtx, hookEvent) {
+  let tracked = null;
+  try {
+    if (relayLike && typeof relayLike.currentAgentRunId === "function") {
+      const snapshot = relayLike.currentAgentRunId(sessionKey);
+      if (snapshot && typeof snapshot === "object") tracked = snapshot;
+    }
+  } catch (_) {
+
+  }
+  const runIdActive = !!(tracked && tracked.active === true);
+  const exact = pickHookRunId(hookCtx) || pickHookRunId(hookEvent);
+
+  if (exact) return { runId: exact, runIdSource: "host_hook", runIdActive, runIdAmbiguous: false };
+  const trackedRunId =
+    tracked && typeof tracked.runId === "string" && tracked.runId ? tracked.runId : null;
+  if (trackedRunId) {
+    return {
+      runId: trackedRunId,
+      runIdSource: "relay_tracker",
+      runIdActive,
+      runIdAmbiguous: tracked.ambiguous === true,
+    };
+  }
+  return { runId: null, runIdSource: null, runIdActive: false, runIdAmbiguous: false };
 }
 
 function createGlassesWakeController(deps = {}) {
@@ -192,4 +292,4 @@ function createGlassesWakeController(deps = {}) {
   return { onParkedGesture, peekWakeOutbox, drainWakeOutbox };
 }
 
-module.exports = { createGlassesWakeController, createAgentTurnTracker, buildWakeMessage, sanitizeWakeToken, GLASSES_WAKE_ENABLED_ORIGINS };
+module.exports = { createGlassesWakeController, createAgentTurnTracker, readAgentRunId, buildWakeMessage, sanitizeWakeToken, GLASSES_WAKE_ENABLED_ORIGINS };

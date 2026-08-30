@@ -1,3 +1,5 @@
+const { gatewaySessionKeyFor } = require("../runtime/openclaw-session-key.cjs");
+
 function removeListenerCompat(emitter, eventName, listener) {
   if (typeof emitter.off === "function") {
     emitter.off(eventName, listener);
@@ -24,6 +26,60 @@ function callClientMethod(openclawClient, name, args) {
   return fn.apply(openclawClient, args);
 }
 
+const SLASH_COMMAND_TEXT_RE = /^\/([A-Za-z][\w-]*)/;
+const AGENT_INTERCEPTED_SLASH_COMMANDS = Object.freeze(["new", "reset"]);
+
+function chatSendSlashCommandName(text) {
+  if (typeof text !== "string") return "";
+  const match = SLASH_COMMAND_TEXT_RE.exec(text);
+  if (!match) return "";
+  const name = match[1].toLowerCase();
+  if (AGENT_INTERCEPTED_SLASH_COMMANDS.indexOf(name) !== -1) return "";
+  return name;
+}
+
+function buildChatSendRequestParams(
+  text,
+  sessionKey,
+  createIdempotencyKey,
+  requestOptions = null,
+) {
+  const relaySessionKey = sessionKey || "main";
+  const agentId =
+    requestOptions && typeof requestOptions.agentId === "string"
+      ? requestOptions.agentId.trim()
+      : "";
+  const gatewaySessionKey = gatewaySessionKeyFor(relaySessionKey, agentId);
+  return {
+    message: text,
+    sessionKey: gatewaySessionKey,
+    idempotencyKey: createIdempotencyKey(),
+    ...(agentId && gatewaySessionKey !== relaySessionKey
+      ? { agentId }
+      : {}),
+  };
+}
+
+function scopeOpenClawSessionKey(sessionKey, requestOptions) {
+  const normalizedSessionKey =
+    typeof sessionKey === "string" && sessionKey.trim()
+      ? sessionKey.trim()
+      : "main";
+  const agentId =
+    requestOptions && typeof requestOptions.agentId === "string"
+      ? requestOptions.agentId.trim()
+      : "";
+  if (!agentId) return normalizedSessionKey;
+  if (
+    agentId.toLowerCase() === "main" &&
+    !/^agent:[^:]+:/i.test(normalizedSessionKey)
+  ) {
+    return normalizedSessionKey;
+  }
+  const bareSessionKey = normalizedSessionKey.replace(/^agent:[^:]+:/i, "");
+  return `agent:${agentId}:${bareSessionKey}`;
+}
+
 function callRequestMethod(openclawClient, method, params, requestOpts) {
   const requestFn = openclawClient && openclawClient.request;
   if (typeof requestFn !== "function") {
@@ -38,10 +94,12 @@ function buildAgentRequestParams(
   attachment,
   createIdempotencyKey,
   requestOptions,
+  scopeOpenClawSessionKey = false,
 ) {
+  const relaySessionKey = sessionKey || "main";
   const params = {
     message: text,
-    sessionKey: sessionKey || "main",
+    sessionKey: relaySessionKey,
     idempotencyKey: createIdempotencyKey(),
   };
   const extraSystemPrompt =
@@ -67,6 +125,9 @@ function buildAgentRequestParams(
       : "";
   if (agentId) {
     params.agentId = agentId;
+    if (scopeOpenClawSessionKey) {
+      params.sessionKey = gatewaySessionKeyFor(relaySessionKey, agentId);
+    }
   }
 
   const deliverReply =
@@ -151,14 +212,30 @@ function createPluginRpcGatewayBridge(opts) {
     ) {
       requestOpts.diagnostic = requestOptions.diagnostic;
     }
+
+    const hasAttachment = Boolean(
+      attachment &&
+        typeof attachment === "object" &&
+        typeof attachment.base64Data === "string" &&
+        attachment.base64Data,
+    );
+    const gatewaySessionKey = scopeOpenClawSessionKey(sessionKey, requestOptions);
+    if (!hasAttachment && chatSendSlashCommandName(text)) {
+      return request(
+        "chat.send",
+        buildChatSendRequestParams(text, gatewaySessionKey, idempotencyKeyFactory),
+        requestOpts,
+      );
+    }
     return request(
       "agent",
       buildAgentRequestParams(
         text,
-        sessionKey,
+        gatewaySessionKey,
         attachment,
         idempotencyKeyFactory,
         requestOptions,
+        true,
       ),
       requestOpts,
     );
@@ -195,4 +272,4 @@ function createPluginRpcGatewayBridge(opts) {
   };
 }
 
-module.exports = { createPluginRpcGatewayBridge, buildAgentRequestParams };
+module.exports = { createPluginRpcGatewayBridge, buildAgentRequestParams, buildChatSendRequestParams, gatewaySessionKeyFor };

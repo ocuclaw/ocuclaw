@@ -1,15 +1,41 @@
 const { substituteTemplate } = require("./glasses-ui-template.cjs");
+const { mapArrayItems } = require("./glasses-ui-array-mapping.cjs");
+const { LIVEUI_TEMPLATE_ERROR_PREFIX, fillLiveuiTemplate, liveuiTemplateHasErrorPresentation, readLiveuiTemplateRefreshPath } = require("./glasses-ui-template-slots.cjs");
 
-const DEFAULT_FAILURE_BODY_PREFIX = "⚠ Update failed: ";
+const DEFAULT_FAILURE_BODY_PREFIX = LIVEUI_TEMPLATE_ERROR_PREFIX;
 
 const DEFAULT_GLASSES_UI_LIMITS = {
   bodyMax: 1000,
   itemMax: 64,
   detailBodyMax: 200,
   maxItems: 20,
+  totalDetailPayloadMax: 6 * 1024,
 };
 
 const BACKOFF_CAP_MS = 60_000;
+
+const GLASSES_PRESENCE_STATES = Object.freeze([
+  "worn",
+  "absent",
+  "in_case",
+  "unknown",
+]);
+
+const HTTP_ABSENT_MIN_INTERVAL_MS = 5 * 60_000;
+
+function normalizePresence(value) {
+  return GLASSES_PRESENCE_STATES.includes(value) ? value : "unknown";
+}
+
+function presenceIsExplicitlyAbsent(value) {
+  return value === "absent" || value === "in_case";
+}
+
+function refreshTier(recipe) {
+  if (recipe && recipe.kind === "llm") return "llm-api";
+  if (recipe && recipe.kind === "http") return "http";
+  return "local";
+}
 
 function createGlassesUiCronEngine(deps) {
   const executeRecipe = deps.executeRecipe;
@@ -27,7 +53,92 @@ function createGlassesUiCronEngine(deps) {
   const emitLifecycle =
     typeof deps.emitLifecycle === "function" ? deps.emitLifecycle : () => {};
 
+  const includeLastRender =
+    typeof deps.includeLastRender === "function"
+      ? () => deps.includeLastRender() === true
+      : () => deps.includeLastRender === true;
+  const validateTemplateSpec = typeof deps.validateTemplateSpec === "function"
+    ? deps.validateTemplateSpec
+    : ({ spec }) => ({ ok: true, spec });
+
+  const isRefreshPaused = typeof deps.isRefreshPaused === "function"
+    ? () => deps.isRefreshPaused() === true
+    : () => false;
+
   const active = new Map();
+  let currentPresence = "unknown";
+
+  function isPaused(state) {
+    return !!(isRefreshPaused() || state.ownerPaused || state.presencePaused);
+  }
+
+  function syncPausedFlag(state) {
+    state.paused = isPaused(state);
+  }
+
+  function clearNextTick(state) {
+    if (state.nextTickTimer) clearTimeoutFn(state.nextTickTimer);
+    state.nextTickTimer = null;
+  }
+
+  function scheduleNextTick(state, delayMs) {
+    clearNextTick(state);
+    if (state.resolved || isPaused(state)) return;
+    const delay = Math.max(0, Number.isFinite(delayMs) ? delayMs : state.refresh.intervalMs);
+    state.nextTickTimer = setTimeoutFn(() => {
+      state.nextTickTimer = null;
+      runOneTick(state);
+    }, delay);
+  }
+
+  function pauseActiveDuration(state) {
+    if (!state.maxDurationTimer) return;
+    clearTimeoutFn(state.maxDurationTimer);
+    state.maxDurationTimer = null;
+    state.maxDurationRemainingMs = Math.max(
+      0,
+      state.maxDurationRemainingMs - (monotonicNowMs() - state.maxDurationArmedAtMs),
+    );
+    state.maxDurationArmedAtMs = null;
+  }
+
+  function armActiveDuration(state) {
+    if (state.resolved || isPaused(state) || state.maxDurationTimer) return true;
+    if (state.maxDurationRemainingMs <= 0) {
+      emitLifecycle("cron_max_duration_reached", "debug", {
+        surfaceId: state.surfaceId,
+        sessionKey: state.sessionKey,
+      });
+      resolveAndClean(state, { result: "timeout" });
+      return false;
+    }
+    state.maxDurationArmedAtMs = monotonicNowMs();
+    state.maxDurationTimer = setTimeoutFn(() => {
+      emitLifecycle("cron_max_duration_reached", "debug", {
+        surfaceId: state.surfaceId,
+        sessionKey: state.sessionKey,
+      });
+      resolveAndClean(state, { result: "timeout" });
+    }, state.maxDurationRemainingMs);
+    return true;
+  }
+
+  function gapOutcome(state) {
+    const gapMs = Number.isFinite(state.presenceGapStartedAtMs)
+      ? Math.max(0, monotonicNowMs() - state.presenceGapStartedAtMs)
+      : 0;
+    return Number.isFinite(state.staleAfterMs) && state.staleAfterMs >= 0 && gapMs > state.staleAfterMs
+      ? "expired"
+      : "queued_with_expiry";
+  }
+
+  function effectiveCadenceDelay(state, delayMs) {
+
+    if (state.tier === "http" && state.presenceGapStartedAtMs !== null) {
+      return Math.max(delayMs, HTTP_ABSENT_MIN_INTERVAL_MS);
+    }
+    return delayMs;
+  }
 
   function emitSurfaceUpdate(state, patch) {
     try {
@@ -47,6 +158,103 @@ function createGlassesUiCronEngine(deps) {
     }
   }
 
+  function staticValuesCopy(raw) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const output = {};
+    const descriptors = Object.getOwnPropertyDescriptors(raw);
+    for (const key of Object.keys(descriptors)) {
+      const descriptor = descriptors[key];
+      if (Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+        output[key] = descriptor.value;
+      }
+    }
+    return output;
+  }
+
+  function prepareTemplateSpec(state, values, error, overrides = {}) {
+    const filled = fillLiveuiTemplate(
+      state.templateRuntime.template,
+      values,
+      error === undefined ? {} : { error },
+    );
+    if (Array.isArray(filled.invalid) && filled.invalid.length > 0) {
+      return {
+        ok: false,
+        code: "slot_value_invalid",
+        message: filled.invalid.map((entry) => entry.key).join(", "),
+      };
+    }
+    const validation = validateTemplateSpec({
+      spec: { ...filled.spec, ...overrides },
+      sessionKey: state.sessionKey,
+      surfaceId: state.surfaceId,
+    });
+    if (!validation || validation.ok !== true || !validation.spec) {
+      return {
+        ok: false,
+        code: validation && validation.code ? validation.code : "template_spec_invalid",
+        message: validation && validation.message
+          ? validation.message
+          : "filled Template failed Engine validation",
+      };
+    }
+    return { ok: true, status: filled.status, spec: validation.spec };
+  }
+
+  function specsEqual(a, b) {
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+
+  function emitTemplateSpec(state, prepared) {
+    if (specsEqual(state.lastSpec, prepared.spec)) return;
+    state.lastSpec = prepared.spec;
+    state.lastBody = prepared.spec.body;
+    state.lastItems = prepared.spec.items;
+    try {
+      deps.sendSurfaceRender({
+        sessionKey: state.sessionKey,
+        surfaceId: state.surfaceId,
+        depth: state.wireDepth,
+        spec: prepared.spec,
+      });
+      emitLifecycle("cron_tick_emit", "debug", {
+        surfaceId: state.surfaceId,
+        sessionKey: state.sessionKey,
+        generationToken: state.generationToken,
+        paused: !!state.paused,
+        templateStatus: prepared.status,
+      });
+    } catch (err) {
+      state.tickFailed += 1;
+      state.lastFailureAt = Date.now();
+      state.failureReason = `relay send failed: ${err && err.message ? err.message : err}`;
+      state.consecutiveFailures += 1;
+    }
+  }
+
+  function emitTemplateErrorPresentation(state, error) {
+    if (!state.templateRuntime ||
+        !liveuiTemplateHasErrorPresentation(state.templateRuntime.template) ||
+        typeof deps.sendSurfaceRender !== "function") return false;
+    const prepared = prepareTemplateSpec(state, state.templateValues, error);
+    if (!prepared.ok) return false;
+    emitTemplateSpec(state, prepared);
+    return true;
+  }
+
+  function describeLastRender(state) {
+    const hasBody = typeof state.lastBody === "string";
+    const items = Array.isArray(state.lastItems) ? state.lastItems : null;
+    const hasDetail =
+      !!items && items.some((i) => i && typeof i === "object" && typeof i.body === "string");
+    const desc = {
+      kind: items ? (hasDetail ? "list_with_details" : "list") : hasBody ? "text" : "unknown",
+    };
+    if (hasBody) desc.body_chars = state.lastBody.length;
+    if (items) desc.item_count = items.length;
+    return desc;
+  }
+
   function makeOutcome(state, extra) {
     const ticks = {
       count: state.tickCount,
@@ -55,7 +263,12 @@ function createGlassesUiCronEngine(deps) {
       lastSuccessAt: state.lastSuccessAt,
     };
     if (state.tickFailed > 0) ticks.lastFailureAt = state.lastFailureAt;
-    const outcome = { ticks, lastBody: state.lastBody, lastItems: state.lastItems };
+    const outcome = { ticks, last_render: describeLastRender(state) };
+
+    if (includeLastRender()) {
+      outcome.lastBody = state.lastBody;
+      outcome.lastItems = state.lastItems;
+    }
     if (state.failureReason) outcome.failureReason = state.failureReason;
     return Object.assign({}, outcome, extra);
   }
@@ -133,11 +346,24 @@ function createGlassesUiCronEngine(deps) {
         .slice(0, limits.maxItems)
         .map((tpl) => substituteOneItemTemplate(tpl, dataForTemplate, opts));
     }
-    return result;
+    if (typeof targets.itemsFromPath === "string" && targets.itemTemplate) {
+      const mapped = mapArrayItems({
+        output,
+        previousOutput,
+        itemsFromPath: targets.itemsFromPath,
+        itemTemplate: targets.itemTemplate,
+        surfaceKind: targets.surfaceKind,
+        limits,
+      });
+      if (!mapped.ok) return mapped;
+      result.items = mapped.items;
+      result.diagnostics = mapped.diagnostics;
+    }
+    return { ok: true, ...result };
   }
 
   async function runOneTick(state) {
-    if (state.resolved) return;
+    if (state.resolved || isPaused(state)) return;
     state.lastTickAt = monotonicNowMs();
     const tickGeneration = state.generationToken;
     state.tickCount += 1;
@@ -165,6 +391,8 @@ function createGlassesUiCronEngine(deps) {
         ? result.retryAfterMs
         : null;
 
+      const templateErrorShown = emitTemplateErrorPresentation(state, result.error);
+
       if (state.refresh.onError === "stop") {
         resolveAndClean(state, { result: "recipe_failed" });
         return;
@@ -173,7 +401,7 @@ function createGlassesUiCronEngine(deps) {
         resolveAndClean(state, { result: "recipe_failed" });
         return;
       }
-      if (state.refresh.onError === "show_error") {
+      if (state.refresh.onError === "show_error" && !templateErrorShown) {
         const errorBody = DEFAULT_FAILURE_BODY_PREFIX + result.error.slice(0, 100);
         if (state.lastBody !== errorBody) {
           state.lastBody = errorBody;
@@ -182,29 +410,92 @@ function createGlassesUiCronEngine(deps) {
       }
 
     } else if (result && Object.prototype.hasOwnProperty.call(result, "output")) {
-      state.tickSucceeded += 1;
-      state.lastSuccessAt = Date.now();
-      state.consecutiveFailures = 0;
-      state.failureReason = undefined;
-      state.pendingRetryAfterMs = null;
-      const substituted = substituteIntoTargets(state.refresh.targets, result.output, state.lastRecipeOutput);
-      state.lastRecipeOutput = result.output;
-      const patch = {};
-      let changed = false;
-      if (substituted.body !== undefined && substituted.body !== state.lastBody) {
-        patch.body = substituted.body;
-        state.lastBody = substituted.body;
-        changed = true;
-      }
-      if (substituted.items !== undefined) {
-        if (!itemsEqual(state.lastItems, substituted.items)) {
-          patch.items = substituted.items;
-          state.lastItems = substituted.items;
-          changed = true;
+      const substituted = substituteIntoTargets(
+        { ...state.refresh.targets, surfaceKind: state.surfaceKind },
+        result.output,
+        state.lastRecipeOutput,
+      );
+      if (substituted.ok && state.templateRuntime &&
+          typeof state.refresh.targets.slot === "string") {
+        const slotValue = readLiveuiTemplateRefreshPath(
+          result.output,
+          state.refresh.targets.path,
+        );
+        const nextValues = {
+          ...staticValuesCopy(state.templateValues),
+          [state.refresh.targets.slot]: slotValue,
+        };
+        const overrides = {};
+        if (substituted.body !== undefined) overrides.body = substituted.body;
+        if (substituted.items !== undefined) overrides.items = substituted.items;
+        const prepared = prepareTemplateSpec(state, nextValues, undefined, overrides);
+        if (!prepared.ok) {
+          substituted.ok = false;
+          substituted.code = prepared.code;
+          substituted.message = prepared.message;
+        } else {
+          substituted.templatePrepared = prepared;
+          substituted.templateValues = nextValues;
         }
       }
-      if (changed) {
-        emitSurfaceUpdate(state, patch);
+      if (!substituted.ok) {
+        state.tickFailed += 1;
+        state.lastFailureAt = Date.now();
+        state.failureReason = `${substituted.code}: ${substituted.message}`;
+        state.consecutiveFailures += 1;
+        state.pendingRetryAfterMs = null;
+        emitLifecycle("cron_items_mapping_diagnostic", "warn", {
+          surfaceId: state.surfaceId,
+          sessionKey: state.sessionKey,
+          code: substituted.code,
+        });
+        const templateErrorShown = emitTemplateErrorPresentation(state, state.failureReason);
+        if (state.refresh.onError === "show_error" && !templateErrorShown) {
+          const errorBody = DEFAULT_FAILURE_BODY_PREFIX + state.failureReason.slice(0, 100);
+          if (state.lastBody !== errorBody) {
+            state.lastBody = errorBody;
+            emitSurfaceUpdate(state, { body: errorBody });
+          }
+        }
+        if (state.refresh.onError === "stop" || state.consecutiveFailures >= state.refresh.maxConsecutiveFailures) {
+          resolveAndClean(state, { result: "recipe_failed" });
+          return;
+        }
+      } else {
+        state.tickSucceeded += 1;
+        state.lastSuccessAt = Date.now();
+        state.consecutiveFailures = 0;
+        state.failureReason = undefined;
+        state.pendingRetryAfterMs = null;
+        state.lastRecipeOutput = result.output;
+        if (substituted.templatePrepared) {
+          state.templateValues = substituted.templateValues;
+          emitTemplateSpec(state, substituted.templatePrepared);
+        }
+        const patch = {};
+        let changed = false;
+        if (substituted.body !== undefined && substituted.body !== state.lastBody) {
+          patch.body = substituted.body;
+          state.lastBody = substituted.body;
+          changed = true;
+        }
+        if (substituted.items !== undefined) {
+          if (!itemsEqual(state.lastItems, substituted.items)) {
+            patch.items = substituted.items;
+            state.lastItems = substituted.items;
+            changed = true;
+          }
+        }
+        if (changed && !substituted.templatePrepared) {
+          emitSurfaceUpdate(state, patch);
+        }
+        for (const diagnostic of substituted.diagnostics || []) {
+          emitLifecycle("cron_items_mapping_diagnostic", "debug", {
+            surfaceId: state.surfaceId,
+            sessionKey: state.sessionKey,
+            ...diagnostic,
+          });
+        }
       }
     } else {
       state.tickFailed += 1;
@@ -216,7 +507,7 @@ function createGlassesUiCronEngine(deps) {
       }
     }
 
-    if (!state.resolved && !state.isSmokeTest && !state.paused) {
+    if (!state.resolved && !state.isSmokeTest && !isPaused(state)) {
       const base = state.refresh.intervalMs;
       let delay = base;
       if (state.consecutiveFailures > 0) {
@@ -225,10 +516,7 @@ function createGlassesUiCronEngine(deps) {
       if (Number.isFinite(state.pendingRetryAfterMs) && state.pendingRetryAfterMs > 0) {
         delay = state.pendingRetryAfterMs;
       }
-      state.nextTickTimer = setTimeoutFn(() => {
-        state.nextTickTimer = null;
-        runOneTick(state);
-      }, delay);
+      scheduleNextTick(state, effectiveCadenceDelay(state, delay));
     }
   }
 
@@ -243,10 +531,21 @@ function createGlassesUiCronEngine(deps) {
       return;
     }
 
-    state.nextTickTimer = setTimeoutFn(() => {
-      state.nextTickTimer = null;
-      runOneTick(state);
-    }, state.refresh.intervalMs);
+    scheduleNextTick(state, effectiveCadenceDelay(state, state.refresh.intervalMs));
+  }
+
+  function runImmediateRefresh(state) {
+
+    if (state.tickCount === 0) {
+      runSmokeTest(state).catch((err) => {
+        resolveAndClean(state, {
+          result: "recipe_failed",
+          failureReason: `smoke test threw: ${err && err.message ? err.message : err}`,
+        });
+      });
+      return;
+    }
+    runOneTick(state);
   }
 
   return {
@@ -255,6 +554,7 @@ function createGlassesUiCronEngine(deps) {
         surfaceId: params.surfaceId,
         sessionKey: params.sessionKey,
         refresh: params.refresh,
+        surfaceKind: params.surfaceKind,
         recipe: params.refresh.recipe,
         onResolve: params.onResolve,
         startedAt: Date.now(),
@@ -264,6 +564,12 @@ function createGlassesUiCronEngine(deps) {
         consecutiveFailures: 0,
         lastBody: params.seedBody,
         lastItems: params.seedItems,
+        lastSpec: params.seedSpec,
+        wireDepth: Number.isFinite(params.wireDepth) ? params.wireDepth : 1,
+        templateRuntime: params.templateRuntime || null,
+        templateValues: staticValuesCopy(
+          params.templateRuntime && params.templateRuntime.values,
+        ),
         lastRecipeOutput: undefined,
         lastSuccessAt: undefined,
         lastFailureAt: undefined,
@@ -277,27 +583,45 @@ function createGlassesUiCronEngine(deps) {
         isSmokeTest: false,
         lastTickAt: null,
         generationToken: 0,
+        ownerPaused: false,
+        presencePaused: false,
         paused: false,
         pendingRetryAfterMs: null,
+        tier: refreshTier(params.refresh.recipe),
+        staleAfterMs: Number.isFinite(params.staleAfterMs) ? params.staleAfterMs : null,
+        presenceGapStartedAtMs: null,
+        presenceGapOutcome: null,
+        presenceCatchUpPending: false,
       };
       active.set(state.surfaceId, state);
 
-      state.maxDurationArmedAtMs = monotonicNowMs();
-      state.maxDurationTimer = setTimeoutFn(() => {
-
-        emitLifecycle("cron_max_duration_reached", "debug", {
+      syncPausedFlag(state);
+      if (presenceIsExplicitlyAbsent(currentPresence) && state.tier !== "local") {
+        state.presenceGapStartedAtMs = monotonicNowMs();
+        state.presenceGapOutcome = "queued_with_expiry";
+        state.presenceCatchUpPending = true;
+        if (state.tier === "llm-api") state.presencePaused = true;
+        syncPausedFlag(state);
+        emitLifecycle("cron_presence_gap", "debug", {
           surfaceId: state.surfaceId,
           sessionKey: state.sessionKey,
+          presence: currentPresence,
+          tier: state.tier,
+          policy: state.tier === "llm-api" ? "paused" : "deep_throttled",
+          outcome: "queued_with_expiry",
         });
-        resolveAndClean(state, { result: "timeout" });
-      }, params.refresh.maxDurationMs);
+      }
 
-      runSmokeTest(state).catch((err) => {
-        resolveAndClean(state, {
-          result: "recipe_failed",
-          failureReason: `smoke test threw: ${err && err.message ? err.message : err}`,
+      armActiveDuration(state);
+
+      if (!isPaused(state)) {
+        runSmokeTest(state).catch((err) => {
+          resolveAndClean(state, {
+            result: "recipe_failed",
+            failureReason: `smoke test threw: ${err && err.message ? err.message : err}`,
+          });
         });
-      });
+      }
     },
     stop(surfaceId, outcome, opts) {
       const state = active.get(surfaceId);
@@ -327,6 +651,54 @@ function createGlassesUiCronEngine(deps) {
     _debugState(surfaceId) {
       return active.get(surfaceId);
     },
+
+    snapshotOf(surfaceId) {
+      const state = active.get(surfaceId);
+      if (!state) {
+        return { active: false, paused: false, ticks: null, lastRender: null };
+      }
+      const ticks = {
+        count: state.tickCount,
+        succeeded: state.tickSucceeded,
+        failed: state.tickFailed,
+        lastSuccessAt: state.lastSuccessAt,
+      };
+      if (state.tickFailed > 0) ticks.lastFailureAt = state.lastFailureAt;
+      return {
+        active: true,
+        paused: isPaused(state),
+        ticks,
+        lastRender: describeLastRender(state),
+        presence: {
+          state: currentPresence,
+          tier: state.tier,
+          policy: state.presencePaused
+            ? "paused"
+            : state.tier === "http" && state.presenceGapStartedAtMs !== null
+              ? "deep_throttled"
+              : "active",
+          gap: state.presenceGapOutcome,
+        },
+      };
+    },
+
+    syncRefreshPause() {
+      const paused = isRefreshPaused();
+      for (const state of active.values()) {
+        if (state.resolved) continue;
+        const wasPaused = state.paused;
+        syncPausedFlag(state);
+        if (state.paused && !wasPaused) {
+          clearNextTick(state);
+          pauseActiveDuration(state);
+          state.generationToken += 1;
+        } else if (!state.paused && wasPaused) {
+          if (armActiveDuration(state)) scheduleNextTick(state, state.refresh.intervalMs);
+        }
+      }
+      emitLifecycle("cron_refresh_pause_sync", "debug", { paused, surfaces: active.size });
+      return paused;
+    },
     bumpGeneration(surfaceId) {
       const state = active.get(surfaceId);
       if (!state) return false;
@@ -343,21 +715,12 @@ function createGlassesUiCronEngine(deps) {
         });
         return false;
       }
-      if (state.nextTickTimer) {
-        clearTimeoutFn(state.nextTickTimer);
-        state.nextTickTimer = null;
-      }
+      const wasPaused = isPaused(state);
+      clearNextTick(state);
 
-      if (state.maxDurationTimer) {
-        clearTimeoutFn(state.maxDurationTimer);
-        state.maxDurationTimer = null;
-        state.maxDurationRemainingMs = Math.max(
-          0,
-          state.maxDurationRemainingMs - (monotonicNowMs() - state.maxDurationArmedAtMs),
-        );
-        state.maxDurationArmedAtMs = null;
-      }
-      state.paused = true;
+      if (!wasPaused) pauseActiveDuration(state);
+      state.ownerPaused = true;
+      syncPausedFlag(state);
 
       state.generationToken += 1;
       emitLifecycle("cron_pause", "debug", { surfaceId, found: true, resolved: false });
@@ -374,31 +737,23 @@ function createGlassesUiCronEngine(deps) {
         });
         return false;
       }
-
-      if (!state.maxDurationTimer) {
-        if (state.maxDurationRemainingMs <= 0) {
-          emitLifecycle("cron_resume", "debug", {
-            surfaceId,
-            found: true,
-            resolved: false,
-            branch: "max_duration_exhausted",
-          });
-          resolveAndClean(state, { result: "timeout" });
-          return false;
-        }
-        state.maxDurationArmedAtMs = monotonicNowMs();
-        state.maxDurationTimer = setTimeoutFn(() => {
-          emitLifecycle("cron_max_duration_reached", "debug", {
-            surfaceId: state.surfaceId,
-            sessionKey: state.sessionKey,
-          });
-          resolveAndClean(state, { result: "timeout" });
-        }, state.maxDurationRemainingMs);
+      state.ownerPaused = false;
+      syncPausedFlag(state);
+      if (isPaused(state)) {
+        emitLifecycle("cron_resume", "debug", {
+          surfaceId,
+          found: true,
+          resolved: false,
+          branch: "presence_blocked",
+        });
+        return true;
       }
-      state.paused = false;
-      if (state.nextTickTimer) {
-        clearTimeoutFn(state.nextTickTimer);
-        state.nextTickTimer = null;
+      if (!armActiveDuration(state)) return false;
+      clearNextTick(state);
+      if (state.presenceCatchUpPending && currentPresence === "worn") {
+        state.presenceCatchUpPending = false;
+        runImmediateRefresh(state);
+        return true;
       }
       const lastTickAt = Number.isFinite(state.lastTickAt) ? state.lastTickAt : 0;
       const elapsed = monotonicNowMs() - lastTickAt;
@@ -415,12 +770,75 @@ function createGlassesUiCronEngine(deps) {
 
         runOneTick(state);
       } else {
-        state.nextTickTimer = setTimeoutFn(() => {
-          state.nextTickTimer = null;
-          runOneTick(state);
-        }, intervalMs - elapsed);
+        scheduleNextTick(state, effectiveCadenceDelay(state, intervalMs - elapsed));
       }
       return true;
+    },
+    setPresence(value) {
+      const next = normalizePresence(value);
+      const prior = currentPresence;
+      currentPresence = next;
+      if (next === prior) return 0;
+      let changed = 0;
+      for (const state of active.values()) {
+        if (state.resolved || state.tier === "local") continue;
+        if (presenceIsExplicitlyAbsent(next)) {
+          if (state.presenceGapStartedAtMs === null) {
+            state.presenceGapStartedAtMs = monotonicNowMs();
+            state.presenceGapOutcome = "queued_with_expiry";
+            state.presenceCatchUpPending = true;
+            emitLifecycle("cron_presence_gap", "debug", {
+              surfaceId: state.surfaceId,
+              sessionKey: state.sessionKey,
+              presence: next,
+              tier: state.tier,
+              policy: state.tier === "llm-api" ? "paused" : "deep_throttled",
+              outcome: "queued_with_expiry",
+            });
+          }
+          if (state.tier === "llm-api" && !state.presencePaused) {
+            const wasPaused = isPaused(state);
+            state.presencePaused = true;
+            syncPausedFlag(state);
+            clearNextTick(state);
+            if (!wasPaused) pauseActiveDuration(state);
+            state.generationToken += 1;
+          } else if (state.tier === "http" && !state.isSmokeTest) {
+            scheduleNextTick(state, HTTP_ABSENT_MIN_INTERVAL_MS);
+          }
+          changed += 1;
+          continue;
+        }
+
+        if (next !== "worn" || state.presenceGapStartedAtMs === null) continue;
+        state.presenceGapOutcome = gapOutcome(state);
+        state.presencePaused = false;
+        syncPausedFlag(state);
+        const deferredByOwner = state.ownerPaused;
+        emitLifecycle("cron_presence_resume", "debug", {
+          surfaceId: state.surfaceId,
+          sessionKey: state.sessionKey,
+          presence: next,
+          tier: state.tier,
+          gapOutcome: state.presenceGapOutcome,
+          refresh: deferredByOwner ? "deferred_until_visible" : "immediate_silent",
+        });
+        state.presenceGapStartedAtMs = null;
+
+        state.presenceGapOutcome = null;
+        if (!deferredByOwner) {
+          if (!armActiveDuration(state)) continue;
+          clearNextTick(state);
+
+          state.presenceCatchUpPending = false;
+          runImmediateRefresh(state);
+        }
+        changed += 1;
+      }
+      return changed;
+    },
+    getPresence() {
+      return currentPresence;
     },
   };
 }

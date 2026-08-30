@@ -23,6 +23,10 @@ function normalizeHostHookFrame(frame) {
   if (typeof rawCtx.agentId === "string" && rawCtx.agentId.trim()) {
     ctx.agentId = rawCtx.agentId.trim();
   }
+
+  if (typeof rawCtx.runId === "string" && rawCtx.runId.trim()) {
+    ctx.runId = rawCtx.runId.trim();
+  }
   return { event, ctx };
 }
 

@@ -1,4 +1,4 @@
-const { MESSAGE_EMOJI_ALLOWLIST, MESSAGE_EMOJI_ALLOWLIST_SET, } = require("./message-emoji-allowlist.cjs");
+const { MESSAGE_EMOJI_ALLOWLIST, MESSAGE_EMOJI_ALLOWLIST_SET } = require("./message-emoji-allowlist.cjs");
 
 const EMOJI_CLUSTER_SEGMENTER = new Intl.Segmenter(undefined, {
   granularity: "grapheme",

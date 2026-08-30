@@ -1,12 +1,13 @@
-const { normalizeEvenAiRoutingMode, normalizeEvenAiDefaultAgent, } = require("../even-ai/even-ai-settings-store.cjs");
+const { normalizeEvenAiRoutingMode, normalizeEvenAiDefaultAgent } = require("../even-ai/even-ai-settings-store.cjs");
 const { activeBackendDisplayName } = require("../gateway/backend-contract.cjs");
-const { normalizeOcuClawDefaultModel, normalizeOcuClawDefaultThinking, normalizeOcuClawSystemPrompt, normalizeOcuClawDefaultAgent, normalizeOcuClawEvenAiSection, normalizeOcuClawEvenAiPeer, normalizeOcuClawPathwayBinding, normalizeOcuClawPathways, } = require("./ocuclaw-settings-store.cjs");
-const { formatMainOperationReceived, formatSendAck, } = require("./relay-worker-protocol.cjs");
-const { CAPABILITY_SNAPSHOT_TYPE, PUSH_MESSAGE_TYPE, } = require("./capability-snapshot.cjs");
+const { normalizeOcuClawDefaultModel, normalizeOcuClawDefaultThinking, normalizeOcuClawAgentProgressNotes, normalizeOcuClawSystemPrompt, normalizeOcuClawDefaultAgent, normalizeOcuClawEvenAiSection, normalizeOcuClawEvenAiPeer, normalizeOcuClawPathwayBinding, normalizeOcuClawPathways } = require("./ocuclaw-settings-store.cjs");
+const { formatMainOperationReceived, formatSendAck } = require("./relay-worker-protocol.cjs");
+const { CAPABILITY_SNAPSHOT_TYPE, PUSH_MESSAGE_TYPE } = require("./capability-snapshot.cjs");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
 const { validateGlassesUiSpec } = require("../tools/glasses-ui-tool.cjs");
-const { normalizeSonioxTemporaryKeyErrorCodeForDownstream: normalizeSonioxTemporaryKeyErrorCode, } = require("../domain/soniox-temp-key-errors.cjs");
+const { normalizeSonioxTemporaryKeyErrorCodeForDownstream: normalizeSonioxTemporaryKeyErrorCode } = require("../domain/soniox-temp-key-errors.cjs");
 const { DEFAULT_EVEN_AI_DEDICATED_SESSION_KEY } = require("../domain/even-ai-session-keys.cjs");
+const { isForeignHermesSessionKey } = require("./hermes-session-keys.cjs");
 
 function hasOwn(obj, key) {
   return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
@@ -35,6 +36,25 @@ function createDownstreamHandler(opts) {
   const onSlashCommand = opts.onSlashCommand;
   const onGetModelsCatalog = opts.onGetModelsCatalog;
   const onGetSkillsCatalog = opts.onGetSkillsCatalog;
+  const onGetLiveuiLibrary = opts.onGetLiveuiLibrary || null;
+  const onOpenLiveuiLibraryItem = opts.onOpenLiveuiLibraryItem || null;
+  const onCancelLiveuiTaskLaunch = opts.onCancelLiveuiTaskLaunch || null;
+  const onGetLiveuiTasksForPhone = opts.onGetLiveuiTasksForPhone || null;
+  const onGetLiveuiTaskRunsForPhone = opts.onGetLiveuiTaskRunsForPhone || null;
+  const onGetLiveuiTaskExecutors = opts.onGetLiveuiTaskExecutors || null;
+  const onSetLiveuiTaskExecutor = opts.onSetLiveuiTaskExecutor || null;
+  const onSetLiveuiTaskSettingValues = opts.onSetLiveuiTaskSettingValues || null;
+  const onSetLiveuiTaskPreferredTemplate = opts.onSetLiveuiTaskPreferredTemplate || null;
+  const isPhoneClient = typeof opts.isPhoneClient === "function"
+    ? opts.isPhoneClient
+    : () => true;
+  const onReviewLiveuiTask = opts.onReviewLiveuiTask || null;
+  const onSetLiveuiTaskContext = opts.onSetLiveuiTaskContext || null;
+  const onGetLiveuiPrefs = opts.onGetLiveuiPrefs || null;
+  const onSetLiveuiPrefs = opts.onSetLiveuiPrefs || null;
+  const onGetLiveuiStatus = opts.onGetLiveuiStatus || null;
+  const onOrganizeLiveuiLibrary = opts.onOrganizeLiveuiLibrary || null;
+  const onGetCommandCatalog = opts.onGetCommandCatalog;
   const onGetAgentsCatalog = opts.onGetAgentsCatalog;
   const onGetSonioxModels = opts.onGetSonioxModels || null;
   const onGetProviderUsageSnapshot = opts.onGetProviderUsageSnapshot || null;
@@ -61,16 +81,22 @@ function createDownstreamHandler(opts) {
   const onRemoteControl = opts.onRemoteControl || null;
   const onAutomationState = opts.onAutomationState || null;
   const onAutomationRegistry = opts.onAutomationRegistry || null;
+  const onLedgerCursor = opts.onLedgerCursor || null;
+  const onResyncRequest = opts.onResyncRequest || null;
   const onReadinessProbe = opts.onReadinessProbe || null;
   const onGlassesUiResult = opts.onGlassesUiResult || null;
   const onDemandResponse = opts.onDemandResponse || null;
   const onGlassesUiRenderInject = opts.onGlassesUiRenderInject || null;
   const onGlassesUiSurfaceUpdateInject = opts.onGlassesUiSurfaceUpdateInject || null;
   const onGlassesUiNavEvent = opts.onGlassesUiNavEvent || null;
+
+  const onGlassesUiRenderReceipt = opts.onGlassesUiRenderReceipt || null;
   const onDeviceInfoResponse = opts.onDeviceInfoResponse || null;
+  const onGlassesPresenceChanged = opts.onGlassesPresenceChanged || null;
   const onLocationResponse = opts.onLocationResponse || null;
   const onSetUserSessionTitle = opts.onSetUserSessionTitle || null;
   const onSetSessionPinned = opts.onSetSessionPinned || null;
+  const onSetSessionHidden = opts.onSetSessionHidden || null;
   const onDeleteSessions = opts.onDeleteSessions || null;
   const onSearchTranscripts = opts.onSearchTranscripts || null;
   const onDebugBundleRequest = opts.onDebugBundleRequest || null;
@@ -114,6 +140,8 @@ function createDownstreamHandler(opts) {
     approvalResolve: "ocuclaw.approval.resolve",
     approvalResolveAck: "ocuclaw.approval.resolve.ack",
     approvalResolved: "ocuclaw.approval.resolved",
+    commandCatalogGet: "ocuclaw.command.catalog.get",
+    commandCatalogSnapshot: "ocuclaw.command.catalog.snapshot",
     commandSlash: "ocuclaw.command.slash",
     debugConfigSnapshot: "ocuclaw.debug.config.snapshot",
     debugEvent: "ocuclaw.debug.event",
@@ -130,6 +158,7 @@ function createDownstreamHandler(opts) {
     messageSend: "ocuclaw.message.send",
     messageSendAck: "ocuclaw.message.send.ack",
     messageStreamDelta: "ocuclaw.message.stream.delta",
+    messageStreamClear: "ocuclaw.message.stream.clear",
     thinkingFinalize: "ocuclaw.thinking.finalize",
     thinkingUpdate: "ocuclaw.thinking.update",
     modelCatalogGet: "ocuclaw.model.catalog.get",
@@ -138,8 +167,40 @@ function createDownstreamHandler(opts) {
     providerUsageSnapshot: "ocuclaw.provider.usage.snapshot",
     skillsCatalogGet: "ocuclaw.skills.catalog.get",
     skillsCatalogSnapshot: "ocuclaw.skills.catalog.snapshot",
+    liveuiLibraryGet: "ocuclaw.liveui.library.get",
+    liveuiLibrarySnapshot: "ocuclaw.liveui.library.snapshot",
+    liveuiLibraryOpen: "ocuclaw.liveui.library.open",
+    liveuiLibraryOpenResult: "ocuclaw.liveui.library.open.result",
+    liveuiTaskCancel: "ocuclaw.liveui.task.cancel",
+    liveuiTasksGet: "ocuclaw.liveui.tasks.get",
+    liveuiTasksSnapshot: "ocuclaw.liveui.tasks.snapshot",
+    liveuiTaskRunsGet: "ocuclaw.liveui.task.runs.get",
+    liveuiTaskRunsSnapshot: "ocuclaw.liveui.task.runs.snapshot",
+    liveuiTaskReview: "ocuclaw.liveui.task.review",
+    liveuiTaskReviewAck: "ocuclaw.liveui.task.review.ack",
+    liveuiTaskExecutorsGet: "ocuclaw.liveui.task.executors.get",
+    liveuiTaskExecutorsSnapshot: "ocuclaw.liveui.task.executors.snapshot",
+    liveuiTaskExecutorSet: "ocuclaw.liveui.task.executor.set",
+    liveuiTaskExecutorAck: "ocuclaw.liveui.task.executor.ack",
+    liveuiTaskPreferredTemplateSet: "ocuclaw.liveui.task.preferred_template.set",
+    liveuiTaskPreferredTemplateAck: "ocuclaw.liveui.task.preferred_template.ack",
+    liveuiTaskContextSet: "ocuclaw.liveui.task.context.set",
+    liveuiTaskContextAck: "ocuclaw.liveui.task.context.ack",
+    liveuiTaskSettingsSet: "ocuclaw.liveui.task.settings.set",
+    liveuiTaskSettingsAck: "ocuclaw.liveui.task.settings.ack",
+    liveuiLibraryOrganize: "ocuclaw.liveui.library.organize",
+    liveuiLibraryOrganizeAck: "ocuclaw.liveui.library.organize.ack",
+    liveuiPrefsGet: "ocuclaw.liveui.prefs.get",
+    liveuiPrefsSet: "ocuclaw.liveui.prefs.set",
+    liveuiPrefsSnapshot: "ocuclaw.liveui.prefs.snapshot",
+    liveuiPrefsAck: "ocuclaw.liveui.prefs.ack",
+    liveuiStatusGet: "ocuclaw.liveui.status.get",
+    liveuiStatusSnapshot: "ocuclaw.liveui.status",
     agentsCatalogGet: "ocuclaw.agent.catalog.get",
     agentsCatalogSnapshot: "ocuclaw.agent.catalog.snapshot",
+    entries: "ocuclaw.ledger.entries",
+    ledgerCursor: "ocuclaw.ledger.cursor",
+    ledgerResyncRequest: "ocuclaw.ledger.resync.request",
     pages: "ocuclaw.view.pages.snapshot",
     protocolSubscribe: "ocuclaw.protocol.tap.subscribe",
     protocolFrame: "ocuclaw.protocol.tap.frame",
@@ -164,6 +225,7 @@ function createDownstreamHandler(opts) {
     sessionCreateEt: "ocuclaw.session.create.et",
     sessionCopy: "ocuclaw.session.copy",
     sessionCopyAck: "ocuclaw.session.copy.ack",
+    sessionHiddenSet: "ocuclaw.session.hidden.set",
     sessionList: "ocuclaw.session.list",
     sessionListDiff: "ocuclaw.session.list.diff",
     sessionListDiffResult: "ocuclaw.session.list.diff.result",
@@ -210,10 +272,34 @@ function createDownstreamHandler(opts) {
     const msg = {
       type: APP_PROTOCOL.pages,
       pages,
+      ...(meta && typeof meta.ledgerV1 === "boolean" ? { ledgerV1: meta.ledgerV1 } : {}),
       ...(revision !== null ? { revision } : {}),
       ...(normalizedAssistantCommit ? { assistantCommit: normalizedAssistantCommit } : {}),
     };
     return JSON.stringify(msg);
+  }
+
+  function formatEntries(snapshot = {}, sessionId = "") {
+    const value = snapshot && typeof snapshot === "object" ? snapshot : {};
+    const rawBaseSeq = value.baseSeq;
+    const rawLastSeq = value.lastSeq;
+    return JSON.stringify({
+      type: APP_PROTOCOL.entries,
+      sessionId: typeof sessionId === "string" ? sessionId : null,
+      entriesRevision: Number.isFinite(Number(value.entriesRevision))
+        ? Math.max(0, Math.floor(Number(value.entriesRevision)))
+        : 0,
+      baseSeq: rawBaseSeq !== null && rawBaseSeq !== undefined &&
+        Number.isFinite(Number(rawBaseSeq))
+        ? Math.max(0, Math.floor(Number(rawBaseSeq)))
+        : 0,
+      lastSeq: rawLastSeq !== null && rawLastSeq !== undefined &&
+        Number.isFinite(Number(rawLastSeq))
+        ? Math.floor(Number(rawLastSeq))
+        : -1,
+      complete: value.complete !== false,
+      entries: Array.isArray(value.entries) ? value.entries : [],
+    });
   }
 
   function formatStatus(status, meta) {
@@ -290,7 +376,7 @@ function createDownstreamHandler(opts) {
     );
   }
 
-  function formatSendAckCompat(id, status, error, errorCode, data) {
+  function formatSendAckCompat(id, status, error, errorCode, data = undefined) {
     return formatSendAck(id, status, error, errorCode, data);
   }
 
@@ -317,8 +403,19 @@ function createDownstreamHandler(opts) {
     });
   }
 
-  function formatStreaming(text, emojiSpans, paceSpans) {
-    const payload = { type: APP_PROTOCOL.messageStreamDelta, text };
+  function formatStreaming(text, emojiSpans, paceSpans, meta = {}) {
+    const payload = {
+      type: APP_PROTOCOL.messageStreamDelta,
+      text,
+    };
+    if (typeof meta.runId === "string" && meta.runId) payload.runId = meta.runId;
+    if (
+      meta.seq !== null &&
+      meta.seq !== undefined &&
+      Number.isFinite(Number(meta.seq))
+    ) {
+      payload.seq = Math.max(0, Math.floor(Number(meta.seq)));
+    }
     if (Array.isArray(emojiSpans) && emojiSpans.length > 0) {
       payload.emojiSpans = emojiSpans;
     }
@@ -326,6 +423,26 @@ function createDownstreamHandler(opts) {
       payload.paceSpans = paceSpans;
     }
     return JSON.stringify(payload);
+  }
+
+  function formatStreamClear(options) {
+    const opts = options && typeof options === "object" ? options : {};
+    const runId =
+      typeof opts.runId === "string" && opts.runId.trim() ? opts.runId.trim() : null;
+    const sessionKey =
+      typeof opts.sessionKey === "string" && opts.sessionKey.trim()
+        ? opts.sessionKey.trim()
+        : null;
+    const reason =
+      typeof opts.reason === "string" && opts.reason.trim()
+        ? opts.reason.trim()
+        : "stream_withdrawn";
+    return JSON.stringify({
+      type: APP_PROTOCOL.messageStreamClear,
+      runId,
+      sessionKey,
+      reason,
+    });
   }
 
   function formatSessions(sessions) {
@@ -345,6 +462,10 @@ function createDownstreamHandler(opts) {
       row.agentId || "",
       row.agentName || "",
       row.status || "",
+      row.activityDescription || "",
+
+      row.unread === true ? "true" : row.unread === false ? "false" : "",
+      row.hidden === true ? "true" : row.hidden === false ? "false" : "",
     ].join("\u001f");
     return fnv1a32Hex(raw);
   }
@@ -365,8 +486,15 @@ function createDownstreamHandler(opts) {
 
   function normalizeSessionDiffKind(kind) {
     const normalized = String(kind || "").trim().toLowerCase();
-    if (normalized === "evenai" || normalized === "terminal") return normalized;
-    return "ocuclaw";
+    if (!normalized) return "ocuclaw";
+    if (
+      normalized === "ocuclaw" ||
+      normalized === "evenai" ||
+      normalized === "terminal"
+    ) {
+      return normalized;
+    }
+    return null;
   }
 
   function isTerminalSessionKey(key) {
@@ -401,6 +529,7 @@ function createDownstreamHandler(opts) {
 
   function buildSessionDiff({ kind, sessions, known, limit, dedicatedKey }) {
     const normalizedKind = normalizeSessionDiffKind(kind);
+    if (!normalizedKind) throw new Error("invalid_session_diff_kind");
     const normalizedLimit = normalizeSessionDiffLimit(limit);
     const rows = Array.isArray(sessions)
       ? sessions.filter((row) => isSessionInDiffKind(normalizedKind, row))
@@ -460,9 +589,11 @@ function createDownstreamHandler(opts) {
   }
 
   function formatEmptySessionDiff(kind, limit, dedicatedKey) {
+    const normalizedKind = normalizeSessionDiffKind(kind);
+    if (!normalizedKind) throw new Error("invalid_session_diff_kind");
     const out = {
       type: APP_PROTOCOL.sessionListDiffResult,
-      kind: normalizeSessionDiffKind(kind),
+      kind: normalizedKind,
       sessions: [],
       deletedKeys: [],
       limit: normalizeSessionDiffLimit(limit),
@@ -473,10 +604,11 @@ function createDownstreamHandler(opts) {
     return JSON.stringify(out);
   }
 
-  function formatSessionSwitched(sessionKey, requestId = "") {
+  function formatSessionSwitched(sessionKey, requestId = "", draft = false) {
     return JSON.stringify({
       type: APP_PROTOCOL.sessionSwitchApplied,
       sessionKey,
+      ...(draft === true ? { draft: true } : {}),
       ...(parseOptionalTrimmedString(requestId)
         ? { requestId: parseOptionalTrimmedString(requestId) }
         : {}),
@@ -524,6 +656,218 @@ function createDownstreamHandler(opts) {
     });
   }
 
+  function formatLiveuiLibrary(items) {
+    return JSON.stringify({
+      type: APP_PROTOCOL.liveuiLibrarySnapshot,
+      items: Array.isArray(items) ? items : [],
+    });
+  }
+
+  function formatLiveuiLibraryOpenResult(payload = {}) {
+    const status = payload.status === "accepted" ? "accepted" : "rejected";
+    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
+    return JSON.stringify({
+      type: APP_PROTOCOL.liveuiLibraryOpenResult,
+      itemType: typeof payload.itemType === "string" ? payload.itemType : "",
+      itemId: typeof payload.itemId === "string" ? payload.itemId : "",
+      status,
+      ...(status === "rejected" && code ? { code } : {}),
+    });
+  }
+
+  function normalizeLiveuiTaskRunning(value) {
+    if (!value || typeof value !== "object") return null;
+    const runId = typeof value.runId === "string" ? value.runId : "";
+    if (!runId) return null;
+    return {
+      since: Number.isSafeInteger(value.since) ? value.since : 0,
+      executor: typeof value.executor === "string" ? value.executor : "",
+      runId,
+    };
+  }
+
+  function formatLiveuiTasks(payload = {}) {
+    const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
+    return JSON.stringify({
+      type: APP_PROTOCOL.liveuiTasksSnapshot,
+      tasks: tasks.map((task) =>
+        task && typeof task === "object"
+          ? { ...task, running: normalizeLiveuiTaskRunning(task.running) }
+          : task,
+      ),
+      templates: Array.isArray(payload.templates) ? payload.templates : [],
+      invalid: Array.isArray(payload.invalid) ? payload.invalid : [],
+      organization: payload.organization && typeof payload.organization === "object"
+        ? payload.organization
+        : { schemaVersion: 1, order: [], hidden: [], digest: "" },
+      ...(typeof payload.organizationInvalid === "string" && payload.organizationInvalid
+        ? { organizationInvalid: payload.organizationInvalid }
+        : {}),
+    });
+  }
+
+  function formatLiveuiTaskRuns(taskId, records) {
+    return JSON.stringify({
+      type: APP_PROTOCOL.liveuiTaskRunsSnapshot,
+      taskId: typeof taskId === "string" ? taskId : "",
+      records: Array.isArray(records) ? records : [],
+    });
+  }
+
+  function formatLiveuiTaskReviewAck(payload = {}) {
+    const status = payload.status === "accepted" ? "accepted" : "rejected";
+    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
+    return JSON.stringify({
+      type: APP_PROTOCOL.liveuiTaskReviewAck,
+      taskId: typeof payload.taskId === "string" ? payload.taskId : "",
+      action: typeof payload.action === "string" ? payload.action : "",
+      status,
+      ...(status === "rejected" && code ? { code } : {}),
+      ...(status === "rejected" && typeof payload.message === "string" && payload.message
+        ? { message: payload.message }
+        : {}),
+      ...(payload.task && typeof payload.task === "object" ? { task: payload.task } : {}),
+    });
+  }
+
+  function formatLiveuiTaskExecutors(payload = {}) {
+    return JSON.stringify({
+      type: APP_PROTOCOL.liveuiTaskExecutorsSnapshot,
+      thisHost: payload.thisHost === "hermes" ? "hermes" : "openclaw",
+      executors: Array.isArray(payload.executors) ? payload.executors : [],
+    });
+  }
+
+  function formatLiveuiTaskExecutorAck(payload = {}) {
+    const status = payload.status === "accepted" ? "accepted" : "rejected";
+    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
+    return JSON.stringify({
+      type: APP_PROTOCOL.liveuiTaskExecutorAck,
+      taskId: typeof payload.taskId === "string" ? payload.taskId : "",
+      status,
+      ...(status === "rejected" && code ? { code } : {}),
+    });
+  }
+
+  function formatLiveuiTaskPreferredTemplateAck(payload = {}) {
+    const status = payload.status === "accepted" ? "accepted" : "rejected";
+    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
+    return JSON.stringify({
+      type: APP_PROTOCOL.liveuiTaskPreferredTemplateAck,
+      taskId: typeof payload.taskId === "string" ? payload.taskId : "",
+      status,
+      ...(status === "rejected" && code ? { code } : {}),
+      ...(payload.task && typeof payload.task === "object" ? { task: payload.task } : {}),
+    });
+  }
+
+  function formatLiveuiTaskContextAck(payload = {}) {
+    const status = payload.status === "accepted" ? "accepted" : "rejected";
+    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
+    return JSON.stringify({
+      type: APP_PROTOCOL.liveuiTaskContextAck,
+      taskId: typeof payload.taskId === "string" ? payload.taskId : "",
+      status,
+      ...(status === "rejected" && code ? { code } : {}),
+    });
+  }
+
+  function formatLiveuiPrefs(payload = {}) {
+    const prefs = payload && typeof payload === "object" ? payload : {};
+    return JSON.stringify({
+      type: APP_PROTOCOL.liveuiPrefsSnapshot,
+      enabled: prefs.enabled !== false,
+      defaultContext: prefs.defaultContext === "current_session" ? "current_session" : "isolated",
+      defaultExecutor: typeof prefs.defaultExecutor === "string" && prefs.defaultExecutor
+        ? prefs.defaultExecutor
+        : null,
+      pauseApps: prefs.pauseApps === true,
+      ...(typeof prefs.prefsInvalid === "string" && prefs.prefsInvalid
+        ? { prefsInvalid: prefs.prefsInvalid }
+        : {}),
+    });
+  }
+
+  function formatLiveuiPrefsAck(payload = {}) {
+    const status = payload.status === "accepted" ? "accepted" : "rejected";
+    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
+    return JSON.stringify({
+      type: APP_PROTOCOL.liveuiPrefsAck,
+      status,
+      ...(status === "rejected" && code ? { code } : {}),
+    });
+  }
+
+  function formatLiveuiStatus(payload = {}) {
+    const status = payload && typeof payload === "object" ? payload : {};
+    const asInt = (value) => (Number.isFinite(value) ? Math.floor(value) : 0);
+    return JSON.stringify({
+      type: APP_PROTOCOL.liveuiStatusSnapshot,
+      host: status.host === "hermes" ? "hermes" : "openclaw",
+      refreshEnabled: status.refreshEnabled !== false,
+      httpEnabled: status.httpEnabled === true,
+      allowedDomains: asInt(status.allowedDomains),
+      llmEnabled: status.llmEnabled === true,
+      allowAgentModelOverride: status.allowAgentModelOverride === true,
+      surfaces: asInt(status.surfaces),
+      maxSurfaces: Number.isFinite(status.maxSurfaces) ? Math.floor(status.maxSurfaces) : 1,
+      stageGraceMs: asInt(status.stageGraceMs),
+      approvalHudSupported: status.approvalHudSupported !== false,
+    });
+  }
+
+  function formatLiveuiTaskSettingsAck(payload = {}) {
+    const status = payload.status === "accepted" ? "accepted" : "rejected";
+    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
+    return JSON.stringify({
+      type: APP_PROTOCOL.liveuiTaskSettingsAck,
+      taskId: typeof payload.taskId === "string" ? payload.taskId : "",
+      status,
+      ...(status === "rejected" && code ? { code } : {}),
+      ...(status === "rejected" && Array.isArray(payload.invalid)
+        ? { invalid: payload.invalid.map((entry) => ({
+            key: entry && typeof entry.key === "string" ? entry.key : "",
+            code: entry && typeof entry.code === "string" ? entry.code : "setting_value_invalid",
+          })) }
+        : {}),
+      ...(payload.task && typeof payload.task === "object" ? { task: payload.task } : {}),
+    });
+  }
+
+  function formatLiveuiLibraryOrganizeAck(payload = {}) {
+    const status = payload.status === "accepted" ? "accepted" : "rejected";
+    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
+    const message = typeof payload.message === "string" && payload.message ? payload.message : null;
+    return JSON.stringify({
+      type: APP_PROTOCOL.liveuiLibraryOrganizeAck,
+      action: typeof payload.action === "string" ? payload.action : "",
+      status,
+      ...(status === "rejected" && code ? { code } : {}),
+      ...(status === "rejected" && message ? { message } : {}),
+      ...(status === "accepted" && Array.isArray(payload.clearedPreferredTemplateTaskIds)
+        ? { clearedPreferredTemplateTaskIds: payload.clearedPreferredTemplateTaskIds }
+        : {}),
+    });
+  }
+
+  function formatCommandCatalog(payload) {
+    return JSON.stringify({
+      type: APP_PROTOCOL.commandCatalogSnapshot,
+      commands: Array.isArray(payload && payload.commands) ? payload.commands : [],
+      fetchedAtMs:
+        Number.isFinite(payload && payload.fetchedAtMs)
+          ? Math.floor(payload.fetchedAtMs)
+          : Date.now(),
+      stale: !!(payload && payload.stale),
+      unsupported: !!(payload && payload.unsupported),
+      backendKind:
+        typeof (payload && payload.backendKind) === "string" && payload.backendKind
+          ? payload.backendKind
+          : "none",
+      executes: (payload && payload.executes) === "all" ? "all" : "intercepted-only",
+    });
+  }
+
   function formatAgentsCatalog(payload) {
     return JSON.stringify({
       type: APP_PROTOCOL.agentsCatalogSnapshot,
@@ -563,7 +907,7 @@ function createDownstreamHandler(opts) {
         ? payload.provider.trim()
         : null;
     const windows = Array.isArray(payload && payload.windows)
-      ? payload.windows.map((window) => ({
+      ? payload.windows.map((window) => Number.isFinite(window && window.usedPercent) ? ({
           key:
             window && typeof window.key === "string" && window.key.trim()
               ? window.key.trim()
@@ -572,10 +916,7 @@ function createDownstreamHandler(opts) {
             window && typeof window.label === "string" && window.label.trim()
               ? window.label.trim()
               : null,
-          usedPercent:
-            Number.isFinite(window && window.usedPercent)
-              ? window.usedPercent
-              : 0,
+          usedPercent: window.usedPercent,
           resetAtMs:
             Number.isFinite(window && window.resetAtMs)
               ? Math.floor(window.resetAtMs)
@@ -584,7 +925,7 @@ function createDownstreamHandler(opts) {
             Number.isFinite(window && window.sortOrder)
               ? Math.floor(window.sortOrder)
               : null,
-        }))
+        }) : null).filter(Boolean)
       : [];
     return JSON.stringify({
       type: APP_PROTOCOL.providerUsageSnapshot,
@@ -616,6 +957,12 @@ function createDownstreamHandler(opts) {
       totalProfileCount:
         Number.isFinite(payload && payload.totalProfileCount) && payload.totalProfileCount >= 0
           ? Math.floor(payload.totalProfileCount)
+          : null,
+      unavailableReason:
+        payload &&
+        typeof payload.unavailableReason === "string" &&
+        payload.unavailableReason.trim()
+          ? payload.unavailableReason.trim()
           : null,
     });
   }
@@ -813,6 +1160,14 @@ function createDownstreamHandler(opts) {
           ? payload.defaultAgent
           : undefined,
       ),
+      agentProgressNotes: normalizeOcuClawAgentProgressNotes(
+        payload && typeof payload.agentProgressNotes === "string"
+          ? payload.agentProgressNotes
+          : undefined,
+      ),
+      conversationToolProgress: !!(
+        payload && payload.conversationToolProgress === true
+      ),
       pathways: normalizeOcuClawPathways(payload && payload.pathways),
       evenAi: formatOcuClawEvenAiSnapshot(payload && payload.evenAi),
     });
@@ -828,6 +1183,12 @@ function createDownstreamHandler(opts) {
     };
     if (payload && payload.error !== undefined) {
       out.error = payload.error;
+    }
+    if (payload && typeof payload.confirmationTitle === "string") {
+      Reflect.set(out, "confirmationTitle", payload.confirmationTitle);
+    }
+    if (payload && typeof payload.confirmationMessage === "string") {
+      Reflect.set(out, "confirmationMessage", payload.confirmationMessage);
     }
     return JSON.stringify(out);
   }
@@ -1416,6 +1777,12 @@ function createDownstreamHandler(opts) {
       normalized === "double-tap" ||
       normalized === "double_tap" ||
       normalized === "doubletap" ||
+      normalized === "long-press" ||
+      normalized === "long_press" ||
+      normalized === "longpress" ||
+      normalized === "long-press-release" ||
+      normalized === "long_press_release" ||
+      normalized === "longpressrelease" ||
       normalized === "scroll-up" ||
       normalized === "scroll_up" ||
       normalized === "scrollup" ||
@@ -1434,6 +1801,15 @@ function createDownstreamHandler(opts) {
         normalized === "doubletap"
       ) {
         return "double-click";
+      }
+      if (normalized === "long_press" || normalized === "longpress") {
+        return "long-press";
+      }
+      if (
+        normalized === "long_press_release" ||
+        normalized === "longpressrelease"
+      ) {
+        return "long-press-release";
       }
       if (normalized === "scroll_up" || normalized === "scrollup" || normalized === "up") {
         return "scroll-up";
@@ -1522,6 +1898,55 @@ function createDownstreamHandler(opts) {
       return "listen-retry";
     }
     if (
+      normalized === "ptt-confirm" ||
+      normalized === "ptt_confirm" ||
+      normalized === "pttconfirm"
+    ) {
+      return "ptt-confirm";
+    }
+    if (
+      normalized === "ptt-redo" ||
+      normalized === "ptt_redo" ||
+      normalized === "pttredo"
+    ) {
+      return "ptt-redo";
+    }
+    if (
+      normalized === "ptt-cancel" ||
+      normalized === "ptt_cancel" ||
+      normalized === "pttcancel"
+    ) {
+      return "ptt-cancel";
+    }
+    if (
+      normalized === "ptt-partial" ||
+      normalized === "ptt_partial" ||
+      normalized === "pttpartial"
+    ) {
+      return "ptt-partial";
+    }
+    if (
+      normalized === "ptt-lab-start" ||
+      normalized === "ptt_lab_start" ||
+      normalized === "pttlabstart"
+    ) {
+      return "ptt-lab-start";
+    }
+    if (
+      normalized === "ptt-lab-commit" ||
+      normalized === "ptt_lab_commit" ||
+      normalized === "pttlabcommit"
+    ) {
+      return "ptt-lab-commit";
+    }
+    if (
+      normalized === "ptt-lab-release" ||
+      normalized === "ptt_lab_release" ||
+      normalized === "pttlabrelease"
+    ) {
+      return "ptt-lab-release";
+    }
+    if (
       normalized === "perf-reset-ladder" ||
       normalized === "perf_reset_ladder" ||
       normalized === "perfresetladder" ||
@@ -1585,6 +2010,12 @@ function createDownstreamHandler(opts) {
     if (typeof raw !== "string") return null;
     const trimmed = raw.trim();
     return trimmed || null;
+  }
+
+  function parseOptionalInteger(raw) {
+    if (raw === null || raw === undefined) return null;
+    if (typeof raw === "string" && raw.trim() === "") return null;
+    return Number.isFinite(Number(raw)) ? Math.floor(Number(raw)) : null;
   }
 
   function parseOptionalBoolean(raw, fieldName) {
@@ -1959,6 +2390,37 @@ function createDownstreamHandler(opts) {
       payload.defaultAgent = normalizeOcuClawDefaultAgent(msg.defaultAgent);
     }
 
+    if (Object.prototype.hasOwnProperty.call(msg, "confirmModelSelection")) {
+      if (typeof msg.confirmModelSelection !== "boolean") {
+        throw new Error("confirmModelSelection must be a boolean");
+      }
+      Reflect.set(payload, "confirmModelSelection", msg.confirmModelSelection);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(msg, "agentProgressNotes")) {
+      if (typeof msg.agentProgressNotes !== "string") {
+        throw new Error("agentProgressNotes must be a string");
+      }
+      const normalizedNotes = msg.agentProgressNotes.trim().toLowerCase();
+      if (
+        normalizedNotes !== "off" &&
+        normalizedNotes !== "status" &&
+        normalizedNotes !== "conversation"
+      ) {
+        throw new Error(
+          "agentProgressNotes must be one of off|status|conversation",
+        );
+      }
+      payload.agentProgressNotes = normalizeOcuClawAgentProgressNotes(normalizedNotes);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(msg, "conversationToolProgress")) {
+      if (typeof msg.conversationToolProgress !== "boolean") {
+        throw new Error("conversationToolProgress must be a boolean");
+      }
+      Reflect.set(payload, "conversationToolProgress", msg.conversationToolProgress);
+    }
+
     if (Object.prototype.hasOwnProperty.call(msg, "pathways")) {
       if (!msg.pathways || typeof msg.pathways !== "object" || Array.isArray(msg.pathways)) {
         throw new Error("pathways must be an object");
@@ -2107,6 +2569,10 @@ function createDownstreamHandler(opts) {
       return payload;
     }
 
+    if (action === "webui-agent-menu-open") {
+      return payload;
+    }
+
     if (
       action === "webui-debug-upload-open" ||
       action === "webui-debug-upload-send" ||
@@ -2120,25 +2586,62 @@ function createDownstreamHandler(opts) {
       return payload;
     }
 
+    if (
+      action === "webui-pair-open" ||
+      action === "webui-pair-phrase-match" ||
+      action === "webui-pair-phrase-mismatch" ||
+      action === "webui-pair-dismiss"
+    ) {
+      return payload;
+    }
+
+    if (action === "webui-pair-scan-payload") {
+      const text = parseOptionalTrimmedString(msg.text);
+      if (!text) {
+        throw new Error("remote-control webui-pair-scan-payload requires text");
+      }
+      return { ...payload, text };
+    }
+
+    if (action === "webui-pair-manual") {
+
+      const text = parseOptionalTrimmedString(msg.text);
+      const value = parseOptionalTrimmedString(msg.value);
+      if (!text) {
+        throw new Error("remote-control webui-pair-manual requires text (the address)");
+      }
+      if (!value) {
+        throw new Error("remote-control webui-pair-manual requires value (the pairing code)");
+      }
+      return { ...payload, text, value };
+    }
+
     if (action === "relay-action") {
-      payload.relayAction = normalizeRemoteRelayAction(msg.relayAction);
+      const normalizedRelayAction = normalizeRemoteRelayAction(msg.relayAction);
+      payload.relayAction = normalizedRelayAction;
       if (
-        payload.relayAction === "listen-start" ||
-        payload.relayAction === "listen-stop" ||
-        payload.relayAction === "listen-send" ||
-        payload.relayAction === "listen-retry"
+        normalizedRelayAction === "listen-start" ||
+        normalizedRelayAction === "listen-stop" ||
+        normalizedRelayAction === "listen-send" ||
+        normalizedRelayAction === "listen-retry"
       ) {
         throw new Error(
-          `remote-control relayAction ${payload.relayAction} was removed; voice stays local to the app`,
+          `remote-control relayAction ${normalizedRelayAction} was removed; voice stays local to the app`,
         );
       }
       const sessionKey = parseOptionalTrimmedString(msg.sessionKey);
       const command = parseOptionalTrimmedString(msg.command);
-      if (payload.relayAction === "switch-session" && !sessionKey) {
+      if (normalizedRelayAction === "switch-session" && !sessionKey) {
         throw new Error("remote-control switch-session requires sessionKey");
       }
-      if (payload.relayAction === "slash-command" && !command) {
+      if (normalizedRelayAction === "slash-command" && !command) {
         throw new Error("remote-control slash-command requires command");
+      }
+      if (
+        (normalizedRelayAction === "ptt-partial" || normalizedRelayAction === "ptt-lab-commit") &&
+        !command
+      ) {
+        throw new Error(`remote-control ${normalizedRelayAction} requires command`);
       }
       if (sessionKey) payload.sessionKey = sessionKey;
       if (command) payload.command = command;
@@ -2167,6 +2670,14 @@ function createDownstreamHandler(opts) {
       if (containerId !== undefined) payload.containerId = containerId;
       if (containerName) payload.containerName = containerName;
       return payload;
+    }
+
+    if (action === "menu-item-click") {
+      const itemId = Number(msg.itemId);
+      if (!Number.isInteger(itemId) || itemId < 1 || itemId > 0xffff_ffff) {
+        throw new Error("remote-control menu-item-click requires itemId to be a non-zero uint32");
+      }
+      return { ...payload, itemId };
     }
 
     if (action === "text-event") {
@@ -2396,14 +2907,27 @@ function createDownstreamHandler(opts) {
         ),
       };
     }
+    const attachment = parsedAttachment.attachment || null;
 
     const text = typeof msg.text === "string" ? msg.text : "";
-    if (!text.trim() && !parsedAttachment.attachment) {
+    if (!text.trim() && !attachment) {
       return {
         unicast: formatSendAckCompat(
           requestId,
           "rejected",
           "Missing required field: text",
+        ),
+      };
+    }
+
+    if (isForeignHermesSessionKey(msg.sessionKey)) {
+      return {
+        unicast: formatSendAckCompat(
+          requestId,
+          "rejected",
+          "Foreign sessions are read-only; copy to OcuClaw before sending.",
+          "unsupported_session_key",
+          undefined,
         ),
       };
     }
@@ -2423,7 +2947,7 @@ function createDownstreamHandler(opts) {
         }
         let status;
         let ack;
-        if (parsedAttachment && parsedAttachment.attachment) {
+        if (attachment) {
 
           status = "rejected";
           ack = formatSendAckCompat(requestId, status, "Even Terminal sessions do not support attachments.");
@@ -2471,7 +2995,7 @@ function createDownstreamHandler(opts) {
       requestId,
       text,
       msg.sessionKey || null,
-      parsedAttachment.attachment,
+      attachment,
       clientDisplaySignals,
     ).then(
       (result) => {
@@ -2519,7 +3043,34 @@ function createDownstreamHandler(opts) {
       : followup;
   }
 
-  function handleAbortSession(clientId, msg) {
+  function handleLedgerSync(
+    msg = {},
+    callback = () => null,
+  ) {
+    const sessionId = parseOptionalTrimmedString(msg.sessionId);
+    if (!sessionId || typeof callback !== "function") return null;
+    try {
+      const result = callback({
+        sessionId,
+        lastSeq: parseOptionalInteger(msg.lastSeq),
+        entriesRevision: parseOptionalInteger(msg.entriesRevision),
+        digest: parseOptionalInteger(msg.digest),
+        fromSeq: parseOptionalInteger(msg.fromSeq),
+      });
+      return result ? { unicast: formatEntries(result, sessionId) } : null;
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      logger.warn(
+        `[downstream] ledger sync handler threw: ${detail}`,
+      );
+      return null;
+    }
+  }
+
+  function handleAbortSession(
+    clientId,
+    msg,
+  ) {
     const requestId = parseOptionalTrimmedString(msg.requestId);
     if (!requestId) {
       return {
@@ -3370,7 +3921,17 @@ function createDownstreamHandler(opts) {
 
   function handleNewChat(clientId) {
     return onNewChat().then(
-      (pages) => ({ broadcast: formatPages(pages) }),
+      (result) => {
+        if (result && typeof result === "object" && typeof result.sessionKey === "string") {
+          return {
+            broadcast: [
+              formatSessionSwitched(result.sessionKey, "", result.draft === true),
+              formatPages(Array.isArray(result.pages) ? result.pages : []),
+            ],
+          };
+        }
+        return { broadcast: formatPages(result) };
+      },
       (err) => {
         logger.error(`[downstream] newChat failed: ${err.message}`);
         return null;
@@ -3390,6 +3951,11 @@ function createDownstreamHandler(opts) {
 
   function handleGetSessionDiff(clientId, msg) {
     const kind = normalizeSessionDiffKind(msg && msg.kind);
+    if (!kind) {
+      return Promise.resolve({
+        unicast: formatError("invalid_session_diff_kind", {}),
+      });
+    }
     const known = parseKnownSessionRows(msg);
     const limit = normalizeSessionDiffLimit(msg && msg.limit);
     if (kind === "evenai") {
@@ -3486,6 +4052,552 @@ function createDownstreamHandler(opts) {
             skills: [],
             fetchedAtMs: Date.now(),
             stale: true,
+          }),
+        };
+      },
+    );
+  }
+
+  function handleGetLiveuiLibrary(clientId) {
+    if (!onGetLiveuiLibrary) return { unicast: formatLiveuiLibrary([]) };
+    return Promise.resolve(onGetLiveuiLibrary()).then(
+      (items) => ({ unicast: formatLiveuiLibrary(items) }),
+      (err) => {
+        logger.error(`[downstream] get LiveUI Library failed: ${err.message}`);
+        return { unicast: formatLiveuiLibrary([]) };
+      },
+    );
+  }
+
+  function handleOpenLiveuiLibraryItem(clientId, msg) {
+    const itemType = typeof msg.itemType === "string" ? msg.itemType : "";
+    const itemId = typeof msg.itemId === "string" ? msg.itemId : "";
+    if (!onOpenLiveuiLibraryItem) {
+      return {
+        unicast: formatLiveuiLibraryOpenResult({
+          itemType,
+          itemId,
+          status: "rejected",
+          code: "item_unavailable",
+        }),
+      };
+    }
+    return Promise.resolve(onOpenLiveuiLibraryItem({ clientId, itemType, itemId })).then(
+      (result) => ({
+        unicast: formatLiveuiLibraryOpenResult({ itemType, itemId, ...(result || {}) }),
+      }),
+      (err) => {
+        logger.error(`[downstream] open LiveUI Library item failed: ${err.message}`);
+        return {
+          unicast: formatLiveuiLibraryOpenResult({
+            itemType,
+            itemId,
+            status: "rejected",
+            code: "template_open_failed",
+          }),
+        };
+      },
+    );
+  }
+
+  function handleCancelLiveuiTaskLaunch(clientId, msg) {
+    const taskId = typeof msg.taskId === "string" ? msg.taskId : "";
+    if (!onCancelLiveuiTaskLaunch) return null;
+    try {
+      const result = onCancelLiveuiTaskLaunch({ clientId, taskId });
+      if (result && typeof result.then === "function") {
+        return result.then(
+          () => null,
+          (err) => {
+            logger.warn(
+              `[downstream] cancel LiveUI Task launch failed: ${err && err.message ? err.message : err}`,
+            );
+            return null;
+          },
+        );
+      }
+      return null;
+    } catch (err) {
+      logger.warn(
+        `[downstream] cancel LiveUI Task launch failed: ${err && err.message ? err.message : err}`,
+      );
+      return null;
+    }
+  }
+
+  function handleGetLiveuiTasksForPhone(clientId) {
+    if (!onGetLiveuiTasksForPhone) {
+      return { unicast: formatLiveuiTasks({ tasks: [], templates: [], invalid: [] }) };
+    }
+    return Promise.resolve(onGetLiveuiTasksForPhone()).then(
+      (payload) => ({ unicast: formatLiveuiTasks(payload || {}) }),
+      (err) => {
+        logger.error(`[downstream] get LiveUI Tasks failed: ${err.message}`);
+        return { unicast: formatLiveuiTasks({ tasks: [], templates: [], invalid: [] }) };
+      },
+    );
+  }
+
+  function handleGetLiveuiTaskRunsForPhone(clientId, msg) {
+    const taskId = typeof msg.taskId === "string" ? msg.taskId.trim() : "";
+    if (!isPhoneClient(clientId)) {
+      return { unicast: formatError("liveui_task_runs_phone_only", {}) };
+    }
+    if (!taskId) {
+      return { unicast: formatError("liveui_task_runs_task_id_required", {}) };
+    }
+    if (!onGetLiveuiTaskRunsForPhone) {
+      return { unicast: formatLiveuiTaskRuns(taskId, []) };
+    }
+    return Promise.resolve(onGetLiveuiTaskRunsForPhone(taskId)).then(
+      (records) => ({ unicast: formatLiveuiTaskRuns(taskId, records) }),
+      (err) => {
+        logger.error(`[downstream] get LiveUI Task Runs failed: ${err.message}`);
+        return { unicast: formatLiveuiTaskRuns(taskId, []) };
+      },
+    );
+  }
+
+  function handleReviewLiveuiTask(clientId, msg) {
+    const taskId = typeof msg.taskId === "string" ? msg.taskId : "";
+    const action = typeof msg.action === "string" ? msg.action : "";
+    const expectedDigest = typeof msg.expectedDigest === "string" ? msg.expectedDigest : "";
+    if (!isPhoneClient(clientId)) {
+      return {
+        unicast: formatLiveuiTaskReviewAck({
+          taskId,
+          action,
+          status: "rejected",
+          code: "phone_only",
+        }),
+      };
+    }
+    if (!onReviewLiveuiTask) {
+      return {
+        unicast: formatLiveuiTaskReviewAck({
+          taskId,
+          action,
+          status: "rejected",
+          code: "item_unavailable",
+        }),
+      };
+    }
+    const failure = (err) => {
+      logger.error(`[downstream] review LiveUI Task failed: ${err.message}`);
+      return {
+        unicast: formatLiveuiTaskReviewAck({
+          taskId,
+          action,
+          status: "rejected",
+          code: "task_review_failed",
+        }),
+      };
+    };
+    return Promise.resolve(onReviewLiveuiTask({ clientId, taskId, action, expectedDigest })).then(
+      (result) => {
+        const ack = formatLiveuiTaskReviewAck({ taskId, action, ...(result || {}) });
+        if (!result || result.status !== "accepted") return { unicast: ack };
+        return Promise.all([
+          onGetLiveuiTasksForPhone ? Promise.resolve(onGetLiveuiTasksForPhone()) : Promise.resolve({}),
+          onGetLiveuiLibrary ? Promise.resolve(onGetLiveuiLibrary()) : Promise.resolve([]),
+        ]).then(([tasks, library]) => ({
+          unicast: ack,
+          broadcast: [formatLiveuiTasks(tasks || {}), formatLiveuiLibrary(library)],
+        }));
+      },
+      failure,
+    ).catch(failure);
+  }
+
+  function handleGetLiveuiTaskExecutors(clientId) {
+    if (!isPhoneClient(clientId)) {
+      return { unicast: formatError("phone_only", { code: "phone_only" }) };
+    }
+    if (!onGetLiveuiTaskExecutors) {
+      return { unicast: formatLiveuiTaskExecutors({ executors: [] }) };
+    }
+    return Promise.resolve(onGetLiveuiTaskExecutors()).then(
+      (payload) => ({ unicast: formatLiveuiTaskExecutors(payload || {}) }),
+      (err) => {
+        logger.error(`[downstream] get LiveUI Task Executors failed: ${err.message}`);
+        return { unicast: formatLiveuiTaskExecutors({ executors: [] }) };
+      },
+    );
+  }
+
+  function handleSetLiveuiTaskExecutor(clientId, msg) {
+    const taskId = typeof msg.taskId === "string" ? msg.taskId : "";
+    const executor = msg.executor && typeof msg.executor === "object"
+      ? {
+          host: typeof msg.executor.host === "string" ? msg.executor.host : "",
+          agentId: typeof msg.executor.agentId === "string" ? msg.executor.agentId : "",
+        }
+      : { host: "", agentId: "" };
+    if (!isPhoneClient(clientId)) {
+      return {
+        unicast: formatLiveuiTaskExecutorAck({
+          taskId,
+          status: "rejected",
+          code: "phone_only",
+        }),
+      };
+    }
+    if (!onSetLiveuiTaskExecutor) {
+      return {
+        unicast: formatLiveuiTaskExecutorAck({
+          taskId,
+          status: "rejected",
+          code: "item_unavailable",
+        }),
+      };
+    }
+    const failure = (err) => {
+      logger.error(`[downstream] set LiveUI Task Executor failed: ${err.message}`);
+      return {
+        unicast: formatLiveuiTaskExecutorAck({
+          taskId,
+          status: "rejected",
+          code: "task_executor_update_failed",
+        }),
+      };
+    };
+    return Promise.resolve(onSetLiveuiTaskExecutor({ clientId, taskId, executor })).then(
+      (result) => {
+        const ack = formatLiveuiTaskExecutorAck({ taskId, ...(result || {}) });
+        if (!result || result.status !== "accepted") return { unicast: ack };
+        return Promise.all([
+          onGetLiveuiTasksForPhone ? Promise.resolve(onGetLiveuiTasksForPhone()) : Promise.resolve({}),
+          onGetLiveuiLibrary ? Promise.resolve(onGetLiveuiLibrary()) : Promise.resolve([]),
+        ]).then(([tasks, library]) => ({
+          unicast: ack,
+          broadcast: [formatLiveuiTasks(tasks || {}), formatLiveuiLibrary(library)],
+        }));
+      },
+      failure,
+    ).catch(failure);
+  }
+
+  function handleSetLiveuiTaskPreferredTemplate(clientId, msg) {
+    const taskId = typeof msg.taskId === "string" ? msg.taskId : "";
+    const expectedDigest = typeof msg.expectedDigest === "string" ? msg.expectedDigest : "";
+    const templateId = msg.templateId === null
+      ? null
+      : typeof msg.templateId === "string"
+        ? msg.templateId
+        : "";
+    if (!isPhoneClient(clientId)) {
+      return {
+        unicast: formatLiveuiTaskPreferredTemplateAck({
+          taskId,
+          status: "rejected",
+          code: "phone_only",
+        }),
+      };
+    }
+    if (!onSetLiveuiTaskPreferredTemplate) {
+      return {
+        unicast: formatLiveuiTaskPreferredTemplateAck({
+          taskId,
+          status: "rejected",
+          code: "item_unavailable",
+        }),
+      };
+    }
+    const failure = (err) => {
+      logger.error(`[downstream] set LiveUI Task Preferred Template failed: ${err.message}`);
+      return {
+        unicast: formatLiveuiTaskPreferredTemplateAck({
+          taskId,
+          status: "rejected",
+          code: "task_preferred_template_update_failed",
+        }),
+      };
+    };
+    return Promise.resolve(onSetLiveuiTaskPreferredTemplate({
+      clientId,
+      taskId,
+      expectedDigest,
+      templateId,
+    })).then(
+      (result) => {
+        const ack = formatLiveuiTaskPreferredTemplateAck({ taskId, ...(result || {}) });
+        if (!result || result.status !== "accepted") return { unicast: ack };
+        return Promise.all([
+          onGetLiveuiTasksForPhone ? Promise.resolve(onGetLiveuiTasksForPhone()) : Promise.resolve({}),
+          onGetLiveuiLibrary ? Promise.resolve(onGetLiveuiLibrary()) : Promise.resolve([]),
+        ]).then(([tasks, library]) => ({
+          unicast: ack,
+          broadcast: [formatLiveuiTasks(tasks || {}), formatLiveuiLibrary(library)],
+        }));
+      },
+      failure,
+    ).catch(failure);
+  }
+
+  function handleSetLiveuiTaskContext(clientId, msg) {
+    const taskId = typeof msg.taskId === "string" ? msg.taskId : "";
+    const context = typeof msg.context === "string" ? msg.context : "";
+    if (!isPhoneClient(clientId)) {
+      return {
+        unicast: formatLiveuiTaskContextAck({
+          taskId,
+          status: "rejected",
+          code: "phone_only",
+        }),
+      };
+    }
+    if (!onSetLiveuiTaskContext) {
+      return {
+        unicast: formatLiveuiTaskContextAck({
+          taskId,
+          status: "rejected",
+          code: "item_unavailable",
+        }),
+      };
+    }
+    const failure = (err) => {
+      logger.error(`[downstream] set LiveUI Task context failed: ${err.message}`);
+      return {
+        unicast: formatLiveuiTaskContextAck({
+          taskId,
+          status: "rejected",
+          code: "task_context_update_failed",
+        }),
+      };
+    };
+    return Promise.resolve(onSetLiveuiTaskContext({ clientId, taskId, context })).then(
+      (result) => {
+        const ack = formatLiveuiTaskContextAck({ taskId, ...(result || {}) });
+        if (!result || result.status !== "accepted") return { unicast: ack };
+        return Promise.all([
+          onGetLiveuiTasksForPhone ? Promise.resolve(onGetLiveuiTasksForPhone()) : Promise.resolve({}),
+          onGetLiveuiLibrary ? Promise.resolve(onGetLiveuiLibrary()) : Promise.resolve([]),
+        ]).then(([tasks, library]) => ({
+          unicast: ack,
+          broadcast: [formatLiveuiTasks(tasks || {}), formatLiveuiLibrary(library)],
+        }));
+      },
+      failure,
+    ).catch(failure);
+  }
+
+  function handleGetLiveuiPrefs(clientId) {
+    if (!isPhoneClient(clientId)) {
+      return { unicast: formatLiveuiPrefsAck({ status: "rejected", code: "phone_only" }) };
+    }
+    if (!onGetLiveuiPrefs) {
+      return { unicast: formatLiveuiPrefsAck({ status: "rejected", code: "item_unavailable" }) };
+    }
+    const failure = (err) => {
+      logger.error(`[downstream] get LiveUI prefs failed: ${err.message}`);
+      return { unicast: formatLiveuiPrefsAck({ status: "rejected", code: "prefs_read_failed" }) };
+    };
+    return Promise.resolve(onGetLiveuiPrefs()).then(
+      (result) => ({
+        unicast: formatLiveuiPrefs({
+          ...((result && result.prefs) || {}),
+          ...(result && result.prefsInvalid ? { prefsInvalid: result.prefsInvalid } : {}),
+        }),
+      }),
+      failure,
+    ).catch(failure);
+  }
+
+  function handleSetLiveuiPrefs(clientId, msg) {
+    if (!isPhoneClient(clientId)) {
+      return { unicast: formatLiveuiPrefsAck({ status: "rejected", code: "phone_only" }) };
+    }
+    if (!onSetLiveuiPrefs) {
+      return { unicast: formatLiveuiPrefsAck({ status: "rejected", code: "item_unavailable" }) };
+    }
+    const patch = {};
+    if (typeof msg.enabled === "boolean") patch.enabled = msg.enabled;
+    if (typeof msg.pauseApps === "boolean") patch.pauseApps = msg.pauseApps;
+    if (typeof msg.defaultContext === "string") patch.defaultContext = msg.defaultContext;
+    if (msg.defaultExecutor === null || typeof msg.defaultExecutor === "string") {
+      patch.defaultExecutor = msg.defaultExecutor;
+    }
+    const failure = (err) => {
+      logger.error(`[downstream] set LiveUI prefs failed: ${err.message}`);
+      return { unicast: formatLiveuiPrefsAck({ status: "rejected", code: "prefs_update_failed" }) };
+    };
+    return Promise.resolve(onSetLiveuiPrefs({ clientId, patch })).then(
+      (result) => {
+        const ack = formatLiveuiPrefsAck(result || {});
+        if (!result || result.status !== "accepted") return { unicast: ack };
+
+        return Promise.resolve(onGetLiveuiStatus ? onGetLiveuiStatus() : null).then((status) => ({
+          unicast: ack,
+          broadcast: [
+            formatLiveuiPrefs(result.prefs || {}),
+            ...(status ? [formatLiveuiStatus(status)] : []),
+          ],
+        }));
+      },
+      failure,
+    ).catch(failure);
+  }
+
+  function handleGetLiveuiStatus(clientId) {
+    if (!isPhoneClient(clientId)) {
+      return { unicast: formatError("LiveUI status is phone-only", { code: "phone_only" }) };
+    }
+    if (!onGetLiveuiStatus) {
+      return { unicast: formatError("LiveUI status unavailable", { code: "item_unavailable" }) };
+    }
+    const failure = (err) => {
+      logger.error(`[downstream] get LiveUI status failed: ${err.message}`);
+      return { unicast: formatError("LiveUI status unavailable", { code: "status_read_failed" }) };
+    };
+    return Promise.resolve(onGetLiveuiStatus()).then(
+      (status) => ({ unicast: formatLiveuiStatus(status || {}) }),
+      failure,
+    ).catch(failure);
+  }
+
+  function handleSetLiveuiTaskSettingValues(clientId, msg) {
+    const taskId = typeof msg.taskId === "string" ? msg.taskId : "";
+    const expectedDigest = typeof msg.expectedDigest === "string" ? msg.expectedDigest : "";
+    const values = msg.values && typeof msg.values === "object" && !Array.isArray(msg.values)
+      ? msg.values
+      : {};
+    if (!isPhoneClient(clientId)) {
+      return {
+        unicast: formatLiveuiTaskSettingsAck({
+          taskId,
+          status: "rejected",
+          code: "phone_only",
+        }),
+      };
+    }
+    if (!onSetLiveuiTaskSettingValues) {
+      return {
+        unicast: formatLiveuiTaskSettingsAck({
+          taskId,
+          status: "rejected",
+          code: "item_unavailable",
+        }),
+      };
+    }
+    const failure = (err) => {
+      logger.error(`[downstream] set LiveUI Task Settings failed: ${err.message}`);
+      return {
+        unicast: formatLiveuiTaskSettingsAck({
+          taskId,
+          status: "rejected",
+          code: "task_setting_values_update_failed",
+        }),
+      };
+    };
+    return Promise.resolve(onSetLiveuiTaskSettingValues({
+      clientId,
+      taskId,
+      expectedDigest,
+      values,
+    })).then(
+      (result) => {
+        const ack = formatLiveuiTaskSettingsAck({ taskId, ...(result || {}) });
+        if (!result || result.status !== "accepted") return { unicast: ack };
+        return Promise.all([
+          onGetLiveuiTasksForPhone ? Promise.resolve(onGetLiveuiTasksForPhone()) : Promise.resolve({}),
+          onGetLiveuiLibrary ? Promise.resolve(onGetLiveuiLibrary()) : Promise.resolve([]),
+        ]).then(([tasks, library]) => ({
+          unicast: ack,
+          broadcast: [formatLiveuiTasks(tasks || {}), formatLiveuiLibrary(library)],
+        }));
+      },
+      failure,
+    ).catch(failure);
+  }
+
+  function handleOrganizeLiveuiLibrary(clientId, msg) {
+    const params = {
+      clientId,
+      action: typeof msg.action === "string" ? msg.action : "",
+      expectedDigest: typeof msg.expectedDigest === "string" ? msg.expectedDigest : "",
+      ...(typeof msg.itemType === "string" ? { itemType: msg.itemType } : {}),
+      ...(typeof msg.itemId === "string" ? { itemId: msg.itemId } : {}),
+      ...(Array.isArray(msg.order) ? { order: msg.order } : {}),
+      ...(Object.prototype.hasOwnProperty.call(msg, "name") ? { name: msg.name } : {}),
+      ...(Object.prototype.hasOwnProperty.call(msg, "description")
+        ? { description: msg.description }
+        : {}),
+      ...(Object.prototype.hasOwnProperty.call(msg, "icon") ? { icon: msg.icon } : {}),
+    };
+    if (!isPhoneClient(clientId)) {
+      return {
+        unicast: formatLiveuiLibraryOrganizeAck({
+          action: params.action,
+          status: "rejected",
+          code: "phone_only",
+        }),
+      };
+    }
+    if (!onOrganizeLiveuiLibrary) {
+      return {
+        unicast: formatLiveuiLibraryOrganizeAck({
+          action: params.action,
+          status: "rejected",
+          code: "item_unavailable",
+        }),
+      };
+    }
+    const failure = (err) => {
+      logger.error(`[downstream] organize LiveUI Library failed: ${err.message}`);
+      return {
+        unicast: formatLiveuiLibraryOrganizeAck({
+          action: params.action,
+          status: "rejected",
+          code: "library_organize_failed",
+        }),
+      };
+    };
+    return Promise.resolve(onOrganizeLiveuiLibrary(params)).then(
+      (result) => {
+        const ack = formatLiveuiLibraryOrganizeAck({
+          action: params.action,
+          ...(result || {}),
+        });
+        if (!result || result.status !== "accepted") return { unicast: ack };
+        return Promise.all([
+          onGetLiveuiTasksForPhone ? Promise.resolve(onGetLiveuiTasksForPhone()) : Promise.resolve({}),
+          onGetLiveuiLibrary ? Promise.resolve(onGetLiveuiLibrary()) : Promise.resolve([]),
+        ]).then(([phone, glasses]) => ({
+          unicast: ack,
+          broadcast: [formatLiveuiTasks(phone || {}), formatLiveuiLibrary(glasses)],
+        }));
+      },
+      failure,
+    ).catch(failure);
+  }
+
+  function handleGetCommandCatalog(clientId) {
+    if (!onGetCommandCatalog) {
+      return {
+        unicast: formatCommandCatalog({
+          commands: [],
+          fetchedAtMs: Date.now(),
+          stale: true,
+          unsupported: true,
+          backendKind: "none",
+          executes: "intercepted-only",
+        }),
+      };
+    }
+    return Promise.resolve(onGetCommandCatalog()).then(
+      (payload) => ({
+        unicast: formatCommandCatalog(payload || {}),
+      }),
+      (err) => {
+        logger.error(`[downstream] getCommands failed: ${err.message}`);
+        return {
+          unicast: formatCommandCatalog({
+            commands: [],
+            fetchedAtMs: Date.now(),
+            stale: true,
+            unsupported: false,
+            backendKind: "none",
+            executes: "intercepted-only",
           }),
         };
       },
@@ -3875,6 +4987,14 @@ function createDownstreamHandler(opts) {
         ],
       }),
       (err) => {
+
+        if (
+          err &&
+          (err.reason === "session_switch_superseded" ||
+            err.code === "session_switch_superseded")
+        ) {
+          return null;
+        }
         logger.error(`[downstream] switchSession failed: ${err.message}`);
         if (err && (err.reason === "unsupported_session_key" || err.code === "unsupported_session_key")) {
           return {
@@ -3894,19 +5014,36 @@ function createDownstreamHandler(opts) {
 
   function handleCopySession(clientId, msg) {
     if (!msg.sessionKey) return null;
-    return onCopySession(msg.sessionKey).then(
-      (result) => ({
+    if (!isForeignHermesSessionKey(msg.sessionKey)) {
+      return {
         unicast: JSON.stringify({
           type: APP_PROTOCOL.sessionCopyAck,
-          ok: true,
-          key: result.sessionKey,
+          ok: false,
           copiedFrom: msg.sessionKey,
+          error: "foreign_session_copy_requires_foreign_source",
         }),
-        broadcast: [
-          formatSessionSwitched(result.sessionKey),
-          formatPages(result.pages),
-        ],
-      }),
+      };
+    }
+    return onCopySession(msg.sessionKey).then(
+      (result) => {
+        const ack = {
+          unicast: JSON.stringify({
+            type: APP_PROTOCOL.sessionCopyAck,
+            ok: true,
+            key: result.sessionKey,
+            copiedFrom: msg.sessionKey,
+          }),
+        };
+
+        if (result.superseded === true) return ack;
+        return {
+          ...ack,
+          broadcast: [
+            formatSessionSwitched(result.sessionKey),
+            formatPages(result.pages),
+          ],
+        };
+      },
       (err) => {
         logger.error(`[downstream] copySession failed: ${err.message}`);
         return {
@@ -3942,7 +5079,7 @@ function createDownstreamHandler(opts) {
     return Promise.resolve(onNewSession(payload)).then(
       (result) => {
         const broadcast = [
-          formatSessionSwitched(result.sessionKey, payload.requestId),
+          formatSessionSwitched(result.sessionKey, payload.requestId, result.draft),
           formatPages(result.pages),
         ];
         if (result && result.sessionModelConfig) {
@@ -3984,13 +5121,16 @@ function createDownstreamHandler(opts) {
           return reject("Even Terminal session creation failed.");
         }
 
-        const action = {
-          broadcast: [
+        const action = {};
+
+        if (result.superseded !== true) {
+          action.broadcast = [
             formatSessionSwitched(result.sessionKey),
             formatPages(result.pages),
-          ],
-        };
+          ];
+        }
         if (requestId) action.unicast = formatSendAckCompat(requestId, "accepted");
+        if (!action.broadcast && !action.unicast) return null;
         return action;
       },
       (err) => {
@@ -4008,8 +5148,41 @@ function createDownstreamHandler(opts) {
     const title = typeof msg.title === "string" ? msg.title.trim() : "";
     if (!sessionKey || !title) return null;
     if (title.length > 55) return null;
-    onSetUserSessionTitle(sessionKey, title);
-    return null;
+
+    const errorAction = (code) => ({
+      unicast: formatError(code, {
+        code,
+        op: "session.title.set",
+      }),
+    });
+    if (isForeignHermesSessionKey(sessionKey)) {
+      return errorAction("session_not_renamable");
+    }
+
+    const failure = (err) => {
+      const message = err && err.message ? err.message : String(err || "");
+      const conflict = /already in use|unique/i.test(message);
+      const code = conflict
+        ? "session_title_conflict"
+        : "session_title_update_failed";
+      return errorAction(code);
+    };
+
+    const finish = (resolved) => {
+      if (!resolved || resolved.ok !== false) return null;
+      return resolved.code === "session_title_conflict"
+        ? errorAction("session_title_conflict")
+        : failure(new Error(resolved.code || "title update rejected"));
+    };
+    try {
+      const result = onSetUserSessionTitle(sessionKey, title);
+      if (result && typeof result.then === "function") {
+        return result.then(finish, failure);
+      }
+      return finish(result);
+    } catch (err) {
+      return failure(err);
+    }
   }
 
   function handleSetSessionPinned(clientId, msg) {
@@ -4018,7 +5191,11 @@ function createDownstreamHandler(opts) {
       typeof msg.sessionKey === "string" ? msg.sessionKey.trim() : "";
     const pinned = msg.pinned === true;
     const kind = msg.kind;
-    if (!sessionKey || (kind !== "ocuclaw" && kind !== "evenai")) {
+    if (
+      !sessionKey ||
+      isForeignHermesSessionKey(sessionKey) ||
+      (kind !== "ocuclaw" && kind !== "evenai")
+    ) {
       return { unicast: formatError("invalid_session_pin_request") };
     }
     const result = onSetSessionPinned(sessionKey, pinned, kind);
@@ -4029,12 +5206,63 @@ function createDownstreamHandler(opts) {
     return null;
   }
 
+  function handleSetSessionHidden(clientId, msg) {
+    if (typeof onSetSessionHidden !== "function") return null;
+    const sessionKey =
+      typeof msg.sessionKey === "string" ? msg.sessionKey.trim() : "";
+    if (!sessionKey) {
+      return {
+        unicast: formatError("invalid_session_hidden_request", {
+          code: "invalid_session_hidden_request",
+          op: "session.hidden.set",
+        }),
+      };
+    }
+    const hidden = msg.hidden === true;
+    const finish = (result) => {
+      if (result && result.ok === false) {
+        const code =
+          typeof result.code === "string"
+            ? result.code
+            : "invalid_session_hidden_request";
+        return {
+          unicast: formatError(code, { code, op: "session.hidden.set" }),
+        };
+      }
+      return null;
+    };
+    const failure = (err) => {
+      logger.warn(
+        `[handler] session.hidden.set failed: ${err && err.message ? err.message : err}`,
+      );
+      return {
+        unicast: formatError("session_hidden_update_failed", {
+          code: "session_hidden_update_failed",
+          op: "session.hidden.set",
+        }),
+      };
+    };
+    try {
+      const result = onSetSessionHidden(sessionKey, hidden);
+      if (result && typeof result.then === "function") {
+        return result.then(finish, failure);
+      }
+      return finish(result);
+    } catch (err) {
+      return failure(err);
+    }
+  }
+
   function handleDeleteSessions(clientId, msg) {
     if (typeof onDeleteSessions !== "function") return null;
     const sessionKeys = Array.isArray(msg.sessionKeys) ? msg.sessionKeys.filter((k) => typeof k === "string" && k) : [];
     const kind = msg.kind;
     const switchBeforeDelete = msg.switchBeforeDelete === true;
-    if (sessionKeys.length === 0 || (kind !== "ocuclaw" && kind !== "evenai")) {
+    if (
+      sessionKeys.length === 0 ||
+      sessionKeys.some(isForeignHermesSessionKey) ||
+      (kind !== "ocuclaw" && kind !== "evenai")
+    ) {
       return { unicast: formatError("invalid_session_delete_request") };
     }
     onDeleteSessions(sessionKeys, kind, switchBeforeDelete);
@@ -4555,6 +5783,10 @@ function createDownstreamHandler(opts) {
       }
 
       switch (msg.type) {
+        case APP_PROTOCOL.ledgerCursor:
+          return handleLedgerSync(msg, onLedgerCursor);
+        case APP_PROTOCOL.ledgerResyncRequest:
+          return handleLedgerSync(msg, onResyncRequest);
         case APP_PROTOCOL.messageSend:
           return handleSend(clientId, msg);
         case APP_PROTOCOL.sessionAbort:
@@ -4602,6 +5834,8 @@ function createDownstreamHandler(opts) {
           return handleSetUserSessionTitle(clientId, msg);
         case "ocuclaw.session.pinned.set":
           return handleSetSessionPinned(clientId, msg);
+        case APP_PROTOCOL.sessionHiddenSet:
+          return handleSetSessionHidden(clientId, msg);
         case "ocuclaw.session.delete":
           return handleDeleteSessions(clientId, msg);
         case "ocuclaw.session.transcripts.search":
@@ -4611,6 +5845,39 @@ function createDownstreamHandler(opts) {
         case APP_PROTOCOL.skillsCatalogGet:
         case "getSkills":
           return handleGetSkillsCatalog(clientId);
+        case APP_PROTOCOL.liveuiLibraryGet:
+          return handleGetLiveuiLibrary(clientId);
+        case APP_PROTOCOL.liveuiLibraryOpen:
+          return handleOpenLiveuiLibraryItem(clientId, msg);
+        case APP_PROTOCOL.liveuiTaskCancel:
+          return handleCancelLiveuiTaskLaunch(clientId, msg);
+        case APP_PROTOCOL.liveuiTasksGet:
+          return handleGetLiveuiTasksForPhone(clientId);
+        case APP_PROTOCOL.liveuiTaskRunsGet:
+          return handleGetLiveuiTaskRunsForPhone(clientId, msg);
+        case APP_PROTOCOL.liveuiTaskReview:
+          return handleReviewLiveuiTask(clientId, msg);
+        case APP_PROTOCOL.liveuiTaskExecutorsGet:
+          return handleGetLiveuiTaskExecutors(clientId);
+        case APP_PROTOCOL.liveuiTaskExecutorSet:
+          return handleSetLiveuiTaskExecutor(clientId, msg);
+        case APP_PROTOCOL.liveuiTaskPreferredTemplateSet:
+          return handleSetLiveuiTaskPreferredTemplate(clientId, msg);
+        case APP_PROTOCOL.liveuiTaskContextSet:
+          return handleSetLiveuiTaskContext(clientId, msg);
+        case APP_PROTOCOL.liveuiTaskSettingsSet:
+          return handleSetLiveuiTaskSettingValues(clientId, msg);
+        case APP_PROTOCOL.liveuiPrefsGet:
+          return handleGetLiveuiPrefs(clientId);
+        case APP_PROTOCOL.liveuiPrefsSet:
+          return handleSetLiveuiPrefs(clientId, msg);
+        case APP_PROTOCOL.liveuiStatusGet:
+          return handleGetLiveuiStatus(clientId);
+        case APP_PROTOCOL.liveuiLibraryOrganize:
+          return handleOrganizeLiveuiLibrary(clientId, msg);
+        case APP_PROTOCOL.commandCatalogGet:
+        case "getCommands":
+          return handleGetCommandCatalog(clientId);
         case APP_PROTOCOL.agentsCatalogGet:
         case "getAgentsCatalog":
           return handleGetAgentsCatalog(clientId);
@@ -4727,15 +5994,28 @@ function createDownstreamHandler(opts) {
           const surfaceId =
             typeof msg.surfaceId === "string" ? msg.surfaceId.trim() : "";
           const result =
-            msg.result === "selected" || msg.result === "dismissed" ? msg.result : "";
+            msg.result === "selected" ||
+            msg.result === "await_text" ||
+            msg.result === "dismissed"
+              ? msg.result
+              : "";
           const selectedIndex = msg.selectedIndex;
           const validSelectedIndex =
             Number.isInteger(selectedIndex) && selectedIndex >= 0;
+          const selectedIndices = Array.isArray(msg.selectedIndices)
+            ? msg.selectedIndices
+            : null;
+          const validSelectedIndices =
+            selectedIndices !== null &&
+            selectedIndices.length > 0 &&
+            selectedIndices.every((value) => Number.isInteger(value) && value >= 0);
           if (
             !surfaceId ||
             !result ||
-            (result === "selected" && !validSelectedIndex) ||
-            (result === "dismissed" && hasOwn(msg, "selectedIndex"))
+            (result === "selected" && !validSelectedIndex && !validSelectedIndices) ||
+            (result === "selected" && validSelectedIndex && validSelectedIndices) ||
+            (result !== "selected" &&
+              (hasOwn(msg, "selectedIndex") || hasOwn(msg, "selectedIndices")))
           ) {
             return null;
           }
@@ -4743,6 +6023,10 @@ function createDownstreamHandler(opts) {
             try {
               const frame = { surfaceId, result };
               if (result === "selected") frame.selectedIndex = selectedIndex;
+              if (result === "selected" && validSelectedIndices) {
+                delete frame.selectedIndex;
+                frame.selectedIndices = selectedIndices;
+              }
               onDemandResponse(frame);
             } catch (err) {
               logger.warn(
@@ -4752,6 +6036,21 @@ function createDownstreamHandler(opts) {
           }
           return null;
         }
+        case "surface_render_receipt":
+
+          if (typeof onGlassesUiRenderReceipt === "function") {
+            try {
+              onGlassesUiRenderReceipt({
+                surfaceId: typeof msg.surfaceId === "string" ? msg.surfaceId : "",
+                seq: Number.isFinite(msg.seq) ? Math.floor(msg.seq) : null,
+              });
+            } catch (err) {
+              logger.warn(
+                `[downstream] surface_render_receipt handler threw: ${err && err.message ? err.message : err}`,
+              );
+            }
+          }
+          return null;
         case "glasses_ui_nav_event":
 
           if (typeof onGlassesUiNavEvent === "function") {
@@ -4776,6 +6075,7 @@ function createDownstreamHandler(opts) {
               try {
                 onGlassesUiRenderInject({
                   surfaceId: typeof msg.surfaceId === "string" ? msg.surfaceId : "",
+                  sessionKey: parseOptionalTrimmedString(msg.sessionKey) || null,
                   depth: Number.isFinite(msg.depth) ? Math.max(1, Math.floor(msg.depth)) : 1,
                   spec: msg.spec,
                 });
@@ -4847,6 +6147,19 @@ function createDownstreamHandler(opts) {
             }
           }
           return null;
+        case "glasses_presence_changed":
+          if (typeof onGlassesPresenceChanged === "function") {
+            try {
+              onGlassesPresenceChanged({
+                presence: typeof msg.presence === "string" ? msg.presence : "unknown",
+              });
+            } catch (err) {
+              logger.warn(
+                `[downstream] glasses_presence_changed handler threw: ${err && err.message ? err.message : err}`,
+              );
+            }
+          }
+          return null;
         case "location_response":
           if (typeof onLocationResponse === "function") {
             try {
@@ -4870,6 +6183,7 @@ function createDownstreamHandler(opts) {
     },
 
     formatPages,
+    formatEntries,
     formatStatus,
     formatActivity,
     formatThinkingUpdate,
@@ -4878,6 +6192,7 @@ function createDownstreamHandler(opts) {
     formatSendAck: formatSendAckCompat,
     formatProtocol,
     formatStreaming,
+    formatStreamClear,
     formatSessions,
     formatSessionDiff,
     sessionInfoFingerprint,
@@ -4885,6 +6200,19 @@ function createDownstreamHandler(opts) {
     formatSessionSwitchRejected,
     formatModelsCatalog,
     formatSkillsCatalog,
+    formatLiveuiLibrary,
+    formatLiveuiLibraryOpenResult,
+    formatLiveuiTasks,
+    formatLiveuiTaskReviewAck,
+    formatLiveuiTaskExecutors,
+    formatLiveuiTaskExecutorAck,
+    formatLiveuiTaskPreferredTemplateAck,
+    formatLiveuiTaskContextAck,
+    formatLiveuiTaskSettingsAck,
+    formatLiveuiPrefs,
+    formatLiveuiPrefsAck,
+    formatLiveuiStatus,
+    formatCommandCatalog,
     formatAgentsCatalog,
     formatSonioxModels,
     formatProviderUsageSnapshot,

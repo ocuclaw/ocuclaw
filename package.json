@@ -5,7 +5,7 @@
   "dependencies": {
     "fflate": "^0.8.3",
     "marked": "^18.0.7",
-    "undici": "^6.27.0",
+    "undici": "^6.28.0",
     "ws": "^8.21.1"
   },
   "engines": {

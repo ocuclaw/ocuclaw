@@ -1,4 +1,4 @@
-const { backendDisplayName, DEFAULT_BACKEND_KIND, isKnownBackendKind, } = require("../gateway/backend-contract.cjs");
+const { backendDisplayName, DEFAULT_BACKEND_KIND, isKnownBackendKind } = require("../gateway/backend-contract.cjs");
 
 const CAPABILITY_SNAPSHOT_TYPE = "ocuclaw.capability.snapshot";
 const PUSH_MESSAGE_TYPE = "ocuclaw.push.message";
@@ -66,15 +66,64 @@ function reasoningCeilingForModel(provider = "", model = "") {
   return null;
 }
 
-const OPENCLAW_PROFILE = Object.freeze({
-  ownedSubsystems: ["openclaw_session", "openclaw_global", "even_ai"],
-  effectCapabilities: ["neural_span_render", "glasses_ui_tool"],
+const BASE_EFFECT_CAPABILITIES = Object.freeze([
+  "neural_span_render",
+  "glasses_ui_tool",
+]);
+
+const HERMES_BASE_EFFECT_CAPABILITIES = Object.freeze([
+  ...BASE_EFFECT_CAPABILITIES,
+  "tool_progress",
+]);
+
+const HERMES_FEATURE_EFFECT_CAPABILITIES = Object.freeze({
+  interim_hook: "agent_progress_notes",
+  stream_hooks: "reasoning_stream",
+
+  session_read_state: "session_read_state",
 });
 
-const HERMES_PROFILE = Object.freeze({
+function normalizeHermesFeatureTokens(value) {
+  const raw = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(",")
+      : [];
+  const tokens = [];
+  for (const entry of raw) {
+    if (typeof entry !== "string") continue;
+    const token = entry.trim().toLowerCase();
+    if (!token) continue;
+    if (!Object.prototype.hasOwnProperty.call(HERMES_FEATURE_EFFECT_CAPABILITIES, token)) {
+      continue;
+    }
+    if (!tokens.includes(token)) tokens.push(token);
+  }
+  return tokens;
+}
+
+function hermesEffectCapabilities(hermesFeatures) {
+  const capabilities = [...HERMES_BASE_EFFECT_CAPABILITIES];
+  for (const token of normalizeHermesFeatureTokens(hermesFeatures)) {
+    const capability = HERMES_FEATURE_EFFECT_CAPABILITIES[token];
+    if (capability && !capabilities.includes(capability)) {
+      capabilities.push(capability);
+    }
+  }
+  return capabilities;
+}
+
+const OPENCLAW_PROFILE = Object.freeze({
   ownedSubsystems: ["openclaw_session", "openclaw_global", "even_ai"],
-  effectCapabilities: ["neural_span_render", "glasses_ui_tool"],
+  effectCapabilities: [...BASE_EFFECT_CAPABILITIES],
 });
+
+function buildHermesProfile(hermesFeatures) {
+  return Object.freeze({
+    ownedSubsystems: ["openclaw_session", "openclaw_global", "even_ai"],
+    effectCapabilities: hermesEffectCapabilities(hermesFeatures),
+  });
+}
 
 function normalizeSource(source) {
   return isKnownBackendKind(source) ? source : DEFAULT_BACKEND_KIND;
@@ -156,15 +205,19 @@ function buildFamilies(source, options = {}) {
     },
     models: {
       catalog: true,
-      sessionOverride: true,
+      sessionOverride:
+        !isHermes || Reflect.get(options, "sessionOptionsSupported") === true,
       oneTurnOverride: isHermes,
       thinkingLevels: [...THINKING_LEVELS],
       reasoningLevels: [...REASONING_VISIBILITY_LEVELS],
       reasoningCeilings: MODEL_REASONING_CEILINGS,
-      fastMode: !isHermes,
+      fastMode: true,
     },
     skills: {
       list: true,
+    },
+    commands: {
+      catalog: true,
     },
     agents: {
       list: true,
@@ -173,7 +226,7 @@ function buildFamilies(source, options = {}) {
     settings: {
       profiles: {
         openclaw: OPENCLAW_PROFILE,
-        hermes: HERMES_PROFILE,
+        hermes: buildHermesProfile(options.hermesFeatures),
       },
     },
     liveui: {
@@ -254,4 +307,4 @@ function buildPushMessage(options = {}) {
   };
 }
 
-module.exports = { CAPABILITY_SNAPSHOT_TYPE, PUSH_MESSAGE_TYPE, THINKING_LEVELS, REASONING_VISIBILITY_LEVELS, MODEL_REASONING_CEILINGS, reasoningCeilingForModel, buildCapabilitySnapshot, buildPushMessage };
+module.exports = { CAPABILITY_SNAPSHOT_TYPE, PUSH_MESSAGE_TYPE, THINKING_LEVELS, REASONING_VISIBILITY_LEVELS, MODEL_REASONING_CEILINGS, reasoningCeilingForModel, buildCapabilitySnapshot, buildPushMessage, HERMES_FEATURE_EFFECT_CAPABILITIES, hermesEffectCapabilities };

@@ -1,8 +1,9 @@
 const { EventEmitter } = require("node:events");
 const { getActiveBackendKind } = require("../gateway/backend-contract.cjs");
 const { Worker } = require("node:worker_threads");
-const { APP_PROTOCOL, DEFAULT_NUDGE_THRESHOLDS, DEFAULT_WORKER_HEALTH_THRESHOLDS, DEFAULT_WORKER_QUEUE_CAPS, DEFAULT_WORKER_RPC_LIMITS, WORKER_FEATURES, formatMainOperationReceived, normalizeRequestId, parseNonNegativeRevision, } = require("./relay-worker-protocol.cjs");
+const { APP_PROTOCOL, DEFAULT_NUDGE_THRESHOLDS, DEFAULT_WORKER_HEALTH_THRESHOLDS, DEFAULT_WORKER_QUEUE_CAPS, DEFAULT_WORKER_RPC_LIMITS, WORKER_FEATURES, formatMainOperationReceived, normalizeRequestId, parseNonNegativeRevision } = require("./relay-worker-protocol.cjs");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
+const { PAIRING_CONTROL_PATH, PAIRING_ENDPOINT_PATH } = require("../domain/pairing/pairing-endpoint-address.cjs");
 
 const DEFAULT_WORKER_TYPE = "commonjs";
 const AUTOMATION_STATE_FALLBACK_MS = 1000;
@@ -84,6 +85,11 @@ function createRelayWorkerSupervisor(options = {}) {
   let worker = null;
   let workerEpoch = 0;
   let addressValue = null;
+
+  let lastAppPresenceTransitionAtMs = 0;
+  const APP_PRESENCE_VERSION_MAX_CHARS = 32;
+  const APP_PRESENCE_VERSION_MAX_COUNT = 8;
+  const APP_PRESENCE_VERSION_CHARSET = /^[A-Za-z0-9._+-]+$/;
   let startPromise = null;
   let readyPromise = Promise.resolve();
   let resolveReady = null;
@@ -260,8 +266,12 @@ function createRelayWorkerSupervisor(options = {}) {
       routes: {
         webSocketPaths: ["/"],
 
-        mainForwardedHttpPaths:
-          options.evenAiEnabled === true ? ["/v1/chat/completions"] : [],
+        mainForwardedHttpPaths: [
+          ...(options.evenAiEnabled === true ? ["/v1/chat/completions"] : []),
+          PAIRING_ENDPOINT_PATH,
+
+          PAIRING_CONTROL_PATH,
+        ],
       },
       externalDebugToolsEnabled: options.externalDebugToolsEnabled === true,
       nudge: {
@@ -300,10 +310,14 @@ function createRelayWorkerSupervisor(options = {}) {
   }
 
   function buildInitialCache() {
-    const initialCache = {};
+    const initialCache = Object.create(null);
     if (typeof options.getCurrentPages === "function") {
       const pages = options.getCurrentPages();
       if (typeof pages === "string") initialCache.pages = pages;
+    }
+    if (typeof options.getCurrentEntries === "function") {
+      const entries = options.getCurrentEntries();
+      if (typeof entries === "string") initialCache.entries = entries;
     }
     if (typeof options.getCurrentStatus === "function") {
       const status = options.getCurrentStatus();
@@ -319,6 +333,7 @@ function createRelayWorkerSupervisor(options = {}) {
         ? options.getCurrentResumeState() || {}
         : {};
     let pagesRevision = parseNonNegativeRevision(resumeState.pagesRevision);
+    let entriesRevision = parseNonNegativeRevision(resumeState.entriesRevision);
     let statusRevision = parseNonNegativeRevision(resumeState.statusRevision);
     if (pagesRevision === null && initialCache.pages) {
       pagesRevision = parseNonNegativeRevision((parseFrame(initialCache.pages) || {}).revision);
@@ -327,8 +342,13 @@ function createRelayWorkerSupervisor(options = {}) {
       statusRevision = parseNonNegativeRevision((parseFrame(initialCache.status) || {}).revision);
     }
     if (pagesRevision !== null) initialCache.pagesRevision = pagesRevision;
+    if (entriesRevision === null && initialCache.entries) {
+      entriesRevision = parseNonNegativeRevision((parseFrame(initialCache.entries) || {}).entriesRevision);
+    }
+    if (entriesRevision !== null) initialCache.entriesRevision = entriesRevision;
+    if (Number.isFinite(Number(resumeState.lastSeq))) initialCache.lastSeq = Math.floor(Number(resumeState.lastSeq));
     if (statusRevision !== null) initialCache.statusRevision = statusRevision;
-    if (initialCache.pages || initialCache.status || initialCache.debugConfig) {
+    if (initialCache.pages || initialCache.entries || initialCache.status || initialCache.debugConfig) {
       const now = Date.now();
       initialCache.lastMainFrameAtMs = now;
       if (initialCache.status) initialCache.lastMainStatusAtMs = now;
@@ -376,12 +396,17 @@ function createRelayWorkerSupervisor(options = {}) {
       emittedAtMs: Date.now(),
       type,
     };
-    if (type === APP_PROTOCOL.pages || type === APP_PROTOCOL.status) {
-      const revision = parseNonNegativeRevision((parsed || {}).revision);
+    if (type === APP_PROTOCOL.pages || type === APP_PROTOCOL.entries || type === APP_PROTOCOL.status) {
+      const revision = parseNonNegativeRevision(
+        type === APP_PROTOCOL.entries
+          ? (parsed || {}).entriesRevision
+          : (parsed || {}).revision,
+      );
       if (revision !== null) {
-        message.revisions =
-          type === APP_PROTOCOL.pages
-            ? { pagesRevision: revision }
+        message.revisions = type === APP_PROTOCOL.pages
+          ? { pagesRevision: revision }
+          : type === APP_PROTOCOL.entries
+            ? { entriesRevision: revision }
             : { statusRevision: revision };
       }
     }
@@ -648,7 +673,10 @@ function createRelayWorkerSupervisor(options = {}) {
         try {
           await processResult(
             message.clientId,
-            handler.handleMessage(message.clientId, message.raw),
+            handler.handleMessage(
+              message.clientId,
+              message.raw,
+            ),
             processOptions,
           );
         } catch (err) {
@@ -681,6 +709,25 @@ function createRelayWorkerSupervisor(options = {}) {
       return;
     }
     if (message.kind === "client.identified") {
+
+      if (
+        typeof message.pairingExchangeId === "string" &&
+        message.pairingExchangeId &&
+        typeof message.pairingConfirmation === "string" &&
+        message.pairingConfirmation &&
+        typeof options.onPairingAuthenticatedHello === "function"
+      ) {
+        try {
+          options.onPairingAuthenticatedHello({
+            exchangeId: message.pairingExchangeId,
+            confirmation: message.pairingConfirmation,
+          });
+        } catch (err) {
+          logger.warn(
+            `[relay-worker] pairing hello correlation failed: ${err && err.message ? err.message : err}`,
+          );
+        }
+      }
       clients.set(message.clientId, {
         clientId: message.clientId,
         clientKind: message.clientKind || "unknown",
@@ -716,6 +763,9 @@ function createRelayWorkerSupervisor(options = {}) {
             `[relay-worker] app identify hook failed: ${err && err.message ? err.message : err}`,
           );
         }
+      }
+      if (connectedEntry && connectedEntry.clientKind === "app") {
+        notifyAppPresenceChanged("connected");
       }
       return;
     }
@@ -781,6 +831,10 @@ function createRelayWorkerSupervisor(options = {}) {
         } else if (getConnectedAppEntries(message.clientId).length === 0) {
           options.onAppClientDisconnect(getActiveSessionKey());
         }
+      }
+      if (disconnectedEntry && disconnectedEntry.clientKind === "app") {
+
+        notifyAppPresenceChanged("disconnected");
       }
       return;
     }
@@ -1103,6 +1157,46 @@ function createRelayWorkerSupervisor(options = {}) {
     return entry && entry.clientKind === "app";
   }
 
+  function notifyAppPresenceChanged(reason) {
+    lastAppPresenceTransitionAtMs = Date.now();
+
+    if (typeof options.onAppPresenceChanged !== "function") return;
+    try {
+      options.onAppPresenceChanged(reason);
+    } catch (err) {
+      logger.warn(
+        `[relay-worker] app presence hook failed: ${err && err.message ? err.message : err}`,
+      );
+    }
+  }
+
+  function getAppPresenceProjection() {
+
+    const entries = getConnectedAppEntries();
+
+    const versions = [];
+    for (const entry of entries) {
+      if (versions.length >= APP_PRESENCE_VERSION_MAX_COUNT) break;
+      const version =
+        entry && typeof entry.clientVersion === "string" ? entry.clientVersion.trim() : "";
+      if (!version.length || version.length > APP_PRESENCE_VERSION_MAX_CHARS) continue;
+      if (!APP_PRESENCE_VERSION_CHARSET.test(version)) continue;
+      if (!versions.includes(version)) versions.push(version);
+    }
+    versions.sort();
+    return {
+
+      relayListening: addressValue !== null,
+      authenticatedAppCount: entries.length,
+      clientVersions: versions,
+
+      lastTransitionAt:
+        lastAppPresenceTransitionAtMs > 0
+          ? new Date(lastAppPresenceTransitionAtMs).toISOString()
+          : null,
+    };
+  }
+
   function formatReadinessProbeFailure(requestId, reasonCode, message) {
     if (handler && typeof handler.formatReadinessProbeAck === "function") {
       return handler.formatReadinessProbeAck({
@@ -1187,6 +1281,7 @@ function createRelayWorkerSupervisor(options = {}) {
       return getConnectedAppEntries(excludeClientId, sessionKey).length;
     },
     getReadinessSnapshot,
+    getAppPresenceProjection,
     closeConnectedAppClients(opts = {}) {
       const excludeClientId =
         typeof opts.excludeClientId === "string" && opts.excludeClientId.trim()

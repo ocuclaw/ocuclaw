@@ -51,6 +51,10 @@ function createSessionContextService(opts) {
   const broadcast = opts.broadcast;
   const getActiveModelKey =
     typeof opts.getActiveModelKey === "function" ? opts.getActiveModelKey : () => null;
+  const getActiveModelContextWindow =
+    typeof opts.getActiveModelContextWindow === "function"
+      ? opts.getActiveModelContextWindow
+      : () => 0;
 
   let lastSnapshot = null;
 
@@ -82,15 +86,23 @@ function createSessionContextService(opts) {
     const contextTokens = Number.isFinite(session.totalTokens)
       ? Math.floor(session.totalTokens)
       : 0;
+    const contextTokensKnown = session.contextTokensKnown !== false;
     const describeWindow = Number.isFinite(session.contextTokens)
       ? Math.floor(session.contextTokens)
       : 0;
     const modelKey = getActiveModelKey();
+    const catalogWindow = getActiveModelContextWindow();
     let contextWindow = describeWindow;
     if (describeWindow > 0) {
 
       if (modelKey && modelContextWindowCache.get(modelKey) !== describeWindow) {
         modelContextWindowCache.set(modelKey, describeWindow);
+        persistModelContextWindowCache(modelContextWindowCachePath, modelContextWindowCache);
+      }
+    } else if (Number.isFinite(catalogWindow) && catalogWindow > 0) {
+      contextWindow = Math.floor(catalogWindow);
+      if (modelKey && modelContextWindowCache.get(modelKey) !== contextWindow) {
+        modelContextWindowCache.set(modelKey, contextWindow);
         persistModelContextWindowCache(modelContextWindowCachePath, modelContextWindowCache);
       }
     } else if (modelKey && modelContextWindowCache.has(modelKey)) {
@@ -102,15 +114,24 @@ function createSessionContextService(opts) {
         ? compactionResp.checkpoints
         : [];
     const compactionCount = checkpoints.length;
+    const compactionKind = compactionResp && compactionResp.metric === "hops"
+      ? "hops"
+      : "compactions";
 
     const snapshot = {
       type: "ocuclaw.session.context.snapshot",
       sessionKey,
       contextTokens,
+      contextTokensKnown,
       contextWindow,
       compactionCount,
+      compactionKind,
       runActive: !!getRunActive(),
       snapshotAtMs: nowMs(),
+
+      ...(Number.isFinite(session.costUsd) && session.costUsd >= 0
+        ? { costUsd: session.costUsd }
+        : {}),
     };
     lastSnapshot = snapshot;
     broadcast(snapshot);

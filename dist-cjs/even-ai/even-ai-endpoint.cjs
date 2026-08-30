@@ -1,6 +1,6 @@
 const { createHash, createHmac, randomUUID } = require("node:crypto");
 const { constantTimeEqual } = require("../domain/constant-time-equal.cjs");
-const { activeBackendDisplayName, getActiveBackendKind, isKnownBackendKind, } = require("../gateway/backend-contract.cjs");
+const { activeBackendDisplayName, getActiveBackendKind, isKnownBackendKind } = require("../gateway/backend-contract.cjs");
 const { filterRawEmojiText } = require("../domain/message-emoji-filter.cjs");
 const { composeReadabilitySystemPrompt } = require("../domain/readability-system-prompt.cjs");
 const { normalizeEvenAiSystemPrompt } = require("./even-ai-settings-store.cjs");
@@ -76,6 +76,12 @@ function parseBearerToken(headerValue) {
   if (!raw) return "";
   const match = raw.match(/^Bearer\s+(.+)$/i);
   return match ? trimString(match[1]) : "";
+}
+
+function classifyAuthFailure(configuredToken = "", authorizationToken = "") {
+  if (!configuredToken) return "configured_token_missing";
+  if (!authorizationToken) return "authorization_missing";
+  return "token_mismatch";
 }
 
 function getHeaderValue(headers, name) {
@@ -960,6 +966,7 @@ function createEvenAiEndpoint(opts = {}) {
           requestId,
           hasConfiguredToken: !!token,
           hasAuthorization: !!authToken,
+          failureReason: classifyAuthFailure(token, authToken),
         }),
       );
       writeJson(

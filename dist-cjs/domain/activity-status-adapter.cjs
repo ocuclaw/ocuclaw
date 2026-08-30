@@ -1,5 +1,5 @@
 const { classifyRank } = require("./activity-status-arbiter.cjs");
-const { DEFAULT_MAX_LABEL_CHARS, SHORT_LABEL_MAX_CHARS, isObject, asString, normalizeLowerToken, pickString, pickStringEntry, collapseWhitespace, sanitizeText, intentFromToolName, mapToolLabel, } = require("./activity-status-labels.cjs");
+const { DEFAULT_MAX_LABEL_CHARS, SHORT_LABEL_MAX_CHARS, isObject, asString, normalizeLowerToken, pickString, pickStringEntry, collapseWhitespace, sanitizeText, intentFromToolName, mapToolLabel } = require("./activity-status-labels.cjs");
 
 const GLOBAL_RUN_KEY = "__global__";
 const THINKING_SUMMARY_KEYS = ["summary", "thinkingSummary", "reasoningSummary", "intentLabel"];
@@ -60,6 +60,18 @@ function normalizeThinkingSummarySource(value) {
 function normalizeIntent(value) {
   const normalized = normalizeLowerToken(value);
   return ACTIVITY_INTENTS.has(normalized) ? normalized : null;
+}
+
+function normalizeToolPhase(value) {
+  const normalized = normalizeLowerToken(value);
+  return normalized === "start" || normalized === "end" ? normalized : null;
+}
+
+function isNarrationActivity(activity) {
+  return (
+    normalizeLowerToken(activity && activity.origin) === "narration" ||
+    normalizeLowerToken(activity && activity.category) === "narration"
+  );
 }
 
 function parseArgs(raw) {
@@ -274,6 +286,7 @@ function createActivityStatusAdapter(opts) {
     const runKey = normalizeRunKey(activity.runId);
     const runState = getRunState(runKey);
     const phase = normalizePhase(activity.phase, activity.state);
+    const toolPhase = normalizeToolPhase(activity.toolPhase);
     const rawPhase = asString(activity.phase) && activity.phase.trim()
       ? activity.phase.trim()
       : null;
@@ -305,7 +318,8 @@ function createActivityStatusAdapter(opts) {
     if (phase === "start" || phase === "update") {
       runState.currentActivityId = activityId;
     }
-    if (phase === "end") {
+
+    if (phase === "end" || toolPhase === "end") {
       runState.currentActivityId = null;
     }
 
@@ -350,9 +364,17 @@ function createActivityStatusAdapter(opts) {
         stabilityKey: activityId,
       })
       : null;
-    const isThinking = isThinkingActivity(activity, category);
+    const isNarration = isNarrationActivity(activity);
+    const isThinking = !isNarration && isThinkingActivity(activity, category);
 
-    if (isThinking) {
+    if (isNarration) {
+      if (!category) category = "narration";
+      if (!label) label = pickThinkingSummary(activity);
+
+      if (label && label.length > SHORT_LABEL_MAX_CHARS) {
+        shortLabel = label;
+      }
+    } else if (isThinking) {
       if (!category) category = "thinking";
       const resolvedThinking = resolveThinkingContent(
         activity,
@@ -461,6 +483,7 @@ function createActivityStatusAdapter(opts) {
       hasRateLimitInfo: isObject(activity.rateLimitInfo),
       failoverPending: activity.failoverPending === true,
       hasTool: !!activity.tool,
+      origin: activity.origin,
       isThinking,
       includeThinking,
       thinkingSummarySource,
@@ -504,6 +527,12 @@ function createActivityStatusAdapter(opts) {
       result.thinkingSignatureId = activity.thinkingSignatureId.trim();
     } else {
       delete result.thinkingSignatureId;
+    }
+
+    if (toolPhase) {
+      result.toolPhase = toolPhase;
+    } else {
+      delete result.toolPhase;
     }
 
     delete result.shortLabel;

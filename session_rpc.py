@@ -25,7 +25,10 @@ hermes environment (framing/unit tests); DB calls run in a worker thread
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import logging
+import re
 import sqlite3
 import threading
 import time
@@ -54,13 +57,151 @@ LIST_LIMIT_MAX = 500
 # the first page (Codex review W05 finding). Bounded, not unbounded: hermes
 # session counts are modest and rows are cheap.
 SEARCH_SCAN_LIMIT = 5000
+# Rich projection is several DB reads per distinct session. Inspect a generous
+# newest-hit window, then surface truncation instead of multiplying that work
+# across an entire long-lived DB (and again across every served profile).
+SEARCH_PROJECTION_MIN = 100
+SEARCH_PROJECTION_MULTIPLIER = 5
 DB_METHOD_SESSIONS_LIST = "db.sessions.list"
+DB_METHOD_SESSIONS_SEARCH = "db.sessions.search"
 DB_METHOD_RESOLVE_KEY = "db.sessions.resolveKey"
 DB_METHOD_SET_TITLE = "db.sessions.setTitle"
+DB_METHOD_SET_READ = "db.sessions.setRead"
+DB_METHOD_SET_HIDDEN = "db.sessions.setHidden"
 DB_METHOD_DELETE = "db.sessions.delete"
 DB_METHOD_CHAT_HISTORY = "db.chat.history"
 DB_METHOD_DESCRIBE = "db.sessions.describe"
 DB_METHOD_COMPACTION_INFO = "db.sessions.compactionInfo"
+
+logger = logging.getLogger(__name__)
+
+# Cache for _read_probe_statements(): deriving the probes parses SCHEMA_SQL
+# through an in-memory SQLite database, so pay that once per process.
+_READ_PROBE_STATEMENTS: Optional[Tuple[str, ...]] = None
+
+# Session read/hidden state (hermes >= 0.20.2 / v2026.8.16): the `sessions`
+# columns and the three SessionDB primitives that back the unread glyph and
+# the Hide action. Feature-detected together, never by version string.
+SESSION_READ_STATE_COLUMNS: Tuple[str, ...] = ("hidden", "last_read_at")
+SESSION_READ_STATE_PRIMITIVES: Tuple[str, ...] = (
+    "set_session_hidden",
+    "set_session_read",
+    "session_unread",
+)
+SESSION_READ_STATE_UNSUPPORTED = "session read state unsupported on this hermes"
+
+# Cache for session_read_state_supported(): the probe parses SCHEMA_SQL, so
+# pay it once per process. `None` = not yet computed.
+_SESSION_READ_STATE_SUPPORTED: Optional[bool] = None
+
+
+def _is_stale_schema_error(exc: BaseException) -> bool:
+    """True for the two errors a store behind ``SCHEMA_SQL`` raises at prepare
+    time: a missing table and a missing column."""
+    message = str(exc).lower()
+    return "no such table" in message or "no such column" in message
+
+
+def _read_probe_statements() -> Tuple[str, ...]:
+    """SELECT statements that fail iff the live store is behind SCHEMA_SQL.
+
+    Prefers hermes's own sanctioned helper,
+    ``hermes_state_schema.schema_read_probe_statements`` (added after the
+    0.20.0 floor). On a 0.20.0 host that helper does not exist,
+    so derive the identical probes from the identical source of truth using
+    the reconciler's own parser (``SessionSchemaMixin._parse_schema_columns``,
+    present at both v2026.8.3 and v2026.8.19) — never a hand-maintained
+    column list, which upstream documents going stale within days.
+
+    Each statement is ``LIMIT 0``: column resolution happens at prepare time,
+    so the probe reads zero rows. Column references are table-qualified —
+    an unqualified double-quoted identifier that fails to resolve silently
+    degrades to a string literal (SQLite's double-quoted-string misfeature),
+    which would make the probe pass on exactly the stale store it exists to
+    catch.
+
+    Returns ``()`` if neither route is importable, which turns the whole
+    heal into a no-op rather than a new failure mode.
+    """
+    global _READ_PROBE_STATEMENTS
+    if _READ_PROBE_STATEMENTS is not None:
+        return _READ_PROBE_STATEMENTS
+    try:
+        from hermes_state_schema import schema_read_probe_statements
+
+        _READ_PROBE_STATEMENTS = tuple(schema_read_probe_statements())
+        return _READ_PROBE_STATEMENTS
+    except ImportError:
+        pass
+    try:
+        from hermes_state_common import SCHEMA_SQL
+        from hermes_state_schema import SessionSchemaMixin
+
+        tables = SessionSchemaMixin._parse_schema_columns(SCHEMA_SQL)
+    except Exception:  # pragma: no cover - hermes absent / API moved
+        logger.debug("session_rpc: no schema read probe available", exc_info=True)
+        _READ_PROBE_STATEMENTS = ()
+        return _READ_PROBE_STATEMENTS
+    _READ_PROBE_STATEMENTS = tuple(
+        'SELECT {} FROM "{}" LIMIT 0'.format(
+            ", ".join(
+                '"{}"."{}"'.format(table.replace('"', '""'), col.replace('"', '""'))
+                for col in cols
+            ),
+            table.replace('"', '""'),
+        )
+        for table, cols in sorted(tables.items())
+    )
+    return _READ_PROBE_STATEMENTS
+
+
+def session_read_state_supported() -> bool:
+    """True when the RUNNING hermes carries session read/hidden state.
+
+    Two halves, both required, neither of them a version string (the release
+    watcher's standing rule — a version gate goes stale the week a patch
+    backports or drops a column):
+
+    1. the `sessions` table in the running hermes's own ``SCHEMA_SQL`` carries
+       ``hidden`` and ``last_read_at``, read through the reconciler's own
+       parser (``SessionSchemaMixin._parse_schema_columns``, present at both
+       v2026.8.3 and v2026.8.19 — the same parser ``_read_probe_statements``
+       already uses), and
+    2. ``hermes_state.SessionDB`` exposes the three primitives that back the
+       lane: ``set_session_hidden``, ``set_session_read``, ``session_unread``.
+
+    Neither half touches the DB, so this is valid at ``register()`` time —
+    before any reader is opened and before the Node child is spawned. Any
+    exception means "not supported": the whole lane goes inert rather than
+    turning a probe failure into a new failure mode. Computed once per
+    process (the answer cannot change without a gateway restart).
+    """
+    global _SESSION_READ_STATE_SUPPORTED
+    if _SESSION_READ_STATE_SUPPORTED is not None:
+        return _SESSION_READ_STATE_SUPPORTED
+    supported = False
+    try:
+        from hermes_state import SessionDB
+        from hermes_state_common import SCHEMA_SQL
+        from hermes_state_schema import SessionSchemaMixin
+
+        tables = SessionSchemaMixin._parse_schema_columns(SCHEMA_SQL)
+        columns = set(tables.get("sessions") or ())
+        supported = all(col in columns for col in SESSION_READ_STATE_COLUMNS) and all(
+            callable(getattr(SessionDB, name, None))
+            for name in SESSION_READ_STATE_PRIMITIVES
+        )
+    except Exception:  # noqa: BLE001 - hermes absent / API moved => inert
+        logger.debug(
+            "session_rpc: session read state probe unavailable", exc_info=True
+        )
+        supported = False
+    _SESSION_READ_STATE_SUPPORTED = supported
+    logger.info(
+        "session_rpc: session read state %s on this hermes",
+        "supported" if supported else "unsupported",
+    )
+    return supported
 
 
 def default_state_db_path() -> Path:
@@ -78,11 +219,24 @@ class SessionRpc:
         self,
         db_path: Path,
         namespace: str = DEFAULT_SESSION_NAMESPACE,
+        session_store_provider: Optional[Callable[[str], Any]] = None,
     ) -> None:
         self._db_path = Path(db_path)
         self._ns = namespace or DEFAULT_SESSION_NAMESPACE
+        self._session_store_provider = session_store_provider
         self._reader: Any = None
         self._writer: Any = None
+        self._identity_warning_keys: set[Tuple[int, str, str]] = set()
+        self._fts_probe_warning_emitted = False
+
+    def _warn_identity_degrade_once(
+        self, reader: Any, session_id: str, reason: str, message: str, *args: Any
+    ) -> None:
+        key = (id(reader), str(session_id), reason)
+        if key in self._identity_warning_keys:
+            return
+        self._identity_warning_keys.add(key)
+        logger.warning(message, *args)
 
     # -- registration ------------------------------------------------------
 
@@ -90,8 +244,11 @@ class SessionRpc:
         """method → async handler, for LinkProcess.register_request_handler."""
         return {
             DB_METHOD_SESSIONS_LIST: self.list_sessions,
+            DB_METHOD_SESSIONS_SEARCH: self.search_sessions,
             DB_METHOD_RESOLVE_KEY: self.resolve_key,
             DB_METHOD_SET_TITLE: self.set_title,
+            DB_METHOD_SET_READ: self.set_read,
+            DB_METHOD_SET_HIDDEN: self.set_hidden,
             DB_METHOD_DELETE: self.delete_session,
             DB_METHOD_CHAT_HISTORY: self.chat_history,
             DB_METHOD_DESCRIBE: self.describe_session,
@@ -106,8 +263,17 @@ class SessionRpc:
     async def resolve_key(self, params: Any) -> Dict[str, Any]:
         return await asyncio.to_thread(self._sync_resolve_key, params)
 
+    async def search_sessions(self, params: Any) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._sync_search, params)
+
     async def set_title(self, params: Any) -> Dict[str, Any]:
         return await asyncio.to_thread(self._sync_set_title, params)
+
+    async def set_read(self, params: Any) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._sync_set_read, params)
+
+    async def set_hidden(self, params: Any) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._sync_set_hidden, params)
 
     async def delete_session(self, params: Any) -> Dict[str, Any]:
         return await asyncio.to_thread(self._sync_delete, params)
@@ -134,10 +300,86 @@ class SessionRpc:
         if self._reader is None:
             if not self._db_path.exists():
                 raise RuntimeError(f"hermes state DB not found at {self._db_path}")
-            from hermes_state import SessionDB
-
-            self._reader = SessionDB(db_path=self._db_path, read_only=True)
+            self._reader = self._open_reader_healed()
         return self._reader
+
+    def _open_reader_healed(self):
+        """Read-only SessionDB, healed once if the store is behind SCHEMA_SQL.
+
+        Read-only opens skip ``_reconcile_columns()`` by design (no DDL
+        against another profile's live DB), so a store created before a schema
+        addition raises "no such column" on read paths until something opens
+        it writable. This is not a hypothetical: hermes 0.20.5 moved
+        ``SCHEMA_VERSION`` 25 -> 26 (``hermes_state_common.py:219``, was
+        ``:155`` at v2026.8.3) with four new ``sessions`` columns
+        (``git_metadata_generation``, ``title_source``, ``hidden``,
+        ``last_read_at``), and ``list_sessions_rich`` appends
+        ``s.hidden = 0`` to the WHERE clause unconditionally when
+        ``include_hidden`` is False (``hermes_state.py:8768-8769``) — so
+        ``db.sessions.list`` fails OUTRIGHT on a pre-upgrade store, not merely
+        in an optional projection that per-row ``in`` gating could cover.
+
+        The one writable open is upstream's own documented remedy for exactly
+        this case, not an OcuClaw invention: see
+        ``hermes_state_schema.schema_read_probe_statements`` ("Callers that
+        heal on staleness (see ``_open_session_db_at_path`` in
+        ``hermes_cli/web_server.py``) run these probes right after a read-only
+        open") and that caller's probe -> one writable open -> reopen
+        read-only sequence. OcuClaw already opens this same store writable for
+        the title-patch / lineage-delete lane (``_get_writer``), so no new
+        access class is introduced, and the healthy path still never takes a
+        write lock: the probe runs first and a current store never reaches the
+        writable branch.
+
+        If the writable reconcile cannot close the gap (e.g. a column SQLite
+        refuses to ADD), the plain read-only reader is returned anyway and the
+        failure is logged once. Reads that do not touch the missing column
+        keep working, which is strictly better than raising on every poll.
+        """
+        from hermes_state import SessionDB
+
+        def _open_probed():
+            db = SessionDB(db_path=self._db_path, read_only=True)
+            # Unit-test fakes may replace SessionDB without a raw connection.
+            conn = getattr(db, "_conn", None)
+            if conn is None:
+                return db
+            try:
+                for statement in _read_probe_statements():
+                    conn.execute(statement).fetchone()
+            except BaseException:
+                close = getattr(db, "close", None)
+                if callable(close):
+                    close()
+                raise
+            return db
+
+        try:
+            return _open_probed()
+        except sqlite3.DatabaseError as exc:
+            if not _is_stale_schema_error(exc):
+                raise
+            logger.info(
+                "hermes state DB at %s is behind the running hermes schema "
+                "(%s); reconciling with one writable open",
+                self._db_path,
+                exc,
+            )
+
+        SessionDB(db_path=self._db_path).close()
+        try:
+            return _open_probed()
+        except sqlite3.DatabaseError as still_stale:
+            if not _is_stale_schema_error(still_stale):
+                raise
+            logger.warning(
+                "hermes state DB at %s is missing schema a writable "
+                "reconcile could not add (%s); serving reads unprobed — "
+                "queries touching the missing column will still fail",
+                self._db_path,
+                still_stale,
+            )
+            return SessionDB(db_path=self._db_path, read_only=True)
 
     def _get_writer(self):
         if self._writer is None:
@@ -162,6 +404,28 @@ class SessionRpc:
             for row in rows
             if row["session_key"]
         }
+
+    def _session_ids_by_key(self, session_key: str) -> List[str]:
+        """Every row id carrying a native session_key, newest carrier first.
+
+        ``session_key`` is a NON-unique index: a ``/new`` reset ends the old
+        row with ``session_reset`` and mints a FRESH row on the same
+        deterministic key. Read straight through sqlite (the
+        ``_session_keys_by_id`` precedent) — SessionDB exposes no key → all-ids
+        primitive, and the recency lookups deliberately return only the newest.
+        """
+        key = str(session_key or "")
+        if not key:
+            return []
+        with sqlite3.connect(self._db_path, timeout=10) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT id FROM sessions
+                   WHERE session_key = ?
+                   ORDER BY started_at DESC""",
+                (key,),
+            ).fetchall()
+        return [str(row["id"]) for row in rows]
 
     def _purge_delivery_obligations_for_deleted_keys(
         self, session_keys: List[str]
@@ -214,17 +478,89 @@ class SessionRpc:
         chat.history: user/assistant with content, server-side tail slice) —
         the agent_end hook payload + history push source (on_session_end
         itself carries no messages)."""
-        rows = self._get_reader().get_messages_as_conversation(
-            str(session_id), include_ancestors=True
-        )
+        rows = self._conversation_rows_with_identity(str(session_id))
         messages = [
-            {"role": row.get("role"), "content": row.get("content")}
+            self._conversation_row_to_wire(row)
             for row in rows
             if row.get("role") in ("user", "assistant") and row.get("content")
         ]
         if limit > 0 and len(messages) > limit:
             messages = messages[-limit:]
         return messages
+
+    def _conversation_rows_with_identity(self, session_id: str) -> List[Dict[str, Any]]:
+        """Enrich the public conversation projection with stable row identity.
+
+        Hermes 0.20 can opt the AUTOINCREMENT primary key into the same public
+        projection query via ``include_row_ids``. Reading content and identity
+        from that one snapshot prevents a concurrent rewind from pairing an old
+        projection with a replacement row's id. Older 0.19-compatible readers
+        lack the keyword and deliberately degrade just that session to derived
+        ids rather than reintroducing a racy private metadata query.
+        """
+        reader = self._get_reader()
+        read_conversation = reader.get_messages_as_conversation
+        try:
+            parameters = inspect.signature(read_conversation).parameters.values()
+            supports_row_ids = any(
+                parameter.name == "include_row_ids"
+                or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            supports_row_ids = True
+
+        if not supports_row_ids:
+            public_rows = read_conversation(
+                session_id,
+                include_ancestors=True,
+            )
+            self._warn_identity_degrade_once(
+                reader,
+                session_id,
+                "metadata_unavailable",
+                "[ocuclaw] Hermes atomic identity projection unavailable for session %s; "
+                "using derived ledger ids",
+                session_id,
+            )
+            return public_rows
+
+        public_rows = read_conversation(
+            session_id,
+            include_ancestors=True,
+            include_row_ids=True,
+        )
+
+        if any(row.get("_row_id") is None for row in public_rows):
+            self._warn_identity_degrade_once(
+                reader,
+                session_id,
+                "metadata_unavailable",
+                "[ocuclaw] Hermes atomic identity projection omitted row ids for session %s; "
+                "using derived ledger ids",
+                session_id,
+            )
+            return [
+                {key: value for key, value in row.items() if key != "_row_id"}
+                for row in public_rows
+            ]
+
+        enriched_rows = []
+        for message in public_rows:
+            enriched = dict(message)
+            enriched["id"] = enriched.pop("_row_id")
+            if enriched.get("message_id") is not None:
+                enriched["platform_message_id"] = enriched.get("message_id")
+            enriched_rows.append(enriched)
+        return enriched_rows
+
+    @staticmethod
+    def _conversation_row_to_wire(row: Dict[str, Any]) -> Dict[str, Any]:
+        wire = {"role": row.get("role"), "content": row.get("content")}
+        for field in ("id", "timestamp", "platform_message_id"):
+            if row.get(field) is not None:
+                wire[field] = row.get(field)
+        return wire
 
     # -- identity resolution -------------------------------------------------
 
@@ -341,6 +677,43 @@ class SessionRpc:
             "preview": row.get("preview"),
             "messageCount": row.get("message_count"),
         }
+        model = row.get("model")
+        if isinstance(model, str) and model.strip():
+            wire["model"] = model.strip()
+        billing_provider = row.get("billing_provider")
+        if isinstance(billing_provider, str) and billing_provider.strip():
+            wire["modelProvider"] = billing_provider.strip()
+        # Additive, column-gated growth. `list_sessions_rich` fetches with
+        # `SELECT s.*`, so a row from a host whose schema predates
+        # `last_activity_description` (hermes_state_common.py:234) simply has
+        # no such KEY — a per-row `in` check is free, exact for THIS db, and
+        # needs no PRAGMA preflight and no reach into SessionDB privates.
+        # The wire stays byte-identical on those hosts.
+        #
+        # Deliberately NOT carried: `last_activity_at`. OcuClaw's existing
+        # `lastActive` is already
+        # `COALESCE(MAX(last_activity_at, MAX(messages.timestamp)), started_at)`
+        # (hermes_state_common.py:105-127) — strictly fresher than the raw
+        # column, and it is already on the wire, so the phone can gate the
+        # description on staleness without a second timestamp.
+        if "last_activity_description" in row:
+            description = row.get("last_activity_description")
+            # Upstream clears this to "" in the turn's `finally`
+            # (`clear_session_activity_labels`), so empty means idle, not
+            # unknown. Normalize both to None so the wire has one absent form.
+            wire["lastActivityDescription"] = (
+                description if isinstance(description, str) and description else None
+            )
+        # Same per-row `in` gate, same reason: `unread` is DERIVED onto every
+        # `list_sessions_rich` row by upstream (`session_unread`, the
+        # last_read_at watermark vs last_active), and `hidden` rides the
+        # `SELECT s.*`. A host whose schema predates them (0.20.0) carries
+        # neither KEY, so the wire stays byte-identical there — the client
+        # sees "absent", never a fabricated `false`.
+        if "unread" in row:
+            wire["unread"] = bool(row.get("unread"))
+        if "hidden" in row:
+            wire["hidden"] = bool(row.get("hidden"))
         return wire
 
     def _list_row_visible(self, row: Dict[str, Any]) -> bool:
@@ -390,6 +763,14 @@ class SessionRpc:
                 tip = self._resolve_target(key_identity)
             except ValueError:
                 return {"sessions": []}
+            # The exact-key path must hydrate a HIDDEN row too: the wearer's
+            # active session can be hidden from the desktop while the glasses
+            # still hold it open, and the honest answer is the row with
+            # `hidden: true`, not a silent disappearance. The kwarg does not
+            # exist at 0.20.0, so pass it only when the lane is supported.
+            hidden_kwargs = (
+                {"include_hidden": True} if session_read_state_supported() else {}
+            )
             # id_query is only honored on the order_by_last_active path
             # (hermes_state.py:2790-2793 — other callers pass None).
             rows = self._get_reader().list_sessions_rich(
@@ -399,6 +780,7 @@ class SessionRpc:
                 include_children=True,
                 order_by_last_active=True,
                 project_compression_tips=True,
+                **hidden_kwargs,
             )
             wire = [
                 self._row_to_wire(row)
@@ -445,6 +827,156 @@ class SessionRpc:
         row["last_active"] = row.get("last_active") or row.get("started_at")
         return {"row": self._row_to_wire(row)}
 
+    @staticmethod
+    def _search_query(query: str) -> str:
+        """Match Hermes dashboard search's partial-word behavior.
+
+        SessionDB.search_messages() applies Hermes 0.20's bounded
+        _sanitize_fts5_query() before MATCH; this layer deliberately mirrors
+        the dashboard's prefix expansion rather than bypassing that sanitizer.
+        """
+        terms = []
+        for token in re.findall(r'"[^"]*"|\S+', query.strip()):
+            if token.startswith('"') or token.endswith("*"):
+                terms.append(token)
+            else:
+                terms.append(f"{token}*")
+        return " ".join(terms)
+
+    def _visible_search_row(self, session_id: str) -> Optional[Dict[str, Any]]:
+        db = self._get_reader()
+        tip = db.resolve_resume_session_id(str(session_id))
+        raw_row = db.get_session(tip)
+        if raw_row is None:
+            return None
+        row = dict(raw_row)
+        if row.get("source") in DENY_SOURCES or not self._list_row_visible(row):
+            return None
+        session_key = row.get("session_key")
+        if session_key:
+            newest = self._lookup_session_key(str(session_key))
+            if newest is None:
+                return None
+            newest_tip = db.resolve_resume_session_id(str(newest["id"]))
+            if newest_tip != tip:
+                # A reset can leave searchable messages on an older carrier
+                # whose public key now identifies a different live row. The
+                # normal session list hides that carrier, so deep search must
+                # hide it too rather than navigate the hit to the wrong chat.
+                return None
+        # Use the same rich-row projection as sessions.list so lastActive,
+        # preview, source, and compression metadata are identical on both
+        # paths. get_session() above is only the indexed identity check.
+        rich_rows = db.list_sessions_rich(
+            exclude_sources=list(DENY_SOURCES),
+            id_query=tip,
+            limit=2,
+            include_children=True,
+            order_by_last_active=True,
+            project_compression_tips=True,
+        )
+        return next(
+            (dict(candidate) for candidate in rich_rows if candidate.get("id") == tip),
+            None,
+        )
+
+    def _sync_search(self, params: Any) -> Dict[str, Any]:
+        p = params if isinstance(params, dict) else {}
+        query = str(p.get("query") or "").strip()
+        try:
+            limit = int(p.get("limit"))
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 100))
+        if not query:
+            return {"available": True, "matches": [], "truncated": False}
+
+        db = self._get_reader()
+        # Hermes 0.20's read-only SessionDB constructor probes the actual FTS
+        # table and stores the result here. search_messages() otherwise maps
+        # the unavailable state to [], which is indistinguishable from a real
+        # zero-match query and therefore cannot cross our public RPC honestly.
+        if not hasattr(db, "_fts_enabled"):
+            if not self._fts_probe_warning_emitted:
+                logger.error("Hermes SessionDB FTS capability probe is unavailable")
+                self._fts_probe_warning_emitted = True
+            return {
+                "available": False,
+                "reason": "fts_probe_unavailable",
+                "matches": [],
+                "truncated": False,
+            }
+        if not bool(db._fts_enabled):
+            return {
+                "available": False,
+                "reason": "fts_unavailable",
+                "matches": [],
+                "truncated": False,
+            }
+
+        raw_matches = db.search_messages(
+            self._search_query(query),
+            exclude_sources=list(DENY_SOURCES),
+            role_filter=["user", "assistant"],
+            limit=SEARCH_SCAN_LIMIT,
+            sort="newest",
+            fields=("session_id", "role", "snippet", "timestamp", "source"),
+        )
+        seen = set()
+        projected: Dict[str, Optional[Dict[str, Any]]] = {}
+        matches: List[Dict[str, Any]] = []
+        projection_limit = max(
+            SEARCH_PROJECTION_MIN,
+            limit * SEARCH_PROJECTION_MULTIPLIER,
+        )
+        projection_count = 0
+        projection_truncated = False
+        for match in raw_matches:
+            raw_session_id = str(match.get("session_id") or "")
+            if raw_session_id not in projected:
+                if projection_count >= projection_limit:
+                    projection_truncated = True
+                    break
+                projection_count += 1
+                projected[raw_session_id] = self._visible_search_row(raw_session_id)
+                visible = projected[raw_session_id]
+                if visible is not None:
+                    # Compression ancestors and their live tip can both carry
+                    # hits. Cache the projected tip too so each visible
+                    # conversation pays the rich-row lookup at most once.
+                    projected.setdefault(str(visible.get("id") or ""), visible)
+            row = projected[raw_session_id]
+            if row is None:
+                continue
+            wire = self._row_to_wire(row)
+            dedupe_key = wire.get("sessionKey") or (
+                wire.get("source"), wire.get("lineageRootId")
+            )
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            matches.append(
+                {
+                    "session": wire,
+                    "role": match.get("role"),
+                    "snippet": match.get("snippet") or "",
+                }
+            )
+        matches.sort(
+            key=lambda match: float(match["session"].get("lastActive") or 0),
+            reverse=True,
+        )
+        truncated = (
+            projection_truncated
+            or len(matches) > limit
+            or len(raw_matches) >= SEARCH_SCAN_LIMIT
+        )
+        return {
+            "available": True,
+            "matches": matches[:limit],
+            "truncated": truncated,
+        }
+
     def _sync_set_title(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
         tip = self._resolve_target(p.get("identity"), fail_closed=True)
@@ -455,6 +987,66 @@ class SessionRpc:
         # UNIQUE collision propagates to the link error surface — the caller's
         # title patch is fire-and-forget and logs it.
         self._get_writer().set_session_title(tip, title if title else None)
+        return {"ok": True}
+
+    def _sync_set_read(self, params: Any) -> Dict[str, Any]:
+        """Stamp the read watermark (`last_read_at`) on one conversation.
+
+        `read=False` writes 0.0 = EXPLICITLY unread (any activity postdates
+        it); NULL, the pre-feature default, means "never tracked" = read, so
+        shipping the column never badges a whole history at once. Upstream
+        stamps the entire compression lineage as a unit, so the tip is the
+        only id this needs.
+        """
+        if not session_read_state_supported():
+            raise ValueError(SESSION_READ_STATE_UNSUPPORTED)
+        p = params if isinstance(params, dict) else {}
+        tip = self._resolve_target(p.get("identity"), fail_closed=True)
+        read = p.get("read")
+        self._get_writer().set_session_read(
+            tip, read=True if read is None else bool(read)
+        )
+        return {"ok": True}
+
+    def _hide_targets(self, identity: Any, tip: str) -> List[str]:
+        """Every row whose `hidden` flag must move with this identity.
+
+        `set_session_hidden` flips ONE compression lineage. A minted key can
+        carry several: a `/new` reset ends the old row with `session_reset`
+        and mints a fresh row on the same deterministic session_key, and
+        `_dedupe_by_session_key` merely keeps the newest carrier in front of
+        the older ones. Hiding only the tip would therefore resurface a stale
+        pre-reset carrier — with its stale preview — on the very next list.
+        So a minted identity flips every carrier of its native key.
+
+        Foreign identities have no minted key grammar to enumerate (and their
+        `remainder` may be an external-root form with no session_key at all),
+        so they flip the resolved tip's lineage only.
+        """
+        ident = identity if isinstance(identity, dict) else {}
+        chat_id = ident.get("chatId")
+        if not isinstance(chat_id, str) or not chat_id:
+            return [tip]
+        ns = str(ident.get("ns") or self._ns)
+        carriers = self._session_ids_by_key(
+            f"agent:{ns}:{OCUCLAW_PLATFORM_SEGMENT}:"
+            f"{OCUCLAW_CHAT_TYPE_SEGMENT}:{chat_id}"
+        )
+        if tip not in carriers:
+            carriers.append(tip)
+        return carriers
+
+    def _sync_set_hidden(self, params: Any) -> Dict[str, Any]:
+        """Hide/unhide a conversation from the global sessions listing."""
+        if not session_read_state_supported():
+            raise ValueError(SESSION_READ_STATE_UNSUPPORTED)
+        p = params if isinstance(params, dict) else {}
+        identity = p.get("identity")
+        hidden = bool(p.get("hidden"))
+        tip = self._resolve_target(identity, fail_closed=True)
+        writer = self._get_writer()
+        for target in self._hide_targets(identity, tip):
+            writer.set_session_hidden(target, hidden)
         return {"ok": True}
 
     def _sync_delete(self, params: Any) -> Dict[str, Any]:
@@ -482,9 +1074,7 @@ class SessionRpc:
     def _sync_history(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
         tip = self._resolve_target(p.get("identity"), fail_closed=True)
-        rows = self._get_reader().get_messages_as_conversation(
-            tip, include_ancestors=True
-        )
+        rows = self._conversation_rows_with_identity(tip)
         # Conversational shaping happens HERE, before serialization: only
         # user/assistant rows with content survive, and the tail slice
         # applies server-side so a long transcript never has to fit the
@@ -492,17 +1082,24 @@ class SessionRpc:
         # (Codex review W05 finding). Content stays scalar-or-block-list;
         # the Node bridge re-shapes defensively over the same pinned shape.
         messages = [
-            {"role": row.get("role"), "content": row.get("content")}
+            self._conversation_row_to_wire(row)
             for row in rows
             if row.get("role") in ("user", "assistant") and row.get("content")
         ]
+        # PRE-slice count. The tail slice below is the only reason a caller
+        # can silently lose the beginning of its own conversation; `total`
+        # is what makes that loss observable instead of invisible. No
+        # `offset` companion: nothing in composeApp or the plugin has a
+        # load-earlier affordance, so an offset would be protocol surface for
+        # a UI that does not exist. The slice stays TAIL-anchored.
+        total = len(messages)
         try:
             limit = int(p.get("limit"))
         except (TypeError, ValueError):
             limit = 0
-        if limit > 0 and len(messages) > limit:
+        if limit > 0 and total > limit:
             messages = messages[-limit:]
-        return {"messages": messages, "sessionId": tip}
+        return {"messages": messages, "sessionId": tip, "total": total}
 
     def _sync_describe(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
@@ -510,7 +1107,7 @@ class SessionRpc:
         row = self._get_reader().get_session(tip)
         if row is None:
             raise ValueError(f"no such session: {tip}")
-        return {
+        described = {
             "model": row.get("model"),
             "tokens": {
                 "input": row.get("input_tokens") or 0,
@@ -521,6 +1118,63 @@ class SessionRpc:
             },
             "messageCount": row.get("message_count") or 0,
         }
+        # Current prompt occupancy is not a SessionDB token total. Hermes owns
+        # it in the public, persisted SessionStore entry as
+        # ``last_prompt_tokens``. The adapter receives that store through
+        # BasePlatformAdapter.set_session_store before connect, so read it via
+        # the public lookup API and never guess from cumulative billed tokens.
+        store = (
+            self._session_store_provider(self._ns)
+            if self._session_store_provider is not None
+            else None
+        )
+        lookup = getattr(store, "lookup_by_session_id", None)
+        if callable(lookup):
+            try:
+                entry = lookup(tip)
+                raw_prompt_tokens = getattr(entry, "last_prompt_tokens", None)
+                if (
+                    isinstance(raw_prompt_tokens, int)
+                    and not isinstance(raw_prompt_tokens, bool)
+                    and raw_prompt_tokens >= 0
+                ):
+                    described["lastMessageTokenCount"] = raw_prompt_tokens
+            except Exception:  # noqa: BLE001 - context row degrades honestly
+                logger.debug(
+                    "session_rpc: SessionStore prompt-token read failed",
+                    exc_info=True,
+                )
+        # Spend belongs on the single-session read, next to the token counters
+        # it sits beside conceptually. COALESCE(actual, estimated) is upstream's
+        # own rule twice over: `HermesSession.displayCostUSD` in Scarf is
+        # `actualCostUSD ?? estimatedCostUSD`, and hermes' reaping filter uses
+        # `COALESCE(s.actual_cost_usd, s.estimated_cost_usd, 0)`
+        # (hermes_state.py:8171). Column-gated per row, same rule as
+        # `_row_to_wire`: absent columns leave the key off entirely.
+        cost = self._coalesced_cost_usd(row)
+        if cost is not None:
+            described["costUsd"] = cost
+        return described
+
+    @staticmethod
+    def _coalesced_cost_usd(row: Dict[str, Any]) -> Optional[float]:
+        """COALESCE(actual_cost_usd, estimated_cost_usd) as a float, or None.
+
+        None covers three cases that must not be distinguishable downstream:
+        the host's schema predates the columns, the columns are NULL, or the
+        values are non-numeric. "No figure" is the honest render in all three.
+        """
+        for column in ("actual_cost_usd", "estimated_cost_usd"):
+            if column not in row:
+                continue
+            value = row.get(column)
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
 
     def _sync_compaction_info(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
@@ -581,22 +1235,28 @@ class ProfileSessionRpc:
         self,
         default_db_path: Path,
         routing_provider: Callable[[], Tuple[bool, Dict[str, Path]]],
+        session_store_provider: Optional[Callable[[str], Any]] = None,
     ) -> None:
         self._default_db_path = Path(default_db_path)
         self._routing_provider = routing_provider
+        self._session_store_provider = session_store_provider
         self._lock = threading.RLock()
         self._rpcs: Dict[str, SessionRpc] = {
             DEFAULT_SESSION_NAMESPACE: SessionRpc(
                 self._default_db_path,
                 namespace=DEFAULT_SESSION_NAMESPACE,
+                session_store_provider=self._session_store_provider,
             )
         }
 
     def handlers(self) -> Dict[str, Callable[[Any], Any]]:
         return {
             DB_METHOD_SESSIONS_LIST: self.list_sessions,
+            DB_METHOD_SESSIONS_SEARCH: self.search_sessions,
             DB_METHOD_RESOLVE_KEY: self.resolve_key,
             DB_METHOD_SET_TITLE: self.set_title,
+            DB_METHOD_SET_READ: self.set_read,
+            DB_METHOD_SET_HIDDEN: self.set_hidden,
             DB_METHOD_DELETE: self.delete_session,
             DB_METHOD_CHAT_HISTORY: self.chat_history,
             DB_METHOD_DESCRIBE: self.describe_session,
@@ -645,15 +1305,19 @@ class ProfileSessionRpc:
             rpc = self._rpcs.get(namespace)
             db_path = homes[namespace] / "state.db"
             if rpc is None or rpc._db_path != db_path:
-                rpc = SessionRpc(db_path, namespace=namespace)
+                rpc = SessionRpc(
+                    db_path,
+                    namespace=namespace,
+                    session_store_provider=self._session_store_provider,
+                )
                 self._rpcs[namespace] = rpc
             return rpc
 
     def _ambient_rpc(self) -> SessionRpc:
-        # VERIFIED Hermes 0.19 anchors: gateway/run.py:18733 enters
-        # _profile_runtime_scope for the whole turn; :16396 carries that
-        # ContextVar through copy_context into the agent worker; and
-        # agent/turn_finalizer.py:610-626 fires on_session_end there. Resolve
+        # VERIFIED Hermes 0.20 anchors: gateway.run._profile_runtime_scope
+        # covers the whole turn, the ContextVar crosses into the agent worker
+        # through copy_context, and agent.turn_finalizer fires on_session_end
+        # inside that scope. Resolve
         # get_hermes_home() NOW, not at adapter construction, so hook lookups
         # follow the profile whose run_conversation is finalizing.
         db_path = default_state_db_path()
@@ -676,6 +1340,68 @@ class ProfileSessionRpc:
 
     async def list_sessions(self, params: Any) -> Dict[str, Any]:
         return await asyncio.to_thread(self._sync_list_sessions, params)
+
+    async def search_sessions(self, params: Any) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._sync_search_sessions, params)
+
+    def _sync_search_sessions(self, params: Any) -> Dict[str, Any]:
+        p = params if isinstance(params, dict) else {}
+        enabled, homes = self._routing()
+        if not enabled:
+            return self._rpcs[DEFAULT_SESSION_NAMESPACE]._sync_search(p)
+        try:
+            limit = int(p.get("limit"))
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 100))
+        fanout_params = dict(p)
+        fanout_params["limit"] = limit
+        matches: List[Dict[str, Any]] = []
+        unavailable_profiles = []
+        failed_profiles = []
+        unavailable_reasons = set()
+        successful_profiles = 0
+        truncated = False
+        for ns, home in homes.items():
+            if not (Path(home) / "state.db").exists():
+                continue
+            try:
+                result = self._rpc_for_namespace(ns)._sync_search(fanout_params)
+            except Exception:  # noqa: BLE001
+                logger.exception("Hermes transcript search failed for profile %s", ns)
+                unavailable_profiles.append(ns)
+                failed_profiles.append(ns)
+                continue
+            if not result.get("available", False):
+                unavailable_profiles.append(ns)
+                unavailable_reasons.add(str(result.get("reason") or "fts_unavailable"))
+            else:
+                successful_profiles += 1
+            matches.extend(result.get("matches") or [])
+            truncated = truncated or bool(result.get("truncated"))
+        matches.sort(
+            key=lambda match: float(match["session"].get("lastActive") or 0),
+            reverse=True,
+        )
+        truncated = truncated or len(matches) > limit
+        response: Dict[str, Any] = {
+            "available": not unavailable_profiles,
+            "matches": matches[:limit],
+            "truncated": truncated,
+        }
+        if unavailable_profiles:
+            if successful_profiles > 0:
+                response["reason"] = "partial_search_unavailable"
+            elif failed_profiles:
+                response["reason"] = "search_failed"
+            elif "fts_probe_unavailable" in unavailable_reasons:
+                response["reason"] = "fts_probe_unavailable"
+            else:
+                response["reason"] = "fts_unavailable"
+            if failed_profiles:
+                response["failedProfiles"] = sorted(failed_profiles)
+            response["unavailableProfiles"] = sorted(unavailable_profiles)
+        return response
 
     def _sync_list_sessions(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
@@ -758,6 +1484,12 @@ class ProfileSessionRpc:
 
     async def set_title(self, params: Any) -> Dict[str, Any]:
         return await self._route("set_title", params)
+
+    async def set_read(self, params: Any) -> Dict[str, Any]:
+        return await self._route("set_read", params)
+
+    async def set_hidden(self, params: Any) -> Dict[str, Any]:
+        return await self._route("set_hidden", params)
 
     async def delete_session(self, params: Any) -> Dict[str, Any]:
         return await self._route("delete_session", params)

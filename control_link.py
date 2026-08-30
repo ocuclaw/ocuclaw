@@ -512,17 +512,129 @@ class LinkProcess:
                 self._log.exception("[ocuclaw] link on_exit callback failed")
 
 
+# ---------------------------------------------------------------------------
+# Child environment allowlist (#1331; locked boundary #1270)
+# ---------------------------------------------------------------------------
+#
+# The boundary requires the Node child receive "an explicit cross-platform
+# environment allowlist plus typed locally synthesized controls — never the
+# relay token, provider/package/Git/SSH credentials, proxy variables, or
+# wildcard environment inheritance."
+#
+# This list is an ALLOWLIST, never a denylist, and that is deliberate: the
+# Hermes CLI's own bang-shell sanitizer is a denylist whose `except` path
+# returns `os.environ.copy()`, so one failure hands over the whole keyring.
+# An allowlist that fails leaks nothing.
+#
+# Nothing here is a secret, and nothing here needs to be: every credential the
+# child uses (relay token, Soniox key, Even-AI token) is delivered deliberately
+# over the control link in the `link.hello.ack` config payload — see
+# `_child_runtime_config` in adapter.py and the secrets table in PROTOCOL.md.
+# The environment is not, and must not become, a credential channel.
+#
+# The list was derived empirically, not guessed. A full sweep of the child's
+# reachable module graph (`hermes-runtime-entry.cjs` plus the 105 repo-local
+# modules and the relay worker thread it transitively loads) finds exactly four
+# environment variables read by the child's own code: the two `OCUCLAW_LINK_*`
+# controls this function synthesizes itself, and the two `OPENCLAW_*` host
+# version strings below. The real Node entry completes the handshake with a
+# *completely empty* environment, so everything else here is justified by what
+# Node and the OS need to run the child correctly rather than by a code read.
+#
+# Windows note: Python normalizes `os.environ` keys to upper case on `nt`, so
+# exact matching against these canonical upper-case names is correct on both
+# platform families. Matching case-insensitively on POSIX would let a lower-
+# case `path=` in the parent environment be promoted into the child's `PATH`.
+CHILD_ENV_ALLOWLIST: Tuple[str, ...] = (
+    # Executable resolution. No module in the child graph shells out today, but
+    # an environment without PATH is a trap for the first one that does.
+    "PATH",
+    # Read by `openclaw-host-version` and reported to the glasses client via
+    # the plugin version service. Non-secret host version strings, primary then
+    # operator-set fallback; both absent reports null ("honest, never faked").
+    "OPENCLAW_SERVICE_VERSION",
+    "OPENCLAW_VERSION",
+    # `os.homedir()` — POSIX reads $HOME, Windows %USERPROFILE%. The child
+    # anchors state under it (relay-core debug-bundle dir, even-terminal
+    # discovery/history roots), so an unset value silently relocates state.
+    "HOME",
+    "USERPROFILE",
+    # `os.tmpdir()` — TMPDIR on POSIX, TEMP/TMP on Windows. The gateway bridge
+    # stages files there.
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    # Locale and timezone: the child renders dates/numbers into glasses text.
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    # Windows platform floor — the Node binary itself will not start without
+    # these, and `PATH` alone is not enough to resolve executables there.
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "COMSPEC",
+    "PATHEXT",
+    "APPDATA",
+    "LOCALAPPDATA",
+)
+
+# Deliberately NOT allowlisted, recorded so a future edit has to argue with it:
+#   OCUCLAW_RELAY_TOKEN / OCUCLAW_SONIOX_API_KEY / OCUCLAW_EVEN_AI_TOKEN —
+#     credentials; they reach the child over `link.hello.ack`, never the env.
+#   NODE_OPTIONS / NODE_PATH — arbitrary-code-injection vectors into the child
+#     (`--require`, module resolution) from whatever the gateway inherited.
+#   NODE_EXTRA_CA_CERTS / NODE_TLS_REJECT_UNAUTHORIZED — parent-controlled TLS
+#     trust for the child's outbound calls.
+#   HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY — named by the boundary.
+#   SSH_AUTH_SOCK / GIT_* / npm_* / provider API keys — named by the boundary.
+
+
+def _synthesized_child_controls(
+    handshake_timeout_s: Optional[float],
+    debug_stderr: bool,
+    hermes_features: Optional[str] = None,
+) -> Dict[str, str]:
+    """The typed, locally synthesized controls — the only non-allowlist keys.
+
+    These are derived from adapter settings, never read from the parent
+    environment, and are the two variables the child actually reads.
+    """
+    controls: Dict[str, str] = {}
+    if handshake_timeout_s is not None:
+        controls["OCUCLAW_LINK_HANDSHAKE_TIMEOUT_MS"] = str(
+            int(handshake_timeout_s * 1000)
+        )
+    if debug_stderr:
+        controls["OCUCLAW_LINK_DEBUG_STDERR"] = "1"
+    if hermes_features is not None:
+        controls["OCUCLAW_HERMES_FEATURES"] = str(hermes_features)
+    return controls
+
+
 def default_child_env(
     base_env: Optional[Dict[str, str]] = None,
     *,
     handshake_timeout_s: Optional[float] = None,
     debug_stderr: bool = False,
+    hermes_features: Optional[str] = None,
 ) -> Dict[str, str]:
-    env = dict(base_env if base_env is not None else os.environ)
-    if handshake_timeout_s is not None:
-        env["OCUCLAW_LINK_HANDSHAKE_TIMEOUT_MS"] = str(
-            int(handshake_timeout_s * 1000)
+    """Build the child environment by allowlist — never by inheritance.
+
+    ``base_env`` (default ``os.environ``) is *filtered*, not copied: a caller
+    passing an environment explicitly gets the same boundary as the adapter.
+    """
+    source = os.environ if base_env is None else base_env
+    env: Dict[str, str] = {}
+    for name in CHILD_ENV_ALLOWLIST:
+        value = source.get(name)
+        if value is not None:
+            env[name] = value
+    env.update(
+        _synthesized_child_controls(
+            handshake_timeout_s,
+            debug_stderr,
+            hermes_features,
         )
-    if debug_stderr:
-        env["OCUCLAW_LINK_DEBUG_STDERR"] = "1"
+    )
     return env

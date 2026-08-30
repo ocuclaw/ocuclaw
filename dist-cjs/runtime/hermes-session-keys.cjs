@@ -2,6 +2,11 @@ const HERMES_SESSION_KEY_PREFIX = "hermes:";
 
 const DEFAULT_HERMES_NAMESPACE = "main";
 
+function hermesProfileIdForNamespace(namespace) {
+  const normalized = normalizeSegment(namespace);
+  return normalized === DEFAULT_HERMES_NAMESPACE ? "default" : normalized;
+}
+
 const HERMES_FOREIGN_KEY_MARKER = "x";
 
 const OCUCLAW_PLATFORM_SEGMENT = "ocuclaw";
@@ -112,4 +117,4 @@ function normalizeSegment(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-module.exports = { HERMES_SESSION_KEY_PREFIX, DEFAULT_HERMES_NAMESPACE, HERMES_FOREIGN_KEY_MARKER, OCUCLAW_PLATFORM_SEGMENT, OCUCLAW_CHAT_TYPE_SEGMENT, isHermesSessionKey, isForeignHermesSessionKey, mintedHermesSessionKey, hermesDefaultSessionKeyPrefix, hermesSupportedSessionKeyPrefixes, stripAgentNamespace, deriveHermesPublicKey, parseHermesPublicKey };
+module.exports = { HERMES_SESSION_KEY_PREFIX, DEFAULT_HERMES_NAMESPACE, hermesProfileIdForNamespace, HERMES_FOREIGN_KEY_MARKER, OCUCLAW_PLATFORM_SEGMENT, OCUCLAW_CHAT_TYPE_SEGMENT, isHermesSessionKey, isForeignHermesSessionKey, mintedHermesSessionKey, hermesDefaultSessionKeyPrefix, hermesSupportedSessionKeyPrefixes, stripAgentNamespace, deriveHermesPublicKey, parseHermesPublicKey };

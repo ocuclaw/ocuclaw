@@ -1,6 +1,6 @@
 const { parentPort } = require("node:worker_threads");
 const { createRelayWorkerTransport } = require("./relay-worker-transport.cjs");
-const { isKnownBackendKind, setActiveBackendKind, } = require("../gateway/backend-contract.cjs");
+const { isKnownBackendKind, setActiveBackendKind } = require("../gateway/backend-contract.cjs");
 
 if (!parentPort) {
   throw new Error("relay worker entry requires parentPort");

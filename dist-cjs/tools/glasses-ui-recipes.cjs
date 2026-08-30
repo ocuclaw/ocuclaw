@@ -72,6 +72,7 @@ function checkResolvedIp(address, family) {
 function makeSafeLookup(dnsLookup) {
   return function safeLookup(hostname, opts, cb) {
     const family = opts && typeof opts.family === "number" ? opts.family : 0;
+    const all = opts && opts.all === true;
     Promise.resolve()
       .then(() => dnsLookup(hostname, { all: true, family: 0 }))
       .then((records) => {
@@ -86,10 +87,20 @@ function makeSafeLookup(dnsLookup) {
             return;
           }
         }
-        const picked =
+        const matching =
           family === 4 || family === 6
-            ? records.find((r) => r.family === family) || records[0]
-            : records[0];
+            ? records.filter((r) => r.family === family)
+            : records;
+        if (matching.length === 0) {
+          cb(new Error(`SSRF guard: no family ${family} DNS records for ${hostname}`));
+          return;
+        }
+
+        if (all) {
+          cb(null, matching.map((r) => ({ address: r.address, family: r.family })));
+          return;
+        }
+        const picked = matching[0];
         cb(null, picked.address, picked.family);
       })
       .catch((err) => cb(err));

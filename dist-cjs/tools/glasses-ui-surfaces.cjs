@@ -1,8 +1,51 @@
-const TERMINAL_RESULTS = new Set(["dismissed", "timeout", "glasses_disconnected", "preempted", "recipe_failed"]);
+const TERMINAL_OUTCOME_RESULTS = Object.freeze([
+  "dismissed",
+  "timeout",
+  "glasses_disconnected",
+  "session_reset",
+  "preempted",
+  "recipe_failed",
+]);
+
+const TERMINAL_RESULTS = new Set(TERMINAL_OUTCOME_RESULTS);
+
+const SETTLEMENT_OUTCOME_RESULTS = Object.freeze([
+  "cancelled",
+  "aborted",
+]);
+
+const SETTLEMENT_RESULTS = new Set(SETTLEMENT_OUTCOME_RESULTS);
+
+const SURFACE_REAP_REASONS = Object.freeze([
+  "drain_session",
+  "drain_all",
+  "pop_back",
+  "exit",
+]);
+
+const SURFACE_EVICTION_REASONS = Object.freeze(["event_log_cap"]);
+
+const DEAD_LETTER_REASONS = Object.freeze([
+  ...SURFACE_REAP_REASONS,
+  ...SURFACE_EVICTION_REASONS,
+]);
 
 function isTerminalOutcome(outcome) {
   return !!(outcome && typeof outcome.result === "string" && TERMINAL_RESULTS.has(outcome.result));
 }
+
+function isSettlementOutcome(outcome) {
+  return !!(outcome && typeof outcome.result === "string" && SETTLEMENT_RESULTS.has(outcome.result));
+}
+
+const RECEIPT_REJECTION_REASONS = Object.freeze([
+  "unknown_surface",
+  "no_send_attempt",
+  "surface_uuid_mismatch",
+  "stale_seq",
+]);
+
+const MAX_TRACKED_SEND_ATTEMPTS = 32;
 
 const GLASS_EVENT_ORIGINS = ["gesture", "schedule", "threshold", "system"];
 
@@ -34,6 +77,212 @@ function createSurfaceStore(deps = {}) {
   const bySurface = new Map();
   const stackBySession = new Map();
 
+  const generationBySession = new Map();
+  let stageHolder = null;
+  let pendingStageGrant = null;
+
+  function generationFor(rawSessionKey) {
+    const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
+    return generationBySession.get(sessionKey) || 1;
+  }
+
+  function advanceGeneration(rawSessionKey) {
+    const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
+    generationBySession.set(sessionKey, generationFor(sessionKey) + 1);
+  }
+
+  function syncStageBusySince() {
+    if (!stageHolder || !stageHolder.surfaceId) return;
+    const marker = markerFor(stageHolder.surfaceId);
+    if (marker === "parked" || marker === null) {
+      stageHolder.busySinceMs = null;
+    } else if (!Number.isFinite(stageHolder.busySinceMs)) {
+      stageHolder.busySinceMs = now();
+    }
+  }
+
+  function planStageGrant(rawSessionKey, opts = {}) {
+    const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
+    const graceMs = Number.isFinite(opts.graceMs)
+      ? Math.max(0, Math.floor(opts.graceMs))
+      : 0;
+    if (!stageHolder) {
+      return { ok: true, action: "grant", reason: "first_render", sessionKey };
+    }
+    if (stageHolder.sessionKey === sessionKey) {
+      return { ok: true, action: "retain", reason: "same_session", sessionKey };
+    }
+
+    const incumbentSurfaceId = topSurfaceId(stageHolder.sessionKey) || stageHolder.surfaceId;
+    const incumbentMarker = markerFor(incumbentSurfaceId) || "parked";
+    if (incumbentMarker === "parked") {
+      stageHolder.busySinceMs = null;
+      return {
+        ok: true,
+        action: "transfer",
+        reason: "lease_transfer",
+        sessionKey,
+        incumbentSessionKey: stageHolder.sessionKey,
+        incumbentSurfaceId,
+        incumbentMarker,
+      };
+    }
+
+    if (!Number.isFinite(stageHolder.busySinceMs)) stageHolder.busySinceMs = now();
+    const busyForMs = Math.max(0, now() - stageHolder.busySinceMs);
+    if (busyForMs >= graceMs) {
+      return {
+        ok: true,
+        action: "transfer",
+        reason: "grace_expired",
+        sessionKey,
+        incumbentSessionKey: stageHolder.sessionKey,
+        incumbentSurfaceId,
+        incumbentMarker,
+        busyForMs,
+      };
+    }
+
+    const retryAfterMs = Math.max(1, graceMs - busyForMs);
+    emitLifecycle("stage_denied", "warn", {
+      surfaceId: incumbentSurfaceId,
+      sessionKey,
+      challengerSessionKey: sessionKey,
+      incumbentSessionKey: stageHolder.sessionKey,
+      incumbentSurfaceId,
+      incumbentMarker,
+      reason: "incumbent_busy",
+      retryAfterMs,
+    });
+    return {
+      ok: false,
+      code: "stage_incumbent_busy",
+      reason: "incumbent_busy",
+      sessionKey,
+      incumbentSessionKey: stageHolder.sessionKey,
+      incumbentSurfaceId,
+      incumbentMarker,
+      retryAfterMs,
+    };
+  }
+
+  function commitStageGrant(rawSessionKey, plan) {
+    const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
+    if (!plan || plan.ok !== true) return false;
+    if (stageHolder && stageHolder.sessionKey === sessionKey && plan.action === "retain") {
+      return true;
+    }
+
+    const prior = stageHolder ? { ...stageHolder } : null;
+    if (prior && prior.sessionKey !== sessionKey) {
+      const priorSurfaceId = topSurfaceId(prior.sessionKey) || prior.surfaceId;
+      if (priorSurfaceId) pauseCron(priorSurfaceId);
+      emitLifecycle("stage_yielded", "info", {
+        surfaceId: priorSurfaceId,
+        sessionKey: prior.sessionKey,
+        challengerSessionKey: sessionKey,
+        reason: plan.reason === "grace_expired" ? "grace_expired" : "lease_transfer",
+        generation: prior.generation,
+      });
+    }
+
+    const candidateSurfaceId = topSurfaceId(sessionKey);
+    if (candidateSurfaceId) resumeCron(candidateSurfaceId);
+    stageHolder = {
+      sessionKey,
+      surfaceId: candidateSurfaceId,
+      generation: generationFor(sessionKey),
+      grantedAtMs: now(),
+      busySinceMs: null,
+    };
+    syncStageBusySince();
+    pendingStageGrant = {
+      sessionKey,
+      priorHolderSessionKey: prior && prior.sessionKey !== sessionKey ? prior.sessionKey : null,
+      priorHolderSurfaceId: prior && prior.sessionKey !== sessionKey ? prior.surfaceId : null,
+      reason: plan.reason === "grace_expired" ? "grace_expired" : plan.reason,
+    };
+    return true;
+  }
+
+  function bindStageSurface(rawSessionKey, surfaceId) {
+    const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
+    if (!stageHolder || stageHolder.sessionKey !== sessionKey) return false;
+    stageHolder.surfaceId = surfaceId;
+    if (pendingStageGrant && pendingStageGrant.sessionKey === sessionKey) {
+      emitLifecycle("stage_granted", "info", {
+        surfaceId,
+        sessionKey,
+        priorHolderSessionKey: pendingStageGrant.priorHolderSessionKey,
+        priorHolderSurfaceId: pendingStageGrant.priorHolderSurfaceId,
+        reason: pendingStageGrant.reason,
+        generation: stageHolder.generation,
+      });
+      pendingStageGrant = null;
+    }
+    syncStageBusySince();
+    return true;
+  }
+
+  function clearStageForSession(rawSessionKey) {
+    const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
+    if (!stageHolder || stageHolder.sessionKey !== sessionKey) return false;
+    stageHolder = null;
+    if (pendingStageGrant && pendingStageGrant.sessionKey === sessionKey) {
+      pendingStageGrant = null;
+    }
+    return true;
+  }
+
+  function activeSessionCount() {
+    let count = 0;
+    for (const sessionKey of stackBySession.keys()) {
+      if (stackDepth(sessionKey) > 0) count += 1;
+    }
+    return count;
+  }
+
+  function stageState(rawSessionKey, opts = {}) {
+    const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
+    const graceMs = Number.isFinite(opts.graceMs)
+      ? Math.max(0, Math.floor(opts.graceMs))
+      : 0;
+    if (!stageHolder) {
+      return {
+        role: "vacant",
+        holderSessionKey: null,
+        holderSurfaceId: null,
+        holderSurfaceUuid: null,
+        holderMarker: null,
+        generation: null,
+        grantedAtMs: null,
+        busySinceMs: null,
+        graceRemainingMs: null,
+      };
+    }
+    syncStageBusySince();
+    const holderEntry = stageHolder.surfaceId ? bySurface.get(stageHolder.surfaceId) : null;
+    const role = stageHolder.sessionKey === sessionKey
+      ? "holder"
+      : stackDepth(sessionKey) > 0
+        ? "backstage"
+        : "contender";
+    const graceRemainingMs = Number.isFinite(stageHolder.busySinceMs)
+      ? Math.max(0, graceMs - Math.max(0, now() - stageHolder.busySinceMs))
+      : null;
+    return {
+      role,
+      holderSessionKey: stageHolder.sessionKey,
+      holderSurfaceId: stageHolder.surfaceId,
+      holderSurfaceUuid: holderEntry ? holderEntry.uuid : null,
+      holderMarker: markerFor(stageHolder.surfaceId),
+      generation: stageHolder.generation,
+      grantedAtMs: stageHolder.grantedAtMs,
+      busySinceMs: stageHolder.busySinceMs,
+      graceRemainingMs,
+    };
+  }
+
   const DEAD_LETTER_EVENT_CAP = 32;
   const SURFACE_EVENT_LOG_CAP = 32;
   const deadLetterBySession = new Map();
@@ -45,21 +294,19 @@ function createSurfaceStore(deps = {}) {
     return list;
   }
 
-  function deadLetterEntryEvents(sessionKey, surfaceId, entry, reason) {
-
-    if (!entry || entry.exitLatched || !entry.events || entry.events.length === 0) return;
-    const eventIds = entry.events.map((e) => e.eventId);
+  function appendDeadLetter(sessionKey, surfaceId, entry, events, reason) {
+    if (!entry || !events || events.length === 0) return;
+    const eventIds = events.map((e) => e.eventId);
     const list = deadLetterFor(sessionKey);
     list.push({
       surfaceUuid: entry.uuid,
       surfaceId,
-      events: entry.events,
+      events,
       reason,
       reapedAtMs: now(),
 
       staleAfterMs: Number.isFinite(entry.staleAfterMs) ? entry.staleAfterMs : null,
     });
-    entry.events = [];
 
     emitLifecycle("dead_letter_appended", "debug", {
       sessionKey,
@@ -83,6 +330,14 @@ function createSurfaceStore(deps = {}) {
     }
   }
 
+  function deadLetterEntryEvents(sessionKey, surfaceId, entry, reason) {
+
+    if (!entry || entry.exitLatched || !entry.events || entry.events.length === 0) return;
+    const events = entry.events;
+    entry.events = [];
+    appendDeadLetter(sessionKey, surfaceId, entry, events, reason);
+  }
+
   function stackFor(sessionKey) {
     let s = stackBySession.get(sessionKey);
     if (!s) { s = []; stackBySession.set(sessionKey, s); }
@@ -92,6 +347,8 @@ function createSurfaceStore(deps = {}) {
   function makeEntry(sessionKey, kind, prior) {
     return {
       sessionKey, kind: kind || null, pending: null, lastContent: null,
+
+      recordedSpec: null,
       state: "visible_pending",
       queuedEvent: prior ? prior.queuedEvent : null,
       exitLatched: prior ? !!prior.exitLatched : false,
@@ -104,7 +361,37 @@ function createSurfaceStore(deps = {}) {
 
       title: prior ? prior.title : null,
       awaitingAgentResponse: false,
+
+      terminationCause: null,
+
+      lastAttemptedSend: null,
+      sendAttempts: new Map(),
+      lastPaintedAt: null,
+      deliveryEvidence: {
+        authoredAtMs: null,
+        validatedAtMs: null,
+        sendAttemptedAtMs: null,
+        clientReceiptAtMs: null,
+
+        wearerInteractedAtMs: null,
+      },
     };
+  }
+
+  function clearSendAndReceiptEvidence(entry) {
+    entry.lastAttemptedSend = null;
+    entry.sendAttempts.clear();
+    entry.lastPaintedAt = null;
+    entry.deliveryEvidence.sendAttemptedAtMs = null;
+    entry.deliveryEvidence.clientReceiptAtMs = null;
+  }
+
+  function stampAuthoredAndValidated(entry) {
+    const atMs = now();
+    if (entry.deliveryEvidence.authoredAtMs === null) {
+      entry.deliveryEvidence.authoredAtMs = atMs;
+    }
+    entry.deliveryEvidence.validatedAtMs = atMs;
   }
 
   function register(rawSessionKey, surfaceId, meta) {
@@ -121,8 +408,13 @@ function createSurfaceStore(deps = {}) {
         existing.staleAfterMs = meta && Number.isFinite(meta.staleAfterMs) ? meta.staleAfterMs : null;
         if (meta && typeof meta.title === "string") existing.title = meta.title;
         existing.awaitingAgentResponse = false;
+        existing.terminationCause = null;
         existing.sessionKey = sessionKey;
         existing.state = "visible_pending";
+
+        clearSendAndReceiptEvidence(existing);
+        stampAuthoredAndValidated(existing);
+        syncStageBusySince();
         return;
       }
       const entry = makeEntry(sessionKey, meta && meta.kind ? meta.kind : null);
@@ -132,7 +424,9 @@ function createSurfaceStore(deps = {}) {
       entry.staleAfterMs = meta && Number.isFinite(meta.staleAfterMs) ? meta.staleAfterMs : null;
       if (meta && typeof meta.title === "string") entry.title = meta.title;
       entry.pending = resolve;
+      stampAuthoredAndValidated(entry);
       bySurface.set(surfaceId, entry);
+      syncStageBusySince();
     });
   }
 
@@ -140,6 +434,23 @@ function createSurfaceStore(deps = {}) {
     if (!outcome || typeof outcome !== "object" || Array.isArray(outcome)) return outcome;
     if (outcome.surfaceUuid !== undefined) return outcome;
     return { ...outcome, surfaceUuid: entry.uuid };
+  }
+
+  function deliveryForRecord(entry, record) {
+    const parkedForMs = Math.max(0, now() - record.queuedAtMs);
+    const delivered = {
+      ...record.outcome,
+      surfaceUuid: entry.uuid,
+      eventId: record.eventId,
+      origin: record.origin,
+      actor: record.actor || "wearer",
+      queuedAtMs: record.queuedAtMs,
+      parkedForMs,
+    };
+    if (Number.isFinite(entry.staleAfterMs) && parkedForMs > entry.staleAfterMs) {
+      delivered.stale = true;
+    }
+    return delivered;
   }
 
   function resolve(surfaceId, outcome) {
@@ -150,12 +461,20 @@ function createSurfaceStore(deps = {}) {
     if (isTerminalOutcome(outcome)) {
       entry.state = "exiting";
       entry.awaitingAgentResponse = false;
+      entry.terminationCause = outcome.result;
+    } else if (isSettlementOutcome(outcome)) {
+
+      entry.state = "visible_awaiting_agent";
+      entry.awaitingAgentResponse = false;
+      entry.terminationCause = outcome.result;
     } else {
       entry.state = "visible_awaiting_agent";
 
       entry.awaitingAgentResponse = !!(outcome && outcome.result !== "window_expired");
+      entry.terminationCause = null;
     }
     pending(decorateDelivery(entry, outcome));
+    syncStageBusySince();
     return true;
   }
 
@@ -187,6 +506,8 @@ function createSurfaceStore(deps = {}) {
       bySurface.delete(surfaceId);
       if (pending) { pending(decorateDrainOutcome(entry, outcome)); n += 1; }
     }
+    clearStageForSession(sessionKey);
+    if (outcome && outcome.result === "session_reset") advanceGeneration(sessionKey);
     return n;
   }
 
@@ -199,9 +520,12 @@ function createSurfaceStore(deps = {}) {
       entry.pending = null;
 
       entry.state = "visible_awaiting_agent";
+      entry.awaitingAgentResponse = false;
+      entry.terminationCause = isSettlementOutcome(outcome) ? outcome.result : null;
       pending(decorateDrainOutcome(entry, outcome));
       n += 1;
     }
+    syncStageBusySince();
     return n;
   }
 
@@ -214,6 +538,9 @@ function createSurfaceStore(deps = {}) {
       bySurface.delete(surfaceId);
       if (pending) { pending(decorateDrainOutcome(entry, outcome)); n += 1; }
     }
+    stageHolder = null;
+    pendingStageGrant = null;
+    generationBySession.clear();
     return n;
   }
 
@@ -228,6 +555,7 @@ function createSurfaceStore(deps = {}) {
     if (isTerminalOutcome(event)) {
       entry.exitLatched = true;
       entry.queuedEvent = event;
+      syncStageBusySince();
       return { ok: true, eventId: ++eventSeq, surfaceUuid: entry.uuid, kind: "terminal_latch" };
     }
     if (entry.exitLatched) {
@@ -253,9 +581,12 @@ function createSurfaceStore(deps = {}) {
     };
     entry.events.push(record);
     if (entry.events.length > SURFACE_EVENT_LOG_CAP) {
-      entry.events.splice(0, entry.events.length - SURFACE_EVENT_LOG_CAP);
+
+      const evicted = entry.events.splice(0, entry.events.length - SURFACE_EVENT_LOG_CAP);
+      appendDeadLetter(entry.sessionKey, surfaceId, entry, evicted, "event_log_cap");
     }
     entry.queuedEvent = event;
+    syncStageBusySince();
     return { ok: true, eventId: record.eventId, surfaceUuid: entry.uuid };
   }
 
@@ -277,6 +608,7 @@ function createSurfaceStore(deps = {}) {
     for (const [, entry] of bySurface) {
       if (entry.sessionKey === sessionKey) entry.awaitingAgentResponse = false;
     }
+    syncStageBusySince();
   }
 
   function breadcrumbFor(rawSessionKey) {
@@ -311,6 +643,16 @@ function createSurfaceStore(deps = {}) {
   function peekDeadLetter(sessionKey) {
     const list = deadLetterBySession.get(normalizeGlassesSessionKey(sessionKey));
     return list ? list.map((r) => ({ ...r, events: [...r.events] })) : [];
+  }
+
+  function deadLetterEventCount(rawSessionKey) {
+    const list = deadLetterBySession.get(normalizeGlassesSessionKey(rawSessionKey));
+    if (!list) return 0;
+    let total = 0;
+    for (const record of list) {
+      total += record && Array.isArray(record.events) ? record.events.length : 0;
+    }
+    return total;
   }
 
   function drainDeadLetter(rawSessionKey) {
@@ -349,27 +691,23 @@ function createSurfaceStore(deps = {}) {
           entry.pending = null;
           pending(decorateDelivery(entry, terminal));
         }
+        syncStageBusySince();
         return "discarded_for_exit";
       }
     }
     entry.state = "reattached";
 
-    const newest = entry.events.length ? entry.events[entry.events.length - 1] : null;
     let delivered = null;
-    if (newest) {
-      const parkedForMs = Math.max(0, now() - newest.queuedAtMs);
+    if (entry.queueMode === "log" && entry.events.length) {
+      const reduced = reduceForDelivery(surfaceId);
+      const records = reduced && Array.isArray(reduced.events) ? reduced.events : [];
       delivered = {
-        ...newest.outcome,
+        mode: "log",
         surfaceUuid: entry.uuid,
-        eventId: newest.eventId,
-        origin: newest.origin,
-        actor: newest.actor || "wearer",
-        queuedAtMs: newest.queuedAtMs,
-        parkedForMs,
+        events: records.map((record) => deliveryForRecord(entry, record)),
       };
-      if (Number.isFinite(entry.staleAfterMs) && parkedForMs > entry.staleAfterMs) {
-        delivered.stale = true;
-      }
+    } else if (entry.events.length) {
+      delivered = deliveryForRecord(entry, entry.events[entry.events.length - 1]);
     } else if (entry.queuedEvent) {
       delivered = decorateDelivery(entry, entry.queuedEvent);
     }
@@ -382,6 +720,7 @@ function createSurfaceStore(deps = {}) {
       entry.awaitingAgentResponse = true;
       pending(delivered);
     }
+    syncStageBusySince();
     return staleLatchDropped ? "reattached_stale_latch_dropped" : "reattached";
   }
 
@@ -400,6 +739,70 @@ function createSurfaceStore(deps = {}) {
     return entry ? entry.sessionKey : null;
   }
 
+  function surfaceFactsFor(surfaceId) {
+    const entry = bySurface.get(surfaceId);
+    if (!entry) return null;
+    return {
+      surfaceUuid: entry.uuid,
+      kind: entry.kind,
+      title: entry.title,
+      state: entry.state,
+      queueMode: entry.queueMode,
+      staleAfterMs: entry.staleAfterMs,
+      pendingRender: entry.pending !== null,
+      awaitingAgentResponse: !!entry.awaitingAgentResponse,
+      exitLatched: !!entry.exitLatched,
+      terminationCause: entry.terminationCause,
+      parkedEventCount: entry.events ? entry.events.length : 0,
+
+      content: entry.lastContent ? JSON.parse(JSON.stringify(entry.lastContent)) : null,
+    };
+  }
+
+  function recordContent(surfaceId, frame) {
+    const entry = bySurface.get(surfaceId);
+    if (!entry || !frame || typeof frame !== "object") return null;
+    const isRender = frame.__render === true;
+    const source = isRender && frame.__spec && typeof frame.__spec === "object"
+      ? frame.__spec
+      : frame;
+    const next = isRender || !entry.lastContent
+      ? { kind: source.kind || entry.kind || null }
+      : { ...entry.lastContent };
+
+    for (const key of ["title", "body", "template", "imageAsset", "imageWidth", "imageHeight"]) {
+      if (Object.prototype.hasOwnProperty.call(source, key)) next[key] = source[key];
+    }
+    if (Object.prototype.hasOwnProperty.call(source, "items")) {
+      next.items = Array.isArray(source.items)
+        ? JSON.parse(JSON.stringify(source.items))
+        : source.items;
+    }
+    entry.lastContent = next;
+    return JSON.parse(JSON.stringify(next));
+  }
+
+  function recordSpec(surfaceId, normalizedSpec) {
+    const entry = bySurface.get(surfaceId);
+    if (!entry || !normalizedSpec || typeof normalizedSpec !== "object" ||
+        Array.isArray(normalizedSpec)) return null;
+    entry.recordedSpec = JSON.parse(JSON.stringify(normalizedSpec));
+    return JSON.parse(JSON.stringify(entry.recordedSpec));
+  }
+
+  function currentSurfaceSpecForSession(rawSessionKey) {
+    const surfaceId = topSurfaceId(rawSessionKey);
+    const entry = surfaceId ? bySurface.get(surfaceId) : null;
+    return entry && entry.recordedSpec
+      ? JSON.parse(JSON.stringify(entry.recordedSpec))
+      : null;
+  }
+
+  function stackSurfaceIds(rawSessionKey) {
+    const s = stackBySession.get(normalizeGlassesSessionKey(rawSessionKey));
+    return s ? [...s] : [];
+  }
+
   function applyRender(rawSessionKey, params) {
     const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
     const stack = stackFor(sessionKey);
@@ -409,6 +812,7 @@ function createSurfaceStore(deps = {}) {
       const id = mintSurfaceId();
       stack.push(id);
       bySurface.set(id, makeEntry(sessionKey, params && params.kind));
+      bindStageSurface(sessionKey, id);
       return { mode: "root", surfaceId: id };
     }
     const update = params && params.update === "patch" ? "patch"
@@ -419,6 +823,7 @@ function createSurfaceStore(deps = {}) {
       const entry = bySurface.get(top);
       if (entry && params && params.kind) entry.kind = params.kind;
       if (entry) entry.state = "visible_pending";
+      bindStageSurface(sessionKey, top);
       return { mode: "patch", surfaceId: top };
     }
     if (update === "push") {
@@ -426,6 +831,7 @@ function createSurfaceStore(deps = {}) {
       const id = mintSurfaceId();
       stack.push(id);
       bySurface.set(id, makeEntry(sessionKey, params && params.kind));
+      bindStageSurface(sessionKey, id);
       return { mode: "push", surfaceId: id };
     }
 
@@ -433,6 +839,7 @@ function createSurfaceStore(deps = {}) {
 
     stopCron(top, { silent: true });
     bySurface.set(top, makeEntry(sessionKey, params && params.kind, priorTop));
+    bindStageSurface(sessionKey, top);
     return { mode: "replace", surfaceId: top };
   }
 
@@ -446,7 +853,18 @@ function createSurfaceStore(deps = {}) {
       bySurface.delete(child);
     }
     const parent = stack[stack.length - 1] || null;
-    if (parent) resumeCron(parent);
+    if (parent) {
+
+      if (!stageHolder || stageHolder.sessionKey === sessionKey) {
+        resumeCron(parent);
+      }
+      if (stageHolder && stageHolder.sessionKey === sessionKey) {
+        stageHolder.surfaceId = parent;
+        syncStageBusySince();
+      }
+    } else {
+      clearStageForSession(sessionKey);
+    }
     return parent;
   }
 
@@ -459,6 +877,7 @@ function createSurfaceStore(deps = {}) {
       bySurface.delete(id);
     }
     stackBySession.set(sessionKey, []);
+    clearStageForSession(sessionKey);
     return true;
   }
 
@@ -466,17 +885,112 @@ function createSurfaceStore(deps = {}) {
     return [...stackBySession.keys()];
   }
 
+  let sendSeq = 0;
+
+  function recordSendAttempt(surfaceId, opts) {
+    const entry = bySurface.get(surfaceId);
+    if (!entry) return null;
+    const mode = opts && opts.mode === "update" ? "update" : "render";
+
+    if (mode === "render") {
+      clearSendAndReceiptEvidence(entry);
+    } else {
+      entry.lastPaintedAt = null;
+      entry.deliveryEvidence.clientReceiptAtMs = null;
+    }
+    const atMs = now();
+    const seq = ++sendSeq;
+    entry.lastAttemptedSend = {
+      seq,
+      atMs,
+      surfaceUuid: entry.uuid,
+      mode,
+    };
+    entry.sendAttempts.set(seq, { ...entry.lastAttemptedSend, receiptAtMs: null });
+    while (entry.sendAttempts.size > MAX_TRACKED_SEND_ATTEMPTS) {
+      const oldestSeq = entry.sendAttempts.keys().next().value;
+      entry.sendAttempts.delete(oldestSeq);
+    }
+    entry.deliveryEvidence.sendAttemptedAtMs = atMs;
+    return { ...entry.lastAttemptedSend };
+  }
+
+  function recordClientReceipt(surfaceId, receipt) {
+    const entry = bySurface.get(surfaceId);
+    if (!entry) return { ok: false, reason: "unknown_surface" };
+    const latestAttempt = entry.lastAttemptedSend;
+    if (!latestAttempt) {
+      return { ok: false, reason: "no_send_attempt", surfaceUuid: entry.uuid };
+    }
+    const claimedUuid =
+      receipt && typeof receipt.surfaceUuid === "string" && receipt.surfaceUuid
+        ? receipt.surfaceUuid
+        : null;
+    if (claimedUuid && claimedUuid !== entry.uuid) {
+      return {
+        ok: false,
+        reason: "surface_uuid_mismatch",
+        surfaceUuid: entry.uuid,
+        expectedSeq: latestAttempt.seq,
+      };
+    }
+    const seq =
+      receipt && Number.isFinite(receipt.seq) ? Math.floor(receipt.seq) : null;
+    const attempt = seq === null ? null : entry.sendAttempts.get(seq);
+    if (!attempt) {
+      return {
+        ok: false,
+        reason: "stale_seq",
+        surfaceUuid: entry.uuid,
+        expectedSeq: latestAttempt.seq,
+        seq,
+      };
+    }
+    const atMs = receipt && Number.isFinite(receipt.atMs) ? receipt.atMs : now();
+    attempt.receiptAtMs = atMs;
+    const superseded = seq !== latestAttempt.seq;
+
+    if (!superseded) {
+      entry.deliveryEvidence.clientReceiptAtMs = atMs;
+      entry.lastPaintedAt = atMs;
+    }
+    return { ok: true, surfaceUuid: entry.uuid, seq, atMs, superseded };
+  }
+
+  function hasClientReceipt(surfaceUuid, seq) {
+    for (const entry of bySurface.values()) {
+      if (entry.uuid !== surfaceUuid) continue;
+      const attempt = entry.sendAttempts.get(seq);
+      return !!attempt && attempt.receiptAtMs !== null;
+    }
+    return false;
+  }
+
+  function deliveryEvidenceOf(surfaceId) {
+    const entry = bySurface.get(surfaceId);
+    if (!entry) return null;
+    return {
+      surfaceUuid: entry.uuid,
+      lastAttemptedSend: entry.lastAttemptedSend ? { ...entry.lastAttemptedSend } : null,
+      lastPaintedAt: entry.lastPaintedAt,
+      evidence: { ...entry.deliveryEvidence },
+    };
+  }
+
   return {
     storeId,
     register, resolve, hasSurface, isPending, drainSession, drainAll, settlePending,
     stateOf, queueEvent, isExitLatched, onReattached,
-    applyRender, popBack, exit, topSurfaceId, stackDepth, sessionKeys, sessionForSurface,
-    uuidOf, titleOf, markerFor, clearAwaitingResponse, breadcrumbFor,
-    peekEvents, reduceForDelivery, peekDeadLetter, drainDeadLetter,
+    applyRender, popBack, exit, topSurfaceId, stackDepth, stackSurfaceIds, sessionKeys, sessionForSurface,
+    planStageGrant, commitStageGrant, stageState, activeSessionCount,
+    uuidOf, titleOf, markerFor, clearAwaitingResponse, breadcrumbFor, surfaceFactsFor,
+    peekEvents, reduceForDelivery, peekDeadLetter, deadLetterEventCount, drainDeadLetter,
+    recordSendAttempt, recordClientReceipt, hasClientReceipt, deliveryEvidenceOf,
+    recordContent, recordSpec, currentSurfaceSpecForSession,
     _bySurface: bySurface,
   };
 }
 
 const createPendingRenderMap = createSurfaceStore;
 
-module.exports = { createPendingRenderMap, createSurfaceStore, isTerminalOutcome, GLASS_EVENT_ORIGINS, normalizeGlassesSessionKey };
+module.exports = { createPendingRenderMap, createSurfaceStore, isTerminalOutcome, isSettlementOutcome, GLASS_EVENT_ORIGINS, normalizeGlassesSessionKey, SETTLEMENT_OUTCOME_RESULTS, TERMINAL_OUTCOME_RESULTS, SURFACE_REAP_REASONS, SURFACE_EVICTION_REASONS, DEAD_LETTER_REASONS, RECEIPT_REJECTION_REASONS };

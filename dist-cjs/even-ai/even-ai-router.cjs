@@ -1,5 +1,5 @@
 const { normalizeEvenAiRoutingMode } = require("./even-ai-settings-store.cjs");
-const { DEFAULT_EVEN_AI_DEDICATED_SESSION_KEY, } = require("../domain/even-ai-session-keys.cjs");
+const { DEFAULT_EVEN_AI_DEDICATED_SESSION_KEY } = require("../domain/even-ai-session-keys.cjs");
 
 function normalizeSessionKey(value) {
   if (typeof value !== "string") return null;

@@ -1,10 +1,19 @@
-const { createGlassesUiToolHandler, DEFAULT_RENDER_GLASSES_UI_TIMEOUT_MS, GLASSES_UI_TOOL_DESCRIPTION, glassesUiParametersSchema, } = require("../tools/glasses-ui-tool.cjs");
+const { createGlassesUiToolHandler, DEFAULT_RENDER_GLASSES_UI_TIMEOUT_MS, GET_GLASSES_UI_STATE_TOOL_DESCRIPTION, GLASSES_UI_TOOL_DESCRIPTION, getGlassesUiStateParametersSchema, glassesUiParametersSchema } = require("../tools/glasses-ui-tool.cjs");
+
+const { readAgentRunId } = require("../tools/glasses-ui-wake.cjs");
 const { normalizeGlassesSessionKey } = require("../tools/glasses-ui-surfaces.cjs");
+
+const { isLiveuiSwitchedOff, liveuiDisabledError, liveuiDisabledResult } = require("../tools/glasses-ui-prefs.cjs");
+const { writeCompanionSnapshot } = require("../tools/glasses-ui-companion-snapshot.cjs");
+const { createLiveuiGlassesLibraryController, dispatchLiveuiTemplateOperation, LIVEUI_TEMPLATE_TOOL_DESCRIPTION, LIVEUI_TEMPLATE_TOOL_NAME, liveuiTemplateToolParametersSchema, runLiveuiTemplateRenderLifecycle } = require("../tools/glasses-ui-template-library.cjs");
+const { dispatchLiveuiTaskOperation, LIVEUI_TASK_TOOL_DESCRIPTION, LIVEUI_TASK_TOOL_NAME, liveuiTaskToolParametersSchema } = require("../tools/glasses-ui-task-library.cjs");
 const { composeChannelTwoFragment } = require("../domain/prompt-channel-fragments.cjs");
-const { DEFAULT_HERMES_NAMESPACE, HERMES_FOREIGN_KEY_MARKER, HERMES_SESSION_KEY_PREFIX, OCUCLAW_CHAT_TYPE_SEGMENT, OCUCLAW_PLATFORM_SEGMENT, isHermesSessionKey, mintedHermesSessionKey, stripAgentNamespace, } = require("./hermes-session-keys.cjs");
+const { formatLiveuiTaskIndex, projectLiveuiTaskIndexRows } = require("../tools/glasses-ui-task-index.cjs");
+const { DEFAULT_STAGE_GRACE_MS } = require("../tools/glasses-ui-limits.cjs");
+const { DEFAULT_HERMES_NAMESPACE, HERMES_FOREIGN_KEY_MARKER, HERMES_SESSION_KEY_PREFIX, OCUCLAW_CHAT_TYPE_SEGMENT, OCUCLAW_PLATFORM_SEGMENT, isHermesSessionKey, mintedHermesSessionKey, parseHermesPublicKey, stripAgentNamespace } = require("./hermes-session-keys.cjs");
 
 const LIVEUI_TOOL_NAME = "render_glasses_ui";
-const LIVEUI_TOOLSET = "plugin_ocuclaw";
+const LIVEUI_TOOLSET = "ocuclaw";
 
 const LINK_LIVEUI_METHODS = Object.freeze({
   render: "liveui.render",
@@ -13,11 +22,18 @@ const LINK_LIVEUI_METHODS = Object.freeze({
   promptAck: "liveui.promptAck",
   llmAuth: "liveui.llmAuth",
   llmRecipe: "liveui.llmRecipe",
+
+  uiState: "liveui.uiState",
+  templates: "liveui.templates",
+  tasks: "liveui.tasks",
 });
+
+const LIVEUI_STATE_TOOL_NAME = "get_glasses_ui_state";
 
 const DEFAULT_LIVEUI_CONFIG = Object.freeze({
   enabled: true,
-  tickBackend: "openai-compat",
+
+  tickBackend: "anthropic-api",
   tickModel: "",
   tickApiBaseUrl: "",
   allowAgentModelOverride: false,
@@ -26,6 +42,9 @@ const DEFAULT_LIVEUI_CONFIG = Object.freeze({
   httpAllowHosts: [],
   llmEnabled: false,
   maxConcurrentSurfacesPerHost: 4,
+  stageGraceMs: DEFAULT_STAGE_GRACE_MS,
+
+  includeLastRenderInOutcome: false,
 });
 
 function silentLogger() {
@@ -114,9 +133,10 @@ function normalizeSessionKeyFromParams(params) {
   return normalizeHermesLiveUiSessionKey(raw);
 }
 
-function buildPromptFence(fragments) {
+function buildPromptFence(fragments, taskIndex = "") {
   const usable = fragments.filter((f) => f && typeof f.text === "string" && f.text.trim());
-  if (usable.length === 0) return null;
+  const usableTaskIndex = typeof taskIndex === "string" ? taskIndex : "";
+  if (usable.length === 0 && !usableTaskIndex) return null;
   return [
     "<ocuclaw_liveui_context_v1>",
     JSON.stringify({
@@ -124,33 +144,77 @@ function buildPromptFence(fragments) {
       provenance: "plugin-generated",
       target: "user_message_ephemeral",
       fragments: usable.map((f) => ({ kind: f.kind, text: f.text })),
+      ...(usableTaskIndex ? { task_index: usableTaskIndex } : {}),
     }),
     "</ocuclaw_liveui_context_v1>",
   ].join("\n");
 }
 
-function buildHermesLiveUiToolDescriptor() {
+function buildHermesToolDescriptor(name, description, parameters, methods) {
   return {
-    name: LIVEUI_TOOL_NAME,
+    name,
     toolset: LIVEUI_TOOLSET,
-    description: GLASSES_UI_TOOL_DESCRIPTION,
-    schema: {
-      name: LIVEUI_TOOL_NAME,
-      description: GLASSES_UI_TOOL_DESCRIPTION,
-      parameters: glassesUiParametersSchema,
-    },
-    methods: {
+    description,
+    schema: { name, description, parameters },
+    methods,
+  };
+}
+
+function buildHermesLiveUiToolDescriptor() {
+  return buildHermesToolDescriptor(
+    LIVEUI_TOOL_NAME,
+    GLASSES_UI_TOOL_DESCRIPTION,
+    glassesUiParametersSchema,
+    {
       render: LINK_LIVEUI_METHODS.render,
       abort: LINK_LIVEUI_METHODS.abort,
       prompt: LINK_LIVEUI_METHODS.prompt,
       promptAck: LINK_LIVEUI_METHODS.promptAck,
     },
-  };
+  );
+}
+
+function buildHermesLiveUiStateToolDescriptor() {
+  return buildHermesToolDescriptor(
+    LIVEUI_STATE_TOOL_NAME,
+    GET_GLASSES_UI_STATE_TOOL_DESCRIPTION,
+    getGlassesUiStateParametersSchema,
+    {
+      uiState: LINK_LIVEUI_METHODS.uiState,
+    },
+  );
+}
+
+function buildHermesLiveUiTemplateToolDescriptor() {
+  return buildHermesToolDescriptor(
+    LIVEUI_TEMPLATE_TOOL_NAME,
+    LIVEUI_TEMPLATE_TOOL_DESCRIPTION,
+    liveuiTemplateToolParametersSchema,
+    {
+      templates: LINK_LIVEUI_METHODS.templates,
+    },
+  );
+}
+
+function buildHermesLiveUiTaskToolDescriptor() {
+  return buildHermesToolDescriptor(
+    LIVEUI_TASK_TOOL_NAME,
+    LIVEUI_TASK_TOOL_DESCRIPTION,
+    liveuiTaskToolParametersSchema,
+    {
+      tasks: LINK_LIVEUI_METHODS.tasks,
+    },
+  );
 }
 
 function buildHermesLiveUiHelloPayload() {
   return {
-    tools: [buildHermesLiveUiToolDescriptor()],
+    tools: [
+      buildHermesLiveUiToolDescriptor(),
+      buildHermesLiveUiStateToolDescriptor(),
+      buildHermesLiveUiTemplateToolDescriptor(),
+      buildHermesLiveUiTaskToolDescriptor(),
+    ],
     methods: { ...LINK_LIVEUI_METHODS },
   };
 }
@@ -162,8 +226,15 @@ function createHermesLiveUiBridge(opts = {}) {
   }
   const link = opts.link || null;
   const logger = opts.logger || silentLogger();
+  const injectedTemplateLibraryDir =
+    opts && typeof opts === "object" ? Reflect.get(opts, "templateLibraryDir") : undefined;
+  const injectedLibraryDir =
+    opts && typeof opts === "object" ? Reflect.get(opts, "libraryDir") : undefined;
+  const injectedNow =
+    opts && typeof opts === "object" ? Reflect.get(opts, "now") : undefined;
   const activeCalls = new Map();
   const depthBySession = new Map();
+  let taskIndexPromptFailureLogged = false;
 
   function emitLifecycle(event, severity, data) {
     try {
@@ -189,6 +260,17 @@ function createHermesLiveUiBridge(opts = {}) {
     return Number.isFinite(runtimeConfig.renderGlassesUiTimeoutMs)
       ? runtimeConfig.renderGlassesUiTimeoutMs
       : DEFAULT_RENDER_GLASSES_UI_TIMEOUT_MS;
+  }
+
+  function describeToolApprovalBehaviour() {
+    const runtimeConfig = readRuntimeConfig(opts);
+    const explicit = runtimeConfig && runtimeConfig.toolApprovalBehaviour;
+    if (typeof explicit === "string" && explicit.trim()) return explicit.trim();
+    const mode = runtimeConfig && runtimeConfig.approvals && runtimeConfig.approvals.mode;
+    if (typeof mode === "string" && mode.trim()) {
+      return `Tool approvals use this Agent's Hermes ${mode.trim()} mode.`;
+    }
+    return "Tool approvals follow this Agent's current settings.";
   }
 
   function nextDepth(sessionKey) {
@@ -234,6 +316,15 @@ function createHermesLiveUiBridge(opts = {}) {
       sendGlassesUiRender: (msg) => relay.sendGlassesUiRender(msg),
       sendGlassesUiSurfaceUpdate: (msg) => relay.sendGlassesUiSurfaceUpdate(msg),
       onGlassesUiResult: (cb) => relay.onGlassesUiResult(cb),
+
+      onGlassesUiRenderReceipt:
+        typeof relay.onGlassesUiRenderReceipt === "function"
+          ? (cb) => relay.onGlassesUiRenderReceipt(cb)
+          : undefined,
+      onGlassesPresenceChanged:
+        typeof relay.onGlassesPresenceChanged === "function"
+          ? (cb) => relay.onGlassesPresenceChanged(cb)
+          : undefined,
     },
     emitLifecycle,
     getGlassesUiLiveConfig: liveConfig,
@@ -256,6 +347,24 @@ function createHermesLiveUiBridge(opts = {}) {
         return false;
       }
     },
+    publishCompanionSnapshot: (machine) => {
+      const parsed = parseHermesPublicKey(
+        machine && typeof machine.sessionKey === "string" ? machine.sessionKey : "",
+      );
+      return writeCompanionSnapshot({
+
+        stateDir: opts.stateDir,
+        backend: "hermes",
+        profile: parsed ? parsed.namespace : DEFAULT_HERMES_NAMESPACE,
+        machine,
+      });
+    },
+    templateLibraryDir:
+      typeof injectedTemplateLibraryDir === "string" ? injectedTemplateLibraryDir : undefined,
+    libraryDir: typeof injectedLibraryDir === "string" ? injectedLibraryDir : undefined,
+    host: "hermes",
+    now: typeof injectedNow === "function" ? injectedNow : undefined,
+    describeToolApprovalBehaviour,
   });
 
   if (typeof relay.onAppClientDisconnect === "function") {
@@ -265,6 +374,24 @@ function createHermesLiveUiBridge(opts = {}) {
       } else {
         handler.drainAll({ result: "glasses_disconnected" });
       }
+    });
+  }
+
+  if (typeof relay.onLogicalSessionReset === "function") {
+    relay.onLogicalSessionReset(({ sessionKey, reason } = {}) => {
+      if (!sessionKey) return;
+      const normalizedSessionKey = normalizeHermesLiveUiSessionKey(sessionKey);
+      const drained = handler.drainSession(normalizedSessionKey, {
+        result: "session_reset",
+        reason: reason || "logical_reset",
+      });
+      resetDepth(normalizedSessionKey);
+      emitLifecycle("session_reset_drain", "info", {
+        sessionKey: normalizedSessionKey,
+        reason: reason || "logical_reset",
+        drained,
+        storeId: handler.storeId,
+      });
     });
   }
 
@@ -282,7 +409,7 @@ function createHermesLiveUiBridge(opts = {}) {
     });
   }
 
-  function handleAgentEnd(_event, ctx = {}) {
+  function handleAgentEnd(event, ctx = {}) {
     const sessionKey =
       ctx && typeof ctx.sessionKey === "string" && ctx.sessionKey.trim()
         ? ctx.sessionKey.trim()
@@ -293,12 +420,15 @@ function createHermesLiveUiBridge(opts = {}) {
     }
     const normalized = normalizeHermesLiveUiSessionKey(sessionKey);
     const stackDepth = handler.surfaceStackDepth(normalized);
-    const settledPending = handler.settleSession(normalized, { result: "preempted" });
+    const settledPending = handler.settleSession(normalized, { result: "aborted" });
     emitLifecycle("agent_end_settle", "debug", {
       sessionKey: normalized,
       stackDepth,
       settledPending,
+      settlement: settledPending > 0 ? "aborted" : null,
       storeId: handler.storeId,
+
+      ...readAgentRunId(relay, normalized, ctx, event),
     });
     handler.parkMarkerOnAgentEnd(normalized);
     resetDepth(normalized);
@@ -308,29 +438,51 @@ function createHermesLiveUiBridge(opts = {}) {
     opts.hostHooks.on("agent_end", handleAgentEnd);
   }
 
-  async function render(params) {
+  async function withActiveCall(params, run) {
     const sessionKey = normalizeSessionKeyFromParams(params);
     const callId = normalizeCallId(params);
     const controller = new AbortController();
     activeCalls.set(callId, { controller, sessionKey });
     try {
-      const outcome = await handler.runDynamicUi({
-        sessionKey,
-        depth: nextDepth(sessionKey),
-        spec: normalizeToolArgs(params),
-        signal: controller.signal,
-      });
-      return {
-        result: outcome,
-        content: [{ type: "text", text: JSON.stringify(outcome) }],
-      };
-    } catch (err) {
-      const prev = depthBySession.get(sessionKey) || 0;
-      depthBySession.set(sessionKey, Math.max(0, prev - 1));
-      throw err;
+      return await run({ sessionKey, signal: controller.signal });
     } finally {
       activeCalls.delete(callId);
     }
+  }
+
+  function toolResultEnvelope(result) {
+    return {
+      result,
+      content: [{ type: "text", text: JSON.stringify(result) }],
+    };
+  }
+
+  function liveuiSwitchedOff() {
+    return isLiveuiSwitchedOff(handler);
+  }
+
+  async function render(params) {
+    if (liveuiSwitchedOff()) throw liveuiDisabledError();
+    const spec = normalizeToolArgs(params);
+
+    const validateOnly = Boolean(spec && spec.validateOnly === true);
+    return withActiveCall(params, async ({ sessionKey, signal }) => {
+      try {
+        const outcome = await handler.runDynamicUi({
+          sessionKey,
+          depth: validateOnly ? 0 : nextDepth(sessionKey),
+          spec,
+          signal,
+        });
+        return toolResultEnvelope(outcome);
+      } catch (err) {
+        if (!validateOnly) {
+          const prev = depthBySession.get(sessionKey) || 0;
+          depthBySession.set(sessionKey, Math.max(0, prev - 1));
+        }
+        throw err;
+      }
+    });
   }
 
   function abort(params) {
@@ -382,20 +534,119 @@ function createHermesLiveUiBridge(opts = {}) {
         `[hermes-liveui] voicemail injection failed: ${err && err.message ? err.message : err}`,
       );
     }
-    const context = buildPromptFence(fragments);
+
+    let feedbackAckToken = null;
+    try {
+      const feedback =
+        typeof handler.previewFeedbackInjection === "function"
+          ? handler.previewFeedbackInjection(sessionKey)
+          : typeof handler.buildFeedbackInjection === "function"
+            ? handler.buildFeedbackInjection(sessionKey)
+            : null;
+      if (typeof feedback === "string" && feedback) {
+        fragments.push({ kind: "feedback", text: feedback });
+      } else if (feedback && typeof feedback === "object" && feedback.fragment) {
+        fragments.push({ kind: "feedback", text: feedback.fragment });
+        feedbackAckToken =
+          typeof feedback.ackToken === "string" && feedback.ackToken
+            ? feedback.ackToken
+            : null;
+      }
+    } catch (err) {
+      logger.warn(
+        `[hermes-liveui] feedback injection failed: ${err && err.message ? err.message : err}`,
+      );
+    }
+    let taskIndex = "";
+    try {
+      const snapshot = glassesLibrary.listTasksForPhone();
+      taskIndex = formatLiveuiTaskIndex(projectLiveuiTaskIndexRows(
+        snapshot && snapshot.tasks,
+        snapshot && snapshot.organization,
+      ));
+    } catch (err) {
+      if (!taskIndexPromptFailureLogged) {
+        taskIndexPromptFailureLogged = true;
+        logger.warn(
+          `[hermes-liveui] task index injection failed: ${String(err)}`,
+        );
+      }
+    }
+    const context = buildPromptFence(fragments, taskIndex);
+    const fragmentKinds = [
+      ...fragments.map((f) => f.kind),
+      ...(taskIndex ? ["task_index"] : []),
+    ];
     return {
       context,
-      fragments: fragments.map((f) => f.kind),
-      fragmentsConcatenated: fragments.length >= 2,
+      fragments: fragmentKinds,
+      fragmentsConcatenated: fragmentKinds.length >= 2,
       ephemeralOnly: true,
       voicemailAckToken,
+      feedbackAckToken,
     };
+  }
+
+  function uiState(params) {
+    if (liveuiSwitchedOff()) return toolResultEnvelope(liveuiDisabledResult());
+    const sessionKey = normalizeSessionKeyFromParams(params);
+    const channels = handler.snapshotUiState(sessionKey);
+    handler.publishCompanionSnapshot(sessionKey);
+    try {
+      emitLifecycle("ui_state_snapshot", "debug", {
+        sessionKey,
+        ...channels.dev,
+
+        machine: channels.machine,
+      });
+    } catch {
+
+    }
+    return { status: "accepted", result: channels.model };
+  }
+
+  async function templates(params) {
+    if (liveuiSwitchedOff()) return toolResultEnvelope(liveuiDisabledResult());
+    const args = normalizeToolArgs(params);
+    const result = await dispatchLiveuiTemplateOperation(handler, args, async (template, values) => {
+      return withActiveCall(params, ({ sessionKey, signal }) =>
+        runLiveuiTemplateRenderLifecycle({
+          template,
+          values,
+          sessionKey,
+          signal,
+          depthBySession,
+          nextDepth,
+          renderStoredTemplate: (renderInput) =>
+            handler.renderStoredTemplate(renderInput),
+        }),
+      );
+    });
+    return toolResultEnvelope(result);
+  }
+
+  async function tasks(params) {
+    if (liveuiSwitchedOff()) return toolResultEnvelope(liveuiDisabledResult());
+    const args = normalizeToolArgs(params);
+    const agentId = params && typeof params.agentId === "string" ? params.agentId : undefined;
+    const sessionKey = normalizeSessionKeyFromParams(params);
+    const result = await dispatchLiveuiTaskOperation({
+      createTaskDraft: (input) => handler.createTaskDraft(input, { agentId }),
+      updateTaskDraft: (input) => handler.updateTaskDraft(input, { agentId }),
+      readTask: (taskId) => handler.readTask(taskId),
+      listTasks: () => handler.listTasks(),
+      findTasks: (query) => handler.findTasks(query),
+      saveUiAsHelper: (input) => handler.saveUiAsHelper(input, { sessionKey, agentId }),
+    }, args);
+    return toolResultEnvelope(result);
   }
 
   function promptAck(params) {
     const sessionKey = normalizeSessionKeyFromParams(params);
     const ackToken =
       params && typeof params.ackToken === "string" ? params.ackToken : "";
+    const feedbackAckToken =
+      params && typeof params.feedbackAckToken === "string" ? params.feedbackAckToken : "";
     let consumed = false;
     try {
       consumed =
@@ -407,21 +658,49 @@ function createHermesLiveUiBridge(opts = {}) {
         `[hermes-liveui] voicemail ack failed: ${err && err.message ? err.message : err}`,
       );
     }
-    return { status: "accepted", consumed };
+
+    let feedbackConsumed = false;
+    try {
+      feedbackConsumed =
+        typeof handler.ackFeedbackInjection === "function"
+          ? !!handler.ackFeedbackInjection(sessionKey, feedbackAckToken)
+          : false;
+    } catch (err) {
+      logger.warn(
+        `[hermes-liveui] feedback ack failed: ${err && err.message ? err.message : err}`,
+      );
+    }
+    return { status: "accepted", consumed, feedbackConsumed };
   }
+
+  const glassesLibrary = createLiveuiGlassesLibraryController({
+    handler,
+    depthBySession,
+    nextDepth,
+    normalizeSessionKey: normalizeHermesLiveUiSessionKey,
+    taskRunController: Reflect.get(opts, "taskRunController"),
+    resolveExecutorState: Reflect.get(opts, "resolveExecutorState"),
+  });
 
   return {
     handler,
+    glassesLibrary,
     methods: {
       [LINK_LIVEUI_METHODS.render]: render,
       [LINK_LIVEUI_METHODS.abort]: abort,
       [LINK_LIVEUI_METHODS.prompt]: prompt,
       [LINK_LIVEUI_METHODS.promptAck]: promptAck,
+      [LINK_LIVEUI_METHODS.uiState]: uiState,
+      [LINK_LIVEUI_METHODS.templates]: templates,
+      [LINK_LIVEUI_METHODS.tasks]: tasks,
     },
     render,
     abort,
     prompt,
     promptAck,
+    uiState,
+    templates,
+    tasks,
     resolveLlmApiKey,
     executeLlmRecipe,
     _debugState() {
@@ -433,4 +712,4 @@ function createHermesLiveUiBridge(opts = {}) {
   };
 }
 
-module.exports = { LIVEUI_TOOL_NAME, LIVEUI_TOOLSET, LINK_LIVEUI_METHODS, normalizeHermesLiveUiSessionKey, buildHermesLiveUiToolDescriptor, buildHermesLiveUiHelloPayload, createHermesLiveUiBridge };
+module.exports = { DEFAULT_LIVEUI_CONFIG, LIVEUI_TOOL_NAME, LIVEUI_TOOLSET, LINK_LIVEUI_METHODS, normalizeHermesLiveUiSessionKey, buildHermesLiveUiToolDescriptor, buildHermesLiveUiStateToolDescriptor, buildHermesLiveUiTemplateToolDescriptor, buildHermesLiveUiTaskToolDescriptor, LIVEUI_STATE_TOOL_NAME, buildHermesLiveUiHelloPayload, createHermesLiveUiBridge };

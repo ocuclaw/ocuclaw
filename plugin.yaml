@@ -1,22 +1,21 @@
 manifest_version: 1
 name: ocuclaw
 kind: platform
-version: 2.0.0
+version: 2.0.2
 description: >
   OcuClaw platform adapter for the hermes gateway. Spawns the shared OcuClaw
   Node runtime (glasses/phone relay, Even-AI endpoint, liveui engine) as a
   supervised child and bridges it over an NDJSON-over-stdio control link.
 author: OcuClaw
+# Hermes discovers the optional full-page tab from dashboard/manifest.json.
+# The adjacent dashboard/README.md records the rejected frontend-toolchain
+# decision and the read-only SDK discipline.
 provides_tools:
   - render_glasses_ui
-requires_env:
-  # Keep this relay-token-only. Hermes 0.19.0 uses requires_env for the
-  # install prompt but documents it as a load gate; listing optional Soniox
-  # or Even-AI secrets could disable the whole plugin if that gate is
-  # implemented by an in-range patch.
-  - name: OCUCLAW_RELAY_TOKEN
-    description: Token entered in the OcuClaw app's relay server token field
-    secret: true
+  - get_glasses_ui_state
+  - manage_liveui_templates
+  - manage_liveui_tasks
+  - ocuclaw_setup
 provides_hooks:
   - on_session_end
   - post_approval_response
@@ -24,3 +23,16 @@ provides_hooks:
   - post_tool_call
   - post_api_request
   - pre_llm_call
+  # Registered ONLY on hosts whose hook vocabulary has it (0.20.5+). Hermes
+  # 0.20 never consumes provides_hooks, so declaring it here is descriptive,
+  # not a load-time promise; the adapter's register-time probe decides.
+  - on_interim_message
+  # Registered only where the host has them AND the operator opted in with
+  # `plugins.stream_reasoning_deltas: true` — registering any on_stream_* hook
+  # changes the provider call shape for every surface on the gateway. Still an
+  # opt-in, but a GUIDED one: `/ocuclaw-setup` reports the key's state and
+  # offers to write it (`enable_stream_reasoning_deltas`, `confirm: true`
+  # required) rather than leaving it to a paragraph in the README.
+  - on_stream_start
+  - on_stream_delta
+  - on_stream_end

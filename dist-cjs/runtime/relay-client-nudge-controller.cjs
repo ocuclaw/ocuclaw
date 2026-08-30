@@ -1,4 +1,4 @@
-const { APP_PROTOCOL, DEFAULT_NUDGE_THRESHOLDS, } = require("./relay-worker-protocol.cjs");
+const { APP_PROTOCOL, DEFAULT_NUDGE_THRESHOLDS } = require("./relay-worker-protocol.cjs");
 
 const RENDER_NUDGE_FRAME = JSON.stringify({ type: "render_nudge" });
 

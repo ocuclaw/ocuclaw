@@ -23,35 +23,62 @@ const { createActivityStatusAdapter } = require("../domain/activity-status-adapt
 const { createEvenAiEndpoint } = require("../even-ai/even-ai-endpoint.cjs");
 const { createEvenAiRouter } = require("../even-ai/even-ai-router.cjs");
 const { createEvenAiRunWaiter } = require("../even-ai/even-ai-run-waiter.cjs");
-const { createEvenAiSettingsStore, normalizeEvenAiDefaultAgent, } = require("../even-ai/even-ai-settings-store.cjs");
+const { createEvenAiSettingsStore, normalizeEvenAiDefaultAgent } = require("../even-ai/even-ai-settings-store.cjs");
 const { createPluginOpenclawClient } = require("../gateway/openclaw-client.cjs");
 const { createPluginRpcGatewayBridge } = require("../gateway/gateway-bridge.cjs");
-const { isKnownBackendKind, setActiveBackendKind, getActiveBackendKind, } = require("../gateway/backend-contract.cjs");
+const { isKnownBackendKind, setActiveBackendKind, getActiveBackendKind } = require("../gateway/backend-contract.cjs");
 const { createAgentTurnTracker } = require("../tools/glasses-ui-wake.cjs");
+const { gatewaySessionKeyFor } = require("./openclaw-session-key.cjs");
+const { getRegisteredLiveuiGlassesLibraryController } = require("../tools/glasses-ui-tool.cjs");
+const { createLiveuiTaskRunController } = require("../tools/glasses-ui-task-run.cjs");
+const { projectTaskRunRecord } = require("../tools/glasses-ui-task-run-records.cjs");
+const { compareRungs } = require("../tools/glasses-ui-delivery-ladder.cjs");
+const { createLiveuiExecutorRegistry, projectTaskExecutorState } = require("../tools/glasses-ui-executor-registry.cjs");
 const { createDownstreamHandler } = require("./downstream-handler.cjs");
 const { handleDebugBundleRequest, handleDebugBundleSave, handleDebugBundleFetch } = require("./debug-bundle-handler.cjs");
 const { createBundleCache } = require("../domain/debug-bundle-cache.cjs");
 const { saveBundleToDisk } = require("../domain/debug-bundle-save.cjs");
-const { createOcuClawSettingsStore, normalizeOcuClawDefaultAgent, } = require("./ocuclaw-settings-store.cjs");
-const { buildCapabilitySnapshot, buildPushMessage, } = require("./capability-snapshot.cjs");
+const { createOcuClawSettingsStore, normalizeOcuClawDefaultAgent } = require("./ocuclaw-settings-store.cjs");
+const { buildCapabilitySnapshot, buildPushMessage } = require("./capability-snapshot.cjs");
 const { createRelayHealthMonitor } = require("./relay-health-monitor.cjs");
 const { createGlassesBackpressureLatch } = require("./glasses-backpressure-latch.cjs");
 const { createRelayOperationRegistry } = require("./relay-operation-registry.cjs");
 const { createRelayWorkerSupervisor } = require("./relay-worker-supervisor.cjs");
-const { activeNewSessionGreetingPrompt, createSessionService, } = require("./session-service.cjs");
+const { isPairingControlPath, isPairingEndpointPath } = require("../domain/pairing/pairing-endpoint-address.cjs");
+const { createPairingControlService } = require("../domain/pairing/pairing-control-service.cjs");
+const { createPairingEndpointService } = require("../domain/pairing/pairing-endpoint-service.cjs");
+const { createPairingExchangeHost } = require("../domain/pairing/pairing-exchange.cjs");
+const { resolveNoiseSuite } = require("../domain/pairing/noise-suite.cjs");
+const { activeNewSessionGreetingPrompt, createSessionService, isSupersededSessionSwitchError } = require("./session-service.cjs");
 const { createUpstreamRuntime } = require("./upstream-runtime.cjs");
 const { isEtSessionKey, parseEtSessionKey, etProviderDisplayName } = require("./even-terminal/session-key.cjs");
 const { createEtStreamInjector } = require("./even-terminal/stream-injector.cjs");
 const { createDemandRouter } = require("./even-terminal/demand-router.cjs");
+const { createHermesSlashConfirmRouter } = require("./hermes-slash-confirm-router.cjs");
 const { buildDemandFrame } = require("./even-terminal/demand-surface.cjs");
+const { createHermesClarifyRouter } = require("./hermes-clarify-router.cjs");
+const { createOpenClawQuestionRouter } = require("./openclaw-question-router.cjs");
 const { buildEtSessionSwitchClearActivity } = require("./even-terminal/activity-clear.cjs");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
-const { normalizeSonioxTemporaryKeyErrorCodeForRelay: normalizeSonioxTemporaryKeyErrorCode, } = require("../domain/soniox-temp-key-errors.cjs");
-const { DEFAULT_EVEN_AI_DEDICATED_SESSION_KEY, extractEmbeddedEvenAiSessionKey, } = require("../domain/even-ai-session-keys.cjs");
-const { mintedHermesSessionKey, parseHermesPublicKey, } = require("./hermes-session-keys.cjs");
+const { normalizeSonioxTemporaryKeyErrorCodeForRelay: normalizeSonioxTemporaryKeyErrorCode } = require("../domain/soniox-temp-key-errors.cjs");
+const { DEFAULT_EVEN_AI_DEDICATED_SESSION_KEY, extractEmbeddedEvenAiSessionKey } = require("../domain/even-ai-session-keys.cjs");
+const { DEFAULT_HERMES_NAMESPACE, hermesProfileIdForNamespace, mintedHermesSessionKey, parseHermesPublicKey } = require("./hermes-session-keys.cjs");
+
+const LIVEUI_TASK_DISCOVERY_CHANNEL_ONE =
+  "The wearer may have saved LiveUI Tasks; before using shell, calendar or search tools for a job that sounds like a saved Task, call manage_liveui_tasks find_tasks.";
 
 const GLASSES_UI_MARKERS = new Set(["listening", "parked", "inflight"]);
 function sanitizeGlassesMarker(v) { return GLASSES_UI_MARKERS.has(v) ? v : undefined; }
+
+function parseHermesFeatureTokens(raw) {
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  const seen = new Set();
+  for (const piece of raw.split(",")) {
+    const token = piece.trim().toLowerCase();
+    if (token) seen.add(token);
+  }
+  return Array.from(seen).sort();
+}
 
 function resolveEvenAiRouterOptionsForBackend(backendKind) {
   const defaultDedicatedSessionKey =
@@ -254,6 +281,10 @@ function normalizeSonioxLanguageRows(rows) {
   return languages;
 }
 
+function decodeBufferedHttpBody(envelope) {
+  return Buffer.from((envelope && envelope.bodyBase64) || "", "base64");
+}
+
 function createBufferedHttpRequest(envelope) {
   const req = new EventEmitter();
   req.method = envelope && envelope.method ? envelope.method : "GET";
@@ -264,7 +295,7 @@ function createBufferedHttpRequest(envelope) {
   req.socket = {
     remoteAddress: "127.0.0.1",
   };
-  const body = Buffer.from((envelope && envelope.bodyBase64) || "", "base64");
+  const body = decodeBufferedHttpBody(envelope);
   process.nextTick(() => {
     if (body.length > 0) {
       req.emit("data", body);
@@ -357,6 +388,26 @@ function createRelay(opts) {
     gatewayBridge && isKnownBackendKind(gatewayBridge.kind)
       ? gatewayBridge.kind
       : "openclaw";
+  const liveuiExecutorRegistry = opts.liveuiExecutorRegistry || createLiveuiExecutorRegistry({
+    libraryDir: opts.liveuiLibraryDir,
+    templateLibraryDir: opts.templateLibraryDir,
+    heartbeatMs: opts.liveuiExecutorHeartbeatMs,
+    now: opts.now,
+  });
+  let liveuiAgents = [];
+  let liveuiExecutorRegistryStarted = false;
+  let liveuiGlassesLibraryController = opts.liveuiGlassesLibraryController || null;
+  let liveuiTaskRunController = null;
+
+  function resolveLiveuiGlassesLibraryController() {
+    return liveuiGlassesLibraryController || getRegisteredLiveuiGlassesLibraryController(
+      globalThis,
+      {
+        taskRunController: liveuiTaskRunController,
+        resolveExecutorState: resolveLiveuiTaskExecutorState,
+      },
+    );
+  }
   const evenAiRouterOptions =
     resolveEvenAiRouterOptionsForBackend(relayBackendKind);
   const defaultEvenAiDedicatedSessionKey =
@@ -389,15 +440,31 @@ function createRelay(opts) {
 
   let pagesRevision = 0;
 
+  let cachedEntries = "";
+  let entriesRevision = 0;
+  let entriesLastSeq = -1;
+
   let cachedStatus = null;
 
   let statusRevision = 0;
+
+  const liveUiSessionGenerationBootId =
+    typeof opts.liveUiSessionGenerationBootId === "string" &&
+    opts.liveUiSessionGenerationBootId.trim()
+      ? opts.liveUiSessionGenerationBootId.trim()
+      : crypto.randomUUID();
+  let liveUiSessionGenerationSeq = 0;
+  const liveUiSessionGenerations = new Map();
 
   let currentSessionModelConfigSnapshot = null;
 
   let simulateStreamRunSeq = 0;
 
   const simulateStreamRuns = new Map();
+
+  const userSendDedupe = new Map();
+  const USER_SEND_DEDUPE_MAX = 512;
+  const USER_SEND_DEDUPE_TTL_MS = 5 * 60_000;
 
   const syntheticTimers = new Map();
 
@@ -511,7 +578,7 @@ function createRelay(opts) {
     }
   }
 
-  function emitDebug(cat, event, severity, context, buildData, options) {
+  function emitDebug(cat, event, severity, context, buildData, options = undefined) {
     const force = !!(options && options.force === true);
     if (!force && !debugStore.isEnabled(cat) && !(liveUiTraceLogEnabled && (cat === "glasses.lifecycle" || cat === "openclaw.message"))) {
       return;
@@ -554,7 +621,8 @@ function createRelay(opts) {
           cat === "openclaw.message"
             ? (event === "user_message" ? "user" : "agent")
             : "openclaw";
-        logger.info(
+
+        logger.traceLog(
           "[liveui] " +
             JSON.stringify({
               trace: "liveui",
@@ -1230,10 +1298,35 @@ function createRelay(opts) {
       systemPrompt: opts.ocuClawSystemPrompt,
     },
   });
-  const setOcuClawSettings =
+  const setOcuClawLocalSettings =
     typeof opts.setOcuClawSettings === "function"
       ? opts.setOcuClawSettings
       : (patch = {}) => ocuClawSettingsStore.setSettings(patch);
+
+  async function getOcuClawSettingsSnapshot() {
+    const local = ocuClawSettingsStore.getSnapshot();
+    if (
+      getActiveBackendKind() !== "hermes" ||
+      typeof opts.getOcuClawProfileOptions !== "function"
+    ) {
+      return local;
+    }
+    const profile = await opts.getOcuClawProfileOptions({
+      sessionKey: sessionService && sessionService.ensureSessionKey(),
+    });
+    return {
+      ...local,
+      defaultModel:
+        profile && typeof profile.defaultModel === "string"
+          ? profile.defaultModel
+          : "",
+      defaultThinking:
+        profile && typeof profile.defaultThinking === "string"
+          ? profile.defaultThinking
+          : "",
+      defaultFastMode: !!(profile && profile.defaultFastMode === true),
+    };
+  }
   function getEvenAiEndpointSettingsSnapshot() {
     const evenAiSettings = evenAiSettingsStore.getSnapshot();
     const ocuClawSettings = ocuClawSettingsStore.getSnapshot();
@@ -1293,6 +1386,7 @@ function createRelay(opts) {
     if (baseReadability) parts.push(baseReadability);
     if (display) parts.push(display);
     if (glassesPointer) parts.push(glassesPointer);
+    parts.push(LIVEUI_TASK_DISCOVERY_CHANNEL_ONE);
     return parts.join("\n\n");
   }
 
@@ -1333,6 +1427,18 @@ function createRelay(opts) {
       options.agentId = agentId.trim();
     }
     return options;
+  }
+
+  function openclawGatewayKeyFor(sessionKey) {
+    if (getActiveBackendKind() === "hermes") {
+      return { key: sessionKey, agentId: "" };
+    }
+    const agentId = sessionService.getSessionAgentId(sessionKey, undefined);
+    const key = gatewaySessionKeyFor(sessionKey, agentId);
+    return {
+      key,
+      agentId: key !== sessionKey ? agentId : "",
+    };
   }
 
   function buildOcuClawSendDiagnostic(params = {}) {
@@ -1425,6 +1531,8 @@ function createRelay(opts) {
   }
 
   function buildOcuClawInitialSessionConfigPatch(settings) {
+
+    if (getActiveBackendKind() === "hermes") return null;
     const patch = {};
     if (settings && typeof settings.defaultModel === "string" && settings.defaultModel.trim()) {
       patch.modelRef = settings.defaultModel.trim();
@@ -1485,7 +1593,11 @@ function createRelay(opts) {
       return;
     }
 
-    const result = await sessionService.setSessionModelConfig(sessionKey, patch);
+    const result = await sessionService.setSessionModelConfig(
+      sessionKey,
+      patch,
+      { initial: true },
+    );
     if (!result || result.status !== "accepted") {
       throw new Error(
         (result && result.error) || "failed to seed OcuClaw new-session defaults",
@@ -1516,7 +1628,15 @@ function createRelay(opts) {
       typeof sessionService.primeSessionModelConfig === "function"
         ? sessionService.primeSessionModelConfig(sessionKey, patch)
         : null;
-    const result = await sessionService.setSessionModelConfig(sessionKey, patch);
+
+    if (getActiveBackendKind() === "hermes") {
+      return seededConfig;
+    }
+    const result = await sessionService.setSessionModelConfig(
+      sessionKey,
+      patch,
+      { initial: true },
+    );
     if (result && result.status === "accepted" && result.config) {
       return result.config;
     }
@@ -1535,6 +1655,12 @@ function createRelay(opts) {
     supportedSessionKeyPrefixes: opts.supportedSessionKeyPrefixes,
     sessionKeyPrefixForAgentRef: opts.sessionKeyPrefixForAgentRef,
     getDefaultSessionAgentRef: getAppPathwayAgentRef,
+
+    sessionReadStateSupported: () =>
+
+      parseHermesFeatureTokens(process.env.OCUCLAW_HERMES_FEATURES).includes(
+        "session_read_state",
+      ),
     etSessionProvider: opts.etSessionProvider,
     etHistoryProvider: opts.etHistoryProvider,
     etTranscriptSearchProvider: opts.etTranscriptSearchProvider,
@@ -1614,6 +1740,70 @@ function createRelay(opts) {
     },
   });
 
+  const REMOTE_SEND_RUN_BINDING_TTL_MS = 60_000;
+  const pendingRemoteSendRunBindings = new Map();
+
+  function emitRemoteSendRunBinding(binding, payload) {
+    if (!server) return;
+    try {
+      server.unicast(
+        binding.clientId,
+        JSON.stringify({
+          type: "remote-control-run-bound",
+          requestId: binding.requestId,
+          action: "send-message",
+          sessionKey: payload.sessionKey || binding.sessionKey || null,
+          runId: payload.runId || null,
+
+          runIdSource: payload.runId ? "relay_send_ack" : null,
+          status: payload.status,
+          error: payload.error || null,
+        }),
+      );
+    } catch (err) {
+      logger.warn(`[relay] remote-control run binding unicast failed: ${String(err)}`);
+    }
+  }
+
+  function settleRemoteSendRunBinding(requestId, payload) {
+    if (!requestId || !payload) return;
+    const binding = pendingRemoteSendRunBindings.get(requestId);
+    if (!binding) return;
+    pendingRemoteSendRunBindings.delete(requestId);
+    clearTimeout(binding.timer);
+    emitRemoteSendRunBinding(binding, payload);
+    emitDebug(
+      "relay.protocol",
+      "remote_control_run_bound",
+      payload.runId ? "info" : "warn",
+      { sessionKey: payload.sessionKey || binding.sessionKey || undefined, runId: payload.runId || undefined },
+      () => ({
+        requestId,
+        runId: payload.runId || null,
+        status: payload.status,
+        elapsedMs: Date.now() - binding.armedAtMs,
+      }),
+    );
+  }
+
+  function armRemoteSendRunBinding({ requestId, clientId, sessionKey }) {
+    if (!requestId || !clientId) return;
+
+    const existing = pendingRemoteSendRunBindings.get(requestId);
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(() => {
+      settleRemoteSendRunBinding(requestId, { status: "unbound_timeout" });
+    }, REMOTE_SEND_RUN_BINDING_TTL_MS);
+    if (typeof timer.unref === "function") timer.unref();
+    pendingRemoteSendRunBindings.set(requestId, {
+      requestId,
+      clientId,
+      sessionKey: sessionKey || null,
+      armedAtMs: Date.now(),
+      timer,
+    });
+  }
+
   function isActiveSessionModelConfig(config) {
     return !!(
       config &&
@@ -1665,7 +1855,14 @@ function createRelay(opts) {
     agentTurnTracker.onActivity(
       (activity && activity.sessionKey) || sessionService.ensureSessionKey(),
       phase,
+
+      runId,
     );
+    if (phase === "end" && liveuiTaskRunController) {
+      liveuiTaskRunController.observeTurnIdle(
+        (activity && activity.sessionKey) || sessionService.ensureSessionKey(),
+      );
+    }
 
     emitDebug(
       "app.timeline",
@@ -1688,6 +1885,30 @@ function createRelay(opts) {
         seq: Number.isFinite(activity && activity.seq) ? activity.seq : null,
         origin,
         phase,
+      }),
+    );
+
+    emitDebug(
+      "activity.status",
+      "activity_resolved",
+      "debug",
+      {
+        sessionKey: (activity && activity.sessionKey) || sessionService.ensureSessionKey(),
+        runId,
+      },
+      () => ({
+        state: (activity && activity.state) || null,
+        label: (activity && activity.label) || null,
+        summary: (activity && activity.summary) || null,
+        thinkingSummarySource: (activity && activity.thinkingSummarySource) || null,
+        candidateRank: (activity && activity.candidateRank) || null,
+        category: (activity && activity.category) || null,
+        origin,
+        phase,
+        toolPhase: (activity && activity.toolPhase) || null,
+        tool: (activity && activity.tool) || null,
+        activityId: (activity && activity.activityId) || null,
+        seq: Number.isFinite(activity && activity.seq) ? activity.seq : null,
       }),
     );
 
@@ -1909,12 +2130,24 @@ function createRelay(opts) {
     return snapshot;
   }
 
+  function broadcastCommandCatalog(snapshot) {
+    if (!server || !handler || typeof handler.formatCommandCatalog !== "function") {
+      return snapshot;
+    }
+    server.broadcast(handler.formatCommandCatalog(snapshot || {}));
+    return snapshot;
+  }
+
   function buildCapabilitySnapshotFrame(agentCatalogSnapshot, options = {}) {
     const snapshot = buildCapabilitySnapshot({
       source: getActiveBackendKind(),
       stale: options.stale === true,
       evenTerminalEnabled: opts.evenTerminalEnabled === true,
+      sessionOptionsSupported:
+        opts.hermesSessionOptionsSupported === true,
       agentCatalogSnapshot,
+
+      hermesFeatures: parseHermesFeatureTokens(process.env.OCUCLAW_HERMES_FEATURES),
     });
     return handler.formatCapabilitySnapshot(snapshot);
   }
@@ -1984,7 +2217,147 @@ function createRelay(opts) {
     return frame;
   }
 
+  function executorRegistryAgents(agents) {
+    if (!Array.isArray(agents)) return [];
+    return agents
+      .map((entry = {}) => {
+        const agentId = typeof entry.id === "string"
+          ? entry.id.trim()
+          : typeof entry.agentId === "string"
+            ? entry.agentId.trim()
+            : "";
+        if (!agentId) return null;
+        const name = typeof entry.name === "string" && entry.name.trim()
+          ? entry.name.trim()
+          : agentId;
+        const emoji = typeof entry.emoji === "string" ? entry.emoji.trim() : "";
+        return { agentId, name, ...(emoji ? { emoji } : {}) };
+      })
+      .filter(Boolean);
+  }
+
+  function readLiveuiExecutorRegistry() {
+    try {
+      return liveuiExecutorRegistry.readAll();
+    } catch (err) {
+      logger.warn(`[relay] LiveUI Executor registry read failed: ${err && err.message ? err.message : err}`);
+      return [];
+    }
+  }
+
+  function updateLiveuiExecutorRegistry(snapshot) {
+    if (
+      !snapshot ||
+      snapshot.stale === true ||
+      snapshot.unsupported === true ||
+      !Array.isArray(snapshot.agents)
+    ) return snapshot;
+    liveuiAgents = snapshot.agents.map((entry) => ({ ...entry }));
+    const publication = {
+      host: relayBackendKind,
+      agents: executorRegistryAgents(snapshot.agents),
+      online: true,
+    };
+    try {
+      if (!liveuiExecutorRegistryStarted) {
+        liveuiExecutorRegistry.startHeartbeat(publication);
+        liveuiExecutorRegistryStarted = true;
+      } else {
+        liveuiExecutorRegistry.updateHeartbeat(publication);
+      }
+    } catch (err) {
+      logger.warn(`[relay] LiveUI Executor registry publish failed: ${err && err.message ? err.message : err}`);
+    }
+    return snapshot;
+  }
+
+  function resolveLiveuiTaskExecutorState(
+    executor,
+    version = {},
+    agents = liveuiAgents,
+  ) {
+    return projectTaskExecutorState({
+      executor,
+      context: version && version.context,
+      thisHost: relayBackendKind,
+      liveAgents: Array.isArray(agents) ? agents : [],
+      backendOnline: !!(upstreamRuntime && upstreamRuntime.isConnected()),
+      registry: readLiveuiExecutorRegistry(),
+    });
+  }
+
+  async function listLiveuiTaskExecutors() {
+    const catalog = await getCapabilityAgentCatalogSnapshot();
+    updateLiveuiExecutorRegistry(catalog);
+    const localCatalogIncompatible = !catalog ||
+      catalog.unsupported === true ||
+      catalog.stale === true ||
+      !Array.isArray(catalog.agents);
+    const registry = readLiveuiExecutorRegistry();
+    const localRecord = registry.find((record) => record && record.host === relayBackendKind);
+    const localLastSeenAt = localRecord && Number.isSafeInteger(localRecord.updatedAt)
+      ? localRecord.updatedAt
+      : catalog && Number.isSafeInteger(catalog.fetchedAtMs)
+        ? catalog.fetchedAtMs
+        : Date.now();
+    const executors = [];
+    const seen = new Set();
+    const pushOption = (host, agent, lastSeenAt, stateInput) => {
+      if (!agent || typeof agent.agentId !== "string" || !agent.agentId.trim()) return;
+      const agentId = agent.agentId.trim();
+      const key = `${host}:${agentId.toLowerCase()}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      const projected = stateInput || resolveLiveuiTaskExecutorState({ host, agentId });
+      executors.push({
+        host,
+        agentId,
+        name: typeof agent.name === "string" && agent.name.trim() ? agent.name.trim() : agentId,
+        ...(typeof agent.emoji === "string" && agent.emoji.trim()
+          ? { emoji: agent.emoji.trim() }
+          : {}),
+        state: projected.state === "ready" ? "available" : projected.reason,
+        lastSeenAt: Number.isSafeInteger(lastSeenAt) ? lastSeenAt : 0,
+      });
+    };
+    for (const agent of executorRegistryAgents(liveuiAgents)) {
+      pushOption(
+        relayBackendKind,
+        agent,
+        localLastSeenAt,
+        localCatalogIncompatible && !!(upstreamRuntime && upstreamRuntime.isConnected())
+          ? { state: "unavailable", reason: "backend_incompatible" }
+          : null,
+      );
+    }
+    for (const record of registry) {
+      if (!record || record.host === relayBackendKind || !Array.isArray(record.agents)) continue;
+      for (const agent of record.agents) {
+        pushOption(
+          record.host,
+          agent,
+          record.updatedAt,
+          { state: "unavailable", reason: "host_not_connected" },
+        );
+      }
+    }
+    return { thisHost: relayBackendKind, executors };
+  }
+
+  function stopLiveuiExecutorRegistry() {
+    if (!liveuiExecutorRegistryStarted) return null;
+    try {
+      const stopped = liveuiExecutorRegistry.stop();
+      liveuiExecutorRegistryStarted = false;
+      return stopped;
+    } catch (err) {
+      logger.warn(`[relay] LiveUI Executor registry offline publish failed: ${err && err.message ? err.message : err}`);
+      return null;
+    }
+  }
+
   function broadcastAgentsCatalog(snapshot) {
+    updateLiveuiExecutorRegistry(snapshot);
     if (!server || !handler || typeof handler.formatAgentsCatalog !== "function") {
       return snapshot;
     }
@@ -2011,16 +2384,153 @@ function createRelay(opts) {
         logger.warn(`[relay] app_client_disconnect handler threw: ${err && err.message ? err.message : err}`);
       }
     }
+    if (liveuiTaskRunController) {
+      liveuiTaskRunController.observeSessionEnd({
+        sessionKey: sessionKey || "",
+        reason: "glasses_disconnected",
+      });
+    }
+  }
+
+  const appPresenceChangedHandlers = new Set();
+  function onAppPresenceChanged(handler) {
+    if (typeof handler !== "function") return () => {};
+    appPresenceChangedHandlers.add(handler);
+    return () => appPresenceChangedHandlers.delete(handler);
+  }
+  function dispatchAppPresenceChanged(reason) {
+    for (const handler of appPresenceChangedHandlers) {
+      try { handler({ reason }); } catch (err) {
+        logger.warn(`[relay] app_presence_changed handler threw: ${err && err.message ? err.message : err}`);
+      }
+    }
+  }
+
+  const pairingCompletedHandlers = new Set();
+  function onPairingCompleted(handler) {
+    if (typeof handler !== "function") return () => {};
+    pairingCompletedHandlers.add(handler);
+    return () => pairingCompletedHandlers.delete(handler);
+  }
+  function dispatchPairingCompleted(completionId) {
+    for (const handler of pairingCompletedHandlers) {
+      try { handler(completionId); } catch (err) {
+        logger.warn(`[relay] pairing_completed handler threw: ${err && err.message ? err.message : err}`);
+      }
+    }
+  }
+
+  const logicalSessionResetHandlers = new Set();
+  function ensureLiveUiSessionGeneration(sessionKey) {
+    const normalizedSessionKey = normalizeAppSessionKeyForCompare(sessionKey);
+    if (!normalizedSessionKey) return null;
+    const existing = liveUiSessionGenerations.get(normalizedSessionKey);
+    if (existing) return existing;
+    const generation = `${liveUiSessionGenerationBootId}:${++liveUiSessionGenerationSeq}`;
+    liveUiSessionGenerations.set(normalizedSessionKey, generation);
+    return generation;
+  }
+  function rotateLiveUiSessionGeneration(sessionKey) {
+    const normalizedSessionKey = normalizeAppSessionKeyForCompare(sessionKey);
+    if (!normalizedSessionKey) return null;
+    const generation = `${liveUiSessionGenerationBootId}:${++liveUiSessionGenerationSeq}`;
+    liveUiSessionGenerations.set(normalizedSessionKey, generation);
+    return generation;
+  }
+  function onLogicalSessionReset(handler) {
+    if (typeof handler !== "function") return () => {};
+    logicalSessionResetHandlers.add(handler);
+    return () => logicalSessionResetHandlers.delete(handler);
+  }
+  function dispatchLogicalSessionReset(sessionKey, reason) {
+    const normalizedSessionKey =
+      typeof sessionKey === "string" && sessionKey.trim() ? sessionKey.trim() : null;
+    if (!normalizedSessionKey) return;
+    const normalizedReason =
+      typeof reason === "string" && reason.trim() ? reason.trim() : "logical_reset";
+    const liveUiSessionGeneration = rotateLiveUiSessionGeneration(normalizedSessionKey);
+    for (const handler of logicalSessionResetHandlers) {
+      try {
+        handler({
+          sessionKey: normalizedSessionKey,
+          reason: normalizedReason,
+          liveUiSessionGeneration,
+        });
+      } catch (err) {
+        logger.warn(`[relay] logical_session_reset handler threw: ${String(err)}`);
+      }
+    }
+    if (liveuiTaskRunController) {
+      liveuiTaskRunController.observeSessionEnd({
+        sessionKey: normalizedSessionKey,
+        reason: "session_reset",
+      });
+    }
+    broadcastGlassesUiSessionReset(
+      normalizedSessionKey,
+      normalizedReason,
+      liveUiSessionGeneration,
+    );
+  }
+
+  function broadcastGlassesUiSessionReset(
+    normalizedSessionKey,
+    normalizedReason,
+    liveUiSessionGeneration,
+  ) {
+    if (server) {
+      server.broadcast(
+        JSON.stringify({
+          type: "glasses_ui_session_reset",
+          sessionKey: normalizedSessionKey,
+          reason: normalizedReason,
+          liveUiSessionGeneration,
+        }),
+      );
+    }
+    emitDebug(
+      "glasses.lifecycle",
+      "session_reset_send",
+      "info",
+      { sessionKey: normalizedSessionKey },
+      () => ({ reason: normalizedReason, liveUiSessionGeneration }),
+      {},
+    );
+
+    broadcastStatus();
+  }
+
+  function clearGlassesUiSurfacesOnly(sessionKey, reason) {
+    const normalizedSessionKey =
+      typeof sessionKey === "string" && sessionKey.trim() ? sessionKey.trim() : null;
+    if (!normalizedSessionKey) return null;
+    const normalizedReason =
+      typeof reason === "string" && reason.trim() ? reason.trim() : "logical_reset";
+    const liveUiSessionGeneration = rotateLiveUiSessionGeneration(normalizedSessionKey);
+    broadcastGlassesUiSessionReset(
+      normalizedSessionKey,
+      normalizedReason,
+      liveUiSessionGeneration,
+    );
+    return liveUiSessionGeneration;
+  }
+  function clearLogicalSessionState(sessionKey, reason) {
+    sessionService.clearLogicalSessionState(sessionKey);
+    dispatchLogicalSessionReset(sessionKey, reason);
   }
 
   const glassesUiResultHandlers = new Set();
 
   function sendGlassesUiRender(params) {
     if (!server) return;
+    const sessionKey = params && typeof params.sessionKey === "string" ? params.sessionKey : null;
     const payload = {
       type: "glasses_ui_render",
-      sessionKey: params && typeof params.sessionKey === "string" ? params.sessionKey : null,
+      sessionKey,
+      liveUiSessionGeneration: ensureLiveUiSessionGeneration(sessionKey),
       surfaceId: params && typeof params.surfaceId === "string" ? params.surfaceId : "",
+
+      seq: Number.isFinite(params && params.seq) ? Math.floor(params.seq) : null,
       depth: Number.isFinite(params && params.depth) ? Math.floor(params.depth) : 1,
       spec: params && params.spec ? params.spec : null,
       marker: sanitizeGlassesMarker(params && params.marker),
@@ -2031,7 +2541,7 @@ function createRelay(opts) {
       "surface_send",
       "debug",
       { sessionKey: payload.sessionKey || undefined },
-      () => ({ surfaceId: payload.surfaceId, mode: "render", depth: payload.depth, ...summarizeGlassesUiContent(payload.spec) }),
+      () => ({ surfaceId: payload.surfaceId, mode: "render", seq: payload.seq, depth: payload.depth, ...summarizeGlassesUiContent(payload.spec) }),
     );
   }
 
@@ -2059,9 +2569,19 @@ function createRelay(opts) {
 
       questionIndex: Number.isInteger(params.questionIndex) ? params.questionIndex : 0,
       questionCount: Number.isInteger(params.questionCount) ? params.questionCount : 0,
+      presentation: params.presentation === "adaptive" ? "adaptive" : "reel",
+      selectionMode:
+        params.selectionMode === "multi" || params.selectionMode === "open"
+          ? params.selectionMode
+          : "single",
+      allowOther: params.allowOther === true,
       options,
     };
-    if (!payload.surfaceId || !payload.question || payload.options.length === 0) return;
+    if (
+      !payload.surfaceId ||
+      !payload.question ||
+      (payload.options.length === 0 && payload.selectionMode !== "open")
+    ) return;
     server.broadcast(JSON.stringify(payload));
     emitDebug(
       "glasses.lifecycle",
@@ -2073,7 +2593,11 @@ function createRelay(opts) {
         kind: payload.kind,
         options: payload.options.length,
         deadlineSec: payload.deadlineSec,
+        presentation: payload.presentation,
+        selectionMode: payload.selectionMode,
+        allowOther: payload.allowOther,
       }),
+      undefined,
     );
   }
 
@@ -2094,8 +2618,65 @@ function createRelay(opts) {
       "debug",
       { sessionKey: payload.sessionKey || undefined },
       () => ({ surfaceId: payload.surfaceId, reason: payload.reason }),
+      undefined,
     );
   }
+
+  function applyConfirmedHermesReset(result = {}) {
+    const sessionKey =
+      typeof result.sessionKey === "string" && result.sessionKey
+        ? result.sessionKey
+        : sessionService.ensureSessionKey();
+    if (!sessionService.isCurrentSession(sessionKey)) return false;
+    sessionService.invalidateSessionsCache();
+    resetActivityStatusAdapter();
+    clearSyntheticWorkForSession(sessionKey);
+    conversationState.clear();
+    stablePromptSnapshots.evict(sessionKey);
+    clearLogicalSessionState(sessionKey, "hermes_slash_reset_confirmed");
+    if (upstreamRuntime && typeof upstreamRuntime.clearTyping === "function") {
+      upstreamRuntime.clearTyping("hermes_slash_reset_confirmed");
+    }
+    conversationState.setAgentName(
+      (upstreamRuntime ? upstreamRuntime.getAgentName() : null) || "Agent",
+    );
+    broadcastPages();
+    emitDebug(
+      "relay.session",
+      "reset_receipt_removed",
+      "info",
+      { sessionKey },
+      () => ({ transientStatus: "Chat reset" }),
+      undefined,
+    );
+    return true;
+  }
+
+  const hermesSlashConfirmRouter = createHermesSlashConfirmRouter({
+    hasConnectedClient: () => !!server && server.getConnectedAppCount() > 0,
+
+    presentDecision: (request) => demandRouter.presentDecision(request),
+    resolve: (request) => {
+      if (typeof opts.resolveHermesSlashConfirm !== "function") {
+        return Promise.resolve({
+          status: "rejected",
+          error: "Hermes slash confirmation resolver is unavailable",
+        });
+      }
+      return opts.resolveHermesSlashConfirm(request);
+    },
+    applyReset: applyConfirmedHermesReset,
+    emit: (event, data) => {
+      emitDebug(
+        "relay.session",
+        event,
+        "info",
+        { sessionKey: data && data.sessionKey },
+        () => data || {},
+        undefined,
+      );
+    },
+  });
 
   function sendGlassesUiSurfaceUpdate(params) {
     if (!server) return;
@@ -2119,10 +2700,14 @@ function createRelay(opts) {
         .filter((i) => i !== null);
     }
     const m = sanitizeGlassesMarker(patch.marker); if (m) cleanPatch.marker = m;
+    const sessionKey = params && typeof params.sessionKey === "string" ? params.sessionKey : null;
     const payload = {
       type: "glasses_ui_surface_update",
-      sessionKey: params && typeof params.sessionKey === "string" ? params.sessionKey : null,
+      sessionKey,
+      liveUiSessionGeneration: ensureLiveUiSessionGeneration(sessionKey),
       surfaceId: params && typeof params.surfaceId === "string" ? params.surfaceId : "",
+
+      seq: Number.isFinite(params && params.seq) ? Math.floor(params.seq) : null,
       patch: cleanPatch,
     };
     server.broadcast(JSON.stringify(payload));
@@ -2131,7 +2716,7 @@ function createRelay(opts) {
       "surface_send",
       "debug",
       { sessionKey: payload.sessionKey || undefined },
-      () => ({ surfaceId: payload.surfaceId, mode: "update", ...summarizeGlassesUiContent(cleanPatch) }),
+      () => ({ surfaceId: payload.surfaceId, mode: "update", seq: payload.seq, ...summarizeGlassesUiContent(cleanPatch) }),
     );
   }
 
@@ -2177,7 +2762,59 @@ function createRelay(opts) {
     }
   }
 
+  const glassesUiRenderReceiptHandlers = new Set();
+
+  function onGlassesUiRenderReceipt(handler) {
+    if (typeof handler !== "function") return () => {};
+    glassesUiRenderReceiptHandlers.add(handler);
+    return () => glassesUiRenderReceiptHandlers.delete(handler);
+  }
+
+  function dispatchGlassesUiRenderReceipt(frame) {
+    if (!frame || typeof frame !== "object") return;
+    for (const handler of glassesUiRenderReceiptHandlers) {
+      try {
+        handler({
+          surfaceId: typeof frame.surfaceId === "string" ? frame.surfaceId : "",
+
+          seq: Number.isFinite(frame.seq) ? Math.floor(frame.seq) : null,
+        });
+      } catch (err) {
+        logger.warn(`[relay] surface_render_receipt handler threw: ${err.message}`);
+      }
+    }
+  }
+
   const deviceInfoResponseHandlers = new Set();
+  const glassesPresenceChangedHandlers = new Set();
+
+  function onGlassesPresenceChanged(handler) {
+    if (typeof handler !== "function") return () => {};
+    glassesPresenceChangedHandlers.add(handler);
+    return () => glassesPresenceChangedHandlers.delete(handler);
+  }
+
+  function dispatchGlassesPresenceChanged(frame) {
+    const allowed = new Set(["worn", "absent", "in_case", "unknown"]);
+    const presence = allowed.has(frame && frame.presence) ? frame.presence : "unknown";
+    emitDebug(
+      "glasses.lifecycle",
+      "glasses_presence_changed",
+      "debug",
+      {},
+      () => ({ presence, handlerCount: glassesPresenceChangedHandlers.size }),
+    );
+    for (const rawHandler of glassesPresenceChangedHandlers) {
+      const handler = rawHandler;
+      try {
+        handler({ presence });
+      } catch (err) {
+        logger.warn(
+          `[relay] glasses_presence_changed handler threw: ${err && err.message ? err.message : err}`,
+        );
+      }
+    }
+  }
 
   function sendDeviceInfoRequest(params) {
     if (!server) return;
@@ -2446,13 +3083,82 @@ function createRelay(opts) {
   }
 
   function dispatchOcuClawUserSend(params = {}) {
+    const sendId = typeof params.id === "string" ? params.id.trim() : "";
+    const dedupeSessionKey = params.sessionKey || sessionService.peekSessionKey();
+    const dedupeKey = sendId && dedupeSessionKey ? `${dedupeSessionKey}\u0000${sendId}` : "";
+    const dedupeNowMs = debugNow();
+    const cachedDedupe = dedupeKey ? userSendDedupe.get(dedupeKey) : null;
+    if (cachedDedupe && cachedDedupe.expiresAtMs > dedupeNowMs) {
+      emitDebug(
+        "relay.protocol",
+        "send_deduped",
+        "info",
+        { sessionKey: dedupeSessionKey },
+        () => ({ messageId: sendId }),
+        {},
+      );
+      return cachedDedupe.operation;
+    }
+    if (dedupeKey && cachedDedupe) userSendDedupe.delete(dedupeKey);
+    const operation = dispatchOcuClawUserSendOnce(params);
+    if (dedupeKey) {
+      const dedupeEntry = {
+        operation,
+        expiresAtMs: dedupeNowMs + USER_SEND_DEDUPE_TTL_MS,
+      };
+      userSendDedupe.set(dedupeKey, dedupeEntry);
+      while (userSendDedupe.size > USER_SEND_DEDUPE_MAX) {
+        userSendDedupe.delete(userSendDedupe.keys().next().value);
+      }
+      if (operation && typeof operation.then === "function") {
+        operation.then((result) => {
+          const status = result && typeof result.status === "string"
+            ? result.status.trim().toLowerCase()
+            : "accepted";
+          if (status !== "accepted" && status !== "queued") {
+            if (userSendDedupe.get(dedupeKey) === dedupeEntry) userSendDedupe.delete(dedupeKey);
+          }
+        }, () => {
+          if (userSendDedupe.get(dedupeKey) === dedupeEntry) userSendDedupe.delete(dedupeKey);
+        });
+      }
+    }
+    return operation;
+  }
+
+  function dispatchOcuClawUserSendOnce(params = {}) {
     const id = params.id;
     const text = params.text;
     const sessionKey = params.sessionKey;
     const attachment = params.attachment || null;
     const clientDisplaySignals = params.clientDisplaySignals || null;
     const resolvedSessionKey = sessionKey || sessionService.ensureSessionKey();
-    sessionService.recordFirstSentUserMessage(resolvedSessionKey, text);
+    if (
+      !attachment &&
+      openClawQuestionRouter &&
+      openClawQuestionRouter.handleText(resolvedSessionKey, text)
+    ) {
+      relayOperationRegistry.markStarted(id);
+      relayOperationRegistry.markUpstreamAck(id, { status: "question_answered" });
+      conversationState.addMessage("user", buildLocalUserMessageContent(text, null));
+      broadcastPages();
+      emitDebug(
+        "glasses.lifecycle",
+        "question_text_answered",
+        "info",
+        { sessionKey: resolvedSessionKey },
+        () => ({ messageId: id, textChars: typeof text === "string" ? text.length : 0 }),
+        undefined,
+      );
+      return Promise.resolve({ status: "accepted", questionAnswer: true });
+    }
+    const materializesHermesDraft =
+      getActiveBackendKind() === "hermes" &&
+      typeof sessionService.markDraftSessionInFlight === "function" &&
+      sessionService.markDraftSessionInFlight(resolvedSessionKey);
+    if (!materializesHermesDraft) {
+      sessionService.recordFirstSentUserMessage(resolvedSessionKey, text);
+    }
     if (clientDisplaySignals && resolvedSessionKey) {
       sessionService.recordNeuralSessionNamesEnabled(
         resolvedSessionKey,
@@ -2506,16 +3212,21 @@ function createRelay(opts) {
       );
       const upstreamDispatchedAt = Date.now();
 
-      const userContent = buildLocalUserMessageContent(text, attachment);
-      conversationState.addMessage("user", userContent);
-      emitDebug(
-        "openclaw.message",
-        "user_message",
-        "info",
-        { sessionKey: resolvedSessionKey },
-        () => ({ text: typeof text === "string" ? text : "" }),
-      );
-      broadcastPages();
+      const publishLocalUserMessage = () => {
+        const userContent = buildLocalUserMessageContent(text, attachment);
+        conversationState.addMessage("user", userContent, null, {
+          clientSendId: id,
+        });
+        emitDebug(
+          "openclaw.message",
+          "user_message",
+          "info",
+          { sessionKey: resolvedSessionKey },
+          () => ({ text: typeof text === "string" ? text : "" }),
+        );
+        broadcastPages();
+      };
+      if (!materializesHermesDraft) publishLocalUserMessage();
       const localPublishDoneAt = Date.now();
 
       emitDebug(
@@ -2529,13 +3240,37 @@ function createRelay(opts) {
           localPublishMs: localPublishDoneAt - upstreamDispatchedAt,
           onSendSyncMs: localPublishDoneAt - sendStartedAt,
           hasAttachment,
+          deferredUntilAccepted: materializesHermesDraft,
         }),
       );
 
       return upstreamPromise.then(
         (result) => {
+          if (materializesHermesDraft && result && result.status === "accepted") {
+            if (sessionService.isCurrentSession(resolvedSessionKey)) {
+              publishLocalUserMessage();
+            }
+            sessionService.recordFirstSentUserMessage(resolvedSessionKey, text);
+            if (sessionService.materializeDraftSession(resolvedSessionKey) && server) {
+              server.broadcast(JSON.stringify({
+                type: "ocuclaw.session.materialized",
+                sessionKey: resolvedSessionKey,
+              }));
+            }
+          } else if (materializesHermesDraft) {
+            sessionService.releaseDraftSessionSend(resolvedSessionKey);
+          }
           const ackAt = Date.now();
           const runId = result && result.runId ? result.runId : null;
+          if (
+            runId &&
+            conversationState &&
+            typeof conversationState.bindRunIdToClientSendId === "function"
+          ) {
+            if (conversationState.bindRunIdToClientSendId(id, runId)) {
+              broadcastEntriesForActiveLedgerClients();
+            }
+          }
           relayOperationRegistry.markUpstreamAck(id, {
             runId,
             status: result && result.status ? result.status : null,
@@ -2549,6 +3284,14 @@ function createRelay(opts) {
               ackAt,
             });
           }
+
+          if (runId) agentTurnTracker.noteRun(resolvedSessionKey, runId);
+
+          settleRemoteSendRunBinding(id, {
+            runId,
+            sessionKey: resolvedSessionKey,
+            status: runId ? "bound" : "unbound_no_run_id",
+          });
           emitDebug(
             "relay.protocol",
             "send_upstream_ack",
@@ -2565,6 +3308,9 @@ function createRelay(opts) {
           return result;
         },
         (err) => {
+          if (materializesHermesDraft) {
+            sessionService.releaseDraftSessionSend(resolvedSessionKey);
+          }
           const mirroredErrorCode =
             err && typeof err.errorCode === "string" && err.errorCode.trim()
               ? err.errorCode.trim()
@@ -2576,6 +3322,12 @@ function createRelay(opts) {
           if (mirroredErrorCode && err && typeof err === "object") {
             err.errorCode = mirroredErrorCode;
           }
+
+          settleRemoteSendRunBinding(id, {
+            sessionKey: resolvedSessionKey,
+            status: "unbound_send_failed",
+            error: err && err.message ? err.message : String(err),
+          });
           emitDebug(
             "relay.protocol",
             "send_upstream_error",
@@ -2609,7 +3361,12 @@ function createRelay(opts) {
       { sessionKey },
       () => ({ requestId }),
     );
-    return gatewayBridge.request("sessions.abort", { key: sessionKey }).then(
+    const gatewaySession = openclawGatewayKeyFor(sessionKey);
+    const request = {
+      key: gatewaySession.key,
+      ...(gatewaySession.agentId ? { agentId: gatewaySession.agentId } : {}),
+    };
+    return gatewayBridge.request("sessions.abort", request).then(
       (result) => ({
         status: "accepted",
         ...(result && typeof result === "object" ? result : {}),
@@ -2627,10 +3384,12 @@ function createRelay(opts) {
     const message = typeof params.message === "string" ? params.message : "";
     const attachment = params.attachment || null;
     const gatewayAttachment = buildGatewayAttachment(attachment);
+    const gatewaySession = openclawGatewayKeyFor(sessionKey);
     const request = {
-      key: sessionKey,
+      key: gatewaySession.key,
       message,
       idempotencyKey: requestId,
+      ...(gatewaySession.agentId ? { agentId: gatewaySession.agentId } : {}),
     };
     if (gatewayAttachment) {
       request.attachments = [gatewayAttachment];
@@ -2688,8 +3447,13 @@ function createRelay(opts) {
             ackAt,
           });
         }
+
+        if (runId) agentTurnTracker.noteRun(sessionKey, runId);
         const userContent = buildLocalUserMessageContent(message, attachment);
-        conversationState.addMessage("user", userContent);
+        conversationState.addMessage("user", userContent, null, {
+          clientSendId: requestId,
+          runId,
+        });
         emitDebug(
           "openclaw.message",
           "user_message",
@@ -2743,7 +3507,47 @@ function createRelay(opts) {
   let relayApi = null;
 
   async function applyOcuClawSettingsPatch(patch = {}) {
-    const result = await setOcuClawSettings(patch);
+    let localPatch = patch;
+    if (
+      getActiveBackendKind() === "hermes" &&
+      typeof opts.setOcuClawProfileOptions === "function"
+    ) {
+      const profilePatch = {};
+      localPatch = {};
+      for (const [key, value] of Object.entries(patch || {})) {
+        if (
+          key === "defaultModel" ||
+          key === "defaultThinking" ||
+          key === "defaultFastMode" ||
+          key === "confirmModelSelection"
+        ) {
+          Reflect.set(profilePatch, key, value);
+        } else if (key === "conversationToolProgress") {
+
+          Reflect.set(profilePatch, key, value);
+          Reflect.set(localPatch, key, value);
+        } else {
+          Reflect.set(localPatch, key, value);
+        }
+      }
+      if (Object.keys(profilePatch).some((key) => key !== "confirmModelSelection")) {
+        const profileResult = await opts.setOcuClawProfileOptions(profilePatch, {
+          sessionKey: sessionService && sessionService.ensureSessionKey(),
+        });
+        if (!profileResult || profileResult.status !== "accepted") {
+          return profileResult || {
+            status: "rejected",
+            error: "Hermes profile settings update failed",
+          };
+        }
+      }
+    }
+    const localResult = Object.keys(localPatch).length > 0
+      ? await setOcuClawLocalSettings(localPatch)
+      : { status: "accepted" };
+    if (!localResult || localResult.status !== "accepted") return localResult;
+    const settings = await getOcuClawSettingsSnapshot();
+    const result = { status: "accepted", settings };
     if (result && result.status === "accepted" && result.settings && server) {
       server.broadcast(handler.formatOcuClawSettings(result.settings));
     }
@@ -2817,9 +3621,13 @@ function createRelay(opts) {
   async function switchToSessionAndRunPostSwitchFlow(sessionKey) {
     try {
       const pages = await sessionService.switchToSession(sessionKey);
+
+      Promise.resolve(sessionService.markSessionRead(sessionKey)).catch(() => {});
       clearCurrentSessionModelConfigSnapshot("switch_session");
 
       demandRouter.forgetAll("switch_session");
+      hermesClarifyRouter?.forgetAll("switch_session");
+      openClawQuestionRouter?.forgetAll("switch_session");
       if (isEtSessionKey(sessionKey)) {
         broadcastActivity(buildEtSessionSwitchClearActivity(sessionKey));
         if (typeof opts.onEtSessionActivated === "function") {
@@ -2867,6 +3675,18 @@ function createRelay(opts) {
         source: "phone_ui",
       });
     },
+    onLedgerCursor(payload = {}) {
+      const sessionId = payload.sessionId;
+      const activeSessionKey = sessionService.peekSessionKey();
+      if (sessionId !== activeSessionKey) return null;
+      return activeLedgerSnapshot();
+    },
+    onResyncRequest(payload = {}) {
+      const sessionId = payload.sessionId;
+      const activeSessionKey = sessionService.peekSessionKey();
+      if (sessionId !== activeSessionKey) return null;
+      return activeLedgerSnapshot();
+    },
     onAbortSession({ requestId, sessionKey }) {
       return dispatchOcuClawSessionAbort({ requestId, sessionKey });
     },
@@ -2879,6 +3699,11 @@ function createRelay(opts) {
       });
     },
     onGlassesUiResult(frame) {
+      const liveuiController = resolveLiveuiGlassesLibraryController();
+      const taskSessionKey =
+        liveuiController && typeof liveuiController.sessionForSurface === "function"
+          ? liveuiController.sessionForSurface(frame && frame.surfaceId)
+          : null;
       emitDebug(
         "glasses.lifecycle",
         "surface_outcome",
@@ -2897,6 +3722,12 @@ function createRelay(opts) {
         );
       }
       dispatchGlassesUiResult(frame);
+      if (liveuiTaskRunController && taskSessionKey) {
+        liveuiTaskRunController.observeSurfaceOutcome({
+          sessionKey: taskSessionKey,
+          outcome: frame && frame.outcome,
+        });
+      }
     },
     onDemandResponse(frame) {
       emitDebug(
@@ -2908,9 +3739,24 @@ function createRelay(opts) {
           surfaceId: frame && frame.surfaceId,
           result: frame && frame.result,
           selectedIndex: frame && frame.selectedIndex,
+          selectedIndices: frame && frame.selectedIndices,
         }),
       );
-      demandRouter.handleOutcome(frame);
+      if (
+        frame &&
+        typeof frame.surfaceId === "string" &&
+        frame.surfaceId.startsWith("hermes-clarify:")
+      ) {
+        hermesClarifyRouter?.handleOutcome(frame);
+      } else if (
+        frame &&
+        typeof frame.surfaceId === "string" &&
+        frame.surfaceId.startsWith("openclaw-question:")
+      ) {
+        openClawQuestionRouter?.handleOutcome(frame);
+      } else {
+        demandRouter.handleOutcome(frame);
+      }
     },
     onGlassesUiNavEvent(frame) {
       emitDebug(
@@ -2922,8 +3768,63 @@ function createRelay(opts) {
       );
       dispatchGlassesUiNavEvent(frame);
     },
+    onGlassesUiRenderReceipt(frame) {
+
+      emitDebug(
+        "glasses.lifecycle",
+        "render_receipt_recv",
+        "debug",
+        {},
+        () => ({
+          surfaceId: frame && frame.surfaceId,
+          seq: frame && frame.seq,
+          handlerCount: glassesUiRenderReceiptHandlers.size,
+        }),
+        {},
+      );
+      dispatchGlassesUiRenderReceipt(frame);
+
+      Promise.resolve().then(() => {
+        if (!liveuiTaskRunController) return;
+        const liveuiController = resolveLiveuiGlassesLibraryController();
+        if (!liveuiController) return;
+        const surfaceId = frame && frame.surfaceId;
+        const seq = frame && frame.seq;
+        if (
+          typeof liveuiController.hasClientReceipt !== "function" ||
+          !liveuiController.hasClientReceipt(surfaceId, seq)
+        ) return;
+        const sessionKey =
+          typeof liveuiController.sessionForSurface === "function"
+            ? liveuiController.sessionForSurface(surfaceId)
+            : null;
+        if (sessionKey) {
+          const first = liveuiTaskRunController.observeFirstRender({
+            sessionKey,
+            surfaceId,
+            at: Date.now(),
+          });
+          if (!first) {
+            liveuiTaskRunController.observeSurfaceRender({ sessionKey, surfaceId });
+          }
+          const delivery = typeof liveuiController.deliveryStateOf === "function"
+            ? liveuiController.deliveryStateOf(surfaceId)
+            : null;
+          if (delivery && typeof delivery.rung === "string") {
+            liveuiTaskRunController.observeSurfaceDelivery({
+              sessionKey,
+              surfaceId,
+              delivery: delivery.rung,
+            });
+          }
+        }
+      });
+    },
     onDeviceInfoResponse(frame) {
       dispatchDeviceInfoResponse(frame);
+    },
+    onGlassesPresenceChanged(frame) {
+      dispatchGlassesPresenceChanged(frame);
     },
     onLocationResponse(frame) {
       dispatchLocationResponse(frame);
@@ -2934,16 +3835,25 @@ function createRelay(opts) {
     onGlassesUiSurfaceUpdateInject(params) {
       sendGlassesUiSurfaceUpdate(params);
     },
-    onSetUserSessionTitle(sessionKey, title) {
-      const result = sessionService.setSessionTitle(sessionKey, title, { userSet: true });
+    async onSetUserSessionTitle(sessionKey, title) {
+      const result = await sessionService.setUserSessionTitle(sessionKey, title);
       if (result && result.ok) {
-        broadcastSessions();
+        await broadcastSessions();
       }
+      return result;
     },
     onSetSessionPinned(sessionKey, pinned, kind) {
       const result = sessionService.setSessionPinned(kind, sessionKey, pinned);
       if (result && result.ok) {
         broadcastSessions();
+      }
+      return result;
+    },
+    async onSetSessionHidden(sessionKey, hidden) {
+      const result = await sessionService.setSessionHidden(sessionKey, hidden);
+      if (result && result.ok) {
+
+        await broadcastSessions();
       }
       return result;
     },
@@ -2984,6 +3894,11 @@ function createRelay(opts) {
           snippets: result && Array.isArray(result.snippets) ? result.snippets : [],
           truncated: !!(result && result.truncated),
           refreshing: !!(result && result.refreshing),
+          unavailable: !!(result && result.unavailable),
+          unavailableReason:
+            result && typeof result.unavailableReason === "string"
+              ? result.unavailableReason
+              : null,
         };
         server.unicast(clientId, JSON.stringify(payload));
       };
@@ -3006,6 +3921,7 @@ function createRelay(opts) {
             const payload = {
               type: "ocuclaw.session.transcripts.search.result",
               query, kind, snippets: [], truncated: false, refreshing: false,
+              unavailable: true, unavailableReason: "search_failed",
             };
             server.unicast(clientId, JSON.stringify(payload));
           }
@@ -3064,9 +3980,19 @@ function createRelay(opts) {
           emitDebug("relay.operation", event, "debug", {}, () => data),
         logError: (m) => logger.error(`[relay] ${m}`),
         newBundleId: () => crypto.randomUUID(),
-        cachePut: (id, e) => bundleCache.put(id, e),
+        cachePut: (id = "", e = {}) => bundleCache.put(id, e),
         now: () => Date.now(),
       };
+      if (
+        relayBackendKind === "hermes" &&
+        typeof opts.getConnectionHealthDocument === "function"
+      ) {
+
+        Object.defineProperty(deps, "getConnectionHealthDocument", {
+          value: opts.getConnectionHealthDocument,
+          enumerable: true,
+        });
+      }
       return Promise.resolve(handleDebugBundleRequest(deps, clientId, msg)).catch(
         (err) => {
           logger.error(
@@ -3233,6 +4159,7 @@ function createRelay(opts) {
             streamedText,
             spansByFamily.emoji || [],
             spansByFamily.pace || [],
+            { runId, seq: index + 1 },
           ));
           emitDebug(
             "relay.protocol",
@@ -3647,15 +4574,37 @@ function createRelay(opts) {
       if (upstreamRuntime && typeof upstreamRuntime.clearTyping === "function") {
         upstreamRuntime.clearTyping("new_chat");
       }
+      if (getActiveBackendKind() === "hermes") {
+        clearSyntheticWorkForSession(sessionService.ensureSessionKey());
+        return sessionService.newSession({
+          sendResetCommand: false,
+          materializeImmediately: false,
+        }).then(async (result) => {
+          stablePromptSnapshots.evict(result.sessionKey);
+          sessionService.clearDisplayToggleStates(result.sessionKey);
+          clearCurrentSessionModelConfigSnapshot("new_chat");
+          if (upstreamRuntime && typeof upstreamRuntime.handleSessionChanged === "function") {
+            upstreamRuntime.handleSessionChanged("new_chat");
+          }
+          const sessionModelConfig = await seedOcuClawSessionConfigForNewSession(
+            result.sessionKey,
+          );
+          return {
+            ...result,
+            draft: true,
+            ...(sessionModelConfig ? { sessionModelConfig } : {}),
+          };
+        });
+      }
       sessionService.invalidateSessionsCache();
       resetActivityStatusAdapter();
 
       clearSyntheticWorkForSession(sessionService.ensureSessionKey());
-      conversationState.clear();
+      conversationState.clear(sessionService.ensureSessionKey(), true);
 
       const newChatSessionKey = sessionService.ensureSessionKey();
       stablePromptSnapshots.evict(newChatSessionKey);
-      sessionService.clearLogicalSessionState(newChatSessionKey);
+      clearLogicalSessionState(newChatSessionKey, "new_chat");
       conversationState.setAgentName(
         (upstreamRuntime ? upstreamRuntime.getAgentName() : null) || "Agent",
       );
@@ -3680,7 +4629,15 @@ function createRelay(opts) {
 
     async onCopySession(sourceKey) {
       const copied = await sessionService.copyForeignSession(sourceKey);
-      const pages = await switchToSessionAndRunPostSwitchFlow(copied.key);
+      let pages;
+      try {
+        pages = await switchToSessionAndRunPostSwitchFlow(copied.key);
+      } catch (err) {
+        if (!isSupersededSessionSwitchError(err)) throw err;
+
+        broadcastSessions();
+        return { sessionKey: copied.key, pages: null, superseded: true };
+      }
       broadcastSessions();
       return { sessionKey: copied.key, pages };
     },
@@ -3735,9 +4692,12 @@ function createRelay(opts) {
       }
 
       clearSyntheticWorkForSession(sessionService.ensureSessionKey());
-      const result = await sessionService.newSession(
-        hasRequestedAgentRef ? { agentRef: resolvedAgentRef } : {},
-      );
+      const hermesDraft = getActiveBackendKind() === "hermes";
+      const result = await sessionService.newSession({
+        ...(hasRequestedAgentRef ? { agentRef: resolvedAgentRef } : {}),
+        sendResetCommand: !hermesDraft,
+        materializeImmediately: !hermesDraft,
+      });
 
       if (result && typeof result.sessionKey === "string" && result.sessionKey.trim()) {
         stablePromptSnapshots.evict(result.sessionKey);
@@ -3756,9 +4716,10 @@ function createRelay(opts) {
       return sessionModelConfig
         ? {
             ...result,
+            draft: hermesDraft,
             sessionModelConfig,
           }
-        : result;
+        : { ...result, draft: hermesDraft };
     },
 
     async createEtSession(provider, text) {
@@ -3775,7 +4736,14 @@ function createRelay(opts) {
       if (typeof opts.onEtSessionActivated === "function") {
         try { opts.onEtSessionActivated(newKey); } catch (e) { logger.warn(`[relay] onEtSessionActivated: ${e.message}`); }
       }
-      const pages = await sessionService.switchToSession(newKey);
+      let pages;
+      try {
+        pages = await sessionService.switchToSession(newKey);
+      } catch (err) {
+        if (!isSupersededSessionSwitchError(err)) throw err;
+
+        return { sessionKey: newKey, pages: null, superseded: true };
+      }
       clearCurrentSessionModelConfigSnapshot("create_et_session");
 
       broadcastStatus();
@@ -3792,6 +4760,163 @@ function createRelay(opts) {
       return upstreamRuntime
         ? upstreamRuntime.getSkillsCatalogSnapshot()
         : Promise.resolve({ skills: [], fetchedAtMs: Date.now(), stale: true });
+    },
+
+    onGetLiveuiLibrary() {
+      const controller = resolveLiveuiGlassesLibraryController();
+      return controller ? controller.listLibrary() : [];
+    },
+
+    onOpenLiveuiLibraryItem({ clientId, itemType, itemId }) {
+      const controller = resolveLiveuiGlassesLibraryController();
+      if (!controller) {
+        return { itemType, itemId, status: "rejected", code: "item_unavailable" };
+      }
+      return controller.openLibraryItem({
+        clientId,
+        itemType,
+        itemId,
+        sessionKey: sessionService.ensureSessionKey(),
+        origin: "glasses",
+        taskRunController: liveuiTaskRunController,
+      });
+    },
+
+    onCancelLiveuiTaskLaunch({ clientId, taskId }) {
+      if (!liveuiTaskRunController) return false;
+      return liveuiTaskRunController.cancelTaskLaunch({ clientId, taskId });
+    },
+
+    onGetLiveuiTasksForPhone() {
+      const controller = resolveLiveuiGlassesLibraryController();
+      return controller
+        ? controller.listTasksForPhone()
+        : { tasks: [], templates: [], invalid: [] };
+    },
+
+    onGetLiveuiTaskRunsForPhone(taskId) {
+      const controller = resolveLiveuiGlassesLibraryController();
+      return controller && typeof controller.listTaskRunRecords === "function"
+        ? controller.listTaskRunRecords(taskId)
+        : [];
+    },
+
+    onGetLiveuiTaskExecutors() {
+      return listLiveuiTaskExecutors();
+    },
+
+    onSetLiveuiTaskExecutor({ taskId, executor }) {
+      const controller = resolveLiveuiGlassesLibraryController();
+      if (!controller) {
+        return { taskId, status: "rejected", code: "item_unavailable" };
+      }
+      return controller.updateTaskExecutor(taskId, executor);
+    },
+
+    onSetLiveuiTaskSettingValues({ taskId, expectedDigest, values }) {
+      const controller = resolveLiveuiGlassesLibraryController();
+      if (!controller || typeof controller.updateTaskSettingValues !== "function") {
+        return { taskId, status: "rejected", code: "item_unavailable" };
+      }
+      return controller.updateTaskSettingValues(taskId, values, { expectedDigest });
+    },
+
+    onSetLiveuiTaskPreferredTemplate({ taskId, expectedDigest, templateId }) {
+      const controller = resolveLiveuiGlassesLibraryController();
+      if (!controller || typeof controller.updateTaskPreferredTemplate !== "function") {
+        return { taskId, status: "rejected", code: "item_unavailable" };
+      }
+      return controller.updateTaskPreferredTemplate({ taskId, expectedDigest, templateId });
+    },
+
+    isPhoneClient(clientId) {
+      const snapshot =
+        server && typeof server.getReadinessSnapshot === "function"
+          ? server.getReadinessSnapshot()
+          : null;
+      const entry = snapshot && Array.isArray(snapshot.clients)
+        ? snapshot.clients.find((client) => client && client.clientId === clientId)
+        : null;
+      return !!(entry && entry.clientKind === "app");
+    },
+
+    onReviewLiveuiTask({ taskId, action, expectedDigest }) {
+      const controller = resolveLiveuiGlassesLibraryController();
+      if (!controller) {
+        return { taskId, action, status: "rejected", code: "item_unavailable" };
+      }
+      return controller.reviewTask({ taskId, action, expectedDigest });
+    },
+
+    onSetLiveuiTaskContext({ taskId, context }) {
+      const controller = resolveLiveuiGlassesLibraryController();
+      if (!controller || typeof controller.updateTaskContext !== "function") {
+        return { taskId, status: "rejected", code: "item_unavailable" };
+      }
+      const result = controller.updateTaskContext(taskId, context);
+      return result && result.status === "saved"
+        ? { taskId, status: "accepted" }
+        : {
+          taskId,
+          status: "rejected",
+          code: result && typeof result.code === "string"
+            ? result.code
+            : "task_context_update_failed",
+        };
+    },
+
+    onGetLiveuiPrefs() {
+      const controller = resolveLiveuiGlassesLibraryController();
+      if (!controller || typeof controller.getLiveuiPrefs !== "function") {
+        return { status: "rejected", code: "item_unavailable" };
+      }
+      return controller.getLiveuiPrefs();
+    },
+
+    onSetLiveuiPrefs({ patch }) {
+      const controller = resolveLiveuiGlassesLibraryController();
+      if (!controller || typeof controller.setLiveuiPrefs !== "function") {
+        return { status: "rejected", code: "item_unavailable" };
+      }
+      const result = controller.setLiveuiPrefs(patch);
+
+      if (result && result.status === "accepted" && Array.isArray(result.clearedSessionKeys)) {
+        for (const sessionKey of result.clearedSessionKeys) {
+          clearGlassesUiSurfacesOnly(sessionKey, "liveui_disabled");
+        }
+      }
+      return result;
+    },
+
+    onGetLiveuiStatus() {
+      const controller = resolveLiveuiGlassesLibraryController();
+      if (!controller || typeof controller.getLiveuiStatus !== "function") return null;
+      return controller.getLiveuiStatus();
+    },
+
+    onOrganizeLiveuiLibrary(params) {
+      const controller = resolveLiveuiGlassesLibraryController();
+      if (!controller) {
+        return {
+          action: params && typeof params.action === "string" ? params.action : "",
+          status: "rejected",
+          code: "item_unavailable",
+        };
+      }
+      return controller.organizeLibrary(params);
+    },
+
+    onGetCommandCatalog() {
+      return upstreamRuntime
+        ? upstreamRuntime.getCommandCatalogSnapshot()
+        : Promise.resolve({
+            commands: [],
+            fetchedAtMs: Date.now(),
+            stale: true,
+            unsupported: true,
+            backendKind: "none",
+            executes: "intercepted-only",
+          });
     },
 
     onGetAgentsCatalog() {
@@ -3849,6 +4974,13 @@ function createRelay(opts) {
     },
 
     onSetSessionAgent(patch) {
+      if (getActiveBackendKind() === "hermes") {
+        return {
+          status: "rejected",
+          error:
+            "Hermes profiles own separate chats. Open or create the profile chat instead.",
+        };
+      }
       const sessionKey = sessionService.ensureSessionKey();
       const result = sessionService.setSessionAgentId(
         sessionKey,
@@ -3879,7 +5011,7 @@ function createRelay(opts) {
     },
 
     onGetOcuClawSettings() {
-      return ocuClawSettingsStore.getSnapshot();
+      return getOcuClawSettingsSnapshot();
     },
 
     async onGetEvenAiSessions() {
@@ -3906,11 +5038,11 @@ function createRelay(opts) {
         { sessionKey: sessionService.ensureSessionKey() },
         () => ({ command }),
       );
-      if (command === "/reset") {
+      if (command === "/reset" && getActiveBackendKind() !== "hermes") {
         sessionService.invalidateSessionsCache();
         resetActivityStatusAdapter();
         clearSyntheticWorkForSession(sessionService.ensureSessionKey());
-        conversationState.clear();
+        conversationState.clear(sessionService.ensureSessionKey(), true);
         if (upstreamRuntime && typeof upstreamRuntime.clearTyping === "function") {
           upstreamRuntime.clearTyping("slash_reset");
         }
@@ -3920,21 +5052,33 @@ function createRelay(opts) {
         broadcastPages();
       }
 
-      if (command === "/new" || command === "/reset") {
+      if (
+        getActiveBackendKind() !== "hermes" &&
+        (command === "/new" || command === "/reset")
+      ) {
         const resetKey = sessionService.ensureSessionKey();
         stablePromptSnapshots.evict(resetKey);
 
-        sessionService.clearLogicalSessionState(resetKey);
+        clearLogicalSessionState(
+          resetKey,
+          command === "/new" ? "slash_new" : "slash_reset",
+        );
       }
       if (upstreamRuntime && upstreamRuntime.isConnected()) {
 
         const outboundCommand =
-          command === "/reset"
+          command === "/reset" && getActiveBackendKind() !== "hermes"
             ? `/reset ${activeNewSessionGreetingPrompt()}`
             : command;
+        const resetSessionKey = sessionService.ensureSessionKey();
+        const resetGatewaySession = openclawGatewayKeyFor(resetSessionKey);
         return gatewayBridge.sendMessage(
           outboundCommand,
-          sessionService.ensureSessionKey(),
+          resetSessionKey,
+          null,
+          resetGatewaySession.agentId
+            ? { agentId: resetGatewaySession.agentId }
+            : undefined,
         );
       }
       return Promise.resolve();
@@ -4138,6 +5282,14 @@ function createRelay(opts) {
         issuedByClientId: clientId,
       };
 
+      if (control.action === "send-message") {
+        armRemoteSendRunBinding({
+          requestId,
+          clientId,
+          sessionKey: control.sessionKey || null,
+        });
+      }
+
       emitDebug(
         "relay.protocol",
         "remote_control_dispatched",
@@ -4148,6 +5300,7 @@ function createRelay(opts) {
           requestId,
           action: control.action || "unknown",
           recipientEstimate,
+          runBindingArmed: control.action === "send-message",
         }),
       );
 
@@ -4531,6 +5684,9 @@ function createRelay(opts) {
     getCurrentPages() {
       return cachedPages;
     },
+    getCurrentEntries() {
+      return cachedEntries;
+    },
     getCurrentStatus() {
       return cachedStatus;
     },
@@ -4540,6 +5696,8 @@ function createRelay(opts) {
     getCurrentResumeState() {
       return {
         pagesRevision: pagesRevision || 0,
+        entriesRevision: entriesRevision || 0,
+        lastSeq: entriesLastSeq,
         statusRevision: statusRevision || 0,
       };
     },
@@ -4557,15 +5715,32 @@ function createRelay(opts) {
     cancelBufferedEvenAiHttpRequest(envelope) {
       return cancelBufferedEvenAiHttpRequest(envelope);
     },
+    onPairingAuthenticatedHello(hello) {
+      notePairingAuthenticatedHello(hello);
+    },
     getActiveSessionKey() {
       return sessionService.peekSessionKey() || null;
     },
     onAppClientDisconnect(sessionKey) {
       dispatchAppClientDisconnect(sessionKey);
+      if (server && server.getConnectedAppCount() === 0) {
+        demandRouter.forgetExternal("client_disconnect");
+      }
     },
     onAppClientIdentified(clientId, entry) {
-      if (!appClientSupportsCapabilitySnapshot(entry)) return;
-      setTimeout(() => unicastCapabilitySnapshot(clientId), 0);
+      if (appClientSupportsCapabilitySnapshot(entry)) {
+        setTimeout(() => unicastCapabilitySnapshot(clientId), 0);
+      }
+      if (
+        Array.isArray(entry && entry.clientCapabilities) &&
+        entry.clientCapabilities.includes("ledgerV1")
+      ) {
+
+        setTimeout(() => broadcastEntriesForActiveLedgerClients(), 0);
+      }
+    },
+    onAppPresenceChanged(reason) {
+      dispatchAppPresenceChanged(reason);
     },
     emitDebug(category, event, severity, context, payloadFactory, options) {
       emitDebug(category, event, severity, context, payloadFactory, options);
@@ -4592,9 +5767,11 @@ function createRelay(opts) {
       agentEmoji: upstreamRuntime ? upstreamRuntime.getAgentEmoji() : null,
       agentAvatarHash: upstreamRuntime ? upstreamRuntime.getAgentAvatarHash() : null,
       session: activeSessionKey,
+      liveUiSessionGeneration: ensureLiveUiSessionGeneration(activeSessionKey),
       evenAiEnabled: opts.evenAiEnabled === true,
       evenTerminalEnabled: opts.evenTerminalEnabled === true,
       evenTerminalProviders,
+      ledgerV1: activeConversationSupportsLedger(),
     };
     if (includeDownstreamReadiness) {
       status.downstreamReadiness =
@@ -4624,7 +5801,7 @@ function createRelay(opts) {
     return out;
   }
 
-  function cachePages(pages) {
+  function cachePages(pages = [], ledgerV1 = false) {
     const nextRevision = pagesRevision + 1;
     const assistantCommit =
       typeof conversationState.getAssistantCommitSnapshot === "function"
@@ -4636,6 +5813,7 @@ function createRelay(opts) {
         : null;
     const next = handler.formatPages(pages, {
       revision: nextRevision,
+      ledgerV1,
       assistantCommit:
         assistantCommit && activeSessionKey
           ? { ...assistantCommit, sessionKey: activeSessionKey }
@@ -4648,6 +5826,53 @@ function createRelay(opts) {
     return cachedPages;
   }
 
+  function activeConversationSupportsLedger() {
+    const activeSessionKey = sessionService.peekSessionKey();
+    if (isEtSessionKey(activeSessionKey)) return false;
+    return !!(
+      conversationState &&
+      typeof conversationState.isLedgerCapable === "function" &&
+      conversationState.isLedgerCapable()
+    );
+  }
+
+  function activeLedgerSnapshot() {
+    if (!activeConversationSupportsLedger()) return null;
+    const snapshot = conversationState.getEntries();
+    return snapshot && snapshot.ledgerV1 === true ? snapshot : null;
+  }
+
+  function hasActiveLedgerClient() {
+    if (!server || typeof server.getReadinessSnapshot !== "function") return false;
+    const readiness = server.getReadinessSnapshot();
+    return !!(
+      readiness &&
+      Array.isArray(readiness.clients) &&
+      readiness.clients.some((client) =>
+        Array.isArray(client && client.clientCapabilities) &&
+        client.clientCapabilities.includes("ledgerV1")
+      )
+    );
+  }
+
+  function broadcastEntriesForActiveLedgerClients() {
+    if (!hasActiveLedgerClient()) return;
+    const snapshot = activeLedgerSnapshot();
+    if (snapshot !== null) server.broadcast(cacheEntries(snapshot));
+  }
+
+  function cacheEntries(snapshot = {}) {
+    const sessionId = sessionService.peekSessionKey();
+    cachedEntries = handler.formatEntries(snapshot, sessionId);
+    entriesRevision = Number.isFinite(Number(snapshot.entriesRevision))
+      ? Math.max(0, Math.floor(Number(snapshot.entriesRevision)))
+      : entriesRevision;
+    entriesLastSeq = Number.isFinite(Number(snapshot.lastSeq))
+      ? Math.floor(Number(snapshot.lastSeq))
+      : -1;
+    return cachedEntries;
+  }
+
   function cacheStatus(statusObj) {
     const nextRevision = statusRevision + 1;
     const next = handler.formatStatus(statusObj, { revision: nextRevision });
@@ -4658,16 +5883,28 @@ function createRelay(opts) {
     return cachedStatus;
   }
 
-  function broadcastPages() {
+  function broadcastPages(options = {}) {
     const pages = conversationState.getPages();
-    const next = cachePages(pages);
+    const ledgerSnapshot = activeLedgerSnapshot();
+    const preserveLedgerLane =
+      options.preserveLedgerLane === true && hasActiveLedgerClient() && !!cachedEntries;
+    const next = cachePages(pages, ledgerSnapshot !== null || preserveLedgerLane);
     if (next !== null) {
       server.broadcast(next);
     }
+    if (ledgerSnapshot !== null) {
+      const entriesFrame = cacheEntries(ledgerSnapshot);
+
+      server.broadcast(entriesFrame);
+    } else if (!preserveLedgerLane) {
+      cachedEntries = "";
+      entriesLastSeq = -1;
+    }
+    return preserveLedgerLane;
   }
 
   function broadcastSessions() {
-    sessionService
+    return sessionService
       .getSessions()
       .then((sessions) => {
         server.broadcast(handler.formatSessions(sessions));
@@ -4714,6 +5951,8 @@ function createRelay(opts) {
         dedicatedIncluded = true;
         continue;
       }
+
+      if (session && session.hidden === true) continue;
       sessions.push(session);
     }
     if (!dedicatedIncluded && dedicatedEvenAiKey) {
@@ -4767,6 +6006,9 @@ function createRelay(opts) {
     }
   }
 
+  let hermesClarifyRouter = null;
+  let openClawQuestionRouter = null;
+
   upstreamRuntime = createUpstreamRuntime({
     logger,
     stateDir: opts.stateDir,
@@ -4780,10 +6022,26 @@ function createRelay(opts) {
     broadcastActivity,
     broadcastProviderUsageSnapshot,
     broadcastSkillsCatalog,
+    broadcastCommandCatalog,
     broadcastAgentsCatalog,
     operationRegistry: relayOperationRegistry,
     getCurrentSessionModelConfigSnapshot() {
       return currentSessionModelConfigSnapshot;
+    },
+
+    getAgentProgressNotes() {
+
+      return Reflect.get(ocuClawSettingsStore.getSnapshot(), "agentProgressNotes") ?? null;
+    },
+    observeTaskToolUse(params) {
+      return liveuiTaskRunController
+        ? liveuiTaskRunController.observeToolUse(params)
+        : false;
+    },
+    observeTaskApproval(params) {
+      return liveuiTaskRunController
+        ? liveuiTaskRunController.observeApproval(params)
+        : false;
     },
     resetActivityStatusAdapter,
     modelsCacheTtlMs: opts.modelsCacheTtlMs,
@@ -4793,9 +6051,200 @@ function createRelay(opts) {
     getVoiceRuntime() {
       return null;
     },
+    onClarify(data) {
+      if (!hermesClarifyRouter) {
+        logger.warn("[hermes] clarify dropped before demand router initialization");
+        return false;
+      }
+      return hermesClarifyRouter.handleRequest(data);
+    },
+    onQuestion(data) {
+      if (!openClawQuestionRouter) {
+        logger.warn("[openclaw] question dropped before demand router initialization");
+        return false;
+      }
+      return openClawQuestionRouter.handleRequest(data);
+    },
+    onQuestionResolved(data) {
+      return openClawQuestionRouter?.handleResolved(data) || false;
+    },
     gatewayUrl: opts.gatewayUrl,
     gatewayToken: opts.gatewayToken,
     fetchAgentAvatar: opts.fetchAgentAvatar,
+  });
+
+  async function resolveLiveuiTaskExecutor(executor) {
+    const catalog = await getCapabilityAgentCatalogSnapshot();
+    updateLiveuiExecutorRegistry(catalog);
+    const projected = resolveLiveuiTaskExecutorState(
+      executor,
+      {},
+      catalog && Array.isArray(catalog.agents) ? catalog.agents : liveuiAgents,
+    );
+    if (projected.state === "unavailable") return projected;
+    if (
+      !catalog ||
+      catalog.unsupported === true ||
+      catalog.stale === true ||
+      !Array.isArray(catalog.agents)
+    ) return { state: "unavailable", reason: "backend_incompatible" };
+    if (projected.state !== "ready") return projected;
+    const needle = executor.agentId.trim().toLowerCase();
+    const match = catalog.agents.find((entry = {}) => {
+      const id = typeof entry.id === "string" ? entry.id.trim().toLowerCase() : "";
+      const name = typeof entry.name === "string" ? entry.name.trim().toLowerCase() : "";
+      return id === needle || name === needle;
+    });
+    if (!match) return { state: "needs_setup", reason: "executor_missing" };
+    const agentId = typeof match.id === "string" && match.id.trim()
+      ? match.id.trim()
+      : executor.agentId.trim();
+    return {
+      state: "ready",
+      executor: { host: relayBackendKind, agentId },
+    };
+  }
+
+  async function createLiveuiTaskSession(executor) {
+    clearSyntheticWorkForSession(sessionService.ensureSessionKey());
+    const hermesDraft = relayBackendKind === "hermes";
+    const result = await sessionService.newSession({
+      agentRef: executor.agentId,
+      sendResetCommand: false,
+      materializeImmediately: !hermesDraft,
+    });
+    if (result && typeof result.sessionKey === "string" && result.sessionKey.trim()) {
+      stablePromptSnapshots.evict(result.sessionKey);
+      sessionService.clearDisplayToggleStates(result.sessionKey);
+    }
+    clearCurrentSessionModelConfigSnapshot("liveui_task_launch");
+    if (upstreamRuntime && typeof upstreamRuntime.clearTyping === "function") {
+      upstreamRuntime.clearTyping("liveui_task_launch");
+    }
+    if (upstreamRuntime && typeof upstreamRuntime.handleSessionChanged === "function") {
+      upstreamRuntime.handleSessionChanged("liveui_task_launch");
+    }
+    const sessionModelConfig = await seedOcuClawSessionConfigForNewSession(result.sessionKey);
+    if (server) {
+      server.broadcast(handler.formatSessionSwitched(result.sessionKey, "", hermesDraft));
+      server.broadcast(handler.formatPages(result.pages, {}));
+      if (sessionModelConfig) {
+        server.broadcast(handler.formatSessionModelConfig(sessionModelConfig));
+      }
+    }
+    broadcastStatus();
+    void broadcastSessions();
+    return { sessionKey: result.sessionKey };
+  }
+
+  function broadcastLiveuiTasksSnapshot() {
+    try {
+      const controller = resolveLiveuiGlassesLibraryController();
+      if (!controller || typeof controller.listTasksForPhone !== "function") return;
+      server.broadcast(handler.formatLiveuiTasks(controller.listTasksForPhone() || {}));
+    } catch (err) {
+      logger.warn(
+        `[liveui] Task Run snapshot broadcast failed: ${err && err.message ? err.message : err}`,
+      );
+    }
+  }
+
+  liveuiTaskRunController = createLiveuiTaskRunController({
+    host: relayBackendKind,
+    loadTask(taskId) {
+      const controller = resolveLiveuiGlassesLibraryController();
+      return controller && typeof controller.readTaskForRun === "function"
+        ? controller.readTaskForRun(taskId)
+        : { status: "rejected", code: "task_not_found" };
+    },
+    resolveTemplateHint(templateId) {
+      const controller = resolveLiveuiGlassesLibraryController();
+      return controller && typeof controller.resolveTemplateHint === "function"
+        ? controller.resolveTemplateHint(templateId)
+        : null;
+    },
+    resolveExecutor: resolveLiveuiTaskExecutor,
+    resolveCurrentSession() {
+      const sessionKey = sessionService.peekSessionKey();
+      if (relayBackendKind === "hermes") {
+        const parsed = sessionKey ? parseHermesPublicKey(sessionKey) : null;
+        const appAgentRef = getAppPathwayAgentRef();
+        return {
+          sessionKey: sessionKey || null,
+          agentId: parsed
+            ? hermesProfileIdForNamespace(parsed.namespace)
+            : appAgentRef || hermesProfileIdForNamespace(DEFAULT_HERMES_NAMESPACE),
+        };
+      }
+      return {
+        sessionKey: sessionKey || null,
+        agentId: sessionKey
+          ? sessionService.getSessionAgentId(sessionKey, undefined)
+          : getAppPathwayAgentRef() || sessionService.getSessionAgentId("", undefined),
+      };
+    },
+    createSession: createLiveuiTaskSession,
+    sendUserMessage({ runId, sessionKey, text, onSessionResolved }) {
+      const operation = dispatchOcuClawUserSendOnce({
+        id: runId,
+        text,
+        sessionKey,
+        attachment: null,
+        clientDisplaySignals: null,
+        source: "liveui_task",
+      });
+      const resolvedSessionKey = sessionService.peekSessionKey();
+      if (typeof onSessionResolved === "function") onSessionResolved(resolvedSessionKey);
+      return Promise.resolve(operation).then((result) => {
+        const status = result && typeof result.status === "string"
+          ? result.status.trim().toLowerCase()
+          : "accepted";
+        if (status !== "accepted" && status !== "queued") {
+          throw new Error("Task Request was not accepted");
+        }
+        return { ...(result || {}), sessionKey: resolvedSessionKey };
+      });
+    },
+    abortSession(sessionKey) {
+      return dispatchOcuClawSessionAbort({
+        requestId: `liveui-task-abort-${crypto.randomUUID()}`,
+        sessionKey,
+      });
+    },
+    newRunId: () => `liveui-task-${crypto.randomUUID()}`,
+    onRunStarted() {
+      broadcastLiveuiTasksSnapshot();
+    },
+    onRunEnded(run) {
+
+      broadcastLiveuiTasksSnapshot();
+      const controller = resolveLiveuiGlassesLibraryController();
+      if (!controller || typeof controller.appendTaskRunRecord !== "function") return;
+      let delivery = typeof run.delivery === "string" ? run.delivery : "none";
+      if (typeof controller.deliveryStateOf === "function" && Array.isArray(run.surfaceIds)) {
+        for (const surfaceId of run.surfaceIds) {
+          const state = controller.deliveryStateOf(surfaceId);
+          const rung = state && typeof state.rung === "string" ? state.rung : null;
+          if (rung && (delivery === "none" || compareRungs(rung, delivery) > 0)) {
+            delivery = rung;
+          }
+        }
+      }
+      controller.appendTaskRunRecord(projectTaskRunRecord({
+        recordId: `liveui-task-record-${crypto.randomUUID()}`,
+        runId: run.runId,
+        taskId: run.taskId,
+        versionId: run.versionId,
+        executor: run.executor,
+        context: run.context,
+        startedAt: run.startedAt,
+        endedAt: run.endedAt,
+        toolNames: run.toolNames,
+        approvals: run.approvals,
+        outcome: run.endedReason,
+        delivery,
+      }));
+    },
   });
 
   async function shouldSeedSessionScopedDefaultForRoute(route) {
@@ -4970,7 +6419,163 @@ function createRelay(opts) {
     });
   }
 
+  let pairingEndpointService = null;
+  let pairingExchangeHost = null;
+  let pairingEndpointPromise = null;
+
+  function ensurePairingEndpoint() {
+    if (pairingEndpointPromise) return pairingEndpointPromise;
+    pairingEndpointPromise = (async () => {
+      let noiseSuite = null;
+      try {
+        noiseSuite = await resolveNoiseSuite();
+      } catch (err) {
+        noiseSuite = null;
+        logger.warn(
+          `[ocuclaw] pairing noise suite probe failed: ${err && err.message ? err.message : err}`,
+        );
+      }
+      if (!noiseSuite) {
+        logger.warn(
+          "[ocuclaw] pairing endpoint held: this runtime cannot carry the Noise handshake",
+        );
+        return null;
+      }
+      const service = createPairingEndpointService({
+        onHandlerError: () => {
+          logger.warn(
+            "[ocuclaw] pairing endpoint handler failed; phone response stayed fail-closed",
+          );
+        },
+
+        tick: () => {
+          if (pairingExchangeHost) pairingExchangeHost.tick();
+        },
+
+        activeExchangeId: () => {
+          try {
+            const snapshot = pairingExchangeHost && pairingExchangeHost.snapshot();
+            return snapshot && snapshot.exchangeId ? snapshot.exchangeId : null;
+          } catch {
+            return null;
+          }
+        },
+      });
+      pairingExchangeHost = createPairingExchangeHost({
+        transport: service.transport,
+        noiseSuite,
+
+        readRelayCredential: () => (typeof opts.token === "string" ? opts.token : ""),
+
+        resolveClientRole: () => "app",
+        onPairingCompleted: (completionId) => dispatchPairingCompleted(completionId),
+      });
+      pairingEndpointService = service;
+      return service;
+    })().catch((err) => {
+
+      logger.warn(
+        `[ocuclaw] pairing endpoint unavailable: ${err && err.message ? err.message : err}`,
+      );
+      return null;
+    });
+    return pairingEndpointPromise;
+  }
+
+  function pairingJsonResult(status, json, extraHeaders = null) {
+    const res = createBufferedHttpResponse(opts.evenAiMaxResponseBytes || 262_144);
+    res.statusCode = status;
+    res.setHeader("content-type", "application/json; charset=utf-8");
+
+    res.setHeader("cache-control", "no-store");
+
+    if (extraHeaders) {
+      for (const key of Object.keys(extraHeaders)) {
+        res.setHeader(key, extraHeaders[key]);
+      }
+    }
+    res.end(status === 204 ? "" : JSON.stringify(json));
+    return res.toResult();
+  }
+
+  async function handleBufferedPairingHttpRequest(envelope) {
+    const service = await ensurePairingEndpoint();
+    if (!service) {
+      return pairingJsonResult(503, { v: 1, error: "rejected" });
+    }
+    const headers =
+      envelope && envelope.headers && typeof envelope.headers === "object"
+        ? envelope.headers
+        : {};
+    const contentType =
+      typeof headers["content-type"] === "string" ? headers["content-type"] : null;
+    const body = decodeBufferedHttpBody(envelope);
+
+    const result = await service.handleRequest({
+      method: envelope && typeof envelope.method === "string" ? envelope.method : "GET",
+      contentType,
+      body: body.toString("utf8"),
+      bodyBytes:
+        envelope && Number.isFinite(envelope.bodyBytes) ? envelope.bodyBytes : body.length,
+    });
+    return pairingJsonResult(result.status, result.json, result.headers);
+  }
+
+  function notePairingAuthenticatedHello(hello) {
+
+    Promise.resolve(ensurePairingEndpoint())
+      .then((service) => (service ? service.noteAuthenticatedHello(hello) : false))
+      .catch((err) => {
+        logger.warn(
+          `[ocuclaw] pairing hello correlation failed: ${err && err.message ? err.message : err}`,
+        );
+      });
+  }
+
+  let pairingControlService = null;
+
+  async function handleBufferedPairingControlRequest(envelope) {
+
+    const service = await ensurePairingEndpoint();
+    if (!service || !pairingExchangeHost) {
+      return pairingJsonResult(503, { v: 1, error: "rejected" });
+    }
+    if (!pairingControlService) {
+      pairingControlService = createPairingControlService({
+        exchangeHost: () => pairingExchangeHost,
+
+        readRelayCredential: () => (typeof opts.token === "string" ? opts.token : ""),
+      });
+    }
+    const headers =
+      envelope && envelope.headers && typeof envelope.headers === "object"
+        ? envelope.headers
+        : {};
+    const contentType =
+      typeof headers["content-type"] === "string" ? headers["content-type"] : null;
+    const body = decodeBufferedHttpBody(envelope);
+    const result = await pairingControlService.handleRequest({
+      method: envelope && typeof envelope.method === "string" ? envelope.method : "GET",
+      contentType,
+      headers,
+      body: body.toString("utf8"),
+      bodyBytes:
+        envelope && Number.isFinite(envelope.bodyBytes) ? envelope.bodyBytes : body.length,
+    });
+
+    return pairingJsonResult(result.status, result.json);
+  }
+
   async function handleBufferedEvenAiHttpRequest(envelope) {
+    const url =
+      envelope && typeof envelope.url === "string" ? envelope.url : "/";
+    const pathname = new URL(url, "http://127.0.0.1").pathname;
+    if (isPairingEndpointPath(pathname)) {
+      return handleBufferedPairingHttpRequest(envelope);
+    }
+    if (isPairingControlPath(pathname)) {
+      return handleBufferedPairingControlRequest(envelope);
+    }
     if (!evenAiEndpoint || typeof evenAiEndpoint.handleRequest !== "function") {
       return {
         statusCode: 404,
@@ -5060,6 +6665,74 @@ function createRelay(opts) {
     },
   });
 
+  hermesClarifyRouter = createHermesClarifyRouter({
+    inject: (surface) => {
+      sendDemand(surface);
+      emitDebug("glasses.lifecycle", "demand_presented", "info", {}, () => ({
+        producer: "hermes",
+        surfaceId: surface.surfaceId,
+        kind: surface.kind,
+        options: surface.options.length,
+        deadlineSec: surface.deadlineSec,
+        presentation: surface.presentation,
+        selectionMode: surface.selectionMode,
+        allowOther: surface.allowOther,
+      }), undefined);
+    },
+    dismiss: ({ surfaceId, sessionKey, reason }) => {
+      sendDemandDismiss({ surfaceId, sessionKey, reason });
+      emitDebug("glasses.lifecycle", "demand_retired", "info", {}, () => ({
+        producer: "hermes",
+        surfaceId,
+        reason,
+      }), undefined);
+    },
+    respond: (id, response) =>
+      gatewayBridge.request("clarify.resolve", { id, response }),
+    awaitText: (id) =>
+      gatewayBridge.request("clarify.await_text", { id }),
+    isCurrentSession: (sessionKey) => sessionService.isCurrentSession(sessionKey),
+    onError: (info) => {
+      logger.warn(`[hermes] clarify outcome ignored: ${info.reason} (${info.surfaceId || info.id || "unknown"})`);
+    },
+  });
+
+  openClawQuestionRouter = createOpenClawQuestionRouter({
+    inject: (surface) => {
+      sendDemand(surface);
+      emitDebug("glasses.lifecycle", "demand_presented", "info", {}, () => ({
+        producer: "openclaw",
+        surfaceId: surface.surfaceId,
+        kind: surface.kind,
+        options: surface.options.length,
+        deadlineSec: surface.deadlineSec,
+        questionIndex: surface.questionIndex,
+        questionCount: surface.questionCount,
+        presentation: surface.presentation,
+        selectionMode: surface.selectionMode,
+        allowOther: surface.allowOther,
+      }), undefined);
+    },
+    dismiss: ({ surfaceId, sessionKey, reason }) => {
+      sendDemandDismiss({ surfaceId, sessionKey, reason });
+      emitDebug("glasses.lifecycle", "demand_retired", "info", {}, () => ({
+        producer: "openclaw",
+        surfaceId,
+        reason,
+      }), undefined);
+    },
+    respond: (id, answers) =>
+      gatewayBridge.request("question.resolve", {
+        id,
+        answers,
+        resolvedBy: "ocuclaw-glasses",
+      }),
+    isCurrentSession: (sessionKey) => sessionService.isCurrentSession(sessionKey),
+    onError: (info) => {
+      logger.warn(`[openclaw] question outcome ignored: ${info.reason} (${info.surfaceId || info.id || "unknown"})`);
+    },
+  });
+
   const etStreamInjector = createEtStreamInjector({
     broadcastStreaming: (text) => server.broadcast(handler.formatStreaming(text)),
     addUserMessage: (text) => conversationState.addMessage("user", [{ type: "text", text }], null),
@@ -5127,6 +6800,24 @@ function createRelay(opts) {
     broadcastStatus,
 
     emitGlassesUiLifecycle(event, severity, data) {
+      if (
+        event === "render_sent" &&
+        liveuiTaskRunController &&
+        data &&
+        typeof data.sessionKey === "string"
+      ) {
+        liveuiTaskRunController.observeRenderAttempt({
+          sessionKey: data.sessionKey,
+          surfaceId: data.surfaceId,
+        });
+      } else if (
+        (event === "render_rejected" || event === "render_receipt_rejected") &&
+        liveuiTaskRunController &&
+        data &&
+        typeof data.sessionKey === "string"
+      ) {
+        liveuiTaskRunController.observeRenderFailure(data.sessionKey);
+      }
       emitDebug("glasses.lifecycle", event, severity, {}, () => data || {});
     },
 
@@ -5178,7 +6869,13 @@ function createRelay(opts) {
     },
 
     stop() {
+      if (liveuiTaskRunController) {
+        liveuiTaskRunController.observeHostLoss();
+      }
+      stopLiveuiExecutorRegistry();
       clearSyntheticWork();
+      sessionService.discardDraftSession("runtime_stop");
+      demandRouter.forgetAll("runtime_stop");
       if (bundleCacheSweepTimer) {
         clearInterval(bundleCacheSweepTimer);
         bundleCacheSweepTimer = null;
@@ -5217,6 +6914,14 @@ function createRelay(opts) {
 
     handleBufferedEvenAiHttpRequest,
 
+    get pairingEndpoint() {
+      return pairingEndpointService;
+    },
+
+    get pairingExchangeHost() {
+      return pairingExchangeHost;
+    },
+
     get server() {
       return server;
     },
@@ -5227,6 +6932,16 @@ function createRelay(opts) {
 
     get debugStoreForTest() {
       return debugStore;
+    },
+
+    __stablePromptWouldChurnForTest(sessionKey, perTurnSignals = {}) {
+      const startEmoji = perTurnSignals.neuralEmojiReactorState === "active";
+      const startPace = perTurnSignals.neuralPaceModulatorState === "active";
+      return stablePromptSnapshots.wouldChurn(
+        sessionKey,
+        sessionKey,
+        computeStableChannelOne({ emoji: startEmoji, pace: startPace }),
+      );
     },
 
     get liveUiTraceLogEnabledForTest() {
@@ -5249,6 +6964,10 @@ function createRelay(opts) {
 
     get activityStatusAdapterForTest() {
       return activityStatusAdapter;
+    },
+
+    get liveuiTaskRunControllerForTest() {
+      return liveuiTaskRunController;
     },
 
     _clearSyntheticWorkForTest(sessionKey = JSON.parse("null")) {
@@ -5351,15 +7070,26 @@ function createRelay(opts) {
     },
 
     _clearLogicalSessionState(sessionKey) {
-      sessionService.clearLogicalSessionState(sessionKey);
+      clearLogicalSessionState(sessionKey, "test_hook");
     },
 
     sendGlassesUiRender(params) {
       sendGlassesUiRender(params);
     },
 
+    setLiveuiGlassesLibraryController(controller) {
+      liveuiGlassesLibraryController = controller || null;
+    },
+
+    resolveLiveuiTaskExecutorState,
+    stopLiveuiExecutorRegistry,
+
     sendDemand(params) {
       sendDemand(params);
+    },
+
+    presentHermesSlashConfirm(params) {
+      return hermesSlashConfirmRouter.present(params || {});
     },
 
     sendGlassesUiSurfaceUpdate(params) {
@@ -5394,13 +7124,22 @@ function createRelay(opts) {
           messageChars: message.length,
         }),
       );
-      const requestParams = { message, sessionKey };
-      if (idempotencyKey) requestParams.idempotencyKey = idempotencyKey;
+      const gatewaySession = openclawGatewayKeyFor(sessionKey);
+      const requestParams = {
+        message,
+        sessionKey: gatewaySession.key,
+        ...(gatewaySession.agentId ? { agentId: gatewaySession.agentId } : {}),
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+      };
       return gatewayBridge.request("agent", requestParams, { expectFinal: false });
     },
 
     isAgentTurnBusy(sessionKey) {
       return agentTurnTracker.isBusy(sessionKey);
+    },
+
+    currentAgentRunId(sessionKey) {
+      return agentTurnTracker.runIdFor(sessionKey);
     },
 
     onGlassesUiResult(handler) {
@@ -5411,12 +7150,19 @@ function createRelay(opts) {
       return onGlassesUiNavEvent(handler);
     },
 
+    onGlassesUiRenderReceipt(handler) {
+      return onGlassesUiRenderReceipt(handler);
+    },
+
     sendDeviceInfoRequest(params) {
       sendDeviceInfoRequest(params);
     },
 
     onDeviceInfoResponse(handler) {
       return onDeviceInfoResponse(handler);
+    },
+    onGlassesPresenceChanged(handler) {
+      return onGlassesPresenceChanged(handler);
     },
 
     sendLocationRequest(params) {
@@ -5464,10 +7210,32 @@ function createRelay(opts) {
     onAppClientDisconnect(handler) {
       return onAppClientDisconnect(handler);
     },
+
+    onAppPresenceChanged(handler) {
+      return onAppPresenceChanged(handler);
+    },
+
+    onPairingCompleted(handler) {
+      return onPairingCompleted(handler);
+    },
+
+    getAppPresenceProjection() {
+
+      if (!server || typeof server.getAppPresenceProjection !== "function") return null;
+      try {
+        return server.getAppPresenceProjection();
+      } catch {
+        return null;
+      }
+    },
+
+    onLogicalSessionReset(handler) {
+      return onLogicalSessionReset(handler);
+    },
   };
   return relayApi;
 }
 
 const createRelayCore = createRelay;
 
-module.exports = { createRelayCore, createRelay, sanitizeGlassesMarker, resolveEvenAiRouterOptionsForBackend };
+module.exports = { LIVEUI_TASK_DISCOVERY_CHANNEL_ONE, createRelayCore, createRelay, sanitizeGlassesMarker, resolveEvenAiRouterOptionsForBackend, parseHermesFeatureTokens };

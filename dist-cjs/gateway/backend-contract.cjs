@@ -13,6 +13,8 @@ const BRIDGE_REQUEST_METHODS = Object.freeze([
   "agents.files.get",
   "agents.list",
   "chat.history",
+  "chat.send",
+  "commands.list",
   "config.get",
   "exec.approval.resolve",
   "models.authStatus",

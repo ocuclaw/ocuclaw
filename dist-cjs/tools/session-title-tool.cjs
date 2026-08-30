@@ -39,7 +39,7 @@ function validateSessionTitleInput(input) {
   return { ok: true, spec: { title: trimmed } };
 }
 
-const { DEFAULT_EVEN_AI_DEDICATED_SESSION_KEY, isHermesEvenAiSessionKey, } = require("../domain/even-ai-session-keys.cjs");
+const { DEFAULT_EVEN_AI_DEDICATED_SESSION_KEY, isHermesEvenAiSessionKey } = require("../domain/even-ai-session-keys.cjs");
 
 function isEvenAiDedicatedKey(sessionKey) {
   if (typeof sessionKey !== "string") return false;

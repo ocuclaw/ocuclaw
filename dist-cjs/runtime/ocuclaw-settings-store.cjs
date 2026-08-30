@@ -41,7 +41,25 @@ function normalizeOcuClawDefaultThinking(value) {
   return "";
 }
 
+const OCUCLAW_AGENT_PROGRESS_NOTES_MODES = Object.freeze([
+  "off",
+  "status",
+  "conversation",
+]);
+const OCUCLAW_AGENT_PROGRESS_NOTES_DEFAULT = "status";
+
+function normalizeOcuClawAgentProgressNotes(value) {
+  const normalized = normalizeTrimmedString(value).toLowerCase();
+  return OCUCLAW_AGENT_PROGRESS_NOTES_MODES.includes(normalized)
+    ? normalized
+    : OCUCLAW_AGENT_PROGRESS_NOTES_DEFAULT;
+}
+
 function normalizeOcuClawDefaultFastMode(value) {
+  return value === true;
+}
+
+function normalizeOcuClawConversationToolProgress(value) {
   return value === true;
 }
 
@@ -129,6 +147,9 @@ function isStoredSnapshotCanonical(value, snapshot) {
     normalizeTrimmedString(value.defaultModel) === snapshot.defaultModel &&
     normalizeOcuClawDefaultThinking(value.defaultThinking) === snapshot.defaultThinking &&
     normalizeOcuClawDefaultFastMode(value.defaultFastMode) === snapshot.defaultFastMode &&
+    normalizeOcuClawAgentProgressNotes(value.agentProgressNotes) === snapshot.agentProgressNotes &&
+    normalizeOcuClawConversationToolProgress(value.conversationToolProgress) ===
+      snapshot.conversationToolProgress &&
     normalizeOcuClawDefaultAgent(value.defaultAgent) === snapshot.defaultAgent &&
     pathwayBindingsEqual(storedPathways, snapshot.pathways) &&
     storedEvenAi.peer.url === snapshot.evenAi.peer.url &&
@@ -144,6 +165,10 @@ function normalizeOcuClawSettingsSnapshot(value = {}) {
     defaultThinking: normalizeOcuClawDefaultThinking(value.defaultThinking),
     defaultFastMode: normalizeOcuClawDefaultFastMode(value.defaultFastMode),
     defaultAgent: normalizeOcuClawDefaultAgent(value.defaultAgent),
+    agentProgressNotes: normalizeOcuClawAgentProgressNotes(value.agentProgressNotes),
+    conversationToolProgress: normalizeOcuClawConversationToolProgress(
+      Reflect.get(value, "conversationToolProgress"),
+    ),
     pathways: normalizeOcuClawPathways(value.pathways),
     evenAi: normalizeOcuClawEvenAiSection(value.evenAi),
   };
@@ -211,6 +236,8 @@ function createOcuClawSettingsStore(opts = {}) {
           defaultModel: snapshot.defaultModel,
           defaultThinking: snapshot.defaultThinking,
           defaultFastMode: snapshot.defaultFastMode,
+          agentProgressNotes: snapshot.agentProgressNotes,
+          conversationToolProgress: snapshot.conversationToolProgress,
           pathwayBindings: Object.fromEntries(
             PATHWAY_KEYS.map((key) => [
               key,
@@ -266,6 +293,8 @@ function createOcuClawSettingsStore(opts = {}) {
           defaultModel: stableSnapshot.defaultModel,
           defaultThinking: stableSnapshot.defaultThinking,
           defaultFastMode: stableSnapshot.defaultFastMode,
+          agentProgressNotes: stableSnapshot.agentProgressNotes,
+          conversationToolProgress: stableSnapshot.conversationToolProgress,
           pathwayBindings: Object.fromEntries(
             PATHWAY_KEYS.map((key) => [
               key,
@@ -315,6 +344,8 @@ function createOcuClawSettingsStore(opts = {}) {
           defaultModel: loaded.defaultModel,
           defaultThinking: loaded.defaultThinking,
           defaultFastMode: loaded.defaultFastMode,
+          agentProgressNotes: loaded.agentProgressNotes,
+          conversationToolProgress: loaded.conversationToolProgress,
           pathwayBindings: Object.fromEntries(
             PATHWAY_KEYS.map((key) => [
               key,
@@ -377,6 +408,14 @@ function createOcuClawSettingsStore(opts = {}) {
         defaultAgent: hasOwn(patch, "defaultAgent")
           ? normalizeOcuClawDefaultAgent(patch.defaultAgent)
           : snapshot.defaultAgent,
+        agentProgressNotes: hasOwn(patch, "agentProgressNotes")
+          ? normalizeOcuClawAgentProgressNotes(patch.agentProgressNotes)
+          : snapshot.agentProgressNotes,
+        conversationToolProgress: hasOwn(patch, "conversationToolProgress")
+          ? normalizeOcuClawConversationToolProgress(
+              Reflect.get(patch, "conversationToolProgress"),
+            )
+          : snapshot.conversationToolProgress,
         pathways: hasOwn(patch, "pathways")
           ? mergePathwaysPatch(snapshot.pathways, patch.pathways)
           : snapshot.pathways,
@@ -401,4 +440,4 @@ function createOcuClawSettingsStore(opts = {}) {
   };
 }
 
-module.exports = { normalizeOcuClawDefaultModel, normalizeOcuClawDefaultThinking, normalizeOcuClawSystemPrompt, normalizeOcuClawDefaultAgent, normalizeOcuClawPathwayBinding, normalizeOcuClawPathways, normalizeOcuClawEvenAiPeer, normalizeOcuClawEvenAiSection, normalizeOcuClawSettingsSnapshot, createOcuClawSettingsStore };
+module.exports = { normalizeOcuClawDefaultModel, normalizeOcuClawDefaultThinking, normalizeOcuClawAgentProgressNotes, normalizeOcuClawConversationToolProgress, OCUCLAW_AGENT_PROGRESS_NOTES_MODES, OCUCLAW_AGENT_PROGRESS_NOTES_DEFAULT, normalizeOcuClawSystemPrompt, normalizeOcuClawDefaultAgent, normalizeOcuClawPathwayBinding, normalizeOcuClawPathways, normalizeOcuClawEvenAiPeer, normalizeOcuClawEvenAiSection, normalizeOcuClawSettingsSnapshot, createOcuClawSettingsStore };

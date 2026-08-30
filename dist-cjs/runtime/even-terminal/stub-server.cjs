@@ -1,7 +1,7 @@
 const { createServer } = require("node:http");
 const { mkdirSync, writeFileSync, unlinkSync } = require("node:fs");
 const { join } = require("node:path");
-const { FIXTURE_SESSIONS, claudeTextTurn, codexTextTurn, } = require("./fixtures.cjs");
+const { FIXTURE_SESSIONS, claudeTextTurn, codexTextTurn } = require("./fixtures.cjs");
 
 function turnFor(provider, sessionId) {
   return provider === "codex" ? codexTextTurn(sessionId) : claudeTextTurn(sessionId);
