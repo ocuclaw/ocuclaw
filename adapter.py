@@ -179,6 +179,19 @@ PLATFORM_LABEL = "OcuClaw"
 # rather than silently coerced to "all" downstream.
 TOOL_PROGRESS_LEVELS = frozenset({"off", "new", "all", "verbose", "log"})
 PAIRING_COMPLETED_METHOD = "pairing.completed"
+# Every successful outcome of `reconcile_pairing_plugin()`. `adopted` is the
+# deep-link-modal happy path (#1888): the modal installs the shipped bytes
+# verbatim, and the next reconcile claims that pristine copy in place by
+# resolving its capability slot. The presenter is fully live afterwards, so
+# consumers must read it exactly like created/updated/unchanged. Keep in step
+# with desktop_pairing.run_desktop_pairing's own allow-list.
+DESKTOP_PLUGIN_RECONCILE_OK = frozenset(
+    {"created", "updated", "unchanged", "adopted"}
+)
+# `reconcile_pairing_widget()` has no adoption path — it renders one owned TUI
+# widget file and reports only created/updated/unchanged (plus preserved and
+# error), so its allow-list stays three-wide on purpose.
+TUI_WIDGET_RECONCILE_OK = frozenset({"created", "updated", "unchanged"})
 OCUCLAW_RELAY_TOKEN_ENV = "OCUCLAW_RELAY_TOKEN"
 OCUCLAW_SONIOX_API_KEY_ENV = "OCUCLAW_SONIOX_API_KEY"
 OCUCLAW_EVEN_AI_TOKEN_ENV = "OCUCLAW_EVEN_AI_TOKEN"
@@ -553,7 +566,7 @@ def _enable_desktop_theme() -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - the stamp is saved; say what failed
         reconcile = {"status": "error", "reason": f"desktop_plugin_reconcile_failed: {exc}"}
     auto_select = _desktop_theme_autoselect_supported()
-    rendered = reconcile.get("status") in {"created", "updated", "unchanged"}
+    rendered = reconcile.get("status") in DESKTOP_PLUGIN_RECONCILE_OK
     if rendered and auto_select:
         message = (
             "OcuClaw theme requested. Hermes Desktop reloads the OcuClaw plugin "
@@ -612,7 +625,7 @@ SETUP_TOOL_DESCRIPTION = (
     "enable_stream_reasoning_deltas and enable_desktop_theme — and only with "
     "confirm: true after the operator has said yes."
 )
-SETUP_GUIDE_VERSION = "2026-08-30 (1.3.17-hermes)"
+SETUP_GUIDE_VERSION = "2026-08-31 (1.3.18-hermes)"
 SETUP_SKILL_LOAD_POINTER = (
     "If the OcuClaw Setup Assistant skill is not loaded in this conversation, "
     "load it via `/ocuclaw-setup` before mutating anything."
@@ -2690,7 +2703,7 @@ def register(ctx: Any) -> None:
     if supported:
         try:
             widget_report = reconcile_pairing_widget()
-            if widget_report.get("status") not in {"created", "updated", "unchanged"}:
+            if widget_report.get("status") not in TUI_WIDGET_RECONCILE_OK:
                 logger.warning(
                     "[ocuclaw] TUI pairing widget unavailable: %s",
                     widget_report.get("reason") or widget_report.get("status"),
@@ -2699,7 +2712,7 @@ def register(ctx: Any) -> None:
             logger.warning("[ocuclaw] TUI pairing widget reconciliation failed: %s", exc)
         try:
             desktop_report = reconcile_pairing_plugin()
-            if desktop_report.get("status") not in {"created", "updated", "unchanged"}:
+            if desktop_report.get("status") not in DESKTOP_PLUGIN_RECONCILE_OK:
                 logger.warning(
                     "[ocuclaw] Desktop pairing presenter unavailable: %s",
                     desktop_report.get("reason") or desktop_report.get("status"),

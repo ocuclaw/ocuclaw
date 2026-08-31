@@ -28,8 +28,8 @@ the bundle publisher; do not hand-edit an installed checkout.
 The human-facing baseline is Hermes release `v2026.8.27`. Its package version
 `0.20.6` and certified commit
 `5fc308a70719a83cccdbba4c0e39c23f5a8239d5` are separate identities. The
-current bundle, shared plugin, and client train is 2.0.2; the bundled setup
-guide has its own `1.3.17-hermes` version. The bidirectional client/plugin
+current bundle, shared plugin, and client train is 2.0.3; the bundled setup
+guide has its own `1.3.18-hermes` version. The bidirectional client/plugin
 compatibility floors are `2.0.2`. This beta bundle ships from the GitHub
 repository only; it has no npm or ClawHub publication leg.
 
@@ -64,6 +64,12 @@ Then, in bare `hermes` or in Hermes Desktop:
 `hermes plugins install` prints that restart instruction and stops there — it
 never restarts the gateway for you. Until the gateway restarts, OcuClaw is
 installed but not loaded, and nothing about the glasses works yet.
+
+**Run `hermes` in a real terminal.** The TUI boots only when stdin *and*
+stdout are a TTY, so a piped or captured run — `hermes | tee log`, a CI
+capture, a headless spawner — silently falls back to the classic CLI: same
+prompt, no pairing panel, and `/ocuclaw-setup` with nowhere to pair. Forcing
+it with `--tui` there does not render either; it bails out instead.
 
 **Never install with `--ref`.** A ref-pinned install is recorded as
 `pinned: true`, and `hermes plugins update ocuclaw` then refuses to move it

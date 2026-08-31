@@ -17,7 +17,11 @@ import {
 import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
+// Claim cadence. The fast rate is reserved for the window where a checkpoint
+// is actually expected — setup is running in a chat — so an idle host that may
+// sit here for days is not polling a side-effecting route four times a second.
 const CLAIM_INTERVAL_MS = 750
+const CLAIM_IDLE_INTERVAL_MS = 2500
 const STATE_INTERVAL_MS = 650
 // The gateway's platform id for OcuClaw — the key the gateway writes into
 // gateway_state.json's `platforms` map, which is what tells this card the
@@ -30,8 +34,20 @@ const CARD_PROBE_TIMEOUT_MS = 2000
 // the card stops narrating progress and offers the retry rather than spinning
 // forever on a restart that failed somewhere the renderer cannot see.
 const RESTART_PATIENCE_MS = 90000
+// A completed pairing retires the card for good. Hold the green confirmation
+// on screen for a beat first: the retirement flag is written immediately, so
+// the hold can never resurrect the card on a later launch.
+const CARD_PAIRED_HOLD_MS = 6000
 const CARD_RETIRED_KEY = 'setup-card-retired'
 const CARD_ANNOUNCED_KEY = 'setup-card-announced'
+// The setup skill's slash name, dispatched to the gateway by the card's own
+// button. The operator is never asked to type it.
+const SETUP_COMMAND = 'ocuclaw-setup'
+const SETUP_RUN_KEY = 'setup-run'
+// A dispatched setup that nobody finished is not a permanent card state — a
+// stale record would offer "Open setup chat" for a conversation the operator
+// abandoned days ago.
+const SETUP_RUN_STALE_MS = 6 * 60 * 60 * 1000
 const PRESENTER_CAPABILITY = '__OCUCLAW_DESKTOP_PRESENTER_CAPABILITY__'
 const QR_QUIET_ZONE_MODULES = 4
 const QR_WATERMARK_FALLBACK = '#667085'
@@ -158,32 +174,227 @@ const applyThemeRequest = ctx => {
   return true
 }
 
-// Hermes Desktop can remount status-bar contributions while their host state
-// refreshes. Keep the active direct-human ceremony visible across those
-// remounts; terminal outcomes still clear this module-local memory explicitly.
-let rememberedCeremony = null
-let rememberedView = 'qr'
+// The card and the presenter are two independent registry contributions, and
+// every signal below has to reach both: the card narrates what the presenter
+// is doing, and the presenter is summoned by a checkpoint the card also shows.
+// A module-local store is the whole mechanism — a shared React context cannot
+// span two registry slots — and it doubles as memory across the remounts
+// Hermes Desktop performs while its own host state refreshes.
+const makeStore = initial => {
+  let value = initial
+  const listeners = new Set()
+  const set = update => {
+    value = typeof update === 'function' ? update(value) : update
+    listeners.forEach(listener => {
+      try { listener(value) } catch {}
+    })
+  }
+  return {
+    get: () => value,
+    set,
+    use: () => {
+      const [snapshot, setSnapshot] = useState(value)
+      useEffect(() => {
+        listeners.add(setSnapshot)
+        setSnapshot(value)
+        return () => { listeners.delete(setSnapshot) }
+      }, [])
+      return snapshot
+    },
+  }
+}
 
-// The post-install card lives in titleBar.right and the ceremony lives in the
-// presenter; "Pair your glasses" has to reach across the two contributions.
-// A module-local store is the whole mechanism — the alternative is a shared
-// React context, which cannot span two independent registry slots.
-let presenterOpened = false
-const presenterListeners = new Set()
-const openPresenter = value => {
-  presenterOpened = value
-  presenterListeners.forEach(listener => {
-    try { listener(value) } catch {}
+// The live ceremony, its window's visibility, and the setup run that leads to
+// both. `presenterStore` is now only ever true WITH a ceremony: the presenter
+// no longer opens on a click and then waits, so there is no window telling the
+// operator to keep it open (#1989 item 2).
+const ceremonyStore = makeStore(null)
+const presenterStore = makeStore(false)
+const viewStore = makeStore('qr')
+const IDLE_SETUP_RUN = Object.freeze({ status: 'idle' })
+const setupRunStore = makeStore(IDLE_SETUP_RUN)
+
+let setupRunCtx = null
+
+const rememberSetupRun = run => {
+  setupRunStore.set(run)
+  if (!setupRunCtx) return
+  try {
+    setupRunCtx.storage.set(SETUP_RUN_KEY, run.status === 'running' ? { v: 1, ...run } : null)
+  } catch {}
+}
+
+const hydrateSetupRun = ctx => {
+  setupRunCtx = ctx
+  let stored = null
+  try { stored = ctx.storage.get(SETUP_RUN_KEY, null) } catch {}
+  if (!stored || typeof stored !== 'object' || stored.v !== 1) return
+  if (stored.status !== 'running' || typeof stored.sessionId !== 'string' || !stored.sessionId) return
+  if (typeof stored.at !== 'number' || Date.now() - stored.at > SETUP_RUN_STALE_MS) return
+  setupRunStore.set({
+    status: 'running',
+    sessionId: stored.sessionId,
+    storedSessionId: typeof stored.storedSessionId === 'string' ? stored.storedSessionId : '',
+    at: stored.at,
   })
 }
-const usePresenterOpened = () => {
-  const [opened, setOpened] = useState(presenterOpened)
+
+// The gateway resolves a skill slash command to the body the model actually
+// reads; `type` is 'skill' for a skill command and 'send' for the quick/bundle
+// shapes that share the directive.
+const skillMessage = result => {
+  if (!result || typeof result !== 'object') return ''
+  if (result.type !== 'skill' && result.type !== 'send') return ''
+  return typeof result.message === 'string' ? result.message.trim() : ''
+}
+
+// Exactly the two-step Hermes Desktop performs for a skill command typed into
+// the composer: `slash.exec` resolves it, `command.dispatch` is the documented
+// fallback when the slash worker refuses the route. Submitting the literal
+// "/ocuclaw-setup" as prompt text is NOT equivalent — the gateway re-expands a
+// slash invocation only on a rewind replay (methods_prompt gates that on
+// `has_truncation`), so the model would receive the bare literal string and no
+// skill at all.
+const resolveSetupInvocation = async sessionId => {
+  let message = ''
+  try {
+    message = skillMessage(await sdk.host.request('slash.exec', { session_id: sessionId, command: SETUP_COMMAND }))
+  } catch {}
+  if (!message) {
+    message = skillMessage(await sdk.host.request('command.dispatch', { session_id: sessionId, name: SETUP_COMMAND, arg: '' }))
+  }
+  if (!message) throw new Error(`the gateway did not resolve /${SETUP_COMMAND}`)
+  return message
+}
+
+// "Pair your glasses" — the whole hand-off (#1989 item 3). The card mints the
+// chat, hands the operator to it, and dispatches the setup skill into it. The
+// operator types nothing and reads no instructions.
+const dispatchSetup = async () => {
+  setupRunStore.set({ status: 'dispatching' })
+  try {
+    const created = await sdk.host.request('session.create', { cols: 96, source: 'desktop' })
+    const sessionId = String((created && created.session_id) || '')
+    if (!sessionId) throw new Error('session.create returned no runtime session')
+    const storedSessionId = String((created && created.stored_session_id) || '') || sessionId
+    const message = await resolveSetupInvocation(sessionId)
+    await sdk.host.request('prompt.submit', { session_id: sessionId, text: message })
+    rememberSetupRun({ status: 'running', sessionId, storedSessionId, at: Date.now() })
+    // Hand off AFTER the submit, not before. Proved on a throwaway 0.20.6
+    // Desktop: opening a just-minted session that still holds no message is a
+    // no-op — the card flipped to "Setup running…" while the operator sat on
+    // the empty home screen. Once the turn exists the same call lands on the
+    // chat, transcript and all.
+    openSetupChat()
+  } catch (error) {
+    rememberSetupRun({ status: 'failed' })
+    try { sdk.host.notifyError(error, `/${SETUP_COMMAND} could not be started in a chat.`) } catch {}
+  }
+}
+
+const openSetupChat = () => {
+  const run = setupRunStore.get()
+  const target = run.storedSessionId || run.sessionId
+  if (!target || typeof sdk.host.openSession !== 'function') return
+  try { void Promise.resolve(sdk.host.openSession(target, { intent: 'in-place' })).catch(() => undefined) } catch {}
+}
+
+// ── The pairing watch ────────────────────────────────────────────────────
+// One module-local poller, owned by the presenter contribution, which is now
+// always mounted (see the register() note). It claims the setup tool's pairing
+// checkpoint and summons the window at the exact moment the QR exists — the
+// operator is never asked to hold anything open waiting for it.
+let watchApi = null
+let watchTimer = null
+let watchMounted = 0
+
+const scheduleWatch = delay => {
+  window.clearTimeout(watchTimer)
+  if (!watchMounted) return
+  watchTimer = window.setTimeout(() => void watchTick(), delay)
+}
+
+const claimDelay = () => (setupRunStore.get().status === 'running' ? CLAIM_INTERVAL_MS : CLAIM_IDLE_INTERVAL_MS)
+
+const watchTick = async () => {
+  if (!watchMounted || !watchApi) return
+  const current = ceremonyStore.get()
+
+  if (!current) {
+    let claimed = null
+    try {
+      claimed = await watchApi('/pairing/claim', { method: 'POST', body: { presenterCapability: PRESENTER_CAPABILITY }, timeoutMs: 2500 })
+    } catch {}
+    if (!watchMounted) return
+    if (claimed && claimed.active) {
+      const adopted = adoptClaim(claimed)
+      if (adopted) {
+        ceremonyStore.set(adopted)
+        // The one place the window is summoned: the checkpoint is live.
+        presenterStore.set(true)
+        scheduleWatch(STATE_INTERVAL_MS)
+        return
+      }
+    }
+    scheduleWatch(claimDelay())
+    return
+  }
+
+  // A delivered terminal outcome has nothing left to poll; clearing the
+  // ceremony restarts the claim loop.
+  if (current.phase === 'outcome' && current.callbackDelivered !== false) return
+
+  try {
+    const next = await watchApi(`/pairing/${encodeURIComponent(current.sessionId)}`, {
+      method: 'POST',
+      body: { op: 'state', presenterCapability: PRESENTER_CAPABILITY },
+      timeoutMs: 5000,
+    })
+    if (!watchMounted) return
+    mergeCeremony(next)
+  } catch {
+    if (!watchMounted) return
+    ceremonyStore.set(live => (live ? { ...live, message: 'The local pairing controller could not be reached; retrying…' } : live))
+  }
+  scheduleWatch(STATE_INTERVAL_MS)
+}
+
+const adoptClaim = claimed => {
+  if (claimed.phase === 'outcome' || claimed.phase === 'words' || claimed.phase === 'deciding') return claimed
+  const parsed = splitBootstrap(claimed.bootstrapBlock)
+  if (!parsed) return null
+  viewStore.set('qr')
+  return { ...claimed, ...parsed, phase: 'qr' }
+}
+
+// Merge a state reply into the live ceremony, re-summoning the window on the
+// two phases the operator MUST see: the four-word confirmation they have to
+// approve, and the outcome that ends the ceremony.
+const mergeCeremony = next => {
+  ceremonyStore.set(live => {
+    if (!live) return live
+    const merged = { ...live, ...next }
+    if (merged.phase !== live.phase && (merged.phase === 'words' || merged.phase === 'outcome')) presenterStore.set(true)
+    return merged
+  })
+}
+
+const clearCeremony = () => {
+  ceremonyStore.set(null)
+  presenterStore.set(false)
+  scheduleWatch(0)
+}
+
+const usePairingWatch = api => {
   useEffect(() => {
-    presenterListeners.add(setOpened)
-    setOpened(presenterOpened)
-    return () => { presenterListeners.delete(setOpened) }
-  }, [])
-  return opened
+    watchApi = api
+    watchMounted += 1
+    scheduleWatch(0)
+    return () => {
+      watchMounted -= 1
+      if (!watchMounted) window.clearTimeout(watchTimer)
+    }
+  }, [api])
 }
 
 // Normalized from the visible alpha bounds of the supplied 1024px OcuClaw
@@ -311,88 +522,33 @@ function QrCanvas({ lines }) {
 }
 
 function PairingDialog({ api }) {
-  const opened = usePresenterOpened()
-  const [ceremony, setCeremonyState] = useState(() => rememberedCeremony)
-  const [view, setViewState] = useState(() => rememberedView)
-  const setCeremony = update => setCeremonyState(current => {
-    const next = typeof update === 'function' ? update(current) : update
-    rememberedCeremony = next
-    return next
-  })
-  const setView = update => setViewState(current => {
-    const next = typeof update === 'function' ? update(current) : update
-    rememberedView = next
-    return next
-  })
+  usePairingWatch(api)
+  const opened = presenterStore.use()
+  const ceremony = ceremonyStore.use()
+  const view = viewStore.use()
   const busy = ceremony?.phase === 'deciding'
 
   const command = async op => {
     const sessionId = ceremony?.sessionId
     if (!sessionId) return
-    setCeremony(current => current ? { ...current, phase: 'deciding', message: op === 'approve' ? 'Approving and waiting for the phone…' : 'Refusing this phone…' } : current)
+    const deciding = op === 'approve'
+      ? 'Approving and waiting for the phone…'
+      : op === 'cancel' ? 'Stopping this pairing…' : 'Refusing this phone…'
+    ceremonyStore.set(current => current ? { ...current, phase: 'deciding', message: deciding } : current)
     try {
       const next = await api(`/pairing/${encodeURIComponent(sessionId)}`, { method: 'POST', body: { op, presenterCapability: PRESENTER_CAPABILITY }, timeoutMs: 5000 })
-      setCeremony(current => current ? { ...current, ...next } : current)
+      mergeCeremony(next)
     } catch {
-      setCeremony(current => current ? { ...current, phase: 'outcome', outcomeState: 'failed', message: 'The local pairing controller could not be reached.' } : current)
+      ceremonyStore.set(current => current ? { ...current, phase: 'outcome', outcomeState: 'failed', message: 'The local pairing controller could not be reached.' } : current)
     }
+    scheduleWatch(STATE_INTERVAL_MS)
   }
 
-  useEffect(() => {
-    let disposed = false
-    let claimTimer = null
-    let stateTimer = null
-
-    const scheduleClaim = () => { claimTimer = window.setTimeout(() => void claim(), CLAIM_INTERVAL_MS) }
-    const scheduleState = () => { stateTimer = window.setTimeout(() => void pollState(), STATE_INTERVAL_MS) }
-
-    const claim = async () => {
-      if (disposed || ceremony) return
-      try {
-        const result = await api('/pairing/claim', { method: 'POST', body: { presenterCapability: PRESENTER_CAPABILITY }, timeoutMs: 2500 })
-        if (result?.active) {
-          if (result.phase === 'outcome' || result.phase === 'words' || result.phase === 'deciding') {
-            setCeremony(result)
-            return
-          }
-          const parsed = splitBootstrap(result.bootstrapBlock)
-          if (!parsed) throw new Error('invalid pairing block')
-          setView('qr')
-          setCeremony({ ...result, ...parsed, phase: 'qr' })
-          return
-        }
-      } catch {}
-      if (!disposed) scheduleClaim()
-    }
-
-    const pollState = async () => {
-      const awaitingCallback = ceremony?.phase === 'outcome' && ceremony?.callbackDelivered === false
-      if (disposed || !ceremony?.sessionId || (ceremony.phase === 'outcome' && !awaitingCallback)) return
-      try {
-        const next = await api(`/pairing/${encodeURIComponent(ceremony.sessionId)}`, { method: 'POST', body: { op: 'state', presenterCapability: PRESENTER_CAPABILITY }, timeoutMs: 5000 })
-        if (!disposed) setCeremony(current => current ? { ...current, ...next } : current)
-      } catch {
-        if (!disposed) setCeremony(current => current ? { ...current, message: 'The local pairing controller could not be reached; retrying…' } : current)
-      }
-      if (!disposed) scheduleState()
-    }
-
-    if (!ceremony) void claim()
-    else if (ceremony.phase === 'qr' || ceremony.phase === 'words' || ceremony.phase === 'deciding' || (ceremony.phase === 'outcome' && ceremony.callbackDelivered === false)) scheduleState()
-
-    return () => {
-      disposed = true
-      window.clearTimeout(claimTimer)
-      window.clearTimeout(stateTimer)
-    }
-  }, [api, ceremony?.sessionId, ceremony?.phase, ceremony?.callbackDelivered])
-
-  const close = () => {
-    openPresenter(false)
-    if (!ceremony) return
-    if (ceremony.phase !== 'outcome') void command('cancel')
-    else setCeremony(null)
-  }
+  // Hiding is not stopping. A live exchange is a 120-second clock the operator
+  // cannot restart by reopening a window, so the window never takes the
+  // ceremony down with it — only "Stop pairing" does. The card carries a
+  // "Show QR" action back (#1989 item 1).
+  const hide = () => presenterStore.set(false)
 
   let body
   let title = 'Pair OcuClaw phone'
@@ -419,45 +575,42 @@ function PairingDialog({ api }) {
   } else if (ceremony?.phase === 'outcome') {
     title = ceremony.outcomeState === 'completed' ? 'Phone paired' : 'Pairing stopped'
     body = jsx('p', { children: ceremony.message || (ceremony.outcomeState === 'completed' ? 'The phone connected back and the managed gateway confirmed it.' : 'Nothing was approved. You can retry this setup checkpoint.') })
-  } else if (opened) {
-    // The card can open the presenter, but it cannot mint a ceremony: pairing
-    // authority stays with the setup tool, which the operator drives from a
-    // Hermes chat. So the opened-but-idle presenter names that one step and
-    // then waits — the claim poll above is already running, so the ceremony
-    // takes over this dialog the moment the setup tool reaches its pairing
-    // checkpoint, with nothing further for the operator to click here.
-    title = 'Pair your glasses'
-    body = jsxs('div', { style: { display: 'grid', gap: 12 }, children: [
-      jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 10 }, children: [
-        jsx(GlyphSpinner, {}),
-        jsx('span', { children: 'Waiting for the pairing checkpoint…' }),
-      ] }),
-      jsx('p', { children: 'Run /ocuclaw-setup in a Hermes chat. This window takes over as soon as it reaches pairing — keep it open.' }),
-      jsx('p', { style: { color: 'var(--ui-text-tertiary)' }, children: 'Your phone and G2 are paired there; nothing is entered on this screen.' }),
-    ] })
   }
 
+  // No idle state exists any more. The window has exactly one reason to be on
+  // screen — a live ceremony — so it can never be the thing that tells the
+  // operator to keep it open (#1989 item 2).
+  const open = Boolean(ceremony) && opened
   return jsx(Dialog, {
-    open: Boolean(ceremony) || opened,
-    onOpenChange: open => { if (!open) close() },
-    children: ceremony || opened ? jsxs(DialogContent, {
-      showCloseButton: !ceremony || ceremony.phase === 'outcome',
+    open,
+    // A terminal outcome is done with; anything else is only hidden.
+    onOpenChange: next => { if (!next) (ceremony.phase === 'outcome' ? clearCeremony : hide)() },
+    children: open ? jsxs(DialogContent, {
+      showCloseButton: ceremony.phase === 'qr' || ceremony.phase === 'outcome',
       fitContent: true,
       style: { width: 'min(92vw, 560px)' },
-      onEscapeKeyDown: event => { if (busy) event.preventDefault() },
+      // #1989 item 1. Radix's DismissableLayer closes a Dialog on any
+      // pointer-down or focus landing outside it, so clicking back into the
+      // chat — or letting the OS move focus — took the pairing window down
+      // while its own copy asked the operator to keep it open. Both are
+      // prevented: this window is dismissed by its own controls or not at all.
+      onPointerDownOutside: event => event.preventDefault(),
+      onFocusOutside: event => event.preventDefault(),
+      onInteractOutside: event => event.preventDefault(),
+      onEscapeKeyDown: event => { if (busy || ceremony.phase === 'words') event.preventDefault() },
       children: [
         jsx(DialogHeader, { children: jsx(DialogTitle, { children: title }) }),
         body,
-        ceremony?.phase === 'qr' ? jsxs(DialogFooter, { children: [
-          jsx(Button, { variant: 'outline', onClick: () => void command('cancel'), children: 'Cancel' }),
-          jsx(Button, { variant: 'secondary', onClick: () => setView(current => current === 'qr' ? 'manual' : 'qr'), children: view === 'qr' ? 'Enter manually' : 'Show QR' }),
+        ceremony.phase === 'qr' ? jsxs(DialogFooter, { children: [
+          jsx(Button, { variant: 'outline', onClick: () => void command('cancel'), children: 'Stop pairing' }),
+          jsx(Button, { variant: 'outline', onClick: hide, children: 'Hide' }),
+          jsx(Button, { variant: 'secondary', onClick: () => viewStore.set(current => current === 'qr' ? 'manual' : 'qr'), children: view === 'qr' ? 'Enter manually' : 'Show QR' }),
         ] }) : null,
-        ceremony?.phase === 'words' ? jsxs(DialogFooter, { children: [
+        ceremony.phase === 'words' ? jsxs(DialogFooter, { children: [
           jsx(Button, { variant: 'outline', onClick: () => void command('deny'), children: 'No — refuse this phone' }),
           jsx(Button, { onClick: () => void command('approve'), children: 'Yes — all four words match' }),
         ] }) : null,
-        ceremony?.phase === 'outcome' ? jsx(DialogFooter, { children: jsx(Button, { onClick: close, children: 'Done' }) }) : null,
-        !ceremony && opened ? jsx(DialogFooter, { children: jsx(Button, { variant: 'outline', onClick: close, children: 'Close' }) }) : null,
+        ceremony.phase === 'outcome' ? jsx(DialogFooter, { children: jsx(Button, { onClick: clearCeremony, children: 'Done' }) }) : null,
       ],
     }) : null,
   })
@@ -482,10 +635,34 @@ const Dot = ({ color }) => jsx('span', {
 // arbitrary-React chrome slot. The status bar was the obvious home and is the
 // wrong one: it ships OFF by default and is unmounted while off, so the users
 // who most need this card are exactly the ones who would never see it.
+// Is the agent mid-turn in the setup chat? The atom is subscribed by hand
+// rather than through the SDK's `useValue` so an older host that never grew
+// `state.busyBySession` degrades to "not busy" instead of throwing in a hook.
+const useSessionBusy = sessionId => {
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    setBusy(false)
+    const atom = sdk.host && sdk.host.state && sdk.host.state.busyBySession
+    if (!sessionId || !atom || typeof atom.subscribe !== 'function') return undefined
+    let unsubscribe = null
+    try {
+      unsubscribe = atom.subscribe(value => setBusy(Boolean(value && value[sessionId])))
+    } catch {
+      return undefined
+    }
+    return () => { try { unsubscribe() } catch {} }
+  }, [sessionId])
+  return busy
+}
+
 function SetupCard({ ctx, api }) {
   const [retired, setRetired] = useState(() => readFlag(ctx, CARD_RETIRED_KEY))
   const [phase, setPhase] = useState('unknown')
   const restartedAtRef = useRef(0)
+  const setupRun = setupRunStore.use()
+  const ceremony = ceremonyStore.use()
+  const presenterOpen = presenterStore.use()
+  const agentBusy = useSessionBusy(setupRun.status === 'running' ? setupRun.sessionId : '')
 
   useEffect(() => {
     if (retired) return undefined
@@ -536,9 +713,13 @@ function SetupCard({ ctx, api }) {
         if (disposed) return
 
         if (paired) {
+          // Written NOW, not when the hold expires: the flag is what keeps a
+          // paired host from ever flashing this card again, and the hold is
+          // only the green confirmation the operator earned (#1989 item 4).
           writeFlag(ctx, CARD_RETIRED_KEY)
-          openPresenter(false)
-          setRetired(true)
+          rememberSetupRun(IDLE_SETUP_RUN)
+          setPhase('paired')
+          timer = window.setTimeout(() => { if (!disposed) setRetired(true) }, CARD_PAIRED_HOLD_MS)
           return
         }
         setPhase('ready')
@@ -601,10 +782,35 @@ function SetupCard({ ctx, api }) {
     dot = '#ff8798'
     label = 'Gateway did not come back'
     action = jsx(Button, { size: 'xs', variant: 'outline', onClick: restart, children: 'Try again' })
-  } else if (phase === 'ready') {
+  } else if (phase === 'paired') {
     dot = '#4dd58a'
-    label = 'OcuClaw ready'
-    action = jsx(Button, { size: 'xs', onClick: () => openPresenter(true), children: 'Pair your glasses' })
+    label = 'Glasses paired'
+  } else if (phase === 'ready') {
+    // #1989 item 4: one live ladder, read off the same checkpoint the
+    // presenter watches. Ordered by how far the journey has actually got, so
+    // the most advanced true statement wins.
+    dot = '#4dd58a'
+    if (ceremony && ceremony.phase !== 'outcome') {
+      label = ceremony.phase === 'words' ? 'Confirm the four words' : 'Waiting for the phone to scan'
+      action = presenterOpen
+        ? jsx(GlyphSpinner, {})
+        : jsx(Button, { size: 'xs', onClick: () => presenterStore.set(true), children: 'Show QR' })
+    } else if (setupRun.status === 'dispatching') {
+      label = 'Starting setup…'
+      action = jsx(GlyphSpinner, {})
+    } else if (setupRun.status === 'running') {
+      // The card never claims a step it cannot see. Busy vs idle in the setup
+      // chat is the honest resolution the host actually exposes.
+      label = agentBusy ? 'Setup running…' : 'Waiting for setup…'
+      action = jsx(Button, { size: 'xs', variant: 'outline', onClick: openSetupChat, children: 'Open setup chat' })
+    } else if (setupRun.status === 'failed') {
+      dot = '#ffb454'
+      label = 'Setup did not start'
+      action = jsx(Button, { size: 'xs', variant: 'outline', onClick: () => void dispatchSetup(), children: 'Try again' })
+    } else {
+      label = 'OcuClaw ready'
+      action = jsx(Button, { size: 'xs', onClick: () => void dispatchSetup(), children: 'Pair your glasses' })
+    }
   }
 
   return jsxs('div', {
@@ -635,10 +841,20 @@ export default {
   name: 'OcuClaw',
   register(ctx) {
     const api = (path, options) => ctx.rest(path, options)
+    hydrateSetupRun(ctx)
+    // The presenter used to ride `statusBar.right`, and that was a latent
+    // dead end: upstream unmounts the whole status bar — not just hides it —
+    // while it is toggled off (contrib/controller.tsx: `{statusbarVisible &&
+    // <WiredPane part="statusbar" />}`), and it ships off. On such a host the
+    // presenter never mounted, so the pairing claim never ran and the card's
+    // button had nothing to open. Since #1989 the presenter must poll on its
+    // own and summon itself, so it moves to the same always-mounted titlebar
+    // slot as the card. It renders no inline chrome — a portalled Dialog and
+    // nothing else — so it costs the titlebar no width.
     ctx.register({
       id: 'pairing-presenter',
-      area: 'statusBar.right',
-      order: 109,
+      area: TITLEBAR_AREAS.right,
+      order: 39,
       render: () => jsx(PairingDialog, { api }),
     })
     ctx.register({

@@ -1,5 +1,5 @@
 const { sanitizeWakeToken } = require("./glasses-ui-wake.cjs");
-const { normalizeGlassesSessionKey } = require("./glasses-ui-surfaces.cjs");
+const { RENDER_FAILURE_CODES, normalizeGlassesSessionKey } = require("./glasses-ui-surfaces.cjs");
 
 const DEFAULT_FEEDBACK_TTL_MS = 10 * 60_000;
 
@@ -10,7 +10,12 @@ const FEEDBACK_PENDING_CAP_PER_SESSION = 16;
 const FEEDBACK_QUALIFYING_CLASSES = Object.freeze([
   "render_rejected",
   "receipt_rejected",
+  "render_error",
 ]);
+
+const FEEDBACK_RENDER_ERROR_CODES = Object.freeze([...RENDER_FAILURE_CODES]);
+
+const FEEDBACK_RENDER_ERROR_CAP_PER_SURFACE = 3;
 
 const FEEDBACK_EXCLUDED_CLASSES = Object.freeze({
   input_unattributed: "not_visible_to_plugin",
@@ -33,6 +38,7 @@ const FEEDBACK_RECEIPT_REASONS = Object.freeze([
 
 const CLASS_ENUM = new Set(FEEDBACK_QUALIFYING_CLASSES);
 const RECEIPT_REASON_ENUM = new Set(FEEDBACK_RECEIPT_REASONS);
+const RENDER_ERROR_CODE_ENUM = new Set(FEEDBACK_RENDER_ERROR_CODES);
 const DELIVERED_KEY_CAP = 128;
 
 const CODE_PATTERN = /^[a-z][a-z0-9_]{0,47}$/;
@@ -163,6 +169,10 @@ function createGlassesFeedbackLedger(deps = {}) {
 
       if (!RECEIPT_REASON_ENUM.has(input && input.code)) return false;
       code = input.code;
+    } else if (cls === "render_error") {
+
+      if (!RENDER_ERROR_CODE_ENUM.has(input && input.code)) return false;
+      code = input.code;
     } else {
       code = sanitizeCode(input && input.code);
     }
@@ -175,7 +185,17 @@ function createGlassesFeedbackLedger(deps = {}) {
 
     if (cls === "receipt_rejected" && surfaceUuid === "none") return false;
 
+    if (cls === "render_error" && surfaceUuid === "none") return false;
+
     const nowMs = now();
+
+    if (cls === "render_error") {
+      const pending = pendingBySession.get(sessionKey) || [];
+      const alreadyPending = pending.filter(
+        (e) => e.class === "render_error" && e.surfaceUuid === surfaceUuid,
+      ).length;
+      if (alreadyPending >= FEEDBACK_RENDER_ERROR_CAP_PER_SURFACE) return false;
+    }
     seq += 1;
     const entry = {
       sessionKey,
@@ -296,4 +316,4 @@ function createGlassesFeedbackLedger(deps = {}) {
   return { record, buildInjection, previewInjection, ackInjection, pendingSessionCount };
 }
 
-module.exports = { createGlassesFeedbackLedger, DEFAULT_FEEDBACK_TTL_MS, FEEDBACK_MAX_ENTRIES_PER_INJECTION, FEEDBACK_PENDING_CAP_PER_SESSION, FEEDBACK_FRAGMENT_MAX_CHARS, FEEDBACK_FRAGMENT_MIN_CHARS, FEEDBACK_QUALIFYING_CLASSES, FEEDBACK_EXCLUDED_CLASSES, FEEDBACK_RECEIPT_REASONS };
+module.exports = { createGlassesFeedbackLedger, DEFAULT_FEEDBACK_TTL_MS, FEEDBACK_MAX_ENTRIES_PER_INJECTION, FEEDBACK_PENDING_CAP_PER_SESSION, FEEDBACK_FRAGMENT_MAX_CHARS, FEEDBACK_FRAGMENT_MIN_CHARS, FEEDBACK_QUALIFYING_CLASSES, FEEDBACK_EXCLUDED_CLASSES, FEEDBACK_RECEIPT_REASONS, FEEDBACK_RENDER_ERROR_CODES, FEEDBACK_RENDER_ERROR_CAP_PER_SURFACE };

@@ -650,6 +650,14 @@ function createRelay(opts) {
     );
   }
 
+  function isForcedLiveuiFailureEvent(payload) {
+    return !!(
+      payload &&
+      (payload.event === "liveui_render_failed" ||
+        payload.event === "liveui_render_unparsed")
+    );
+  }
+
   function simulateStreamRunKey(sessionKey, runId) {
     return JSON.stringify([sessionKey, runId]);
   }
@@ -2781,6 +2789,46 @@ function createRelay(opts) {
         });
       } catch (err) {
         logger.warn(`[relay] surface_render_receipt handler threw: ${err.message}`);
+      }
+    }
+  }
+
+  const glassesUiClientFailureHandlers = new Set();
+
+  function onGlassesUiClientFailure(handler) {
+    if (typeof handler !== "function") return () => {};
+    glassesUiClientFailureHandlers.add(handler);
+    return () => glassesUiClientFailureHandlers.delete(handler);
+  }
+
+  function dispatchGlassesUiClientFailure(clientId, data) {
+    if (!data || typeof data !== "object") return;
+
+    emitDebug(
+      "glasses.lifecycle",
+      "client_failure_recv",
+      "debug",
+      {},
+      () => ({
+        clientId: typeof clientId === "string" ? clientId : null,
+        surfaceId: data.surfaceId,
+        seq: data.seq,
+        code: data.code,
+        handlerCount: glassesUiClientFailureHandlers.size,
+      }),
+    );
+    for (const handler of glassesUiClientFailureHandlers) {
+      try {
+        handler({
+          clientId: typeof clientId === "string" ? clientId : null,
+          surfaceId: typeof data.surfaceId === "string" ? data.surfaceId : "",
+
+          seq: Number.isFinite(data.seq) ? Math.floor(data.seq) : null,
+          code: typeof data.code === "string" ? data.code : "",
+          sdkCode: Number.isFinite(data.sdkCode) ? data.sdkCode : null,
+        });
+      } catch (err) {
+        logger.warn(`[relay] liveui client-failure handler threw: ${err.message}`);
       }
     }
   }
@@ -5107,7 +5155,8 @@ function createRelay(opts) {
     onEventDebug(clientId, payload) {
       if (!payload || typeof payload !== "object") return;
       const cat = payload.cat;
-      const forceStore = isForcedReadinessProofEvent(payload);
+      const forceStore =
+        isForcedReadinessProofEvent(payload) || isForcedLiveuiFailureEvent(payload);
       if (!forceStore && !debugStore.isEnabled(cat)) return;
       emitDebug(
         cat,
@@ -5124,6 +5173,10 @@ function createRelay(opts) {
         }),
         { force: forceStore },
       );
+
+      if (isForcedLiveuiFailureEvent(payload)) {
+        dispatchGlassesUiClientFailure(clientId, payload.data || {});
+      }
     },
 
     onApprovalResolve(id, decision, meta = { reason: undefined }) {
@@ -7154,6 +7207,10 @@ function createRelay(opts) {
       return onGlassesUiRenderReceipt(handler);
     },
 
+    onGlassesUiClientFailure(handler) {
+      return onGlassesUiClientFailure(handler);
+    },
+
     sendDeviceInfoRequest(params) {
       sendDeviceInfoRequest(params);
     },
@@ -7205,6 +7262,25 @@ function createRelay(opts) {
 
     isGlassesSendBufferOverHighWater() {
       return glassesBackpressureLatch.isOverHighWater();
+    },
+
+    hasConnectedAppClientCapability(capability) {
+
+      if (typeof capability !== "string" || !capability) return false;
+      try {
+        const snap =
+          server && typeof server.getReadinessSnapshot === "function"
+            ? server.getReadinessSnapshot()
+            : null;
+        const clients = snap && Array.isArray(snap.clients) ? snap.clients : [];
+        return clients.some(
+          (entry) =>
+            Array.isArray(entry && entry.clientCapabilities) &&
+            entry.clientCapabilities.includes(capability),
+        );
+      } catch {
+        return false;
+      }
     },
 
     onAppClientDisconnect(handler) {

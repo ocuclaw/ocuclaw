@@ -1,6 +1,6 @@
 # OcuClaw Hermes wrap-up and feedback
 
-**Guide version:** 2026-08-30 (1.3.17-hermes)
+**Guide version:** 2026-08-31 (1.3.18-hermes)
 
 Use this `ocuclaw_setup` response only at a genuine finish: fresh install,
 update, or standalone fix completed. Never after an unresolved failure or
@@ -66,7 +66,7 @@ confusing or surprising? After the user answers, render this block exactly
 once. Use only evidence already recorded; never run new probes at wrap.
 
 ```text
-OcuClaw setup assistant feedback — guide 2026-08-30 (1.3.17-hermes)
+OcuClaw setup assistant feedback — guide 2026-08-31 (1.3.18-hermes)
 Platform: <OS only>
 Hermes version: <version or unknown>
 OcuClaw bundle version: <version or unknown>

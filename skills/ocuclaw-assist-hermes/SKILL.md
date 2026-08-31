@@ -7,7 +7,7 @@ metadata: {"hermes": {"emoji": "glasses"}}
 
 # OcuClaw Setup Assistant for Hermes
 
-**Guide version:** 2026-08-30 (1.3.17-hermes)
+**Guide version:** 2026-08-31 (1.3.18-hermes)
 
 **Provenance:** deliberately forked from the OcuClaw Setup Assistant guide
 1.0.41 at commit `fffbb2154`. That is the source guide version, not an
@@ -48,7 +48,7 @@ checklist, probes, or step content.
 Shape it like this:
 
 > I'll walk you through setting up OcuClaw. The OcuClaw Setup Assistant,
-> guide version 2026-08-30 (1.3.17-hermes), is loaded to guide it. I'll do most
+> guide version 2026-08-31 (1.3.18-hermes), is loaded to guide it. I'll do most
 > of the checks and setup; you'll run a few commands yourself so optional
 > service credentials never pass through me. Hermes may briefly restart — if I
 > go quiet, say "continue OcuClaw setup." One question before we start: are

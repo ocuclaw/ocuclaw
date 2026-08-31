@@ -45,6 +45,14 @@ const RECEIPT_REJECTION_REASONS = Object.freeze([
   "stale_seq",
 ]);
 
+const RENDER_FAILURE_CODES = Object.freeze([
+  "paint_failed",
+  "unsupported_kind",
+  "spec_unparseable",
+]);
+
+const MAX_TRACKED_CLIENT_FAILURES = 4;
+
 const MAX_TRACKED_SEND_ATTEMPTS = 32;
 
 const GLASS_EVENT_ORIGINS = ["gesture", "schedule", "threshold", "system"];
@@ -957,6 +965,68 @@ function createSurfaceStore(deps = {}) {
     return { ok: true, surfaceUuid: entry.uuid, seq, atMs, superseded };
   }
 
+  function recordClientFailureEvidence(surfaceId, report) {
+    const entry = bySurface.get(surfaceId);
+    if (!entry) return { ok: false, reason: "unknown_surface" };
+    const latestAttempt = entry.lastAttemptedSend;
+    if (!latestAttempt) {
+      return { ok: false, reason: "no_send_attempt", surfaceUuid: entry.uuid };
+    }
+    const code = report && typeof report.code === "string" ? report.code : "";
+    if (!RENDER_FAILURE_CODES.includes(code)) {
+      return { ok: false, reason: "invalid_code", surfaceUuid: entry.uuid };
+    }
+    const seq =
+      report && Number.isFinite(report.seq) ? Math.floor(report.seq) : null;
+    const attempt = seq === null ? null : entry.sendAttempts.get(seq);
+    if (!attempt) {
+      return {
+        ok: false,
+        reason: "stale_seq",
+        surfaceUuid: entry.uuid,
+        expectedSeq: latestAttempt.seq,
+        seq,
+      };
+    }
+    const clientId =
+      report && typeof report.clientId === "string" && report.clientId
+        ? report.clientId
+        : "unknown";
+    const atMs = now();
+    if (!entry.clientFailures) {
+      entry.clientFailures = { total: 0, byClient: new Map(), recent: [] };
+    }
+    const failures = entry.clientFailures;
+    failures.total += 1;
+    const perClient = failures.byClient.get(clientId) || { count: 0 };
+    perClient.count += 1;
+    perClient.lastCode = code;
+    perClient.lastSeq = seq;
+    perClient.lastAtMs = atMs;
+    failures.byClient.set(clientId, perClient);
+    failures.recent.push({ clientId, seq, code, atMs });
+    if (failures.recent.length > MAX_TRACKED_CLIENT_FAILURES) {
+      failures.recent.splice(0, failures.recent.length - MAX_TRACKED_CLIENT_FAILURES);
+    }
+    return { ok: true, surfaceUuid: entry.uuid, seq, code, clientId, total: failures.total };
+  }
+
+  function clientFailuresOf(surfaceId) {
+    const entry = bySurface.get(surfaceId);
+    if (!entry || !entry.clientFailures) return null;
+    const failures = entry.clientFailures;
+    return {
+      total: failures.total,
+      clients: Array.from(failures.byClient.entries()).map(([clientId, info]) => ({
+        clientId,
+        count: info.count,
+        lastCode: info.lastCode,
+        lastSeq: info.lastSeq === undefined ? null : info.lastSeq,
+        lastAtMs: info.lastAtMs === undefined ? null : info.lastAtMs,
+      })),
+    };
+  }
+
   function hasClientReceipt(surfaceUuid, seq) {
     for (const entry of bySurface.values()) {
       if (entry.uuid !== surfaceUuid) continue;
@@ -986,6 +1056,7 @@ function createSurfaceStore(deps = {}) {
     uuidOf, titleOf, markerFor, clearAwaitingResponse, breadcrumbFor, surfaceFactsFor,
     peekEvents, reduceForDelivery, peekDeadLetter, deadLetterEventCount, drainDeadLetter,
     recordSendAttempt, recordClientReceipt, hasClientReceipt, deliveryEvidenceOf,
+    recordClientFailureEvidence, clientFailuresOf,
     recordContent, recordSpec, currentSurfaceSpecForSession,
     _bySurface: bySurface,
   };
@@ -993,4 +1064,4 @@ function createSurfaceStore(deps = {}) {
 
 const createPendingRenderMap = createSurfaceStore;
 
-module.exports = { createPendingRenderMap, createSurfaceStore, isTerminalOutcome, isSettlementOutcome, GLASS_EVENT_ORIGINS, normalizeGlassesSessionKey, SETTLEMENT_OUTCOME_RESULTS, TERMINAL_OUTCOME_RESULTS, SURFACE_REAP_REASONS, SURFACE_EVICTION_REASONS, DEAD_LETTER_REASONS, RECEIPT_REJECTION_REASONS };
+module.exports = { createPendingRenderMap, createSurfaceStore, isTerminalOutcome, isSettlementOutcome, GLASS_EVENT_ORIGINS, normalizeGlassesSessionKey, SETTLEMENT_OUTCOME_RESULTS, TERMINAL_OUTCOME_RESULTS, SURFACE_REAP_REASONS, SURFACE_EVICTION_REASONS, DEAD_LETTER_REASONS, RECEIPT_REJECTION_REASONS, RENDER_FAILURE_CODES };

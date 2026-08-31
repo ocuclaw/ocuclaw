@@ -1131,6 +1131,49 @@ function createGlassesUiToolHandler(deps) {
     });
   }
 
+  if (typeof deps.relay.onGlassesUiClientFailure === "function") {
+    deps.relay.onGlassesUiClientFailure((msg) => {
+      if (!msg || typeof msg.surfaceId !== "string" || !msg.surfaceId) return;
+      const result = surfaceStore.recordClientFailureEvidence(msg.surfaceId, {
+        seq: msg.seq,
+        code: msg.code,
+        clientId: msg.clientId,
+      });
+      if (!result.ok) {
+
+        emitLifecycle("render_failure_rejected", "debug", {
+          surfaceId: msg.surfaceId,
+          sessionKey: surfaceStore.sessionForSurface(msg.surfaceId),
+          reason: result.reason,
+          clientId: typeof msg.clientId === "string" ? msg.clientId : null,
+          seq: Number.isFinite(msg.seq) ? Math.floor(msg.seq) : null,
+          expectedSeq: result.expectedSeq === undefined ? null : result.expectedSeq,
+        });
+        return;
+      }
+      const delivery = surfaceStore.deliveryEvidenceOf(msg.surfaceId);
+      const state = delivery ? deliveryLadderState(delivery.evidence) : null;
+      emitLifecycle("render_failure_evidence", "debug", {
+        surfaceId: msg.surfaceId,
+        sessionKey: surfaceStore.sessionForSurface(msg.surfaceId),
+        surfaceUuid: result.surfaceUuid,
+        clientId: result.clientId,
+        code: result.code,
+        seq: result.seq,
+
+        rung: state ? state.rung : null,
+      });
+
+      feedbackLedger.record({
+        sessionKey: surfaceStore.sessionForSurface(msg.surfaceId),
+        class: "render_error",
+        code: result.code,
+        surfaceUuid: result.surfaceUuid,
+        seq: result.seq,
+      });
+    });
+  }
+
   deps.relay.onGlassesUiResult((msg) => {
     if (!msg || typeof msg.surfaceId !== "string" || !msg.outcome) return;
 
@@ -2391,6 +2434,10 @@ function createGlassesUiToolHandler(deps) {
       });
 
       const deadLetterCount = surfaceStore.deadLetterEventCount(sessionKey);
+
+      const errorChannelAvailable = hostCapabilities.clientCapabilityRead
+        ? safeBool(() => port.relay.hasClientCapability("liveui-failure-events"))
+        : null;
       const stage = surfaceStore.stageState(sessionKey, {
         graceMs: readStageConfig().stageGraceMs,
       });
@@ -2412,6 +2459,8 @@ function createGlassesUiToolHandler(deps) {
             stage,
 
             deadLetterCount,
+
+            errorChannelAvailable,
           }),
         );
       }
@@ -2457,6 +2506,9 @@ function createGlassesUiToolHandler(deps) {
         cron,
         delivery: projectDelivery(deliveryState, receiptPresent),
         deliveryEvidence: deliveryState ? deliveryState.evidence : null,
+
+        clientFailures: surfaceStore.clientFailuresOf(topSurfaceId),
+        errorChannelAvailable,
         renderContext,
         readingProfile: deriveReadingProfile(facts.kind, null),
         hostCapabilities,
@@ -2670,6 +2722,7 @@ function registerGlassesUiTool(api, service, opts = {}) {
 
   let capturedOnGlassesUiResult = null;
   let capturedOnGlassesUiRenderReceipt = null;
+  let capturedOnGlassesUiClientFailure = null;
   let capturedOnGlassesPresenceChanged = null;
   const handler = createsHandler ? createGlassesUiToolHandler({
     relay: {
@@ -2686,6 +2739,18 @@ function registerGlassesUiTool(api, service, opts = {}) {
               capturedOnGlassesUiRenderReceipt = cb;
               return service.onGlassesUiRenderReceipt(cb);
             }
+          : undefined,
+
+      onGlassesUiClientFailure:
+        typeof service.onGlassesUiClientFailure === "function"
+          ? (cb) => {
+              capturedOnGlassesUiClientFailure = cb;
+              return service.onGlassesUiClientFailure(cb);
+            }
+          : undefined,
+      hasClientCapability:
+        typeof service.hasConnectedAppClientCapability === "function"
+          ? (capability) => service.hasConnectedAppClientCapability(capability)
           : undefined,
       onGlassesPresenceChanged:
         typeof service.onGlassesPresenceChanged === "function"
@@ -2840,6 +2905,7 @@ function registerGlassesUiTool(api, service, opts = {}) {
       relayCallbacks: {
         onGlassesUiResult: capturedOnGlassesUiResult,
         onGlassesUiRenderReceipt: capturedOnGlassesUiRenderReceipt,
+        onGlassesUiClientFailure: capturedOnGlassesUiClientFailure,
         onGlassesPresenceChanged: capturedOnGlassesPresenceChanged,
         onAppClientDisconnect: onDisconnect,
         onLogicalSessionReset,
@@ -2864,6 +2930,9 @@ function registerGlassesUiTool(api, service, opts = {}) {
     }
     if (callbacks.onGlassesUiRenderReceipt && typeof service.onGlassesUiRenderReceipt === "function") {
       service.onGlassesUiRenderReceipt(callbacks.onGlassesUiRenderReceipt);
+    }
+    if (callbacks.onGlassesUiClientFailure && typeof service.onGlassesUiClientFailure === "function") {
+      service.onGlassesUiClientFailure(callbacks.onGlassesUiClientFailure);
     }
     if (callbacks.onGlassesPresenceChanged && typeof service.onGlassesPresenceChanged === "function") {
       service.onGlassesPresenceChanged(callbacks.onGlassesPresenceChanged);

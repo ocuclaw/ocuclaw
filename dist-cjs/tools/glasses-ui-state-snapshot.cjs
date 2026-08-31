@@ -1,8 +1,8 @@
 const { DELIVERY_RUNG_PHRASING, DELIVERY_RUNGS, assertHonestFieldName } = require("./glasses-ui-delivery-ladder.cjs");
 const { MACHINE_PROJECTION_LIST_CAP, allowlistWireKind, capCodeList, resolveLayoutBudgets } = require("./glasses-ui-plan-lint.cjs");
 
-const UI_STATE_SCHEMA_ID = "glasses-ui/state-snapshot@6";
-const UI_STATE_SCHEMA_VERSION = 6;
+const UI_STATE_SCHEMA_ID = "glasses-ui/state-snapshot@7";
+const UI_STATE_SCHEMA_VERSION = 7;
 
 const UI_STATE_RESULT = "ui_state";
 
@@ -56,6 +56,10 @@ const LIVEUI_HOST_CAPABILITY_HOOKS = Object.freeze([
   Object.freeze({ capability: "wakeDispatch", hook: "dispatchWake" }),
   Object.freeze({ capability: "agentTurnBusy", hook: "isAgentTurnBusy" }),
   Object.freeze({ capability: "companionSnapshot", hook: "publishCompanionSnapshot" }),
+
+  Object.freeze({ capability: "clientFailureChannel", hook: "relay.onGlassesUiClientFailure" }),
+
+  Object.freeze({ capability: "clientCapabilityRead", hook: "relay.hasClientCapability" }),
 ]);
 
 function readHookPath(port, path) {
@@ -92,6 +96,9 @@ const UI_STATE_MODEL_FIELDS = Object.freeze([
   "deadLetterCount",
   "cron",
   "delivery",
+
+  "clientFailures",
+  "errorChannelAvailable",
   "renderContext",
   "readingProfile",
   "hostCapabilities",
@@ -115,6 +122,8 @@ const UI_STATE_MACHINE_FIELDS = Object.freeze([
   "deadLetterCount",
   "cron",
   "delivery",
+  "clientFailures",
+  "errorChannelAvailable",
   "renderContext",
   "readingProfile",
   "hostCapabilities",
@@ -141,6 +150,8 @@ const UI_STATE_DEV_FIELDS = Object.freeze([
   "cron",
   "delivery",
   "deliveryEvidence",
+  "clientFailures",
+  "errorChannelAvailable",
   "renderContext",
   "readingProfile",
   "hostCapabilities",
@@ -349,6 +360,10 @@ function projectUiStateChannels(facts) {
     cron: f.cron || null,
     delivery: f.delivery || null,
     deliveryEvidence: f.deliveryEvidence || null,
+    clientFailures: f.clientFailures || null,
+
+    errorChannelAvailable:
+      f.errorChannelAvailable === undefined ? null : f.errorChannelAvailable,
     renderContext: f.renderContext || null,
     readingProfile: f.readingProfile || null,
     hostCapabilities: f.hostCapabilities || null,
@@ -514,6 +529,9 @@ function emptyUiStateFacts(sessionKey, extra) {
     cron: { active: false, paused: false, ticks: null, lastRender: null },
     delivery: projectDelivery(null, false),
     deliveryEvidence: null,
+    clientFailures: null,
+    errorChannelAvailable:
+      e.errorChannelAvailable === undefined ? null : e.errorChannelAvailable,
     renderContext: e.renderContext || deriveRenderContext(null),
     readingProfile: e.readingProfile || deriveReadingProfile(null, null),
     hostCapabilities: e.hostCapabilities || null,

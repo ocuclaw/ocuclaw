@@ -1,6 +1,6 @@
 # OcuClaw on Hermes — quick reference
 
-**Guide version:** 2026-08-30 (1.3.17-hermes)
+**Guide version:** 2026-08-31 (1.3.18-hermes)
 
 Use this as a lookup only. The loaded setup skill owns guardrails and
 checkpoints.

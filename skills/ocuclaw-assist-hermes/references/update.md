@@ -1,6 +1,6 @@
 # Updating OcuClaw on Hermes
 
-**Guide version:** 2026-08-30 (1.3.17-hermes)
+**Guide version:** 2026-08-31 (1.3.18-hermes)
 
 Use this for an installed, healthy OcuClaw on Hermes moving to a strictly
 higher published bundle version. It is version-neutral: it never names a
@@ -43,6 +43,12 @@ Then, in bare `hermes` or in Hermes Desktop:
 `hermes plugins install` prints that restart instruction and stops there — it
 never restarts the gateway for you. Until the gateway restarts, OcuClaw is
 installed but not loaded, and nothing about the glasses works yet.
+
+**Run `hermes` in a real terminal.** The TUI boots only when stdin *and*
+stdout are a TTY, so a piped or captured run — `hermes | tee log`, a CI
+capture, a headless spawner — silently falls back to the classic CLI: same
+prompt, no pairing panel, and `/ocuclaw-setup` with nowhere to pair. Forcing
+it with `--tui` there does not render either; it bails out instead.
 
 **Never install with `--ref`.** A ref-pinned install is recorded as
 `pinned: true`, and `hermes plugins update ocuclaw` then refuses to move it

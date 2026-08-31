@@ -321,6 +321,15 @@ function createHermesLiveUiBridge(opts = {}) {
         typeof relay.onGlassesUiRenderReceipt === "function"
           ? (cb) => relay.onGlassesUiRenderReceipt(cb)
           : undefined,
+
+      onGlassesUiClientFailure:
+        typeof relay.onGlassesUiClientFailure === "function"
+          ? (cb) => relay.onGlassesUiClientFailure(cb)
+          : undefined,
+      hasClientCapability:
+        typeof relay.hasConnectedAppClientCapability === "function"
+          ? (capability) => relay.hasConnectedAppClientCapability(capability)
+          : undefined,
       onGlassesPresenceChanged:
         typeof relay.onGlassesPresenceChanged === "function"
           ? (cb) => relay.onGlassesPresenceChanged(cb)

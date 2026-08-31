@@ -31,7 +31,7 @@ router = APIRouter()
 
 PLUGIN_NAME = "ocuclaw"
 PLATFORM_RECEIPT_EMPIRICAL_TTL_S = 300.0
-SETUP_GUIDE_VERSION = "2026-08-30 (1.3.17-hermes)"
+SETUP_GUIDE_VERSION = "2026-08-31 (1.3.18-hermes)"
 
 _LEG_ORDER = (
     ("hermesGateway", "Hermes gateway"),
