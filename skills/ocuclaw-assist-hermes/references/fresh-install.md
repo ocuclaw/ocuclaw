@@ -1,6 +1,6 @@
 # OcuClaw fresh install on Hermes — Steps 1–12 (plus Step 4b)
 
-**Guide version:** 2026-08-31 (1.3.18-hermes)
+**Guide version:** 2026-09-05 (1.3.19-hermes)
 
 Keep using the loaded setup skill for guardrails, the lane card, and the
 internal completion checklist.
@@ -24,6 +24,34 @@ in flight.
 
 ## Step 1 · Prerequisites
 
+On first setup, when no durable pairing/completion receipt or recorded G2
+answer exists, ask through `clarify`: "Do you already have Even Realities G2
+glasses?" Offer "Yes, I have G2 glasses" and "Not yet". Record the answer in
+the lane card; an interruption does not reset it.
+
+If not yet, explain that glasses are needed for pairing and the welcome proof,
+then offer: "Would you like me to open the Even website to check them out?"
+Use "Open the website" and "Not now". Declining is final: open nothing and
+leave setup incomplete, ready to resume when they have glasses. Do not turn
+this into a purchase requirement or claim hardware proof.
+
+After an explicit yes, open exactly `https://evenrealities.sjv.io/Even` once.
+On a confirmed local graphical host, use the available host Python interpreter
+with `-m webbrowser -n https://evenrealities.sjv.io/Even` through the terminal
+tool. This requests a new system-browser window outside Hermes. Verify the
+opener's result; an accepted request does not prove the page loaded, and the
+OS/browser may reuse a window. Do not install a browser, create a new profile,
+or change the default browser. If the backend is remote/headless, its location
+is uncertain, or opening fails, provide
+[View G2 glasses](https://evenrealities.sjv.io/Even) and say to Ctrl-click
+(Command-click on macOS) or middle-click in Hermes Desktop to open it in the
+system browser; an ordinary click opens Hermes' embedded browser on 0.21.0.
+Record opened, declined, or handoff without repeating the offer on resume.
+Pause pairing until the user has glasses; local configuration can continue
+only if they explicitly ask to prepare it in advance.
+
+For someone who has G2 glasses, continue with the existing readiness question:
+
 Ask: "Are your glasses paired in the Even Realities app, and can you open Even
 Hub on your phone?"
 
@@ -35,29 +63,21 @@ hermes --version
 
 When `{"operation":"status"}` reports a non-unknown `hermesVersion`, that
 receipt decides the gate: PASS when it is inside `supportedRange`; a version
-outside `>=0.20.0,<0.21.0` -> `HERMES-GATE-REFUSED`, regardless of the shell
+outside `>=0.21.0,<0.22.0` -> `HERMES-GATE-REFUSED`, regardless of the shell
 probe. Only when `hermesVersion` is `"unknown"` does the probe decide: Hermes
-0.20.x is PASS, and an earlier or later version -> `HERMES-GATE-REFUSED`.
+0.21.x is PASS, and an earlier or later version -> `HERMES-GATE-REFUSED`.
 `command not found` beside a supported `status.hermesVersion` is the
 trust-ladder case: Hermes is installed; continue, handing commands to the
 user's terminal. Only when the probe fails *and* `hermesVersion` is `"unknown"`
 is Hermes itself missing — installing Hermes is outside this skill; point to
 the official Hermes installation docs and return when the command works.
 
-Inspect the non-secret profile posture now, so multiplex cannot be silently
-skipped later:
+Before the gateway restart, follow [Agent choice](agent-mode.md): offer
+creation and switching as the recommended option, record the user's choice,
+and require `status.mandatoryConfiguration.agentModeChosen: true`. Do not
+silently default to single-agent mode or require an authorization bypass.
 
-```bash
-hermes config get gateway.multiplex_profiles
-hermes profile list
-```
-
-Record off, on-single, or on-multiple in the lane card. If on-multiple, enter
-`PROFILE-AUTHZ-DROP` before setup can finish. The gateway boot warning in Step
-5 is authoritative if a process environment override disagrees with the saved
-config reading.
-
-## Step 2 · Install from the public bundle
+## Step 2 · Install from the beta bundle
 
 Skip when `hermes plugins list` already shows an enabled or disabled `ocuclaw`
 plugin from the intended GitHub bundle. Do not overwrite an unexplained local
@@ -73,9 +93,21 @@ only when it is actually needed. Running the block wholesale would issue no-op
 commands and skip the checks. The terminal path is the one this skill drives;
 mention the Desktop deep link only to a user who asked for it.
 
+For someone already installing through Desktop, skip this terminal reference
+block. Continue with the applicable checks; do not change the terminal default
+or present it as an outstanding requirement in Desktop.
+
 <!-- ocuclaw:install-block:start -->
-OcuClaw needs Hermes `>=0.20.0,<0.21.0`; the certified baseline is Hermes
-`0.20.6`.
+OcuClaw needs Hermes `>=0.21.0,<0.22.0`; the certified baseline is Hermes
+`0.21.0`.
+
+**Private beta access.** `ocuclaw/ocuclaw` requires an invited GitHub account
+and Git HTTPS authentication on the installing machine (Desktop uses Git too).
+Verify access with `git ls-remote https://github.com/ocuclaw/ocuclaw.git HEAD`
+before installing. “Repository not found” or “could not read Username” means
+confirm your invitation with the beta contact and configure Git authentication
+locally; never paste an access token into setup chat. Repository visibility is
+not changed by this release. Even Hub beta access is a separate invitation.
 
 **Terminal first.** This is the supported path and the one every beta build is
 tested on:
@@ -115,18 +147,22 @@ hermes://plugin/install?repo=ocuclaw/ocuclaw
 ```
 
 installs the same bundle through the Desktop install modal, enabled by default.
-Desktop picks up the OcuClaw presenter immediately, but the agent half still
-only enters the gateway on the gateway's next start — so a Desktop install
-leaves two follow-ups, and the OcuClaw setup card in the Hermes Desktop title
-bar walks you through both:
+OcuClaw ships **one** Desktop UI, and the enabled plugin generates it, so the
+order is: install, then restart the gateway, and the OcuClaw UI appears in the
+Hermes Desktop title bar on the next Desktop launch or reload.
 
-1. The card explains the pending restart and offers **Restart gateway**. Click
-   it, or run `hermes gateway restart` in a terminal — either works. The card
-   reads the gateway's own reported platforms rather than its own web route, so
-   it advances only once the gateway has genuinely loaded OcuClaw.
-2. The card then reads **Pair your glasses**. Run `/ocuclaw-setup` and finish
-   pairing. The card retires on the durable pairing receipt and stays gone,
-   including across a Desktop relaunch.
+1. Restart the gateway — use the native **Restart gateway** button when the
+   OcuClaw card is visible, otherwise `hermes gateway restart` in a terminal. Until it
+   restarts, OcuClaw is installed but not loaded, and there is no OcuClaw
+   Desktop UI yet.
+2. The OcuClaw setup card then appears in the title bar reading
+   **Pair your glasses**. Run `/ocuclaw-setup` and finish pairing. The card
+   retires on the durable pairing receipt and stays gone, including across a
+   Desktop relaunch.
+
+Desktop leaves `display.interface` alone; the terminal-default command above
+applies only to terminal setup. Optional Soniox and Even AI credentials use
+private Desktop forms, with masked terminal prompts available in the TUI.
 
 **Update.** In `hermes plugins update ocuclaw`, `ocuclaw` is the **plugin id** —
 the `name:` field in `plugin.yaml` — and not the `ocuclaw/ocuclaw` repository
@@ -150,7 +186,7 @@ CHECKPOINT:
 hermes plugins install ocuclaw/ocuclaw --enable
 ```
 
-This clones the public OcuClaw Hermes beta bundle. There is no npm or ClawHub
+This clones the access-controlled OcuClaw Hermes beta bundle. There is no npm or ClawHub
 leg. Never add `--ref`, for the reason the block states.
 
 VERIFY:
@@ -183,41 +219,63 @@ credential-entry path.
 
 ## Step 4 · Configure the beta posture
 
+Enter here directly for `journey.nextCheckpoint: mandatory-configuration`.
+The read-only `status.mandatoryConfiguration.toolProgressOff` must be true
+before network setup. A healthy gateway does not prove this setting. On resume,
+re-read status and skip satisfied settings; preserve all earlier receipts.
+
+Also require `status.mandatoryConfiguration.agentModeChosen: true`. If missing,
+call `{"operation":"agent_mode"}` and complete that choice before proceeding.
+
+Also require `status.mandatoryConfiguration.adoptConfigured: true` — "Continue
+here": the glasses can pick up a chat started in Hermes Desktop, the CLI or the
+TUI and carry it on. It needs `platforms.ocuclaw.extra.allow_admin_from` to list
+the one user id the plugin sends, `ocuclaw-wearer`. Write it on fresh AND
+existing installs; never ask the user to understand slash-command gating.
+
 Include the plugin-enable command only if `hermes plugins list` shows OcuClaw
-disabled. Inspect the three non-secret settings first and include only lines
+disabled. Inspect the applicable non-secret settings first and include only lines
 whose desired value is not already present; do not create no-op user commands.
-Do not skip the Even Terminal check: the Hermes runtime default is off, while
-this beta's ratified posture is ON.
 
 CHECKPOINT:
 
 ```bash
-hermes config set platforms.ocuclaw.extra.evenTerminalEnabled true
 hermes config set display.platforms.ocuclaw.tool_progress off
-hermes config set display.interface tui
+hermes config set platforms.ocuclaw.extra.allow_admin_from '["ocuclaw-wearer"]'
 hermes plugins enable ocuclaw
 ```
 
+The `allow_admin_from` line turns Hermes's slash-command gating ON for the
+OcuClaw platform as a whole; that is safe because `ocuclaw-wearer` is the only
+user id the plugin ever stamps, so the wearer is the sole admin and nothing else
+can reach the gate. If the key already lists other ids, preserve them and append
+`ocuclaw-wearer`.
+
 The native install normally enables the plugin; the conditional command also
-recovers an older disabled install. The non-secret commands enable the product
-ET route and keep Hermes' conversational tool-progress bubbles out of the
-OcuClaw transcript. Hermes TUI and Desktop are the guided beta pairing
+recovers an older disabled install. The non-secret commands keep Hermes'
+conversational tool-progress bubbles out of the OcuClaw transcript. Hermes TUI
+and Desktop are the guided beta pairing
 surfaces: each presents the secure QR and four-word decision directly without
-routing either through the model. `display.interface=tui` keeps the supported
-terminal default; it does not replace or disable Desktop. Classic `hermes
---cli` hands the pairing checkpoint to one of those two surfaces. Configuration
+routing either through the model. For a terminal install only, inspect
+`hermes config get display.interface` and, if needed, run
+`hermes config set display.interface tui` to select the secure terminal pairing
+surface. For Desktop installs, leave the terminal default alone: it is not a
+completion requirement and must not appear as an unresolved setup check.
+Classic `hermes --cli` hands the pairing checkpoint to TUI or Desktop. Configuration
 changes require a gateway restart.
 
 VERIFY the non-secret gate without reading any secret:
 
 ```bash
-hermes config get platforms.ocuclaw.extra.evenTerminalEnabled
 hermes config get display.platforms.ocuclaw.tool_progress
-hermes config get display.interface
+hermes config get platforms.ocuclaw.extra.allow_admin_from
 ```
 
-Continue only when the ET setting reports `true`, the tool-progress setting
-reports `false`, and the interface reports `tui`. Hermes 0.20 stores the CLI
+The second read must list `ocuclaw-wearer`; re-read `ocuclaw_setup` status and
+require `mandatoryConfiguration.adoptConfigured: true`.
+
+Continue only when the tool-progress setting reports `false` (and, for a
+terminal install only, the interface reports `tui`). Hermes 0.21 stores the CLI
 value `off` as a boolean, so
 `false` is the correct readback. If the optional config-gated Hermes `/verbose`
 command changes OcuClaw's per-platform mode, restore `off` before continuing.
@@ -236,7 +294,7 @@ already have. It says exactly one of four things, and each has one response:
 - `offer` -> make the offer below.
 
 CHECKPOINT. Tell the user what it does and what it costs, in their own words:
-reasoning reaches the glasses as it is written rather than in whole pieces,
+reasoning streams as it is written to the glasses rather than arriving in whole pieces,
 and the key is Hermes' own and gateway-wide — it changes how Hermes calls the
 model for every surface on this gateway, not only OcuClaw. Then ask for a
 yes or a no. A no is a legitimate finished answer; record it and move on.
@@ -523,27 +581,56 @@ one hour; an `expired` or `failed` Attempt restarts with a fresh phone-origin
 turn and G2 confirmation. A later outage changes Current Connection Health but
 never erases a previously committed First-Run Proof or reopens completion.
 
-## Step 11 · Voice input via Soniox [OPTIONAL — recommended]
+## Step 11 · Optional voice and Even AI setup
 
-Offer this step and wait for a yes/skip before doing anything else:
+Ask about Soniox first, then resolve its setup or skip before asking about Even
+AI. Keep the questions and popups separate, even when the user wants both.
+Never offer a combined credential form or infer consent to one from the other.
 
-> Would you like to set up voice input? You will be able to speak to the agent
-> from the glasses. It needs a Soniox account and API key. Say yes to continue
-> or skip to move on.
+### Soniox voice setup
 
-If accepted, check only `sonioxApiKeyPresent` through
-`{"operation":"status"}`. When it is absent, mark this wizard as USER ACTION
-REQUIRED; the assistant must not execute it:
+CHECKPOINT. Ask:
+
+> Would you like to set up voice inside OcuClaw? Soniox lets you speak to your
+> agent using the glasses mic. It needs a Soniox account and API key.
+
+If they decline, record the skip and continue to the separate Even AI question.
+If they accept, check only `sonioxApiKeyPresent` through
+`{"operation":"status"}`. Keep an existing key; gather only a missing one.
+
+For a missing Soniox key, first guide the user to https://console.soniox.com/:
+sign up or sign in, open their project (new accounts start with **My First
+Project**), then **API Keys** and create a key. Have them keep it private and
+ready to paste into the masked prompt below, never into chat. If account or
+billing setup blocks key creation, stay at that step or let them skip Soniox;
+do not mark it configured. The API console is distinct from the Soniox
+transcription app. These steps follow https://soniox.com/docs/stt/get-started.
+
+Once the Soniox key is ready, **Desktop users stay in Desktop**.
+Call `{"operation":"request_credentials","integrations":["soniox"]}`.
+The **Private Soniox API key** popup opens automatically with just its key field.
+Have them paste there and choose **Save privately**.
+Blank configured fields preserve existing values. Cancellation is a valid skip;
+check `desktopCredentials.state` through status and never reopen after a cancel
+unless they ask. Only presence booleans return to the assistant, never values.
+They can reopen later from the command palette: **Set up OcuClaw voice with Soniox**.
+If the dialog is unavailable, explain that before offering the terminal fallback.
+
+For **terminal users**, mark this wizard USER ACTION REQUIRED and show one command:
 
 ```bash
 hermes gateway setup
 ```
 
-Have them select OcuClaw and use its masked optional prompt. Never solicit or
-display the value in the guided conversation. Continue only when a fresh
-status receipt reports the presence boolean as true.
+Have them select OcuClaw, enter
+the Soniox key in its masked optional prompt, and leave Even AI unchanged.
+Existing credentials should be kept, not replaced.
+Never solicit or display either value in the guided conversation. Never use
+`clarify` or a chat text box for secrets. Continue only when a fresh status
+receipt reports `sonioxApiKeyPresent: true`.
 
-Warn about the brief interruption, restart Hermes once, then verify the user
+Warn about the brief interruption and restart Hermes only if the key changed.
+Then verify the user
 can tap the microphone/listen control on the glasses, speak a short phrase,
 and see the transcription appear as their message:
 
@@ -551,32 +638,132 @@ and see the transcription appear as their message:
 hermes gateway restart
 ```
 
-Failure to activate voice or transcribe -> `ESCALATE`, recording Step 11 as
+Failure to activate voice or transcribe -> `ESCALATE`, recording Soniox as
 the failing lane. A skip is an intentional optional-step outcome, not a block.
 
-After Step 11 resolves, offer Even AI and wait for a separate yes/skip. If
-accepted, first check only `evenAiTokenPresent` through
-`{"operation":"status"}`. When it is absent, use the same USER ACTION REQUIRED
-`hermes gateway setup` wizard; the assistant must not execute it. Have them
-select OcuClaw and use its masked optional prompt. Never solicit or display the
-value. Continue only when a fresh status receipt reports the presence boolean
-as true.
+Do not offer either integration again after its choice has resolved. A direct
+minimal activation request from an installed and healthy host enters the same
+lane after the required read-only status check; it does not replay Steps 1–10.
 
-When the secret-presence boolean is already true, enable the non-secret route:
+### Even AI activation lane
+
+After Soniox is configured or skipped, ask this separate CHECKPOINT question:
+
+> Would you like to connect the Even Realities app's own Even AI feature to
+> your Hermes agent? This uses Agent Configuration in that app and a private token.
+
+If they decline, record the skip and continue to Step 12. If they accept, follow
+the checkpoints below. Do not reopen Soniox's popup during this journey.
+
+This is one ordered six-checkpoint journey. Keep it in the main Hermes
+conversation. A phone or G2 conversation redirects there and stops.
+
+#### Checkpoint 1 · Unlock Agent Configuration
+
+Have the user open https://hub.evenrealities.com/hub in a browser and log in
+with the SAME email address they use in the Even Realities phone app. This
+enables the beta **Agent Configuration** option in the app's **Even AI**
+settings. Then return to the Even Realities app, outside the OcuClaw app,
+open **Even AI**, tap the settings/sliders icon at the top right, and scroll
+down to **Agent configuration** (below Reading speed).
+
+Ask: "Can you see the Agent Configuration area in the Even AI settings of
+the Even Realities app?" Agent Configuration is an area, not a URL. The Hub
+website is only the login prerequisite, not the agent endpoint to paste later.
+If the user already enabled this option, skip the Hub login and confirm the
+area is visible; do not make them repeat activation. If absent, confirm the
+same-email login and reopen the Even Realities app before continuing.
+
+#### Checkpoint 2 · Store the private Even AI secret
+
+First check only `evenAiTokenPresent` through `{"operation":"status"}`. If it is
+false, explain that this Token is a shared private secret chosen by the user,
+not a key issued by the Hub website. Have them create a strong random secret in
+their password manager and keep it for Hermes and the phone's Token field.
+Never generate it in an assistant response or ask them to paste it into chat.
+In Desktop, call `{"operation":"request_credentials","integrations":["evenAi"]}`.
+The **Private Even AI token** popup contains only its token field. Have them
+choose **Save privately**. A cancel is a valid skip; do not reopen without a
+new request. The command palette entry **Set up OcuClaw Even AI** reopens it later.
+For terminal users, use the user-run masked wizard described above, enter only
+the Even AI token, and keep Soniox unchanged. The
+assistant must not execute the wizard. Never ask for, echo, display, log, or
+return the secret. Continue only after a fresh status receipt reports
+`evenAiTokenPresent: true`; that presence boolean is the entire receipt.
+
+#### Checkpoint 3 · Enable Even AI on Hermes
+
+Only after secret presence is verified, explain and request approval for the
+non-secret setting:
 
 ```bash
 hermes config set platforms.ocuclaw.extra.evenAiEnabled true
 ```
 
-Optional non-secret Even-AI settings use their dotted keys:
+Warn once: Hermes may go quiet briefly while its gateway restarts; if it does
+not return, say "continue OcuClaw setup". Apply the saved setting with exactly
+one lifecycle command:
 
 ```bash
-hermes config set platforms.ocuclaw.extra.evenAiSystemPrompt "<VALUE>"
-hermes config set platforms.ocuclaw.extra.evenAiRoutingMode active
-# active | background | background_new only; any other value is rejected
+hermes gateway restart
 ```
 
-Run one `hermes gateway restart` phase and verify the accepted Even-AI behavior.
+Afterward obtain a fresh status receipt. Do not repeat the restart without a
+new finding. Optional settings use only official dotted Hermes keys.
+
+#### Checkpoint 4 · Approve and verify the private :8443 route
+
+Call the assistant-visible read-only classifier. It resolves this selected
+Primary Runtime's local port, this host's tailnet DNS name, and the current
+Serve document from the supported live evidence surfaces:
+
+```json
+{"operation":"even_ai_route"}
+```
+
+Use only the returned `agent_url` and fully substituted `command`; never build
+either from remembered or model-supplied values. The optional **Even AI agent
+URL** is `https://<tailnet-dns-name>:8443/v1/chat/completions`. It is not the
+**OcuClaw app relay address**, which uses the existing :8446 Managed Serve
+Route.
+
+Classify the live `:8443` state before proposing any change. An absent route
+may produce this one fully substituted, tailnet-only proposal:
+
+```bash
+tailscale serve --bg --https=8443 http://127.0.0.1:<relay-port>
+```
+
+Show the exact substituted command, explain that it exposes only this
+loopback relay to the user's tailnet, and wait for explicit approval before it
+runs. After an approved apply, call `{"operation":"even_ai_route"}` again and
+require its fresh live Serve result to be `verified_noop` / `route_matches`.
+Configuration shape or command exit alone is not verification.
+
+An already-correct route is a verified no-op. Refuse mutation when `:8443`
+targets another Primary Runtime, a foreign service, an ambiguous target, or a
+non-proxy web handler, or when Funnel is enabled. Never use Funnel, widen the
+relay bind, publish a public address, or run a host-wide Serve reset. Do not
+change or remove the :8446 Managed Serve Route, its ownership receipt, or its
+teardown contract. This optional :8443 mapping is not automatically removed
+during uninstall.
+
+#### Checkpoint 5 · Configure the Even Realities app
+
+In **Agent configuration**, choose **Add agent** (or **Edit agent** for the
+existing entry). Give it a recognizable **Name**, put the **Even AI agent URL**
+from Checkpoint 4 in **URL**, and enter the same private secret in **Token**.
+Tap **Save**, then select that agent in **Select agent**. These labels are in
+the Even Realities app, outside OcuClaw. Keep the **OcuClaw app relay address** labelled separately; it connects
+the phone app and is not valid in the Even AI agent URL field.
+
+#### Checkpoint 6 · Exercise a real glasses request
+
+Have the wearer make a real request from the glasses through Even AI and
+confirm that their Hermes agent answers. An enabled flag, host configuration,
+route shape, endpoint response, or WebUI state alone is not end-to-end success.
+Do not claim `g2-validated` without wearer-confirmed real G2 evidence.
+
 After both choices have resolved, do not explain the support path separately
 here. The final `wrap_feedback` response owns the single support explanation,
 including connected and offline fallbacks. Load troubleshooting `ESCALATE`
@@ -603,11 +790,10 @@ receipt you already have. It says exactly one of four things:
 
 CHECKPOINT. Ask, in plain words:
 
-> Would you like Hermes Desktop to use the OcuClaw look? It is a dark theme —
-> observation-deck black with the Even G2 lens green — and it stays dark in
-> both Light and Dark modes. The built-in themes stay one click away in
-> Settings > Appearance, and disabling or uninstalling OcuClaw returns Desktop
-> to its default skin. Yes or no?
+> Would you like Hermes Desktop to use the OcuClaw look? OcuClaw black/green.
+> It keeps the same dark black-and-green appearance in both Light and Dark modes. The
+> built-in themes stay one click away in Settings > Appearance, and disabling
+> or uninstalling OcuClaw returns Desktop to its default skin. Yes or no?
 
 A no is a legitimate finished answer; record it and move on. The theme is
 still listed in Settings > Appearance > Theme for later.

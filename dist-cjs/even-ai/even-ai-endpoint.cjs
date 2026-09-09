@@ -1,7 +1,8 @@
 const { createHash, createHmac, randomUUID } = require("node:crypto");
+const { Agent } = require("undici");
 const { constantTimeEqual } = require("../domain/constant-time-equal.cjs");
 const { activeBackendDisplayName, getActiveBackendKind, isKnownBackendKind } = require("../gateway/backend-contract.cjs");
-const { filterRawEmojiText } = require("../domain/message-emoji-filter.cjs");
+const { filterPlainAssistantOutputText } = require("../domain/message-emoji-filter.cjs");
 const { composeReadabilitySystemPrompt } = require("../domain/readability-system-prompt.cjs");
 const { normalizeEvenAiSystemPrompt } = require("./even-ai-settings-store.cjs");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
@@ -175,10 +176,190 @@ function buildPeerEndpointUrl(rawUrl) {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("Even AI peer pathway must use http or https.");
   }
+  if (url.username || url.password) {
+    throw new Error("Even AI peer pathway URL credentials are not allowed.");
+  }
   if (!url.pathname || url.pathname === "/") {
     url.pathname = EVEN_AI_CHAT_COMPLETIONS_PATH;
   }
+  return url;
+}
+
+function normalizedHostname(url) {
+  return url.hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "").replace(/\.$/, "");
+}
+
+function mappedIpv4Address(address) {
+  const normalized = String(address || "").toLowerCase();
+  const prefix = normalized.startsWith("::ffff:")
+    ? "::ffff:"
+    : normalized.startsWith("::")
+      ? "::"
+      : "";
+  if (!prefix) return "";
+  const suffix = normalized.slice(prefix.length);
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(suffix)) return suffix;
+  const groups = suffix.split(":");
+  if (groups.length !== 2 || groups.some((group) => !/^[a-f0-9]{1,4}$/.test(group))) {
+    return "";
+  }
+  const high = Number.parseInt(groups[0], 16);
+  const low = Number.parseInt(groups[1], 16);
+  return [high >> 8, high & 0xff, low >> 8, low & 0xff].join(".");
+}
+
+function ipAddressFamily(address) {
+  const normalized = String(address || "").toLowerCase();
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(normalized)) return 4;
+  if (/^[a-f0-9:.]+$/.test(normalized) && normalized.includes(":")) return 6;
+  return 0;
+}
+
+function isLoopbackAddress(address) {
+  const normalized = String(address || "").toLowerCase();
+  if (normalized === "::1") return true;
+  const mapped = mappedIpv4Address(normalized);
+  if (mapped) return isLoopbackAddress(mapped);
+  if (ipAddressFamily(normalized) !== 4) return false;
+  return Number(normalized.split(".")[0]) === 127;
+}
+
+function isPublicIpv4(address) {
+  const parts = String(address || "").split(".").map(Number);
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return false;
+  }
+  const [a, b, c] = parts;
+  return !(
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 192 && b === 0 && (c === 0 || c === 2)) ||
+    (a === 192 && b === 88 && c === 99) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    (a === 198 && b === 51 && c === 100) ||
+    (a === 203 && b === 0 && c === 113) ||
+    a >= 224
+  );
+}
+
+function isPublicIpAddress(address) {
+  const normalized = String(address || "").toLowerCase();
+  const family = ipAddressFamily(normalized);
+  if (family === 4) return isPublicIpv4(normalized);
+  if (family !== 6) return false;
+  const mapped = mappedIpv4Address(normalized);
+  if (mapped) return isPublicIpv4(mapped);
+  return !(
+    normalized === "::" ||
+    normalized === "::1" ||
+    normalized.startsWith("2001:db8:") ||
+    normalized.startsWith("fc") ||
+    normalized.startsWith("fd") ||
+    /^fe[c-f]/.test(normalized) ||
+    /^fe[89ab]/.test(normalized) ||
+    normalized.startsWith("ff")
+  );
+}
+
+function isTailnetIpAddress(address) {
+  const normalized = String(address || "").toLowerCase();
+  if (ipAddressFamily(normalized) === 4) {
+    const [a, b] = normalized.split(".").map(Number);
+    return a === 100 && b >= 64 && b <= 127;
+  }
+  return normalized.startsWith("fd7a:115c:a1e0:");
+}
+
+function peerAddressAllowed(hostname, address) {
+  const normalizedHost = String(hostname || "").toLowerCase();
+  return isPublicIpAddress(address) ||
+    (normalizedHost === "localhost" && isLoopbackAddress(address)) ||
+    (normalizedHost.endsWith(".ts.net") && isTailnetIpAddress(address));
+}
+
+function makePeerSafeLookup(resolveAddresses) {
+  return function peerSafeLookup(hostname, options, callback) {
+    Promise.resolve(resolveAddresses(hostname))
+      .then((addresses) => {
+        const records = Array.isArray(addresses)
+          ? addresses.map((entry) => typeof entry === "string"
+              ? { address: entry, family: ipAddressFamily(entry) }
+              : entry,
+            ).filter((entry) => entry && entry.address)
+          : [];
+        if (
+          records.length === 0 ||
+          records.some((entry) => !peerAddressAllowed(hostname, entry.address))
+        ) {
+          callback(new Error("Even AI peer pathway destination is not allowed."));
+          return;
+        }
+        const family = options && (options.family === 4 || options.family === 6)
+          ? options.family
+          : 0;
+        const matching = family
+          ? records.filter((entry) => entry.family === family)
+          : records;
+        if (matching.length === 0) {
+          callback(new Error("Even AI peer pathway destination could not be verified."));
+          return;
+        }
+        if (options && options.all === true) {
+          callback(null, matching);
+          return;
+        }
+        callback(null, matching[0].address, matching[0].family);
+      })
+      .catch((error) => callback(error));
+  };
+}
+
+async function assertAllowedPeerEndpointUrl(rawUrl, resolveAddresses) {
+  const url = buildPeerEndpointUrl(rawUrl);
+  const hostname = normalizedHostname(url);
+  const loopback = hostname === "localhost" || isLoopbackAddress(hostname);
+  if (url.protocol !== "https:" && !loopback) {
+    throw new Error("Even AI peer pathway requires https outside loopback.");
+  }
+  if (loopback) return url.toString();
+
+  if (ipAddressFamily(hostname)) {
+    if (!isPublicIpAddress(hostname)) {
+      throw new Error("Even AI peer pathway destination is not allowed.");
+    }
+    return url.toString();
+  }
+  if (!hostname.includes(".") || hostname.endsWith(".local")) {
+    throw new Error("Even AI peer pathway destination is not allowed.");
+  }
+
+  let addresses;
+  try {
+    addresses = await resolveAddresses(hostname);
+  } catch {
+    throw new Error("Even AI peer pathway destination could not be verified.");
+  }
+  const normalizedAddresses = Array.isArray(addresses)
+    ? addresses.map((entry) => typeof entry === "string" ? entry : entry && entry.address).filter(Boolean)
+    : [];
+  if (
+    normalizedAddresses.length === 0 ||
+    normalizedAddresses.some((address) => !peerAddressAllowed(hostname, address))
+  ) {
+    throw new Error("Even AI peer pathway destination is not allowed.");
+  }
   return url.toString();
+}
+
+async function defaultResolvePeerAddresses(hostname) {
+
+  const dns = await import("node:dns/promises");
+  return dns.lookup(hostname, { all: true, verbatim: true });
 }
 
 function buildCompletionPayload(opts = {}) {
@@ -445,12 +626,42 @@ function createEvenAiEndpoint(opts = {}) {
     typeof opts.getSystemPrompt === "function"
       ? opts.getSystemPrompt
       : () => opts.systemPrompt;
+  const hostProvidesReadability =
+    Reflect.get(opts, "hostProvidesReadability") === true;
   const getSettingsSnapshot =
     typeof opts.getSettingsSnapshot === "function"
       ? opts.getSettingsSnapshot
       : () => opts.settingsSnapshot || {};
   const router = opts.router;
   const gatewayBridge = opts.gatewayBridge;
+  const configuredDispatchGatewayUserSend = Reflect.get(
+    opts,
+    "dispatchGatewayUserSend",
+  );
+  const dispatchGatewayUserSend =
+    typeof configuredDispatchGatewayUserSend === "function"
+      ? configuredDispatchGatewayUserSend
+      : (_sessionKey, send) => send();
+  const configuredBeginPromptTurnOwnership = Reflect.get(
+    opts,
+    "beginPromptTurnOwnership",
+  );
+  const beginPromptTurnOwnership =
+    typeof configuredBeginPromptTurnOwnership === "function"
+      ? configuredBeginPromptTurnOwnership
+      : () => null;
+  const configuredCancelPromptTurnOwnership = Reflect.get(
+    opts,
+    "cancelPromptTurnOwnership",
+  );
+  const cancelPromptTurnOwnership =
+    typeof configuredCancelPromptTurnOwnership === "function"
+      ? configuredCancelPromptTurnOwnership
+      : () => false;
+  const configuredGatewayUserSendHoldDeadlineMs = Reflect.get(
+    opts,
+    "gatewayUserSendHoldDeadlineMs",
+  );
   const runWaiter = opts.runWaiter;
   const emitDebug = typeof opts.emitDebug === "function" ? opts.emitDebug : () => {};
   const onSessionActivated =
@@ -520,6 +731,18 @@ function createEvenAiEndpoint(opts = {}) {
       : typeof globalThis.fetch === "function"
         ? globalThis.fetch.bind(globalThis)
         : null;
+  const configuredResolvePeerAddresses = Reflect.get(opts, "resolvePeerAddresses");
+  const resolvePeerAddresses =
+    typeof configuredResolvePeerAddresses === "function"
+      ? configuredResolvePeerAddresses
+      : defaultResolvePeerAddresses;
+  const configuredPeerDispatcher = Reflect.get(opts, "peerDispatcher");
+  const peerDispatcher = configuredPeerDispatcher === null
+    ? null
+    : configuredPeerDispatcher || new Agent({
+        connect: { lookup: makePeerSafeLookup(resolvePeerAddresses) },
+      });
+  const ownsPeerDispatcher = !configuredPeerDispatcher && peerDispatcher;
   const localBackendKind =
     normalizeBackendKind(opts.localBackendKind) ||
     normalizeBackendKind(gatewayBridge && gatewayBridge.kind) ||
@@ -531,6 +754,22 @@ function createEvenAiEndpoint(opts = {}) {
     opts.requestTimeoutMs,
     DEFAULT_TIMEOUT_MS,
   );
+  const gatewayUserSendHoldDeadlineMs =
+    Number.isFinite(configuredGatewayUserSendHoldDeadlineMs) &&
+    configuredGatewayUserSendHoldDeadlineMs > 0
+      ? Math.floor(configuredGatewayUserSendHoldDeadlineMs)
+      : 0;
+  const gatewayUserSendHoldMarginMs = Math.max(
+    1,
+    Math.min(1_000, Math.ceil(gatewayUserSendHoldDeadlineMs / 10)),
+  );
+  const gatewayUserSendTimeoutMs =
+    gatewayUserSendHoldDeadlineMs > 0
+      ? Math.max(
+          requestTimeoutMs,
+          gatewayUserSendHoldDeadlineMs + gatewayUserSendHoldMarginMs,
+        )
+      : requestTimeoutMs;
   const maxBodyBytes = normalizePositiveInt(
     opts.maxBodyBytes,
     DEFAULT_MAX_BODY_BYTES,
@@ -645,7 +884,10 @@ function createEvenAiEndpoint(opts = {}) {
     if (!peerTargetConfigured(peerTarget)) {
       throw new Error("Even AI peer pathway is not configured.");
     }
-    const peerUrl = buildPeerEndpointUrl(peerTarget.url);
+    const peerUrl = await assertAllowedPeerEndpointUrl(
+      peerTarget.url,
+      resolvePeerAddresses,
+    );
     const forwardedPayload = {
       ...(payload && typeof payload === "object" ? payload : {}),
     };
@@ -711,6 +953,8 @@ function createEvenAiEndpoint(opts = {}) {
             ),
           },
           body: forwardedBodyText,
+          ...(peerDispatcher ? { dispatcher: peerDispatcher } : {}),
+          redirect: "error",
           signal: fetchAbortController ? fetchAbortController.signal : undefined,
         });
         const status = Number.isFinite(response && response.status)
@@ -937,7 +1181,9 @@ function createEvenAiEndpoint(opts = {}) {
     const startedAtMs = now();
     const authToken = parseBearerToken(req.headers && req.headers.authorization);
     const configuredSystemPrompt = normalizeEvenAiSystemPrompt(getSystemPrompt());
-    const systemPrompt = composeReadabilitySystemPrompt(configuredSystemPrompt);
+    const systemPrompt = composeReadabilitySystemPrompt(configuredSystemPrompt, {
+      hostProvidesReadability,
+    });
 
     emitDebug(
       "evenai",
@@ -1873,7 +2119,13 @@ function createEvenAiEndpoint(opts = {}) {
     );
 
     try {
-      const sendOptions = { extraSystemPrompt: systemPrompt };
+      const sendOptions = {
+        prompt: {
+          content: systemPrompt,
+          owner: "even-ai",
+          lane: "turn-scoped",
+        },
+      };
       const bindingAgentRef = trimString(
         route && route.sessionMinted === true && route.mintedAgentRef
           ? route.mintedAgentRef
@@ -1943,21 +2195,41 @@ function createEvenAiEndpoint(opts = {}) {
       } else if (bindingAgentRef && localBackendKind !== "hermes") {
         sendOptions.agentId = bindingAgentRef;
       }
+      let promptTurnTicket = JSON.parse("null");
       const ack = await promiseWithTimeout(
-        gatewayBridge.sendMessage(
-          userText,
-          sessionKey,
-          null,
-          sendOptions,
-        ),
-        requestTimeoutMs,
+        dispatchGatewayUserSend(sessionKey, () => {
+
+          if (!userText.trimStart().startsWith("/")) {
+            promptTurnTicket = beginPromptTurnOwnership(sessionKey, {
+              owner: "even-ai",
+              lane: "turn-scoped",
+
+              sharesOcuClawSession: routingMode === "active",
+            });
+          }
+          try {
+            return Promise.resolve(
+              gatewayBridge.sendMessage(userText, sessionKey, null, sendOptions),
+            ).catch((err) => {
+              cancelPromptTurnOwnership(promptTurnTicket);
+              throw err;
+            });
+          } catch (err) {
+            cancelPromptTurnOwnership(promptTurnTicket);
+            throw err;
+          }
+        }),
+
+        gatewayUserSendTimeoutMs,
       );
       const runId = trimString(ack && ack.runId);
       if (!runId) {
+        cancelPromptTurnOwnership(promptTurnTicket);
         throw new Error("Even AI upstream ack was missing a runId.");
       }
       activeRunId = runId;
       if (trimString(ack && ack.status) && trimString(ack.status) !== "accepted") {
+        cancelPromptTurnOwnership(promptTurnTicket);
         throw new Error(
           trimString(ack && ack.error) || `Even AI upstream returned ${ack.status}.`,
         );
@@ -1989,13 +2261,16 @@ function createEvenAiEndpoint(opts = {}) {
         return true;
       }
 
-      const remainingTimeoutMs = Math.max(1, requestTimeoutMs - (now() - startedAtMs));
+      const remainingTimeoutMs = Math.max(
+        1,
+        requestTimeoutMs - (now() - startedAtMs),
+      );
       const assistantText = await runWaiter.waitForRun({
         runId,
         sessionKey,
         timeoutMs: remainingTimeoutMs,
       });
-      const filteredAssistantText = filterRawEmojiText(assistantText);
+      const filteredAssistantText = filterPlainAssistantOutputText(assistantText);
       const emptyText = !trimString(filteredAssistantText);
       const completionContent = emptyText
         ? "Even AI finished without a text reply."
@@ -2101,6 +2376,9 @@ function createEvenAiEndpoint(opts = {}) {
         httpServer.removeListener("request", onRequest);
       }
       attached = false;
+      if (ownsPeerDispatcher && typeof peerDispatcher.close === "function") {
+        void peerDispatcher.close();
+      }
     },
 
     handleRequest,

@@ -1,5 +1,6 @@
 const { normalizeEvenAiRoutingMode } = require("../even-ai/even-ai-settings-store.cjs");
 const { DEFAULT_STAGE_GRACE_MS, MIN_STAGE_GRACE_MS, MAX_STAGE_GRACE_MS } = require("../tools/glasses-ui-limits.cjs");
+const { buildModelAliasIndex, resolveConfiguredDefaultModelRef } = require("../runtime/upstream-runtime.cjs");
 
 const OPENCLAW_BUNDLE_DEFAULT_WS_PORT = 9000;
 const HERMES_FRESH_INSTALL_WS_PORT_CANDIDATES = Object.freeze([
@@ -143,14 +144,73 @@ const GLASSES_UI_LIVE_DEFAULT_MODEL = {
   "openai-compat": "gpt-4o-mini",
 };
 
-function resolveGlassesUiLive(value) {
-  const raw = isObject(value) ? value : {};
+function configuredDefaultModelIsPresent(openclawConfig) {
+  const modelConfig =
+    openclawConfig && openclawConfig.agents && openclawConfig.agents.defaults
+      ? openclawConfig.agents.defaults.model
+      : undefined;
+  if (typeof modelConfig === "string") return modelConfig.trim() !== "";
+  return !!(
+    modelConfig &&
+    typeof modelConfig === "object" &&
+    typeof modelConfig.primary === "string" &&
+    modelConfig.primary.trim()
+  );
+}
 
-  const tickBackend = GLASSES_UI_LIVE_BACKENDS.has(raw.tickBackend)
+function warnNoTickBackend(logger, provider) {
+  const message =
+    `[ocuclaw] glassesUiLive llm disabled: no tick backend for provider "${provider || "none"}"`;
+  if (logger && typeof logger.warn === "function") {
+    logger.warn(message);
+    return;
+  }
+  console.warn(message);
+}
+
+function defaultLiveModelForBackend(backend) {
+  return backend === "openai-compat"
+    ? GLASSES_UI_LIVE_DEFAULT_MODEL["openai-compat"]
+    : GLASSES_UI_LIVE_DEFAULT_MODEL["anthropic-api"];
+}
+
+function resolveGlassesUiLive(value, openclawConfig, logger) {
+  const raw = isObject(value) ? value : {};
+  const explicitTickBackend = Object.prototype.hasOwnProperty.call(raw, "tickBackend");
+  const explicitTickModel = pickString(raw.tickModel) !== "";
+
+  let tickBackend = GLASSES_UI_LIVE_BACKENDS.has(raw.tickBackend)
     ? raw.tickBackend
     : "anthropic-api";
-  const tickModel = pickString(raw.tickModel) || GLASSES_UI_LIVE_DEFAULT_MODEL[tickBackend];
+  let tickModel = pickString(raw.tickModel) || defaultLiveModelForBackend(tickBackend);
   const tickApiBaseUrl = pickString(raw.tickApiBaseUrl) || "https://api.openai.com";
+  let llmDisabledReason;
+
+  if (!explicitTickBackend && !explicitTickModel) {
+
+    const configured = configuredDefaultModelIsPresent(openclawConfig);
+    const hostModel = configured
+      ? resolveConfiguredDefaultModelRef(
+          openclawConfig,
+          buildModelAliasIndex(openclawConfig),
+        )
+      : null;
+    const provider = hostModel && hostModel.provider ? hostModel.provider : "";
+    if (provider === "anthropic") {
+      tickBackend = "anthropic-api";
+      tickModel = defaultLiveModelForBackend(tickBackend);
+    } else if (
+      provider === "openai" &&
+      (!pickString(raw.tickApiBaseUrl) || tickApiBaseUrl === "https://api.openai.com")
+    ) {
+      tickBackend = "openai-compat";
+      tickModel = defaultLiveModelForBackend(tickBackend);
+    } else {
+      llmDisabledReason = "no_backend";
+      warnNoTickBackend(logger, provider);
+    }
+  }
+
   return {
     enabled: parseBool(raw.enabled, true),
     tickBackend,
@@ -159,13 +219,19 @@ function resolveGlassesUiLive(value) {
     allowAgentModelOverride: parseBool(raw.allowAgentModelOverride, false),
     tickMaxOutputTokens: parseIntOrDefault(raw.tickMaxOutputTokens, 200),
 
-    httpEnabled: parseBool(raw.httpEnabled, false),
+    httpEnabled: parseBool(raw.httpEnabled, true),
+
+    httpHostPolicy:
+      typeof raw.httpHostPolicy === "string"
+        ? raw.httpHostPolicy
+        : "owner-grants",
 
     httpAllowHosts: Array.isArray(raw.httpAllowHosts)
       ? raw.httpAllowHosts.filter((h) => typeof h === "string")
       : [],
 
-    llmEnabled: parseBool(raw.llmEnabled, false),
+    llmEnabled: parseBool(raw.llmEnabled, true) && !llmDisabledReason,
+    ...(llmDisabledReason ? { llmDisabledReason } : {}),
 
     maxConcurrentSurfacesPerHost: clampInt(raw.maxConcurrentSurfacesPerHost, 1, 64, 4),
 
@@ -225,6 +291,11 @@ function createRuntimeConfig(opts = {}) {
     );
   }
 
+  const externalDebugToolsEnabled = parseBool(
+    pluginConfig.externalDebugToolsEnabled,
+    false,
+  );
+
   return {
     gatewayUrl,
     gatewayToken,
@@ -241,10 +312,8 @@ function createRuntimeConfig(opts = {}) {
       pluginConfig.debugNoisyPolicies,
       undefined,
     ),
-    externalDebugToolsEnabled: parseBool(
-      pluginConfig.externalDebugToolsEnabled,
-      false,
-    ),
+    externalDebugToolsEnabled,
+    debugAutoArm: parseBool(pluginConfig.debugAutoArm, externalDebugToolsEnabled),
     allowDebugUpload: parseBool(pluginConfig.allowDebugUpload, false),
     debugUploadMaxZipBytes: clampInt(pluginConfig.debugUploadMaxZipBytes, 100_000, 4_300_000, 4_000_000),
     debugUploadCapturePreset: Array.isArray(pluginConfig.debugUploadCapturePreset) ? pluginConfig.debugUploadCapturePreset : undefined,
@@ -273,16 +342,12 @@ function createRuntimeConfig(opts = {}) {
       pluginConfig.renderGlassesUiTimeoutMs,
       30 * 60 * 1000,
     ),
-    glassesUiLive: resolveGlassesUiLive(pluginConfig.glassesUiLive),
+    glassesUiLive: resolveGlassesUiLive(
+      pluginConfig.glassesUiLive,
+      openclawConfig,
+      Reflect.get(opts, "logger"),
+    ),
     freshnessWindowMs: parseIntOrDefault(pluginConfig.freshnessWindowMs, 5000),
-    evenTerminalEnabled: parseBool(
-      pluginConfig.evenTerminal && pluginConfig.evenTerminal.enabled,
-      false,
-    ),
-    evenTerminalRefreshMs: parseIntOrDefault(
-      pluginConfig.evenTerminal && pickValue(pluginConfig.evenTerminal.refreshMs),
-      15000,
-    ),
   };
 }
 

@@ -676,6 +676,7 @@ function createRelayWorkerSupervisor(options = {}) {
             handler.handleMessage(
               message.clientId,
               message.raw,
+              { liveuiRenderErrorAuthority: message.liveuiRenderErrorAuthority },
             ),
             processOptions,
           );
@@ -728,6 +729,7 @@ function createRelayWorkerSupervisor(options = {}) {
           );
         }
       }
+      const readinessSnapshot = normalizeIngestedReadinessSnapshot(message.readinessSnapshot);
       clients.set(message.clientId, {
         clientId: message.clientId,
         clientKind: message.clientKind || "unknown",
@@ -737,7 +739,8 @@ function createRelayWorkerSupervisor(options = {}) {
           ? message.clientCapabilities.filter((value) => typeof value === "string" && value)
           : [],
         sessionKey: message.sessionKey || null,
-        readinessSnapshot: normalizeIngestedReadinessSnapshot(message.readinessSnapshot),
+        readinessSnapshot,
+        deviceProjection: deviceProjectionFromReadiness(readinessSnapshot),
         connectedAtMs: Number.isFinite(message.connectedAtMs)
           ? message.connectedAtMs
           : Date.now(),
@@ -770,6 +773,7 @@ function createRelayWorkerSupervisor(options = {}) {
       return;
     }
     if (message.kind === "client.disconnected") {
+      void handler?.removeClient?.(message.clientId);
       const disconnectedEntry = clients.get(message.clientId) || null;
       for (const [requestId, pending] of pendingReadinessProbeRequests) {
         if (
@@ -885,10 +889,26 @@ function createRelayWorkerSupervisor(options = {}) {
     if (message.kind === "client.readinessSnapshot") {
       const entry = clients.get(message.clientId);
       if (entry) {
+        const previousDeviceFacts = deviceFactsKey(getDeviceProjection());
+        const previousActiveSessionKey =
+          entry.readinessSnapshot && typeof entry.readinessSnapshot.activeSessionKey === "string"
+            ? entry.readinessSnapshot.activeSessionKey
+            : null;
         entry.readinessSnapshot = normalizeIngestedReadinessSnapshot(message.readinessSnapshot);
+        entry.deviceProjection = deviceProjectionFromReadiness(entry.readinessSnapshot);
         entry.updatedAtMs = Number.isFinite(message.updatedAtMs)
           ? message.updatedAtMs
           : Date.now();
+        const nextActiveSessionKey =
+          entry.readinessSnapshot && typeof entry.readinessSnapshot.activeSessionKey === "string"
+            ? entry.readinessSnapshot.activeSessionKey
+            : null;
+        if (entry.clientKind === "app" && (
+          deviceFactsKey(getDeviceProjection()) !== previousDeviceFacts ||
+          nextActiveSessionKey !== previousActiveSessionKey
+        )) {
+          notifyAppPresenceChanged("readiness");
+        }
       }
       return;
     }
@@ -902,13 +922,20 @@ function createRelayWorkerSupervisor(options = {}) {
 
       if (ack && ack.ok !== false && typeof ack.activeSessionKey === "string" && ack.activeSessionKey) {
         const ackEntry = clients.get(message.clientId);
-        if (ackEntry && ackEntry.readinessSnapshot) {
+        if (ackEntry) {
+          const previousActiveSessionKey =
+            ackEntry.readinessSnapshot && typeof ackEntry.readinessSnapshot.activeSessionKey === "string"
+              ? ackEntry.readinessSnapshot.activeSessionKey
+              : null;
           ackEntry.readinessSnapshot = {
-            ...ackEntry.readinessSnapshot,
+            ...(ackEntry.readinessSnapshot || {}),
             activeSessionKey: ack.activeSessionKey,
             emittedAtMs: Number.isFinite(ack.emittedAtMs) ? ack.emittedAtMs : Date.now(),
           };
           ackEntry.updatedAtMs = Date.now();
+          if (ackEntry.clientKind === "app" && ack.activeSessionKey !== previousActiveSessionKey) {
+            notifyAppPresenceChanged("readiness");
+          }
         }
       }
       const protocol = clients.get(message.clientId) || {};
@@ -1047,6 +1074,7 @@ function createRelayWorkerSupervisor(options = {}) {
         logger.warn(`[relay-worker] ${err.message}`);
         const wasPreReady = Boolean(rejectReady);
         addressValue = null;
+        for (const clientId of clients.keys()) void handler?.removeClient?.(clientId);
         clients.clear();
         pendingReadinessProbeRequests.clear();
         clearPendingAutomationStateRequests();
@@ -1105,6 +1133,7 @@ function createRelayWorkerSupervisor(options = {}) {
         if (worker === activeWorker) worker = null;
         startPromise = null;
         addressValue = null;
+        for (const clientId of clients.keys()) void handler?.removeClient?.(clientId);
         clients.clear();
         pendingReadinessProbeRequests.clear();
         clearPendingAutomationStateRequests();
@@ -1158,7 +1187,7 @@ function createRelayWorkerSupervisor(options = {}) {
   }
 
   function notifyAppPresenceChanged(reason) {
-    lastAppPresenceTransitionAtMs = Date.now();
+    if (reason !== "readiness") lastAppPresenceTransitionAtMs = Date.now();
 
     if (typeof options.onAppPresenceChanged !== "function") return;
     try {
@@ -1168,6 +1197,53 @@ function createRelayWorkerSupervisor(options = {}) {
         `[relay-worker] app presence hook failed: ${err && err.message ? err.message : err}`,
       );
     }
+  }
+
+  function deviceProjectionFromReadiness(snapshot) {
+    const glasses = snapshot && typeof snapshot === "object" ? snapshot.glasses : null;
+    if (!glasses || typeof glasses !== "object" || Array.isArray(glasses)) return null;
+    if (typeof glasses.connected !== "boolean") return null;
+    if (!Number.isFinite(snapshot.emittedAtMs) || !Number.isFinite(glasses.statusAgeMs)) {
+      return null;
+    }
+    const observedAtMs = Math.floor(snapshot.emittedAtMs - Math.max(0, glasses.statusAgeMs));
+    if (!Number.isFinite(observedAtMs) || observedAtMs < 0 || observedAtMs > 8.64e15) return null;
+    const batteryPercent =
+      Number.isInteger(glasses.batteryPercent) &&
+      glasses.batteryPercent >= 0 &&
+      glasses.batteryPercent <= 100
+        ? glasses.batteryPercent
+        : null;
+    const charging = typeof glasses.charging === "boolean" ? glasses.charging : null;
+    return {
+      connected: glasses.connected,
+      batteryPercent,
+      charging,
+
+      inCase: glasses.presence === "in_case" ? true : null,
+      observedAt: new Date(observedAtMs).toISOString(),
+    };
+  }
+
+  function getDeviceProjection(entries = getConnectedAppEntries()) {
+    let latest = null;
+    for (const entry of entries) {
+      const candidate = entry && entry.deviceProjection;
+      if (!candidate) continue;
+      if (!latest || candidate.observedAt > latest.observedAt) latest = candidate;
+    }
+    return latest
+      ? { ...latest }
+      : { connected: null, batteryPercent: null, charging: null, inCase: null, observedAt: null };
+  }
+
+  function deviceFactsKey(device) {
+    return JSON.stringify({
+      connected: device?.connected ?? null,
+      batteryPercent: device?.batteryPercent ?? null,
+      charging: device?.charging ?? null,
+      inCase: device?.inCase ?? null,
+    });
   }
 
   function getAppPresenceProjection() {
@@ -1194,6 +1270,7 @@ function createRelayWorkerSupervisor(options = {}) {
         lastAppPresenceTransitionAtMs > 0
           ? new Date(lastAppPresenceTransitionAtMs).toISOString()
           : null,
+      device: getDeviceProjection(entries),
     };
   }
 

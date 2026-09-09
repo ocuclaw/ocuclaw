@@ -40,6 +40,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # glasses session list (messaging viewports stay visible by design).
 DENY_SOURCES: Tuple[str, ...] = ("tool", "cron", "subagent")
 
+# Sources whose rows have no gateway peer and may be adopted onto the glasses
+# (Continue here, #2509). Mirrors ADOPTABLE_FOREIGN_SOURCES in
+# hermes-session-keys.ts and ADOPTABLE_FOREIGN_HERMES_SOURCES in SessionRoute.kt.
+ADOPTABLE_SOURCES: Tuple[str, ...] = ("desktop", "cli", "tui")
+
+
+class NotAdoptableError(ValueError):
+    """A resolvable row the adopt lane refuses to re-key (verdict in ``str()``)."""
+
 # Hermes's default-lane session-key namespace is the literal ``agent:main``
 # whenever SessionSource.profile is unset (session.py:766-780). Mirrors
 # DEFAULT_HERMES_NAMESPACE in hermes-session-keys.ts.
@@ -72,6 +81,11 @@ DB_METHOD_DELETE = "db.sessions.delete"
 DB_METHOD_CHAT_HISTORY = "db.chat.history"
 DB_METHOD_DESCRIBE = "db.sessions.describe"
 DB_METHOD_COMPACTION_INFO = "db.sessions.compactionInfo"
+# Desktop→glasses mirror (#2513): the row-id high-water mark of a lane's live
+# transcript. One indexed `MAX(id)` over the tip's messages on a read-only
+# connection — NOT `latest_message_row_id`, which is role/text-filtered
+# (hermes_state.py:11948-11981) and would sit still on a tool-call-only tail.
+DB_METHOD_CHAT_WATERMARK = "db.chat.watermark"
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +107,16 @@ SESSION_READ_STATE_UNSUPPORTED = "session read state unsupported on this hermes"
 # Cache for session_read_state_supported(): the probe parses SCHEMA_SQL, so
 # pay it once per process. `None` = not yet computed.
 _SESSION_READ_STATE_SUPPORTED: Optional[bool] = None
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    """A JSON number/string as int, or None for absent/unparseable input."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _is_stale_schema_error(exc: BaseException) -> bool:
@@ -253,9 +277,13 @@ class SessionRpc:
             DB_METHOD_CHAT_HISTORY: self.chat_history,
             DB_METHOD_DESCRIBE: self.describe_session,
             DB_METHOD_COMPACTION_INFO: self.compaction_info,
+            DB_METHOD_CHAT_WATERMARK: self.chat_watermark,
         }
 
     # -- async handler wrappers (DB work off the event loop) ----------------
+
+    async def chat_watermark(self, params: Any) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._sync_watermark, params)
 
     async def list_sessions(self, params: Any) -> Dict[str, Any]:
         return await asyncio.to_thread(self._sync_list, params)
@@ -419,10 +447,13 @@ class SessionRpc:
             return []
         with sqlite3.connect(self._db_path, timeout=10) as conn:
             conn.row_factory = sqlite3.Row
+            # Live carriers first (same rule as `_carriers_for_key`): after an
+            # adopt the newest row on the key is the ended empty stub and the
+            # live transcript is the OLDER row (#2509).
             rows = conn.execute(
                 """SELECT id FROM sessions
                    WHERE session_key = ?
-                   ORDER BY started_at DESC""",
+                   ORDER BY (ended_at IS NULL) DESC, started_at DESC""",
                 (key,),
             ).fetchall()
         return [str(row["id"]) for row in rows]
@@ -564,31 +595,98 @@ class SessionRpc:
 
     # -- identity resolution -------------------------------------------------
 
+    def _carriers_for_key(self, session_key: str) -> List[Dict[str, Any]]:
+        """Every raw row carrying a native session_key, LIVE carriers first.
+
+        Read through the public ``list_sessions_rich(session_key=K)`` filter
+        (hermes_state.py ``s.session_key = ?``), never through
+        ``list_gateway_sessions``: that lister picks the newest row per key
+        with a ``MAX(started_at)`` subquery that runs BEFORE its
+        ``ended_at IS NULL`` clause, so a key whose newest row is an EMPTY
+        ended predecessor resolves to that dead row (#2509 — the adopt trap:
+        ``/resume <tip> --all`` mints a fresh row on the adopt key, ends it
+        with ``session_switch`` and re-keys the OLDER Desktop transcript,
+        which is the live carrier). Compression self-heals the trap (the
+        continuation child is newest again); an uncompressed lineage never
+        does, which is why this ordering is the contract, not a tie-break.
+
+        Order: live rows (``ended_at`` NULL) before ended rows, newest
+        ``started_at`` first within each group — hermes's own recovery order
+        for reset carriers (a ``/new`` reset ends the old row and mints a
+        fresh live one), extended with the liveness rule.
+        """
+        key = str(session_key or "")
+        if not key:
+            return []
+        reader = self._get_reader()
+        kwargs: Dict[str, Any] = {
+            "session_key": key,
+            "limit": SEARCH_SCAN_LIMIT,
+            "include_children": True,
+            "include_archived": True,
+            "order_by_last_active": True,
+            "project_compression_tips": False,
+        }
+        if session_read_state_supported():
+            # A hidden carrier is still the carrier (the wearer's open chat
+            # may be hidden from the desktop) — the 0.20.5+ kwarg only.
+            kwargs["include_hidden"] = True
+        try:
+            rows = reader.list_sessions_rich(**kwargs)
+        except TypeError:
+            # Pre-``session_key`` filter hosts: wide scan, exact-key match.
+            kwargs.pop("session_key", None)
+            rows = [
+                row
+                for row in reader.list_sessions_rich(**kwargs)
+                if row.get("session_key") == key
+            ]
+        carriers = [dict(row) for row in rows if row.get("session_key") == key]
+        carriers.sort(
+            key=lambda row: (
+                row.get("ended_at") is None,
+                float(row.get("started_at") or 0.0),
+            ),
+            reverse=True,
+        )
+        return carriers
+
+    def lineage_for_key(self, session_key: str) -> List[str]:
+        """Every session id Desktop's marker/lease files could name for a
+        native key: the live carrier's tip first, then its compression chain
+        to the root, then every other carrier (ended predecessors included —
+        a Desktop lease claimed before the adopt names the OLD tip). Deduped,
+        order preserved. Empty when the key carries nothing (#2510)."""
+        ordered: List[str] = []
+        seen: set = set()
+
+        def push(value: Any) -> None:
+            text = str(value or "")
+            if text and text not in seen:
+                seen.add(text)
+                ordered.append(text)
+
+        carriers = self._carriers_for_key(session_key)
+        if carriers:
+            live = carriers[0]
+            tip = str(self._get_reader().resolve_resume_session_id(str(live.get("id"))))
+            push(tip)
+            for value in self._walk_compression_chain(tip):
+                push(value)
+        for row in carriers:
+            push(row.get("id"))
+        return ordered
+
     def _lookup_session_key(self, session_key: str) -> Optional[Dict[str, Any]]:
         # session_key is NOT unique (regular index): reset/re-created chats
         # reuse the same deterministic key on a FRESH row that is not a
-        # compression child of the old one. Newest-first matches hermes's own
-        # recovery lookups — the oldest row would route history/title/delete
-        # to a dead transcript (Codex review W05 finding). The tip walk then
-        # resolves compression forks from whichever row we picked.
-        lister = getattr(self._get_reader(), "list_gateway_sessions", None)
-        if callable(lister):
-            rows = lister(active_only=False)
-            for row in rows:
-                if row.get("session_key") == session_key:
-                    return dict(row)
-            return None
-        rows = self._get_reader().list_sessions_rich(
-            limit=SEARCH_SCAN_LIMIT,
-            include_children=True,
-            include_archived=True,
-            order_by_last_active=True,
-            project_compression_tips=False,
-        )
-        for row in rows:
-            if row.get("session_key") == session_key:
-                return dict(row)
-        return None
+        # compression child of the old one, and an adopt re-keys an OLDER
+        # transcript under a key whose newest row is an ended stub. The live
+        # carrier wins, newest-first within liveness (`_carriers_for_key`);
+        # the tip walk then resolves compression forks from whichever row we
+        # picked.
+        carriers = self._carriers_for_key(session_key)
+        return carriers[0] if carriers else None
 
     def _lookup_minted_chat_id(self, ns: str, chat_id: str) -> Optional[Dict[str, Any]]:
         # Exact DM-shaped native key ONLY — the Node grammar derives every
@@ -728,17 +826,26 @@ class SessionRpc:
         newest-first, matching hermes recovery order in ``_lookup_session_key``,
         so keep-first prevents stale reset carriers from shadowing the live row.
         NULL/empty keys stay distinct because downstream identifies them by id.
+
+        Liveness beats recency (#2509): an adopt ends a fresh EMPTY row on
+        the adopt key (newest by ``last_active`` — its ``started_at``) and
+        re-keys the older Desktop transcript, which stays live. The live
+        carrier is the row the key resolves to (`_lookup_session_key`), so
+        it is the row the list shows.
         """
-        seen = set()
-        deduped = []
+        first_index: Dict[str, int] = {}
+        deduped: List[Dict[str, Any]] = []
         for row in rows:
             session_key = row.get("session_key")
             if not session_key:
                 deduped.append(row)
                 continue
-            if session_key in seen:
+            if session_key in first_index:
+                kept = deduped[first_index[session_key]]
+                if kept.get("ended_at") is not None and row.get("ended_at") is None:
+                    deduped[first_index[session_key]] = row
                 continue
-            seen.add(session_key)
+            first_index[session_key] = len(deduped)
             deduped.append(row)
         return deduped
 
@@ -1093,13 +1200,65 @@ class SessionRpc:
         # load-earlier affordance, so an offset would be protocol surface for
         # a UI that does not exist. The slice stays TAIL-anchored.
         total = len(messages)
+        # Desktop→glasses mirror (#2513): `afterId` tails the transcript past a
+        # `db.chat.watermark` row id. Applied BEFORE the limit so the caller
+        # gets exactly the rows that landed since its watermark. A store whose
+        # projection carries no row ids (0.19-compatible readers) cannot tail
+        # — say so instead of returning the whole transcript as "new".
+        after_id = _optional_int(p.get("afterId"))
+        row_ids_unavailable = False
+        if after_id is not None:
+            if any(message.get("id") is None for message in messages):
+                row_ids_unavailable = True
+                messages = []
+            else:
+                messages = [
+                    message for message in messages if int(message["id"]) > after_id
+                ]
         try:
             limit = int(p.get("limit"))
         except (TypeError, ValueError):
             limit = 0
-        if limit > 0 and total > limit:
+        if limit > 0 and len(messages) > limit:
             messages = messages[-limit:]
-        return {"messages": messages, "sessionId": tip, "total": total}
+        result: Dict[str, Any] = {"messages": messages, "sessionId": tip, "total": total}
+        if row_ids_unavailable:
+            result["rowIdsUnavailable"] = True
+        return result
+
+    # -- Desktop→glasses mirror (#2513) --------------------------------------
+
+    def _sync_watermark(self, params: Any) -> Dict[str, Any]:
+        """``{identity}`` → ``{sessionId, watermark, dbPath, hermesHome}``.
+
+        ``watermark`` is ``MAX(messages.id)`` over the lane's LIVE transcript
+        (the compression tip); ``None`` for an empty transcript. New rows —
+        Desktop's, the gateway's, anyone's — always land on the tip with a
+        higher AUTOINCREMENT id, and a compression fork moves ``sessionId``,
+        which the caller treats as "rehydrate", never as a tail. Read on a
+        separate ``mode=ro`` connection (no write lock, hermes_state.py:902-919)
+        so a Desktop mid-write is never blocked by the mirror.
+        """
+        p = params if isinstance(params, dict) else {}
+        tip = self._resolve_target(p.get("identity"), fail_closed=True)
+        return {
+            "sessionId": tip,
+            "watermark": self._max_message_row_id(tip),
+            "dbPath": str(self._db_path),
+            "hermesHome": str(self._db_path.parent),
+        }
+
+    def _max_message_row_id(self, session_id: str) -> Optional[int]:
+        uri = f"file:{self._db_path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=10)
+        try:
+            row = conn.execute(
+                "SELECT MAX(id) FROM messages WHERE session_id = ?",
+                (str(session_id),),
+            ).fetchone()
+        finally:
+            conn.close()
+        return int(row[0]) if row and row[0] is not None else None
 
     def _sync_describe(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
@@ -1227,6 +1386,97 @@ class SessionRpc:
         row_dict = dict(row)
         return self._row_to_wire(row_dict)
 
+    # -- Continue here (adopt) — #2509 ---------------------------------------
+
+    def resolve_adopt_source(self, identity: Any) -> Dict[str, Any]:
+        """identity → the live tip of an ADOPTABLE external row.
+
+        Adoptable = a row Hermes wrote with no gateway peer (``session_key``
+        NULL — Desktop/CLI/TUI, ADR-0004's external-root form) whose source
+        is in ``ADOPTABLE_SOURCES``. Platform-origin rows (Telegram/Discord/…)
+        own a gateway peer that ``/resume`` would rewrite, so they stay
+        read-only (map #2507). Minted identities are refused before the DB
+        is touched — adopting the wearer's own chat would end it.
+
+        Raises ``ValueError`` (not found / not resolvable) or
+        ``NotAdoptableError`` (resolvable, but a row this lane must not
+        re-key). Returns ``{tip, rootId, source, title, lineage}`` where
+        ``lineage`` is tip → root (the ids Desktop's marker/lease files key
+        on — T2's hold check reads them).
+        """
+        ident = identity if isinstance(identity, dict) else {}
+        if ident.get("chatId"):
+            raise NotAdoptableError("minted_identity_refused")
+        ns = str(ident.get("ns") or self._ns)
+        if ns != DEFAULT_SESSION_NAMESPACE:
+            raise NotAdoptableError("adopt_requires_default_namespace")
+        tip = self._resolve_target(identity, fail_closed=True)
+        db = self._get_reader()
+        row = db.get_session(tip)
+        if row is None:
+            raise ValueError(f"no such session: {tip}")
+        row = dict(row)
+        source = str(row.get("source") or "")
+        if row.get("session_key"):
+            raise NotAdoptableError("platform_row_not_adoptable")
+        if source not in ADOPTABLE_SOURCES:
+            raise NotAdoptableError("source_not_adoptable")
+        lineage = self._walk_compression_chain(tip)
+        return {
+            "tip": tip,
+            "rootId": lineage[-1] if lineage else tip,
+            "source": source,
+            "title": row.get("title"),
+            "lineage": lineage,
+        }
+
+    def adopt_outcome(self, adopt_key: str, tip: str) -> Dict[str, Any]:
+        """Read the adopt verdict from the DB, never from Hermes's reply text.
+
+        After ``switch_session`` the tip row carries the adopt key and is
+        live; every OTHER carrier of that key is the ended fresh stub
+        (``end_reason='session_switch'``, 0 messages). ``adopted`` is True
+        only when the tip is the LIVE carrier the key resolves to.
+        """
+        carriers = self._carriers_for_key(adopt_key)
+        live = [row for row in carriers if row.get("ended_at") is None]
+        tip_row = next((row for row in carriers if str(row.get("id")) == tip), None)
+        adopted = (
+            tip_row is not None
+            and tip_row.get("ended_at") is None
+            and bool(live)
+            and str(live[0].get("id")) == tip
+        )
+        predecessors = [
+            {
+                "id": str(row.get("id")),
+                "endReason": row.get("end_reason"),
+                "messageCount": int(row.get("message_count") or 0),
+            }
+            for row in carriers
+            if str(row.get("id")) != tip
+        ]
+        return {
+            "adopted": adopted,
+            "tip": tip,
+            "predecessors": predecessors,
+            "session": self._row_to_wire(tip_row) if tip_row is not None else None,
+        }
+
+    def hide_sessions(self, session_ids: List[str]) -> List[str]:
+        """Hide rows with the public view-state flag (no-op pre-0.20.5)."""
+        if not session_read_state_supported():
+            return []
+        writer = self._get_writer()
+        hidden = []
+        for session_id in session_ids:
+            try:
+                writer.set_session_hidden(str(session_id), True)
+                hidden.append(str(session_id))
+            except Exception:  # noqa: BLE001 - presentation only, never fatal
+                logger.debug("hide predecessor %s failed", session_id, exc_info=True)
+        return hidden
+
 
 class ProfileSessionRpc:
     """Route the db.* lane across profile-isolated Hermes state DBs."""
@@ -1261,6 +1511,7 @@ class ProfileSessionRpc:
             DB_METHOD_CHAT_HISTORY: self.chat_history,
             DB_METHOD_DESCRIBE: self.describe_session,
             DB_METHOD_COMPACTION_INFO: self.compaction_info,
+            DB_METHOD_CHAT_WATERMARK: self.chat_watermark,
         }
 
     def _routing(self) -> Tuple[bool, Dict[str, Path]]:
@@ -1497,6 +1748,9 @@ class ProfileSessionRpc:
     async def chat_history(self, params: Any) -> Dict[str, Any]:
         return await self._route("chat_history", params)
 
+    async def chat_watermark(self, params: Any) -> Dict[str, Any]:
+        return await self._route("chat_watermark", params)
+
     async def describe_session(self, params: Any) -> Dict[str, Any]:
         return await self._route("describe_session", params)
 
@@ -1528,4 +1782,26 @@ class ProfileSessionRpc:
             identity,
             chat_id=chat_id,
             target_public_key=target_public_key,
+        )
+
+    # -- Continue here (adopt) — #2509: default-lane only, by contract ------
+
+    def resolve_adopt_source(self, identity: Any) -> Dict[str, Any]:
+        return self._rpc_for_namespace(
+            self._namespace_from_params({"identity": identity})
+        ).resolve_adopt_source(identity)
+
+    def adopt_outcome(self, adopt_key: str, tip: str) -> Dict[str, Any]:
+        return self._rpc_for_namespace(DEFAULT_SESSION_NAMESPACE).adopt_outcome(
+            adopt_key, tip
+        )
+
+    def lineage_for_key(self, session_key: str, ns: Optional[str] = None) -> List[str]:
+        return self._rpc_for_namespace(
+            str(ns or DEFAULT_SESSION_NAMESPACE)
+        ).lineage_for_key(session_key)
+
+    def hide_sessions(self, session_ids: List[str]) -> List[str]:
+        return self._rpc_for_namespace(DEFAULT_SESSION_NAMESPACE).hide_sessions(
+            session_ids
         )

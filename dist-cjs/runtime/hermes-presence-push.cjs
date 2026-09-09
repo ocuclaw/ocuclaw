@@ -6,6 +6,7 @@ const UNOBSERVABLE_PROJECTION = {
   authenticatedAppCount: null,
   clientVersions: [],
   lastTransitionAt: null,
+  device: { connected: null, batteryPercent: null, charging: null, inCase: null, observedAt: null },
 };
 
 const CLIENT_VERSION_MAX_CHARS = 32;
@@ -76,7 +77,20 @@ function createHermesPresencePush({ relay, link, logger }) {
       !(
         value.lastTransitionAt === null ||
         typeof value.lastTransitionAt === "string"
-      )
+      ) ||
+      !value.device ||
+      typeof value.device !== "object" ||
+      Array.isArray(value.device) ||
+      !(value.device.connected === null || typeof value.device.connected === "boolean") ||
+      !(
+        value.device.batteryPercent === null ||
+        (Number.isInteger(value.device.batteryPercent) &&
+          value.device.batteryPercent >= 0 &&
+          value.device.batteryPercent <= 100)
+      ) ||
+      !(value.device.inCase === null || typeof value.device.inCase === "boolean") ||
+      !(value.device.charging === null || typeof value.device.charging === "boolean") ||
+      !(value.device.observedAt === null || typeof value.device.observedAt === "string")
     ) {
       return { ...UNOBSERVABLE_PROJECTION };
     }
@@ -85,6 +99,13 @@ function createHermesPresencePush({ relay, link, logger }) {
       authenticatedAppCount: value.authenticatedAppCount,
       clientVersions: boundClientVersions(value.clientVersions),
       lastTransitionAt: value.lastTransitionAt || null,
+      device: {
+        connected: value.device.connected,
+        batteryPercent: value.device.batteryPercent,
+        charging: value.device.charging,
+        inCase: value.device.inCase,
+        observedAt: value.device.observedAt || null,
+      },
     };
   }
 

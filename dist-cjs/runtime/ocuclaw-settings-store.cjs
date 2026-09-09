@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
+const { normalizeAndValidateCustomSystemPrompt, normalizeCustomSystemPrompt } = require("../domain/custom-system-prompt-limit.cjs");
 
 const STORE_VERSION = 1;
 const STORE_FILENAME = "ocuclaw-settings.json";
@@ -16,7 +17,7 @@ function normalizeTrimmedString(value) {
 }
 
 function normalizeOcuClawSystemPrompt(value) {
-  return normalizeTrimmedString(value);
+  return normalizeCustomSystemPrompt(value);
 }
 
 function normalizeOcuClawDefaultModel(value) {
@@ -46,10 +47,11 @@ const OCUCLAW_AGENT_PROGRESS_NOTES_MODES = Object.freeze([
   "status",
   "conversation",
 ]);
-const OCUCLAW_AGENT_PROGRESS_NOTES_DEFAULT = "status";
+const OCUCLAW_AGENT_PROGRESS_NOTES_DEFAULT = "conversation";
 
 function normalizeOcuClawAgentProgressNotes(value) {
   const normalized = normalizeTrimmedString(value).toLowerCase();
+  if (normalized === "status") return "conversation";
   return OCUCLAW_AGENT_PROGRESS_NOTES_MODES.includes(normalized)
     ? normalized
     : OCUCLAW_AGENT_PROGRESS_NOTES_DEFAULT;
@@ -100,6 +102,31 @@ function normalizeOcuClawEvenAiSection(value = {}) {
   return {
     peer: normalizeOcuClawEvenAiPeer(source.peer),
   };
+}
+
+function normalizedUrlOrigin(value) {
+  const normalized = normalizeTrimmedString(value);
+  if (!normalized) return "";
+  try {
+    return new URL(normalized).origin;
+  } catch {
+    return "";
+  }
+}
+
+function mergeEvenAiPeerPatch(current = {}, patch = {}) {
+  const currentPeer = normalizeOcuClawEvenAiPeer(current);
+  const patchPeer = patch && typeof patch === "object" ? patch : {};
+  const nextUrl = hasOwn(patchPeer, "url")
+    ? normalizeTrimmedString(patchPeer.url)
+    : currentPeer.url;
+  const originChanged = hasOwn(patchPeer, "url")
+    && normalizedUrlOrigin(currentPeer.url) !== normalizedUrlOrigin(nextUrl);
+  return normalizeOcuClawEvenAiPeer({
+    ...currentPeer,
+    ...(originChanged ? { bearerToken: "", forwardSecret: "" } : {}),
+    ...patchPeer,
+  });
 }
 
 function pathwayBindingsEqual(left, right) {
@@ -392,10 +419,11 @@ function createOcuClawSettingsStore(opts = {}) {
     },
 
     async setSettings(patch = {}) {
+      const nextSystemPrompt = hasOwn(patch, "systemPrompt")
+        ? normalizeAndValidateCustomSystemPrompt(patch.systemPrompt)
+        : snapshot.systemPrompt;
       const next = {
-        systemPrompt: hasOwn(patch, "systemPrompt")
-          ? normalizeOcuClawSystemPrompt(patch.systemPrompt)
-          : snapshot.systemPrompt,
+        systemPrompt: nextSystemPrompt,
         defaultModel: hasOwn(patch, "defaultModel")
           ? normalizeOcuClawDefaultModel(patch.defaultModel)
           : snapshot.defaultModel,
@@ -423,10 +451,10 @@ function createOcuClawSettingsStore(opts = {}) {
           ? normalizeOcuClawEvenAiSection({
               ...snapshot.evenAi,
               ...(patch.evenAi || {}),
-              peer: {
-                ...snapshot.evenAi.peer,
-                ...((patch.evenAi && patch.evenAi.peer) || {}),
-              },
+              peer: mergeEvenAiPeerPatch(
+                snapshot.evenAi.peer,
+                patch.evenAi && patch.evenAi.peer,
+              ),
             })
           : snapshot.evenAi,
       };

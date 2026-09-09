@@ -18,6 +18,20 @@ const REASONING_VISIBILITY_LEVELS = Object.freeze([
   "on.full",
 ]);
 
+const OPENCLAW_AGENT_CREATE_MIN_VERSION = [2026, 7, 1];
+
+function supportsOpenClawAgentCreate(hostVersion) {
+  if (typeof hostVersion !== "string") return false;
+  const match = hostVersion.trim().match(/^(\d{4})\.(\d+)\.(\d+)/);
+  if (!match) return false;
+  const actual = [Number(match[1]), Number(match[2]), Number(match[3])];
+  for (let index = 0; index < OPENCLAW_AGENT_CREATE_MIN_VERSION.length; index += 1) {
+    if (actual[index] > OPENCLAW_AGENT_CREATE_MIN_VERSION[index]) return true;
+    if (actual[index] < OPENCLAW_AGENT_CREATE_MIN_VERSION[index]) return false;
+  }
+  return true;
+}
+
 const MODEL_REASONING_CEILINGS = Object.freeze({
   providers: Object.freeze({
     anthropic: "max",
@@ -165,7 +179,6 @@ function normalizeAgentCatalog(snapshot = { agents: [] }, backend = "") {
 
 function buildFamilies(source, options = {}) {
   const isHermes = source === "hermes";
-  const evenTerminalEnabled = options.evenTerminalEnabled === true;
   return {
     sessions: {
       list: true,
@@ -180,10 +193,14 @@ function buildFamilies(source, options = {}) {
       routes: {
         openclaw: { selectable: true },
         hermes: { selectable: isHermes },
-        evenTerminal: { selectable: evenTerminalEnabled },
       },
       foreignSessions: {
-        adopt: false,
+
+        adopt: isHermes && options.agentCatalogSnapshot?.foreignSessionAdopt === true,
+
+        driverLock: isHermes && options.agentCatalogSnapshot?.foreignSessionAdopt === true,
+
+        desktopMirror: isHermes && options.agentCatalogSnapshot?.foreignSessionAdopt === true,
         inject: false,
         copy: true,
       },
@@ -222,6 +239,24 @@ function buildFamilies(source, options = {}) {
     agents: {
       list: true,
       identityFile: true,
+
+      hermesManagement: isHermes,
+
+      openclawAgentCreate:
+        source === "openclaw" && supportsOpenClawAgentCreate(options.openclawHostVersion),
+      hermesProfileCreate:
+        isHermes && options.agentCatalogSnapshot?.hermesProfileCreate === true,
+      agentCreateSetup: source === "openclaw"
+        ? supportsOpenClawAgentCreate(options.openclawHostVersion)
+        : isHermes && options.agentCatalogSnapshot?.agentCreateSetup === true,
+      agentEmojiSet:
+        source === "openclaw"
+          ? supportsOpenClawAgentCreate(options.openclawHostVersion)
+          : isHermes && options.agentCatalogSnapshot?.hermesProfileEmojiSet === true,
+      agentSettings:
+        source === "openclaw"
+          ? supportsOpenClawAgentCreate(options.openclawHostVersion)
+          : isHermes && options.agentCatalogSnapshot?.hermesProfileSettings === true,
     },
     settings: {
       profiles: {
@@ -232,9 +267,6 @@ function buildFamilies(source, options = {}) {
     liveui: {
       render: true,
       nav: true,
-    },
-    evenTerminal: {
-      enabled: evenTerminalEnabled,
     },
     pathways: {
       evenAiBindingEditable: source === "openclaw",

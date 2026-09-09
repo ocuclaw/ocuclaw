@@ -1,7 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const DEFAULTS = { emoji: false, pace: false };
+const DEFAULTS = { emoji: false, pace: false, beat: false };
 const STORE_FILENAME = "ocuclaw-display-toggles.json";
 
 function createDisplayToggleTracker(opts = {}) {
@@ -14,7 +14,11 @@ function createDisplayToggleTracker(opts = {}) {
   const byKey = new Map();
 
   function norm(v) {
-    return { emoji: !!(v && v.emoji), pace: !!(v && v.pace) };
+    return {
+      emoji: !!(v && v.emoji),
+      pace: !!(v && v.pace),
+      beat: !!(v && v.beat),
+    };
   }
 
   function load() {

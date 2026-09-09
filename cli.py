@@ -187,6 +187,12 @@ REPAIR_TEXT: Dict[str, str] = {
         "Configure the Even AI secret, or turn Even AI off, then restart the "
         "Hermes gateway."
     ),
+    "configure_continue_here": (
+        "Run: hermes config set platforms.ocuclaw.extra.allow_admin_from "
+        "'[\"ocuclaw-wearer\"]' — then restart the Hermes gateway. This lets the "
+        "glasses continue a Desktop, CLI or TUI chat (it turns slash-command "
+        "gating on for the OcuClaw platform; the wearer id is its only admin)."
+    ),
     "install_node": (
         "Install Node.js on this host, or point the OcuClaw runtime command at "
         "an existing Node.js, then restart the Hermes gateway."
@@ -551,7 +557,82 @@ def _render_provenance(snapshot: Mapping[str, Any]) -> List[str]:
     return lines
 
 
-def _render_setup(snapshot: Mapping[str, Any]) -> List[str]:
+AGENT_CHOICE_UNCHOSEN = "unchosen"
+AGENT_CHOICE_MULTIPLE = "multiple"
+AGENT_CHOICE_SINGLE = "single"
+AGENT_CHOICE_MISMATCH = "mismatch"
+AGENT_CHOICE_UNKNOWN = "unknown"
+
+# Same wording the phone shows when the grey "+" is tapped (#2515), so a
+# tester reading either surface recognises the other.
+AGENT_CHOICE_SETUP_HINT = "run /ocuclaw-setup in a Hermes chat to choose"
+
+
+def agent_choice_state(facts: Mapping[str, Any]) -> str:
+    """Classify the agent choice from the raw config leaves (#2515).
+
+    Mirrors `_setup_status`'s `agentModeChosen` rule — a choice counts only
+    when the recorded answer and the switch agree — but keeps the reason,
+    because the report's job is to say WHY the phone's "+" is grey:
+
+    - ``unchosen``  the switch is off (or absent) and nothing was recorded —
+                    an install that predates the agent question.
+    - ``multiple``  switch on, answer ``multiple``: "+" creates agents.
+    - ``single``    switch off, answer ``single``: "+" is grey by choice.
+    - ``mismatch``  answer and switch disagree — an interrupted write or a
+                    hand edit; the choice must be re-run, not guessed.
+    - ``unknown``   the config could not be read.
+    """
+    if not facts.get("configReadable"):
+        return AGENT_CHOICE_UNKNOWN
+    multiplex = facts.get("multiplexProfiles")
+    mode = facts.get("agentMode")
+    if mode is None:
+        # An unrecorded answer is "unchosen" even with the switch flipped on
+        # by hand: the recorded choice is what the skill and the phone trust.
+        return AGENT_CHOICE_UNCHOSEN
+    if mode == "multiple" and multiplex is True:
+        return AGENT_CHOICE_MULTIPLE
+    if mode == "single" and multiplex is not True:
+        return AGENT_CHOICE_SINGLE
+    return AGENT_CHOICE_MISMATCH
+
+
+def _render_agent_choice(facts: Mapping[str, Any], *, prescribe: bool) -> List[str]:
+    """The `multiple agents` row of the Setup section (#2515).
+
+    `status` names the state; only `doctor` (``prescribe``) adds the arrow line
+    that offers the choice, matching the passive/prescribing split the Serve
+    section already draws (#1273 §10).
+    """
+    state = agent_choice_state(facts)
+    multiplex = facts.get("multiplexProfiles")
+    switch = "on" if multiplex is True else "off"
+    if state == AGENT_CHOICE_UNKNOWN:
+        text = "unknown (configuration could not be read)"
+    elif state == AGENT_CHOICE_MULTIPLE:
+        text = "on  (agent mode: multiple — the phone's \"+\" creates agents)"
+    elif state == AGENT_CHOICE_SINGLE:
+        text = "off  (agent mode: single, chosen — the phone's \"+\" stays grey)"
+    elif state == AGENT_CHOICE_MISMATCH:
+        text = (
+            f"{switch}  but agent mode is recorded as {facts.get('agentMode')!r} — "
+            "the choice and the switch disagree"
+        )
+    else:
+        text = f"{switch}  · agent mode not chosen yet — the phone's \"+\" is grey"
+    lines = [f"  multiple agents           {text}"]
+    if prescribe and state in (AGENT_CHOICE_UNCHOSEN, AGENT_CHOICE_MISMATCH):
+        lines.append(f"    → {AGENT_CHOICE_SETUP_HINT} (multiple agents is recommended)")
+    return lines
+
+
+def _render_setup(
+    snapshot: Mapping[str, Any],
+    facts: Optional[Mapping[str, Any]] = None,
+    *,
+    prescribe: bool = False,
+) -> List[str]:
     setup = snapshot.get("setup") or {}
     state = _safe(setup.get("state"))
     gloss = _SETUP_STATE_GLOSS.get(state, "state not known to this build")
@@ -575,7 +656,7 @@ def _render_setup(snapshot: Mapping[str, Any]) -> List[str]:
     else:
         secret_text = "no secret slots reported"
 
-    return [
+    lines = [
         "",
         "Hermes Setup State — durable installation and configuration",
         f"  state                     {state}  ({gloss})",
@@ -583,11 +664,18 @@ def _render_setup(snapshot: Mapping[str, Any]) -> List[str]:
         f"  hermes CLI on PATH        {_yes_no(setup.get('hermesCliOnPath'))}",
         f"  plugin enabled            {_yes_no(setup.get('pluginEnabled'))}",
         f"  platform enabled          {_yes_no(setup.get('platformEnabled'))}",
-        f"  Node.js                   {node_text}",
-        f"  OcuClaw runtime           "
-        f"{'available' if setup.get('runtimeAvailable') else 'not available'}",
-        f"  secrets configured        {secret_text}",
     ]
+    if facts is not None:
+        lines.extend(_render_agent_choice(facts, prescribe=prescribe))
+    lines.extend(
+        [
+            f"  Node.js                   {node_text}",
+            f"  OcuClaw runtime           "
+            f"{'available' if setup.get('runtimeAvailable') else 'not available'}",
+            f"  secrets configured        {secret_text}",
+        ]
+    )
+    return lines
 
 
 def _render_health(snapshot: Mapping[str, Any]) -> List[str]:
@@ -1040,7 +1128,7 @@ def render_snapshot_text(
     lines: List[str] = []
     lines.extend(_render_header(snapshot))
     lines.extend(_render_provenance(snapshot))
-    lines.extend(_render_setup(snapshot))
+    lines.extend(_render_setup(snapshot, facts, prescribe=prescribe))
     lines.extend(_render_health(snapshot))
     if facts is not None:
         lines.extend(
@@ -1058,6 +1146,63 @@ def render_snapshot_text(
         lines.extend(_render_probes(probe_outcomes))
     lines.extend(_render_findings(snapshot))
     return "\n".join(lines) + "\n"
+
+
+def render_removal_notice(notice: Mapping[str, Any]) -> List[str]:
+    """Doctor's removal advisory for the generated Desktop runtime (#2086).
+
+    Pure. Silent unless there is something true and actionable to say, so the
+    ordinary report is unchanged for a profile with no generated runtime.
+
+    Two cases, and only two:
+
+    * the Agent plugin and its owned runtime are both present — warn that
+      generic `hermes plugins remove ocuclaw` is not complete removal, because
+      it deletes the Agent package while `<home>/desktop-plugins/ocuclaw/` is
+      not part of any Hermes package and keeps loading;
+    * the runtime is owned and the Agent package is already gone — print the
+      self-contained recovery command. This branch is close to unreachable in
+      practice, because generic removal takes the very command printing it;
+      it exists so the observation has one honest answer in both directions.
+
+    A foreign file at that path is not OcuClaw's to discuss, and says nothing.
+    """
+
+    state = notice.get("state")
+    path = notice.get("runtimePath")
+    if state != "owned" or not isinstance(path, str):
+        return []
+    if notice.get("orphaned"):
+        command = notice.get("recoveryCommand")
+        lines = [
+            "",
+            "Removal — an OcuClaw-owned Hermes Desktop runtime is orphaned",
+            "",
+            "  The OcuClaw Agent plugin is gone, but this generated Desktop "
+            "runtime remains and still loads:",
+            f"    {path}",
+        ]
+        if isinstance(command, str) and command:
+            lines.append("")
+            lines.append(
+                "  Remove only that orphan — it checks OcuClaw's ownership "
+                "marker first and preserves anything else:"
+            )
+            lines.append("")
+            lines.extend(f"    {line}" for line in command.splitlines())
+        return lines
+    return [
+        "",
+        "Removal — use `hermes ocuclaw uninstall`, not generic plugin removal",
+        "",
+        "  OcuClaw generates and owns this Hermes Desktop runtime:",
+        f"    {path}",
+        "",
+        "  It is not part of the Agent package, so `hermes plugins remove "
+        "ocuclaw` leaves it behind and Hermes Desktop keeps loading it.",
+        "  `hermes ocuclaw uninstall` removes the Agent package, this runtime, "
+        "and OcuClaw's own profile state together.",
+    ]
 
 
 def render_error_text(envelope: Mapping[str, Any]) -> str:
@@ -1319,6 +1464,14 @@ def _default_teardown_permitted(facts: Mapping[str, Any]) -> bool:
         return False
 
 
+def _default_removal_notice() -> Mapping[str, Any]:
+    """Doctor's read-only look at the generated Desktop runtime (#2086)."""
+
+    from . import uninstall as uninstall_mod
+
+    return uninstall_mod.desktop_removal_notice()
+
+
 def _emit_error(
     code: str,
     *,
@@ -1344,6 +1497,7 @@ def run(
     record_fn: Optional[Callable[..., Any]] = None,
     teardown_fn: Optional[Callable[[Mapping[str, Any]], bool]] = None,
     replacement_fn: Optional[Callable[[Mapping[str, Any]], bool]] = None,
+    removal_notice_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
     stdout: Optional[TextIO] = None,
     stderr: Optional[TextIO] = None,
 ) -> int:
@@ -1464,6 +1618,21 @@ def run(
                 prescribe=(command == "doctor"),
             )
         )
+        if command == "doctor":
+            # `doctor` prescribes; `status` is passive by contract (#1273 §10)
+            # and never prints a command. A failed observation is not an
+            # outage — the report stands without the advisory.
+            try:
+                notice = (
+                    _default_removal_notice()
+                    if removal_notice_fn is None
+                    else removal_notice_fn()
+                )
+                lines = render_removal_notice(notice)
+            except Exception:  # noqa: BLE001 - advisory only, never fatal
+                lines = []
+            if lines:
+                out.write("\n".join(lines) + "\n")
 
     if command == "doctor":
         # The *proposed* half, recorded only after the command that justifies

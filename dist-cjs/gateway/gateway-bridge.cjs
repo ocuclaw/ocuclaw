@@ -1,4 +1,6 @@
 const { gatewaySessionKeyFor } = require("../runtime/openclaw-session-key.cjs");
+const { splitReadabilitySystemPrompt } = require("../domain/readability-system-prompt.cjs");
+const { normalizeBridgePrompt } = require("./backend-contract.cjs");
 
 function removeListenerCompat(emitter, eventName, listener) {
   if (typeof emitter.off === "function") {
@@ -102,13 +104,16 @@ function buildAgentRequestParams(
     sessionKey: relaySessionKey,
     idempotencyKey: createIdempotencyKey(),
   };
-  const extraSystemPrompt =
-    requestOptions && typeof requestOptions.extraSystemPrompt === "string"
-      ? requestOptions.extraSystemPrompt.trim()
-      : "";
+  const prompt = normalizeBridgePrompt(requestOptions);
 
-  if (extraSystemPrompt) {
-    params.extraSystemPrompt = extraSystemPrompt;
+  if (prompt) {
+
+    params.extraSystemPrompt = prompt.content;
+    if (!prompt.legacy) {
+
+      Reflect.set(params, "promptOwner", prompt.owner);
+      Reflect.set(params, "promptLane", prompt.lane);
+    }
   }
 
   const thinking =
@@ -221,24 +226,34 @@ function createPluginRpcGatewayBridge(opts) {
     );
     const gatewaySessionKey = scopeOpenClawSessionKey(sessionKey, requestOptions);
     if (!hasAttachment && chatSendSlashCommandName(text)) {
+
+      normalizeBridgePrompt(requestOptions);
       return request(
         "chat.send",
         buildChatSendRequestParams(text, gatewaySessionKey, idempotencyKeyFactory),
         requestOpts,
       );
     }
-    return request(
-      "agent",
-      buildAgentRequestParams(
-        text,
-        gatewaySessionKey,
-        attachment,
-        idempotencyKeyFactory,
-        requestOptions,
-        true,
-      ),
-      requestOpts,
+    const agentParams = buildAgentRequestParams(
+      text,
+      gatewaySessionKey,
+      attachment,
+      idempotencyKeyFactory,
+      requestOptions,
+      true,
     );
+
+    if (Reflect.get(agentParams, "promptOwner") === "even-ai") {
+      const { readability } = splitReadabilitySystemPrompt(
+        Reflect.get(agentParams, "extraSystemPrompt"),
+      );
+      if (readability) Reflect.set(agentParams, "extraSystemPrompt", readability);
+      else Reflect.deleteProperty(agentParams, "extraSystemPrompt");
+    }
+
+    Reflect.deleteProperty(agentParams, "promptOwner");
+    Reflect.deleteProperty(agentParams, "promptLane");
+    return request("agent", agentParams, requestOpts);
   }
 
   function resolveApproval(id, decision) {

@@ -39,6 +39,7 @@ const DEFAULT_DEBUG_CATEGORIES = Object.freeze([
   "approvals.state",
   "voice.timeline",
   "voice.transport",
+  "voice.transport.result",
   "voice.ptt",
   "voice.waveform",
   "evenai",
@@ -96,7 +97,7 @@ const DEFAULT_NOISY_CATEGORY_POLICIES = Object.freeze({
   "sdk.frames": Object.freeze({
 
     sampleEvery: 1,
-    dedupeWindowMs: 150,
+    dedupeWindowMs: 0,
     alwaysAllow: Object.freeze([
       "coalescing_summary",
       "stream_first_visible_latency_v1",
@@ -115,6 +116,37 @@ function clampInt(value, min, max, fallback) {
   if (rounded < min) return min;
   if (rounded > max) return max;
   return rounded;
+}
+
+function createNoisyPolicyFilter(options = {}) {
+  const noisyPolicies = {
+    ...DEFAULT_NOISY_CATEGORY_POLICIES,
+    ...(options.noisyPolicies || {}),
+  };
+  const noisyCounters = new Map();
+  const noisyLast = new Map();
+
+  return function allowByNoisyPolicy(cat, eventName, serializedData, ts) {
+    const rawPolicy = noisyPolicies[cat];
+    if (!rawPolicy) return true;
+
+    const alwaysAllow = rawPolicy.alwaysAllow;
+    if (Array.isArray(alwaysAllow) && alwaysAllow.includes(eventName)) return true;
+
+    const sampleEvery = clampInt(rawPolicy.sampleEvery, 1, 1000, 1);
+    const dedupeWindowMs = clampInt(rawPolicy.dedupeWindowMs, 0, 60000, 0);
+    const nextCount = (noisyCounters.get(cat) || 0) + 1;
+    noisyCounters.set(cat, nextCount);
+    if (sampleEvery > 1 && nextCount % sampleEvery !== 1) return false;
+
+    if (dedupeWindowMs > 0) {
+      const key = `${eventName}|${serializedData.slice(0, 160)}`;
+      const prev = noisyLast.get(cat);
+      if (prev && prev.key === key && ts - prev.ts <= dedupeWindowMs) return false;
+      noisyLast.set(cat, { key, ts });
+    }
+    return true;
+  };
 }
 
 function normalizeCategoryList(raw) {
@@ -157,11 +189,6 @@ function createDebugStore(opts) {
       : DEFAULT_DEBUG_CATEGORIES;
   const categories = new Set(configuredCategories);
 
-  const noisyPolicies = {
-    ...DEFAULT_NOISY_CATEGORY_POLICIES,
-    ...(options.noisyPolicies || {}),
-  };
-
   const enabledUntil = new Map();
 
   if (Array.isArray(options.initialEnabled)) {
@@ -175,9 +202,7 @@ function createDebugStore(opts) {
     }
   }
 
-  const noisyCounters = new Map();
-
-  const noisyLast = new Map();
+  const allowByNoisyPolicy = createNoisyPolicyFilter(options);
 
   const ring = new Array(capacity);
   let ringWrite = 0;
@@ -305,36 +330,6 @@ function createDebugStore(opts) {
     return { data: normalized, serialized };
   }
 
-  function allowByNoisyPolicy(cat, eventName, serializedData, ts) {
-    const rawPolicy = noisyPolicies[cat];
-    if (!rawPolicy) return true;
-
-    const alwaysAllow = rawPolicy.alwaysAllow;
-    if (Array.isArray(alwaysAllow) && alwaysAllow.includes(eventName)) {
-      return true;
-    }
-
-    const sampleEvery = clampInt(rawPolicy.sampleEvery, 1, 1000, 1);
-    const dedupeWindowMs = clampInt(rawPolicy.dedupeWindowMs, 0, 60000, 0);
-
-    const nextCount = (noisyCounters.get(cat) || 0) + 1;
-    noisyCounters.set(cat, nextCount);
-    if (sampleEvery > 1 && nextCount % sampleEvery !== 1) {
-      return false;
-    }
-
-    if (dedupeWindowMs > 0) {
-      const key = `${eventName}|${serializedData.slice(0, 160)}`;
-      const prev = noisyLast.get(cat);
-      if (prev && prev.key === key && ts - prev.ts <= dedupeWindowMs) {
-        return false;
-      }
-      noisyLast.set(cat, { key, ts });
-    }
-
-    return true;
-  }
-
   function append(event) {
     ring[ringWrite] = event;
     ringWrite = (ringWrite + 1) % capacity;
@@ -363,7 +358,7 @@ function createDebugStore(opts) {
         : "debug";
 
     const normalized = normalizeData(raw.data);
-    if (!allowByNoisyPolicy(cat, eventName, normalized.serialized, ts)) {
+    if (!force && !allowByNoisyPolicy(cat, eventName, normalized.serialized, ts)) {
       return false;
     }
 
@@ -374,6 +369,7 @@ function createDebugStore(opts) {
       severity,
       seq: ++seq,
       data: normalized.data,
+      ...(force ? { forced: true } : {}),
     };
 
     if (typeof raw.sessionKey === "string" && raw.sessionKey) {
@@ -510,7 +506,11 @@ function createDebugStore(opts) {
     let oldestMatchedMs = null;
     const all = getAllEvents();
     for (const evt of all) {
-      if (categorySet && !categorySet.has(evt.cat)) continue;
+      if (
+        categorySet &&
+        !categorySet.has(evt.cat) &&
+        !(req.includeForced === true && evt.forced === true)
+      ) continue;
       if (oldestMatchedMs === null || evt.ts < oldestMatchedMs) oldestMatchedMs = evt.ts;
       if (sinceMs !== null && evt.ts < sinceMs) continue;
       if (untilMs !== null && evt.ts > untilMs) continue;
@@ -569,4 +569,4 @@ function createDebugStore(opts) {
   };
 }
 
-module.exports = { createDebugStore, DEFAULT_DEBUG_CATEGORIES, DEFAULT_NOISY_CATEGORY_POLICIES };
+module.exports = { createDebugStore, createNoisyPolicyFilter, DEFAULT_DEBUG_CATEGORIES, DEFAULT_NOISY_CATEGORY_POLICIES };

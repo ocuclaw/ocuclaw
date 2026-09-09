@@ -30,8 +30,9 @@ const llmRecipeSchema = {
   required: ["kind", "prompt"],
   properties: {
     kind: { const: "llm" },
-    prompt: { type: "string" },
-    systemPrompt: { type: "string" },
+
+    prompt: { type: "string", maxLength: 4096 },
+    systemPrompt: { type: "string", maxLength: 4096 },
     model: { type: "string" },
     maxOutputTokens: { type: "integer" },
   },

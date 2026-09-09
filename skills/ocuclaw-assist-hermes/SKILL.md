@@ -7,7 +7,7 @@ metadata: {"hermes": {"emoji": "glasses"}}
 
 # OcuClaw Setup Assistant for Hermes
 
-**Guide version:** 2026-08-31 (1.3.18-hermes)
+**Guide version:** 2026-09-05 (1.3.19-hermes)
 
 **Provenance:** deliberately forked from the OcuClaw Setup Assistant guide
 1.0.41 at commit `fffbb2154`. That is the source guide version, not an
@@ -30,6 +30,27 @@ any setup step. Reply only:
 
 Then stop. Setup never transfers into the OcuClaw phone/G2 conversation.
 
+## Even AI activation intent
+
+Treat this exact request, and a clear equivalent, as explicit Even AI activation intent:
+
+> I want to enable Even AI for OcuClaw. Use the OcuClaw setup skill and guide me through it.
+
+This journey is host-owned. It must run in the user's main Hermes conversation.
+If it arrives from an OcuClaw phone or G2 conversation, use the phone-session
+entry gate above and stop; do not begin host setup there.
+
+After the Opening move and calibration, call `{"operation":"status"}` and use
+only the required read-only host checks. When OcuClaw is installed and healthy,
+load `{"operation":"fresh_install"}` and enter its **Even AI activation lane**
+directly. Do not replay unrelated Hermes Core Setup Completion steps. If the
+host is unhealthy, route only to the prerequisite that blocks activation.
+
+The lane owns all six checkpoints: Agent Configuration unlock; masked secret
+entry and presence-only verification; non-secret enablement; explicit approval
+and live verification of private `:8443`; Even Realities app configuration; and
+a real glasses request. Never add a beta qualifier to Hermes in this journey.
+
 ## Opening move
 
 After the phone-session entry gate passes, your FIRST reply in every new setup
@@ -37,7 +58,8 @@ conversation does these three things, in this order, and NOTHING else: no
 checklist, probes, or step content.
 
 1. Warmly announce that you will walk them through setup and name the
-   **OcuClaw Setup Assistant**, including the full Guide version above.
+   **OcuClaw Setup Assistant**. Keep guide version and provenance in diagnostic
+   details, available on request.
 2. Explain briefly that you will do most checks, but they will enter optional
    service credentials themselves; Hermes may restart; after an interruption
    they can say "continue OcuClaw setup".
@@ -47,13 +69,16 @@ checklist, probes, or step content.
 
 Shape it like this:
 
-> I'll walk you through setting up OcuClaw. The OcuClaw Setup Assistant,
-> guide version 2026-08-31 (1.3.18-hermes), is loaded to guide it. I'll do most
-> of the checks and setup; you'll run a few commands yourself so optional
-> service credentials never pass through me. Hermes may briefly restart — if I
-> go quiet, say "continue OcuClaw setup." One question before we start: are
-> you comfortable in a terminal, or would you like everything explained as we
-> go?
+> I'll walk you through setting up OcuClaw with the OcuClaw Setup Assistant.
+> I'll do most checks and setup. In Desktop, private Soniox and Even AI forms
+> keep optional credentials out of this chat, and the Restart gateway button
+> applies changes when needed. If we get interrupted, say "continue OcuClaw
+> setup." Would you like each step explained, or are you comfortable with
+> brief technical instructions?
+
+For TUI/terminal entry, describe Hermes' masked credential prompts and the
+guided restart instead of Desktop forms and buttons. Desktop setup leaves the
+terminal default alone. Retain the same explanation and calibration contract.
 
 First-reply output gate: if the draft lacks the announcement, expectations, or
 calibration question, or contains anything else, replace it with the template
@@ -86,7 +111,7 @@ and enabled. It must remain useful while OcuClaw is unconfigured, unavailable,
 or broken. Do not promise that this plugin-owned skill or setup tool remains
 available after the plugin is removed or disabled.
 
-OcuClaw connects an Even G2 and its Even Hub phone app to a Hermes 0.20.x
+OcuClaw connects an Even G2 and its Even Hub phone app to a supported Hermes
 gateway. The Hermes platform plugin starts a loopback relay on port 47801;
 Tailscale Serve exposes only the authenticated relay at `:8446` to the user's
 tailnet.
@@ -105,12 +130,29 @@ the state is invalid or unavailable. Then request exactly one guidance branch:
 - a command lookup -> `{"operation":"quick_reference"}`
 - a genuine finish -> `{"operation":"wrap_feedback"}`
 
+For installation access, uninstall, or route teardown details, load
+`{"operation":"install_lifecycle"}`. This retained reference replaces the
+long terminal launch output; its recovery and consent rules still apply.
+
 Setup is host-owned for the whole journey. Treat `journey.nextCheckpoint` in
 every status/fresh-install receipt as the resume authority and never repeat an
 earlier checkpoint merely because Hermes restarted or this is a fresh agent
 turn. The OcuClaw phone/G2 conversation supplies only the test message, wearer
 display confirmation, and welcome dismissal. Never ask the user to invoke
 `/ocuclaw-setup`, load this skill, or continue setup inside that conversation.
+
+`mandatory-configuration` means enter fresh-install Step 4 directly. Read
+`status.mandatoryConfiguration`, perform only missing non-secret checks, verify
+them, then continue through the explicit optional Step 4b choice. Connection
+health describes the relay, not completion of these guide checks. Proven or
+armed completion receipts keep their existing resume point; do not replay
+earlier onboarding for them.
+
+On first setup only, after calibration and the read-only status, ask the G2
+ownership question in fresh-install Step 1 before starting configuration, even
+when the local relay is already healthy. A durable pairing/completion receipt
+or the lane card's recorded G2 answer satisfies this question. Resume uses that
+answer; updates, recovery, and Even AI activation do not re-ask it.
 
 `{"operation":"pair_phone"}` is the direct local pairing action. Use it only
 at `journey.nextCheckpoint: secure-phone-pairing`, after `doctor` has verified
@@ -150,8 +192,9 @@ the welcome wait, `expired` or `failed` restarts at the phone-origin turn, and
 `committed` means the durable milestone already exists. Never advertise these
 private actions as slash commands.
 
-There is no beta-channel reference: this Hermes beta has one public GitHub
-bundle channel. Never introduce npm or ClawHub instructions.
+There is no beta-channel reference: this Hermes beta has one GitHub bundle
+channel. The repository is private; testers need repository access and working
+Git HTTPS authentication on the Hermes host. Never introduce npm or ClawHub instructions.
 
 Every operation above is read-only. The tool has exactly TWO writing
 operations, and both write only with `confirm: true`, which is only ever sent
@@ -221,9 +264,12 @@ receipt.
    plugin generates it once during initial bootstrap on a provably fresh
    profile; there is no user-entry lane. If an established profile is missing
    it, stop normal setup and load the credential-reset branch.
-   Optional user-supplied Soniox and Even AI credentials also use Hermes'
-   masked platform setup. Never ask the user to paste, echo, inspect, or read
-   back any secret. `hermes gateway setup` is interactive and always marked
+   Optional Soniox and Even AI credentials use the private Desktop dialog via
+   `request_credentials`, with exactly one integration name as the tool
+   argument. Ask about Soniox and Even AI separately and open each popup at its
+   own checkpoint. Terminal users use Hermes' masked platform setup. Never ask the
+   user to paste a secret into chat or echo, inspect, or read back any secret.
+   `hermes gateway setup` is interactive and always marked
    USER ACTION REQUIRED; the assistant must never execute that wizard.
 4. **Checkpoint a mutating phase, never a read-only check.** Before a change,
    say what it does and why, show every command with a one-line explanation,
@@ -255,9 +301,9 @@ receipt.
    needs a failed listed path, a plain-language proposal, user OK, one attempt,
    and verification.
 9. **Use honest proof language.** Static checks or this walkthrough are not
-   `sim-clean` or `g2-validated`. LiveUI and Even Terminal ship enabled, but
-   their remaining simulator/hardware evidence belongs to separate gates. This
-   guided ceremony does not earn a named evidence rung by itself.
+   `sim-clean` or `g2-validated`. LiveUI's remaining simulator/hardware
+   evidence belongs to separate gates. This guided ceremony does not earn a
+   named evidence rung by itself.
 
 ### Placeholders
 
@@ -274,7 +320,7 @@ user-relevant connection proofs.
 
 - [ ] User level recorded
 - [ ] Even G2 / Even Hub readiness confirmed
-- [ ] Hermes version is within `>=0.20.0,<0.21.0`
+- [ ] Hermes version is within `>=0.21.0,<0.22.0`
 - [ ] Installation source recorded accurately
 - [ ] Secure relay access ready
 - [ ] OcuClaw conversational tool progress is off (`config get` reports `false`)
@@ -283,16 +329,16 @@ user-relevant connection proofs.
 - [ ] Relay listening on loopback port 47801 (or recorded override)
 - [ ] Tailscale connected on host and phone
 - [ ] Tailscale Serve `:8446` relay route verified
-- [ ] Direct pairing presenter is live in Hermes TUI or Desktop (`display.interface=tui` remains the terminal default)
+- [ ] Direct pairing presenter is live in Hermes TUI or Desktop (require `display.interface=tui` only for terminal installs; Desktop does not require changing or mentioning the terminal default)
 - [ ] Phone-origin reply confirmed on the Even G2
 - [ ] First-Run Proof committed by welcome dismissal, or split-truth warning recorded
 - [ ] Profile/multiplex posture explained when applicable
 - [ ] Optional integrations resolved
 - [ ] Ordered wrap delivered, including the single support-path explanation
 
-Use the public GitHub bundle in the supported production lane. An explicitly
+Use the GitHub distribution bundle in the supported production lane. An explicitly
 identified local test candidate is valid only for a test lane and must be
-recorded as such; never describe it as the public GitHub bundle.
+recorded as such; never describe it as a published GitHub installation.
 
 ## Lane card
 
@@ -300,6 +346,7 @@ Maintain this compact card internally. Never include secret values.
 
 ```text
 User level: guided | terminal-comfortable
+G2 glasses: unknown | has-glasses | not-yet (website opened | declined | handoff)
 Host OS: linux | macOS | Windows | unknown
 Hermes version: <version | unknown>
 Hermes CLI on agent PATH: yes | no | unknown
@@ -357,10 +404,17 @@ hermes config get gateway.multiplex_profiles
 hermes profile list
 ```
 
-`true` plus more than one listed profile is `Multiplex: on-multiple` and must
-enter `PROFILE-AUTHZ-DROP` before finishing. Missing/false is off; true with
-only the default profile is on-single. A gateway boot warning is authoritative
-when a process-level environment override makes persisted config disagree.
+During fresh setup, call `{"operation":"agent_mode"}` before
+the restart. Multiple agents is recommended, single agent remains a choice.
+Require `status.mandatoryConfiguration.agentModeChosen: true`; verify the
+served list after restart. The same operation applies to an EXISTING install
+whose status reports `agentModeChosen: false` (#2515): the phone's grey "+"
+sends the wearer here with "Multiple agents is off on your Hermes host. Run
+/ocuclaw-setup", and `hermes ocuclaw status` shows `multiple agents  off ·
+agent mode not chosen yet`. Ask the question, apply the branch (allowlist
+BEFORE the switch, `--force` on `hermes config set`, expect and explain the
+"not a recognized config key" notice if it was run without), then one restart. Enter `PROFILE-AUTHZ-DROP` only for an actual
+secondary-profile rejection, not merely because multiple profiles exist.
 
 ## Router
 
@@ -368,6 +422,10 @@ when a process-level environment override makes persisted config disagree.
   at its earliest unproved step.
 - Installed and healthy, user asks to update -> call
   `{"operation":"update"}`.
+- Installed and healthy, `status.mandatoryConfiguration.agentModeChosen` is
+  false (the phone's "+" is grey, or the user quotes its "Run /ocuclaw-setup"
+  line) -> call `{"operation":"agent_mode"}` and complete that choice; it
+  needs one gateway restart and nothing else.
 - Lost/compromised phone or explicit reset request -> call
   `{"operation":"credential_reset"}` and complete that branch before pairing.
 - Failure text or failed verify -> call `{"operation":"troubleshooting"}` and
@@ -376,23 +434,25 @@ when a process-level environment override makes persisted config disagree.
 
 ## Shipping posture that must remain truthful
 
-- Supported Hermes is exactly `>=0.20.0,<0.21.0` (Hermes 0.20.x).
-- Install and update use the public GitHub bundle:
-  `ocuclaw/ocuclaw`.
+- Supported Hermes is exactly `>=0.21.0,<0.22.0` (Hermes 0.21.x).
+- Install and update use the private GitHub bundle `ocuclaw/ocuclaw`.
+  Beta testers need repository access and Git HTTPS authentication on this host.
 - The relay defaults to `wsBind` `127.0.0.1` and `wsPort` `47801`, loopback
   only; the host has one OcuClaw-managed Tailscale Serve route on `:8446`.
 - A gateway that has to be POKED — a config key flipped, a stand-in model, a
   platform restarted — never gets poked at 47801. `bash
-  tools/hermes-throwaway-gateway.sh --version 0.20.6|0.20.0 --boot-check` brings
+  tools/hermes-throwaway-gateway.sh --version 0.21.0|0.20.0 --boot-check` brings
   up a gateway on 47802/47803 against a fresh `HERMES_HOME` under `/tmp`, with
   this repo's bundle symlinked in and a token generated per boot, and prints the
-  `--relay-url`/`--token` pair to drive it with. It touches nothing in the
-  operator's `~/.hermes` beyond reading the certified venv as an interpreter.
+  `--relay-url`/`--token` pair to drive it with. The 0.20.0 case is a legacy
+  refusal-proof lane, not a supported host. It touches nothing in the operator's
+  `~/.hermes` beyond reading the certified venv as an interpreter.
 - Environment values beat legacy yaml secrets. Initial plugin bootstrap
   generates `OCUCLAW_RELAY_TOKEN` once on a provably fresh profile and writes
   a separate secret-free generation marker after the credential. It is absent
   from `requires_env`; only the locally confirmed all-device reset may replace
-  it. Soniox and Even-AI secrets are optional and use masked platform setup.
+  it. Soniox and Even-AI secrets are optional: use the private Desktop dialog
+  or, for terminal users, masked platform setup.
 - `/ocuclaw-setup` is the guided front door. `hermes ocuclaw status` is
   passive and exit-0; `hermes ocuclaw doctor` is bounded-active and non-zero
   on problems. The dashboard's read-only `/ocuclaw` tab is optional detail,
@@ -403,18 +463,17 @@ when a process-level environment override makes persisted config disagree.
   `hermes gateway stop`, `hermes ocuclaw uninstall`, and
   `hermes gateway start`. The command prints its ownership receipt and
   preserves shared Hermes sessions.
-- `GATEWAY_MULTIPLEX_PROFILES=1` with multiple served profiles requires an
-  explicit allowlist or the authz-open `OCUCLAW_ALLOW_ALL_USERS=true`; never
-  present authz-open as the default. Hermes logs `Unauthorized user:` when a
-  secondary-profile turn is dropped.
+- Multiple agents use the relay's authenticated transport provenance on
+  Hermes 0.21; never enable `OCUCLAW_ALLOW_ALL_USERS` as setup. The served
+  profile allowlist selects agents and is distinct from sender authorization.
 - `plugins.stream_reasoning_deltas` is Hermes' own gateway-wide key, not a
-  glasses setting, and has no effect below Hermes 0.20.5. It is offered during
-  setup and set only on the user's yes; it is never on by default and never
-  set silently. Live only after a gateway restart.
+  glasses setting. It is offered during setup and set only on the user's yes;
+  it is never on by default and never set silently. Live only after a gateway
+  restart.
 - Hermes conversational tool progress is explicitly off for OcuClaw through
   `display.platforms.ocuclaw.tool_progress`; the expected CLI readback is
   `false`. OcuClaw's structured tool activity remains active. If the optional
   Hermes `/verbose` gateway command changes the setting, restore it before
   continuing beta validation.
-- LiveUI and Even Terminal ship ON. Do not claim their still-owed simulator or
-  real-Even-G2 proof has already happened.
+- LiveUI ships ON. Do not claim its still-owed simulator or real-Even-G2 proof
+  has already happened.

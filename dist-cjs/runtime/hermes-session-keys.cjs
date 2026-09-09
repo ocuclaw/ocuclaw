@@ -31,6 +31,31 @@ function isForeignHermesSessionKey(key) {
   );
 }
 
+const ADOPTABLE_FOREIGN_SOURCES = Object.freeze(["desktop", "cli", "tui"]);
+
+function isAdoptableHermesSessionKey(key) {
+  if (!isForeignHermesSessionKey(key)) return false;
+  const segments = key.trim().toLowerCase().split(":");
+  return (
+    segments.length === 5 &&
+    ADOPTABLE_FOREIGN_SOURCES.includes(segments[3]) &&
+    segments[4].length > 0
+  );
+}
+
+const ADOPT_CHAT_ID_PREFIX = "adopt-";
+
+function isAdoptedHermesSessionKey(key) {
+  const parsed = parseHermesPublicKey(typeof key === "string" ? key.trim() : "");
+  return !!(
+    parsed &&
+    parsed.kind === "minted" &&
+    typeof parsed.chatId === "string" &&
+    parsed.chatId.toLowerCase().startsWith(ADOPT_CHAT_ID_PREFIX) &&
+    parsed.chatId.length > ADOPT_CHAT_ID_PREFIX.length
+  );
+}
+
 function mintedHermesSessionKey(chatId, namespace) {
   const ns = normalizeSegment(namespace) || DEFAULT_HERMES_NAMESPACE;
   const chat = typeof chatId === "string" ? chatId.trim() : "";
@@ -117,4 +142,4 @@ function normalizeSegment(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-module.exports = { HERMES_SESSION_KEY_PREFIX, DEFAULT_HERMES_NAMESPACE, hermesProfileIdForNamespace, HERMES_FOREIGN_KEY_MARKER, OCUCLAW_PLATFORM_SEGMENT, OCUCLAW_CHAT_TYPE_SEGMENT, isHermesSessionKey, isForeignHermesSessionKey, mintedHermesSessionKey, hermesDefaultSessionKeyPrefix, hermesSupportedSessionKeyPrefixes, stripAgentNamespace, deriveHermesPublicKey, parseHermesPublicKey };
+module.exports = { HERMES_SESSION_KEY_PREFIX, DEFAULT_HERMES_NAMESPACE, hermesProfileIdForNamespace, HERMES_FOREIGN_KEY_MARKER, OCUCLAW_PLATFORM_SEGMENT, OCUCLAW_CHAT_TYPE_SEGMENT, isHermesSessionKey, isForeignHermesSessionKey, ADOPTABLE_FOREIGN_SOURCES, isAdoptableHermesSessionKey, ADOPT_CHAT_ID_PREFIX, isAdoptedHermesSessionKey, mintedHermesSessionKey, hermesDefaultSessionKeyPrefix, hermesSupportedSessionKeyPrefixes, stripAgentNamespace, deriveHermesPublicKey, parseHermesPublicKey };

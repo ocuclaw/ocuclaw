@@ -3,7 +3,7 @@ const { PAIRING_CONTROL_MAX_REQUEST_BODY_BYTES, PAIRING_ENDPOINT_CONTENT_TYPE } 
 const { randomBytes: nodeRandomBytes } = require("node:crypto");
 
 const { constantTimeEqual } = require("../constant-time-equal.cjs");
-const { renderPairingBootstrap, pairingBootstrapPayloadText } = require("./pairing-bootstrap-presenter.cjs");
+const { renderPairingBootstrap, pairingBootstrapPayloadText, ASSUMED_TERMINAL } = require("./pairing-bootstrap-presenter.cjs");
 
 const PAIRING_CONTROL_PROTOCOL_VERSION = 1;
 
@@ -15,6 +15,23 @@ const PAIRING_CONTROL_MAX_REQUESTS_PER_WINDOW = 240;
 const PAIRING_CONTROL_RATE_WINDOW_MS = 60_000;
 
 const CONTROL_SECRET_BYTES = 32;
+
+function parseTerminalCapabilities(value         )                       {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return ASSUMED_TERMINAL;
+  }
+  const record = value                           ;
+  const columns = record["columns"];
+  return {
+    unicode: record["unicode"] === true,
+    color: record["color"] === true,
+
+    columns:
+      typeof columns === "number" && Number.isInteger(columns) && columns > 0 && columns <= 10000
+        ? columns
+        : 0,
+  };
+}
 
 function refusal(status        )                             {
   return {
@@ -197,6 +214,8 @@ function createPairingControlService(
             pairingCode: started.pairingCode,
             expiresInSeconds: started.expiresInSeconds,
             lightTerminal: parsed.lightTerminal === true,
+
+            terminal: parseTerminalCapabilities(parsed.terminal),
           }),
 
           payloadText: pairingBootstrapPayloadText(started.qrPayload),

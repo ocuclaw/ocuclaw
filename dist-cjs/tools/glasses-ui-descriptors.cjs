@@ -27,6 +27,129 @@ const GLASSES_UI_CHECKLIST_ITEM_SCHEMA = {
   additionalProperties: false,
 };
 
+const GLASSES_UI_CHILD_KINDS = Object.freeze(["text_surface", "paged_text_surface"]);
+const CHILD_ALLOWED_KEYS = Object.freeze(["kind", "title", "body", "pages"]);
+
+const GLASSES_UI_CHILD_SURFACE_SCHEMA = {
+  anyOf: [
+    { type: "null" },
+    {
+      type: "object",
+      required: ["kind"],
+      properties: {
+        kind: { type: "string", enum: [...GLASSES_UI_CHILD_KINDS] },
+        title: { type: "string", maxLength: GLASSES_UI_LIMITS.titleMax },
+        body: { type: "string", maxLength: GLASSES_UI_LIMITS.bodyMax },
+        pages: {
+          type: "array",
+          minItems: 1,
+          maxItems: GLASSES_UI_LIMITS.maxChildPages,
+          items: { type: "string", maxLength: GLASSES_UI_LIMITS.pageMax },
+        },
+      },
+      additionalProperties: false,
+    },
+  ],
+};
+
+const GLASSES_UI_CHILDREN_SCHEMA = {
+  type: "array",
+  maxItems: GLASSES_UI_LIMITS.maxItems,
+  items: GLASSES_UI_CHILD_SURFACE_SCHEMA,
+  description:
+    "Preloaded Child Surface: an optional deeper page per row, parallel to items " +
+    "(children[i] belongs to items[i]; null = no child). A tap on that row opens the " +
+    "child on the glasses at once with no agent turn; Back pops it. Use it when you " +
+    "already know the full text the wearer wants to READ (release notes or a briefing). " +
+    "Preload at most 8 reading rows. For a 20-row list, keep every item but put children " +
+    "on at most the first 8 rows (null elsewhere), or omit children. Omit children for " +
+    "selection questions: a tap must answer the question. Omit children when detail needs " +
+    "fresh data or a tool call; fetch after selection, then render with update:push. Leaf " +
+    `only: text_surface {title?, body} or paged_text_surface {title?, pages (max ${GLASSES_UI_LIMITS.maxChildPages})}; ` +
+    `no refresh, no children inside a child; all children together max ${GLASSES_UI_LIMITS.totalChildPayloadMax} chars. ` +
+    "Rows with a child show a trailing › glyph. You learn which child the wearer " +
+    "opened from THIS call's window_expired result (opened_child: {surfaceId, itemIndex}). " +
+    "Cannot be combined with refresh.",
+};
+
+function childPayloadChars(spec) {
+  let n = typeof spec.title === "string" ? spec.title.length : 0;
+  if (typeof spec.body === "string") n += spec.body.length;
+  if (Array.isArray(spec.pages)) for (const page of spec.pages) n += page.length;
+  return n;
+}
+
+function validateChildren(obj, itemCount) {
+  const raw = obj.children;
+  if (raw === undefined) return { ok: true, children: null };
+  if (!Array.isArray(raw)) {
+    return {
+      ok: false,
+      code: "children_invalid",
+      message: "children must be an array parallel to items (null for rows without a child)",
+    };
+  }
+  if (raw.length > itemCount) {
+    return {
+      ok: false,
+      code: "children_length_mismatch",
+      message: `children has ${raw.length} entries; items has ${itemCount} (children[i] belongs to items[i])`,
+    };
+  }
+  const children = [];
+  let total = 0;
+  let hasChild = false;
+  for (let i = 0; i < itemCount; i += 1) {
+    const child = raw[i];
+    if (child === undefined || child === null) {
+      children.push(null);
+      continue;
+    }
+    if (typeof child !== "object" || Array.isArray(child)) {
+      return { ok: false, code: "children_invalid", message: `children[${i}] must be null or an object` };
+    }
+    if (!GLASSES_UI_CHILD_KINDS.includes(child.kind)) {
+      return {
+        ok: false,
+        code: "child_kind_invalid",
+        message:
+          `children[${i}].kind must be one of ${GLASSES_UI_CHILD_KINDS.join(", ")}; got ${JSON.stringify(child.kind)} ` +
+          "(a child is a leaf: no lists, one level deep)",
+      };
+    }
+    const unknown = Object.keys(child).find((key) => !CHILD_ALLOWED_KEYS.includes(key));
+    if (unknown) {
+      return {
+        ok: false,
+        code: "child_field_unknown",
+        message: `children[${i}].${unknown} is not supported (a child carries only kind, title, body or pages)`,
+      };
+    }
+    const result = getKindDescriptor(child.kind).validateSpec(child);
+    if (!result.ok) {
+      return { ok: false, code: `child_${result.code}`, message: `children[${i}]: ${result.message}` };
+    }
+    if (Array.isArray(result.spec.pages) && result.spec.pages.length > GLASSES_UI_LIMITS.maxChildPages) {
+      return {
+        ok: false,
+        code: "child_too_many_pages",
+        message: `children[${i}] has ${result.spec.pages.length} pages; max ${GLASSES_UI_LIMITS.maxChildPages}`,
+      };
+    }
+    total += childPayloadChars(result.spec);
+    children.push(result.spec);
+    hasChild = true;
+  }
+  if (total > GLASSES_UI_LIMITS.totalChildPayloadMax) {
+    return {
+      ok: false,
+      code: "total_child_payload_too_large",
+      message: `children sum to ${total} chars; max ${GLASSES_UI_LIMITS.totalChildPayloadMax}`,
+    };
+  }
+  return { ok: true, children: hasChild ? children : null };
+}
+
 function defineKindItemGrammar(schema) {
   const properties = schema.properties || {};
   const required = new Set(schema.required || []);
@@ -267,6 +390,7 @@ const listSurfaceDescriptor = {
   kind: "list_surface",
   itemGrammar: listItemGrammar,
   refreshTargets: ["items"],
+  supportsChildren: true,
   schemaBranch: {
     title: "list_surface",
     type: "object",
@@ -280,6 +404,7 @@ const listSurfaceDescriptor = {
         maxItems: GLASSES_UI_LIMITS.maxItems,
         items: GLASSES_UI_LIST_ITEM_SCHEMA,
       },
+      children: GLASSES_UI_CHILDREN_SCHEMA,
       refresh: undefined,
     },
   },
@@ -310,8 +435,11 @@ const listSurfaceDescriptor = {
         };
       }
     }
+    const kids = validateChildren(obj, items.length);
+    if (!kids.ok) return kids;
     const spec = { kind: "list_surface", items };
     if (typeof obj.title === "string") spec.title = obj.title;
+    if (kids.children) spec.children = kids.children;
     return { ok: true, spec };
   },
 };
@@ -320,6 +448,7 @@ const listWithDetailsSurfaceDescriptor = {
   kind: "list_with_details_surface",
   itemGrammar: detailItemGrammar,
   refreshTargets: ["items"],
+  supportsChildren: true,
   schemaBranch: {
     title: "list_with_details_surface",
     type: "object",
@@ -333,6 +462,7 @@ const listWithDetailsSurfaceDescriptor = {
         maxItems: GLASSES_UI_LIMITS.maxItems,
         items: GLASSES_UI_DETAIL_ITEM_SCHEMA,
       },
+      children: GLASSES_UI_CHILDREN_SCHEMA,
       refresh: undefined,
     },
   },
@@ -426,8 +556,11 @@ const listWithDetailsSurfaceDescriptor = {
         message: `bodies sum to ${totalBodyChars} chars; max ${GLASSES_UI_LIMITS.totalDetailPayloadMax}`,
       };
     }
+    const kids = validateChildren(obj, normalizedItems.length);
+    if (!kids.ok) return kids;
     const spec = { kind: "list_with_details_surface", items: normalizedItems };
     if (typeof obj.title === "string") spec.title = obj.title;
+    if (kids.children) spec.children = kids.children;
     return { ok: true, spec };
   },
 };
@@ -626,4 +759,4 @@ function buildOneOfBranches() {
   return GLASSES_UI_KIND_DESCRIPTORS.map((d) => d.schemaBranch);
 }
 
-module.exports = { GLASSES_UI_LIST_ITEM_SCHEMA, GLASSES_UI_DETAIL_ITEM_SCHEMA, GLASSES_UI_CHECKLIST_ITEM_SCHEMA, GLASSES_UI_IMAGE_ASSETS, GLASSES_UI_KIND_DESCRIPTORS, getKindDescriptor, getKindItemGrammar, listKindItemSchemas, validateKindItemAgainstGrammar, listKindStrings, buildOneOfBranches };
+module.exports = { GLASSES_UI_LIST_ITEM_SCHEMA, GLASSES_UI_DETAIL_ITEM_SCHEMA, GLASSES_UI_CHECKLIST_ITEM_SCHEMA, GLASSES_UI_CHILD_KINDS, GLASSES_UI_CHILD_SURFACE_SCHEMA, GLASSES_UI_CHILDREN_SCHEMA, GLASSES_UI_IMAGE_ASSETS, GLASSES_UI_KIND_DESCRIPTORS, getKindDescriptor, getKindItemGrammar, listKindItemSchemas, validateKindItemAgainstGrammar, listKindStrings, buildOneOfBranches };

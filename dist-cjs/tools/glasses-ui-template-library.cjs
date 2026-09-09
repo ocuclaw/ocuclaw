@@ -5,6 +5,7 @@ const { LIVEUI_LIBRARY_ITEM_TYPES, canonicalSerialize, createLiveuiLibrary, isVa
 const { listKindItemSchemas, validateKindItemAgainstGrammar } = require("./glasses-ui-descriptors.cjs");
 const { refreshSchemaForToolParams } = require("./glasses-ui-refresh-schema.cjs");
 const { projectLiveuiTaskRunForPhone } = require("./glasses-ui-task-run.cjs");
+const { isLiveuiSwitchedOff, liveuiDisabledResult } = require("./glasses-ui-prefs.cjs");
 const { GLASSES_UI_LIMITS, LIVEUI_TEMPLATE_RENDER_TIMEOUT_MAX_MS } = require("./glasses-ui-limits.cjs");
 const { LIVEUI_TEMPLATE_SLOT_LIST_MAX, LIVEUI_TEMPLATE_SLOT_MAX, LIVEUI_TEMPLATE_SLOT_TEXT_MAX, copyLiveuiStaticJson, fillLiveuiTemplate, previewLiveuiTemplatePresentation, sampleLiveuiTemplateValues, validateLiveuiTemplateSlotContract } = require("./glasses-ui-template-slots.cjs");
 
@@ -757,6 +758,30 @@ function createLiveuiGlassesLibraryController(opts) {
       return handler.liveuiStatus();
     },
 
+    liveuiGrantsSnapshot() {
+      if (typeof handler.liveuiGrantsSnapshot !== "function") {
+        return { status: "rejected", code: "item_unavailable" };
+      }
+      return handler.liveuiGrantsSnapshot();
+    },
+
+    liveuiHostCheck() {
+      if (typeof handler.liveuiHostCheck !== "function") return null;
+      return handler.liveuiHostCheck();
+    },
+
+    onLiveuiGrantsChanged(listener) {
+      if (typeof handler.onLiveuiGrantsChanged !== "function") return () => {};
+      return handler.onLiveuiGrantsChanged(listener);
+    },
+
+    applyLiveuiGrantIntent(intent) {
+      if (typeof handler.applyLiveuiGrantIntent !== "function") {
+        return { status: "rejected", code: "item_unavailable" };
+      }
+      return handler.applyLiveuiGrantIntent(intent);
+    },
+
     updateTaskContext(taskId, context) {
       if (typeof handler.updateTaskContext !== "function") {
         return {
@@ -780,6 +805,7 @@ function createLiveuiGlassesLibraryController(opts) {
     },
 
     async openLibraryItem(params) {
+      if (isLiveuiSwitchedOff(handler)) return liveuiDisabledResult();
       const itemType = params && typeof params.itemType === "string" ? params.itemType : "";
       const itemId = params && typeof params.itemId === "string" ? params.itemId : "";
       if (itemType === "task") {

@@ -709,6 +709,17 @@ function mapToolLabel(toolName, activityPath, args, options) {
         intent: "device.check",
       };
     case "render_glasses_ui":
+
+      if (["text_surface", "list_surface", "list_with_details_surface", "checklist_surface", "paged_text_surface"].includes(args.kind) &&
+          (args.validateOnly === undefined || args.validateOnly === false) &&
+          (args.update === undefined || args.update === "replace" || args.update === "push")) {
+        return {
+          label: "Building interface",
+          detail: null,
+          category: "generic",
+          intent: "interface.build",
+        };
+      }
       return {
         label: "Showing interface...",
         detail: null,

@@ -23,6 +23,10 @@ const TASK_RECORD_KEYS = new Set([
 const TASK_COSMETIC_KEYS = new Set(["description", "icon"]);
 const TASK_VERSION_KEYS = new Set([
   "versionId",
+  "name",
+  "description",
+  "preferredTemplateId",
+  "preferredTemplateName",
   "request",
   "executor",
   "context",
@@ -144,6 +148,30 @@ function validTaskVersion(version) {
     return false;
   }
   if (
+    version.name !== undefined &&
+    (typeof version.name !== "string" ||
+      !version.name.trim() ||
+      version.name !== version.name.trim() ||
+      version.name.length > 120)
+  ) return false;
+  if (
+    version.description !== undefined &&
+    (typeof version.description !== "string" || version.description.length > 500)
+  ) return false;
+  if (
+    version.preferredTemplateId !== undefined &&
+    version.preferredTemplateId !== null &&
+    !isValidLiveuiLibraryItemId(version.preferredTemplateId)
+  ) return false;
+  if (
+    version.preferredTemplateName !== undefined &&
+    version.preferredTemplateName !== null &&
+    (typeof version.preferredTemplateName !== "string" ||
+      !version.preferredTemplateName.trim() ||
+      version.preferredTemplateName !== version.preferredTemplateName.trim() ||
+      version.preferredTemplateName.length > 120)
+  ) return false;
+  if (
     typeof version.request !== "string" ||
     !version.request.trim() ||
     version.request !== version.request.trim() ||
@@ -255,8 +283,11 @@ function projectTaskRow(record, executorStateProvider = null) {
   return {
     itemType: "task",
     itemId: record.taskId,
-    name: record.name,
+    name: approved && typeof approved.name === "string"
+      ? approved.name
+      : record.name,
     digest: record.digest,
+    ...(approved ? { description: libraryDescription(record.cosmetic?.description || approved.description || approved.request) } : {}),
     status,
     ...(approved && ["needs_setup", "unavailable"].includes(status) &&
       projectedState && typeof projectedState.reason === "string"
@@ -363,6 +394,10 @@ function orderLiveuiLibraryItems(items, organization = null) {
   return [...ordered, ...tail];
 }
 
+function libraryDescription(value) {
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim().slice(0, 500) : "";
+}
+
 function projectLiveuiLibraryForGlasses(items, organization = null) {
   if (!Array.isArray(items)) return [];
   const hidden = new Set(
@@ -382,6 +417,7 @@ function projectLiveuiLibraryForGlasses(items, organization = null) {
       itemId: item.itemId,
       name: item.name,
       status: item.status,
+      ...(libraryDescription(item.description) ? { description: libraryDescription(item.description) } : {}),
       ...(["needs_setup", "unavailable"].includes(item.status) &&
         typeof item.reason === "string"
         ? { reason: item.reason }
@@ -674,6 +710,9 @@ function createLiveuiLibrary(opts = {}) {
                   itemType,
                   itemId,
                   name: loaded.record.name,
+                  ...(libraryDescription(loaded.record.fields?.body || loaded.record.defaults?.body || loaded.record.defaults?.title)
+                    ? { description: libraryDescription(loaded.record.fields?.body || loaded.record.defaults?.body || loaded.record.defaults?.title) }
+                    : {}),
                   digest: loaded.record.digest,
                   status: "ready",
                 },
@@ -818,7 +857,24 @@ function createLiveuiLibrary(opts = {}) {
     const expectedDigest = options.expectedDigest;
     const targetPath = itemPath(itemType, itemId);
     const current = loadItem(itemType, itemId);
-    if (current.status !== "accepted" || current.record.digest !== expectedDigest) {
+    let deletingInvalid = false;
+    if (current.status !== "accepted") {
+      const listed = listItems();
+      deletingInvalid = listed.items.some(
+        (item) =>
+          item &&
+          item.status === "invalid" &&
+          item.itemType === itemType &&
+          item.itemId === itemId,
+      );
+
+      const confirmed = deletingInvalid ? loadItem(itemType, itemId) : current;
+      if (confirmed.status === "accepted") deletingInvalid = false;
+    }
+    if (
+      (!deletingInvalid && current.status !== "accepted") ||
+      (current.status === "accepted" && current.record.digest !== expectedDigest)
+    ) {
       return rejectedConflict(
         "saved item changed since it was read",
         current.status === "accepted" ? current.record.digest : current.digest,
@@ -830,7 +886,12 @@ function createLiveuiLibrary(opts = {}) {
       if (!err || err.code !== "ENOENT") throw err;
       return rejectedConflict("saved item changed since it was read", null);
     }
-    return { status: "deleted", itemType, itemId, record: current.record };
+    return {
+      status: "deleted",
+      itemType,
+      itemId,
+      ...(current.status === "accepted" ? { record: current.record } : {}),
+    };
   }
 
   return {

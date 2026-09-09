@@ -5,6 +5,7 @@ const path = require("node:path");
 const WebSocket = require("ws");
 const { createGatewayTimingLedger } = require("./gateway-timing-ledger.cjs");
 const { sanitizeConnectReason } = require("./sanitize-connect-reason.cjs");
+const { sanitizeProtocolFrame } = require("../runtime/downstream-handler.cjs");
 
 const DEVICE_KEY_FILE = "ocuclaw-device-key.json";
 const DEVICE_TOKEN_FILE = "ocuclaw-device-token.json";
@@ -810,6 +811,10 @@ class OpenClawClient extends EventEmitter {
 
   _thinkingStreamSegments;
 
+  _ws;
+  _socketGeneration;
+  _stopped;
+
   constructor(opts = {}) {
     super();
     this._logger = normalizeLogger(opts.logger);
@@ -909,8 +914,9 @@ class OpenClawClient extends EventEmitter {
     this._invalidateActiveRun();
     this._stopTickWatch();
     if (this._ws) {
-      this._ws.close();
+      const ws = this._ws;
       this._ws = null;
+      try { ws.close(); } catch {  }
     }
     this._flushPendingErrors(new Error("client stopped"));
     this.emit("status", "stopped");
@@ -920,7 +926,7 @@ class OpenClawClient extends EventEmitter {
 
     const ws = this._ws;
     const gen = this._socketGeneration;
-    if (!ws || ws !== this._ws || ws.readyState !== WebSocket.OPEN) {
+    if (this._stopped || !ws || ws !== this._ws || ws.readyState !== WebSocket.OPEN) {
 
       return Promise.reject(new Error("gateway not connected"));
     }
@@ -967,12 +973,17 @@ class OpenClawClient extends EventEmitter {
       expectFinal,
       diagnostic,
     });
-    this.emit("protocol", { direction: "out", frame });
+    this.emit("protocol", {
+      direction: "out",
+      frame: sanitizeProtocolFrame(frame),
+    });
+    if (!this._isCurrentSocket(ws, gen)) return promise;
     ws.send(raw);
 
     if (method === "chat.send") {
       this._registerChatCommandRun(params);
       promise.catch(() => {
+        if (!this._isCurrentSocket(ws, gen)) return;
         this._forgetChatCommandRun(params);
       });
     }
@@ -980,6 +991,8 @@ class OpenClawClient extends EventEmitter {
   }
 
   sendMessage(text, sessionKey, attachment) {
+    const ws = this._ws;
+    const generation = this._socketGeneration;
     const key = sessionKey || "main";
     const idempotencyKey = crypto.randomUUID();
     const params = { message: text, sessionKey: key, idempotencyKey };
@@ -1003,6 +1016,7 @@ class OpenClawClient extends EventEmitter {
       "agent",
       params,
     ).then((result) => {
+      if (!this._isCurrentSocket(ws, generation)) return result;
       const status = result && result.status;
       if (result && result.runId) {
         this._activeRunId = result.runId;
@@ -1010,6 +1024,7 @@ class OpenClawClient extends EventEmitter {
       }
       return result;
     }).catch((err) => {
+      if (!this._isCurrentSocket(ws, generation)) throw err;
       this._logger.error(`[openclaw] Agent request failed: ${err.message}`);
       this.emit("error", err);
       throw err;
@@ -1017,8 +1032,11 @@ class OpenClawClient extends EventEmitter {
   }
 
   async fetchAgentIdentity(sessionKey) {
+    const ws = this._ws;
+    const generation = this._socketGeneration;
     const params = sessionKey ? { sessionKey } : {};
     const result = await this.request("agent.identity.get", params);
+    if (!this._isCurrentSocket(ws, generation)) return result;
     this._agentIdentity = result;
     this.emit("agentIdentity", result);
     this._logger.info(`[openclaw] Agent identity: ${result && result.name}`);
@@ -1151,12 +1169,23 @@ class OpenClawClient extends EventEmitter {
     );
   }
 
+  _isCurrentSocket(ws, generation) {
+    return !this._stopped && ws === this._ws && generation === this._socketGeneration;
+  }
+
   _connect() {
     if (this._stopped) return;
 
-    if (this._ws) {
-      try { this._ws.close(); } catch {  }
-      this._ws = null;
+    const previous = this._ws;
+    this._ws = null;
+    this._flushPendingErrors(new Error("gateway connection replaced"));
+    this._stopTickWatch();
+    if (previous) {
+      try { previous.close(); } catch {  }
+    }
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
     }
 
     if (this._connectTimer) {
@@ -1166,14 +1195,11 @@ class OpenClawClient extends EventEmitter {
 
     this._clearEstablishTimer();
 
-    const url = this._gatewayUrl;
-    this.emit("status", "connecting");
-    this._logger.info(`[openclaw] Connecting to ${url}`);
-
     this._connectNonce = null;
     this._connectSent = false;
 
     this._socketGeneration += 1;
+    const generation = this._socketGeneration;
 
     this._timingLedger.clear("connect_reset");
     this._lastSeq = null;
@@ -1184,43 +1210,60 @@ class OpenClawClient extends EventEmitter {
     this._chatCommandRuns.clear();
     this._invalidateActiveRun();
 
+    const url = this._gatewayUrl;
+    this.emit("status", "connecting");
+
+    if (this._stopped || generation !== this._socketGeneration) return;
+    this._logger.info(`[openclaw] Connecting to ${url}`);
     const ws = new WebSocket(url, { maxPayload: 25 * 1024 * 1024 });
     this._ws = ws;
+    const isCurrent = () => this._isCurrentSocket(ws, generation);
 
     this._armEstablishTimer(ws);
 
     ws.on("open", () => {
+      if (!isCurrent()) return;
 
       this._clearEstablishTimer();
       this._logger.info("[openclaw] WebSocket open, waiting for challenge...");
 
       this._connectTimer = setTimeout(() => {
+        if (!isCurrent()) return;
         this._sendConnect();
       }, 750);
     });
 
     ws.on("message", (data) => {
+      if (!isCurrent()) return;
       this._handleMessage(data.toString());
     });
 
     ws.on("close", (code, reason) => {
+      if (!isCurrent()) return;
       const reasonText = reason ? reason.toString() : "";
       this._logger.info(`[openclaw] WebSocket closed: ${code} ${reasonText}`);
       this._ws = null;
+      if (this._connectTimer) {
+        clearTimeout(this._connectTimer);
+        this._connectTimer = null;
+      }
       this._clearEstablishTimer();
       this._stopTickWatch();
       this._stopHistoryActivityPolling();
       this._timingLedger.clear("disconnect");
       this._flushPendingErrors(new Error(`gateway closed (${code}): ${reasonText}`));
       this.emit("disconnected", { code, reason: reasonText });
+      if (this._stopped || generation !== this._socketGeneration) return;
       this.emit("status", "disconnected");
 
-      if (!this._reconnectTimer) {
+      if (!this._ws && generation === this._socketGeneration && !this._reconnectTimer) {
         this._scheduleReconnect();
       }
     });
 
     ws.on("error", (err) => {
+
+      if (!isCurrent()) return;
       this._logger.error(`[openclaw] WebSocket error: ${err.message}`);
       if (!this._connectSent) {
         this.emit("error", err);
@@ -1230,11 +1273,11 @@ class OpenClawClient extends EventEmitter {
 
   _armEstablishTimer(ws) {
     const establishGeneration = this._socketGeneration;
-    this._establishTimer = setTimeout(() => {
-      this._establishTimer = null;
-      if (this._stopped || ws !== this._ws || establishGeneration !== this._socketGeneration) {
+    const timer = setTimeout(() => {
+      if (this._establishTimer !== timer || !this._isCurrentSocket(ws, establishGeneration)) {
         return;
       }
+      this._establishTimer = null;
       this._logger.warn(
         `[openclaw] Connect establishment timeout (${ESTABLISH_TIMEOUT_MS}ms), terminating socket`
       );
@@ -1244,6 +1287,7 @@ class OpenClawClient extends EventEmitter {
 
       }
     }, ESTABLISH_TIMEOUT_MS);
+    this._establishTimer = timer;
     if (this._establishTimer.unref) {
       this._establishTimer.unref();
     }
@@ -1257,6 +1301,8 @@ class OpenClawClient extends EventEmitter {
   }
 
   _handleMessage(raw) {
+    const ws = this._ws;
+    const generation = this._socketGeneration;
     let parsed;
     try {
       parsed = JSON.parse(raw);
@@ -1265,7 +1311,11 @@ class OpenClawClient extends EventEmitter {
       return;
     }
 
-    this.emit("protocol", { direction: "in", frame: parsed });
+    this.emit("protocol", {
+      direction: "in",
+      frame: sanitizeProtocolFrame(parsed),
+    });
+    if (!this._isCurrentSocket(ws, generation)) return;
 
     if (parsed.type === "event") {
       this._handleEvent(parsed);
@@ -1330,6 +1380,8 @@ class OpenClawClient extends EventEmitter {
   }
 
   _handleEvent(evt) {
+    const ws = this._ws;
+    const generation = this._socketGeneration;
 
     if (evt.event === "connect.challenge") {
       const nonce =
@@ -1350,6 +1402,7 @@ class OpenClawClient extends EventEmitter {
           `[openclaw] Sequence gap: expected ${gapInfo.expected}, received ${gapInfo.received}`
         );
         this.emit("gap", gapInfo);
+        if (!this._isCurrentSocket(ws, generation)) return;
 
         if (this._activeRunId) {
           this._gapDuringRun = true;
@@ -1368,11 +1421,12 @@ class OpenClawClient extends EventEmitter {
       const restartMs = typeof payload.restartExpectedMs === "number" ? payload.restartExpectedMs : 5000;
       this._logger.info(`[openclaw] Gateway shutdown, reconnecting in ${restartMs}ms`);
       this.emit("status", "shutdown");
+      if (!this._isCurrentSocket(ws, generation)) return;
 
       this._scheduleReconnect(restartMs);
 
-      if (this._ws) {
-        this._ws.close(1000, "shutdown");
+      if (ws) {
+        ws.close(1000, "shutdown");
       }
       return;
     }
@@ -1673,8 +1727,12 @@ class OpenClawClient extends EventEmitter {
     this._stopHistoryActivityPolling();
     if (!this._activeRunId || !this._activeRunSessionKey) return;
 
+    const ws = this._ws;
+    const generation = this._socketGeneration;
     const poll = () => {
+      if (!this._isCurrentSocket(ws, generation)) return;
       this._pollHistoryActivity().catch((err) => {
+        if (!this._isCurrentSocket(ws, generation)) return;
 
         const benignTransient =
           !!err &&
@@ -1710,6 +1768,8 @@ class OpenClawClient extends EventEmitter {
 
   async _pollHistoryActivity() {
     if (!this._historyResolved) return;
+    const ws = this._ws;
+    const generation = this._socketGeneration;
     const runContext = {
       generation: this._activeRunGeneration,
       runId: normalizeRunId(this._activeRunId),
@@ -1726,6 +1786,7 @@ class OpenClawClient extends EventEmitter {
         sessionKey: runContext.sessionKey,
         limit: HISTORY_ACTIVITY_POLL_LIMIT,
       });
+      if (!this._isCurrentSocket(ws, generation)) return;
       if (!this._isActiveRunContextCurrent(runContext)) {
         this._logger.debug(
           `[openclaw] Dropped stale thinking-summary poll for run ${runContext.runId}`
@@ -1945,6 +2006,7 @@ class OpenClawClient extends EventEmitter {
   }
 
   _sendConnect() {
+    if (this._stopped || !this._ws) return;
     if (this._connectSent) return;
     this._connectSent = true;
 
@@ -2004,9 +2066,12 @@ class OpenClawClient extends EventEmitter {
     this._logger.info("[openclaw] Sending connect request...");
 
     const connectGeneration = this._socketGeneration;
+    const ws = this._ws;
+    const isCurrent = () => this._isCurrentSocket(ws, connectGeneration);
 
     this.request("connect", params)
       .then((helloOk) => {
+        if (!isCurrent()) return;
         this._logger.info(
           `[openclaw] Connected! protocol=${helloOk.protocol}, ` +
             `tick=${helloOk.policy && helloOk.policy.tickIntervalMs}ms`
@@ -2039,14 +2104,18 @@ class OpenClawClient extends EventEmitter {
           protocol: helloOk.protocol,
           tickIntervalMs: this._tickIntervalMs,
         });
+        if (!isCurrent()) return;
         this.emit("status", "connected");
+        if (!isCurrent()) return;
 
         this._postConnect().catch((err) => {
+          if (!isCurrent()) return;
           this._logger.error(`[openclaw] Post-connect setup failed: ${err.message}`);
           this.emit("error", err);
         });
       })
       .catch((err) => {
+        if (!isCurrent()) return;
         this._logger.error(`[openclaw] Connect failed: ${err.message}`);
 
         if (canFallback) {
@@ -2063,33 +2132,42 @@ class OpenClawClient extends EventEmitter {
           maxProtocol: MAX_PROTOCOL_VERSION,
         });
         this.emit("error", err);
-        if (this._ws) {
-          this._ws.close(1008, "connect failed");
+        if (isCurrent()) {
+          ws.close(1008, "connect failed");
         }
       });
   }
 
   async _postConnect() {
+    const ws = this._ws;
+    const generation = this._socketGeneration;
 
     this.fetchAgentIdentity().catch((err) => {
+      if (!this._isCurrentSocket(ws, generation)) return;
       this._logger.error(`[openclaw] Agent identity fetch failed: ${err.message}`);
     });
+    if (!this._isCurrentSocket(ws, generation)) return;
 
     try {
       await this._fetchHistory("main");
     } catch (err) {
+      if (!this._isCurrentSocket(ws, generation)) return;
       this._logger.error(`[openclaw] Chat history fetch failed: ${err.message}`);
     }
 
+    if (!this._isCurrentSocket(ws, generation)) return;
     this._historyResolved = true;
     this._drainEventQueue();
   }
 
   async _fetchHistory(sessionKey, options = {}) {
+    const ws = this._ws;
+    const generation = this._socketGeneration;
     const result = await this.request("chat.history", {
       sessionKey,
       limit: 200,
     });
+    if (!this._isCurrentSocket(ws, generation)) return result;
 
     if (Number.isFinite(options.idleRunGeneration)) {
       const historyResult = result;
@@ -2120,9 +2198,12 @@ class OpenClawClient extends EventEmitter {
   }
 
   _drainEventQueue() {
+    const ws = this._ws;
+    const generation = this._socketGeneration;
     const queue = this._eventQueue;
     this._eventQueue = [];
     for (const evt of queue) {
+      if (!this._isCurrentSocket(ws, generation)) return;
 
       if (evt && evt.chatCommit) {
         this._commitChatCommandRun(evt.chatCommit);
@@ -2153,10 +2234,13 @@ class OpenClawClient extends EventEmitter {
     if (this._reconnectTimer) {
       clearTimeout(this._reconnectTimer);
     }
-    this._reconnectTimer = setTimeout(() => {
+    const generation = this._socketGeneration;
+    const timer = setTimeout(() => {
+      if (this._stopped || generation !== this._socketGeneration || this._reconnectTimer !== timer) return;
       this._reconnectTimer = null;
       this.start();
     }, delay);
+    this._reconnectTimer = timer;
 
     if (this._reconnectTimer.unref) {
       this._reconnectTimer.unref();
@@ -2171,9 +2255,11 @@ class OpenClawClient extends EventEmitter {
 
   _startTickWatch() {
     this._stopTickWatch();
+    const ws = this._ws;
+    const generation = this._socketGeneration;
     const pollMs = Math.max(Math.floor(this._tickIntervalMs / 4), 1000);
     this._tickWatchTimer = setInterval(() => {
-      if (this._stopped) return;
+      if (!this._isCurrentSocket(ws, generation)) return;
       if (!this._lastTick) return;
       const elapsed = Date.now() - this._lastTick;
       if (elapsed > this._tickIntervalMs * TICK_STALE_MULTIPLIER) {

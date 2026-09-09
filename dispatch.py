@@ -27,6 +27,9 @@ DISPATCH_METHOD = "dispatch.send"
 BACKEND_EVENT_METHOD = "backend.event"
 BACKEND_HOOK_METHOD = "backend.hook"
 
+PROMPT_OWNERS = frozenset({"ocuclaw", "even-ai"})
+PROMPT_LANES = frozenset({"logical-session-frozen", "turn-scoped"})
+
 KIND_TURN = "turn"
 KIND_SLASH = "slash"
 
@@ -69,6 +72,30 @@ STREAM_CURSOR = " ▉"
 # the running turn first (base.py _dispatch_active_session_command). The
 # ledger mirrors that: the cancelled head closes with code "cancelled".
 CANCELLING_SLASH_COMMANDS = ("/stop", "/new", "/reset")
+
+
+def validate_prompt_metadata(params: Any) -> Optional[Tuple[str, str]]:
+    """Validate bounded #2089 prompt metadata on ``dispatch.send``.
+
+    Legacy dispatches carry only ``channelPrompt`` and remain valid. New
+    owned prompts carry both enum fields together; the metadata never changes
+    the channel-prompt bytes Hermes passes to the model.
+    """
+    values = params if isinstance(params, dict) else {}
+    owner = values.get("promptOwner")
+    lane = values.get("promptLane")
+    if owner is None and lane is None:
+        return None
+    if not isinstance(owner, str) or owner not in PROMPT_OWNERS:
+        raise ValueError("promptOwner must be 'ocuclaw' or 'even-ai'")
+    if not isinstance(lane, str) or lane not in PROMPT_LANES:
+        raise ValueError(
+            "promptLane must be 'logical-session-frozen' or 'turn-scoped'"
+        )
+    content = values.get("channelPrompt")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("prompt metadata requires a non-empty channelPrompt")
+    return str(owner), str(lane)
 
 
 def strip_stream_cursor(text: Any) -> str:
@@ -166,6 +193,8 @@ class DispatchRecord:
     idempotency_key: Optional[str] = None
     status: str = "accepted"
     session_state: Optional[str] = None
+    prompt_owner: Optional[str] = None
+    prompt_lane: Optional[str] = None
     # Current (latest) outbound message for this turn — the StreamConsumer
     # opens one per segment; ``finalize=True`` commits it; a fresh send while
     # one is open commits the previous first (defensive).
@@ -241,6 +270,8 @@ class DispatchLedger:
         idempotency_key: Optional[str] = None,
         session_state: Optional[str] = None,
         has_media: bool = False,
+        prompt_owner: Optional[str] = None,
+        prompt_lane: Optional[str] = None,
     ) -> DispatchRecord:
         with self._lock:
             now = self._now()
@@ -288,6 +319,8 @@ class DispatchLedger:
                 idempotency_key=idempotency_key,
                 session_state=session_state,
                 has_media=has_media,
+                prompt_owner=prompt_owner,
+                prompt_lane=prompt_lane,
             )
             if carrier is not None:
                 carrier.riders.append(record)
@@ -897,6 +930,8 @@ def status_activity(
     *,
     status_key: Optional[str] = None,
     record: Optional[DispatchRecord] = None,
+    label: Optional[str] = None,
+    candidate_rank: Optional[str] = None,
 ) -> Dict[str, Any]:
     # origin "status" keeps notices off the terminal-boundary classifier
     # (isTerminalActivityBoundary requires origin=="lifecycle").
@@ -908,6 +943,13 @@ def status_activity(
     }
     if status_key:
         payload["statusKey"] = status_key
+    # A label makes the notice VISIBLE: the app's status presenter clears
+    # label-less non-thinking slots (clear_non_visible_activity). Only the
+    # notices the wearer must see carry one (the Desktop lease wait, #2510).
+    if label:
+        payload["label"] = label
+    if candidate_rank:
+        payload["candidateRank"] = candidate_rank
     if record is not None:
         payload["runId"] = record.run_id
         payload["sessionKey"] = record.public_key

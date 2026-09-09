@@ -179,6 +179,15 @@ FACTS_KEYS_V1: Tuple[str, ...] = (
     "relayBindSafe",  # bool: relay still bound to loopback
     "relayPortValid",  # bool
     "evenAiEnabled",  # bool
+    "continueHereConfigured",  # bool: allow_admin_from lists the wearer id (#2509)
+    # -- agent choice (#2515) ---------------------------------------------
+    # The raw, non-secret posture behind the phone's "+" button. Both are
+    # read from config.yaml only — never from the process environment — so a
+    # GATEWAY_MULTIPLEX_PROFILES override is a disagreement to name, not a
+    # value to report. `None` means the key is absent or the config is
+    # unreadable.
+    "multiplexProfiles",  # bool | None — gateway.multiplex_profiles as written
+    "agentMode",  # "multiple" | "single" | None — platforms.ocuclaw.extra.agent_mode
     "secretsPresent",  # mapping[str, bool] — presence booleans ONLY
     "hermesCliOnPath",  # bool
     "nodeRequired",  # bool
@@ -193,7 +202,7 @@ FACTS_KEYS_V1: Tuple[str, ...] = (
     "gatewayReceiptUpdatedAt",  # the receipt's own updated_at, or None
     "gatewayReceiptStatus",  # see RECEIPT_STATUSES
     # -- leg 2+4: OcuClaw app-presence receipt ---------------------------
-    "appPresenceRecord",  # the v1 receipt body, or None
+    "appPresenceRecord",  # the v2 receipt body, or None
     "appPresenceStatus",  # see RECEIPT_STATUSES
     "appPresenceWriterLive",  # True | False | None — PID/start-time guard
     # -- leg 3: tailnet route --------------------------------------------
@@ -360,6 +369,14 @@ _FINDINGS: Dict[str, Tuple[str, str, str, Optional[str]]] = {
         "Even AI is enabled but its secret is not configured.",
         "configure_even_ai_secret",
     ),
+    "continue_here_not_configured": (
+        "setup",
+        "warning",
+        "Continue here (adopting a Desktop, CLI or TUI chat onto the glasses) "
+        "is off: platforms.ocuclaw.extra.allow_admin_from does not list "
+        "ocuclaw-wearer.",
+        "configure_continue_here",
+    ),
     "node_unavailable": (
         "setup",
         "error",
@@ -381,7 +398,10 @@ _FINDINGS: Dict[str, Tuple[str, str, str, Optional[str]]] = {
     "hermes_unsupported": (
         "setup",
         "error",
-        "This Hermes host is outside the supported OcuClaw contract.",
+        "This Hermes host is outside the supported OcuClaw contract. "
+        "Use Hermes 0.21.x (recommended release v2026.8.31 / engine 0.21.0), "
+        "then restart and run hermes ocuclaw doctor --json. "
+        "Do not force-load this bundle on older or 0.22+ engines.",
         "install_supported_hermes",
     ),
     "profile_unresolved": (
@@ -456,7 +476,7 @@ _FINDINGS: Dict[str, Tuple[str, str, str, Optional[str]]] = {
 
 _TOKEN_RE = re.compile(r"[^A-Za-z0-9._+\-]")
 # A version RANGE legitimately carries comparison operators and a comma; a
-# separate, still-bounded allowlist keeps ">=0.20.0,<0.21.0" readable without
+# separate, still-bounded allowlist keeps ">=0.21.0,<0.22.0" readable without
 # widening the charset that producer/profile identity strings pass through.
 _RANGE_RE = re.compile(r"[^A-Za-z0-9._+\-<>=!~^,* ]")
 _TOKEN_MAX_CHARS = 40
@@ -586,6 +606,9 @@ def blank_facts(**overrides: Any) -> Dict[str, Any]:
         "relayBindSafe": True,
         "relayPortValid": True,
         "evenAiEnabled": False,
+        "continueHereConfigured": False,
+        "multiplexProfiles": None,
+        "agentMode": None,
         "secretsPresent": {},
         "hermesCliOnPath": False,
         "nodeRequired": True,
@@ -765,6 +788,11 @@ def _derive_setup(facts: Mapping[str, Any], out: _Builder) -> Dict[str, Any]:
         out.finding("invalid_relay_port")
     if facts["evenAiEnabled"] and not even_ai_token_present:
         out.finding("even_ai_token_missing")
+    # A readable config that never lists the wearer id is the whole beta
+    # population before the #2509 install leg ran; the unreadable case is
+    # already `config_unreadable` above.
+    if facts["configReadable"] and not facts["continueHereConfigured"]:
+        out.finding("continue_here_not_configured")
     if node_required and not node_available:
         out.finding("node_unavailable")
     if not runtime_available:

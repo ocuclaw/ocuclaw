@@ -27,6 +27,7 @@ const ACTIVITY_INTENTS = new Set([
   "canvas.edit",
   "session.title.update",
   "device.check",
+  "interface.build",
   "generic",
 ]);
 
@@ -334,6 +335,7 @@ function createActivityStatusAdapter(opts) {
       ? runState.toolContextByActivityId.get(activityId)
       : null;
     const hasCurrentToolContext =
+      (activity.tool === "render_glasses_ui" && normalizeArgs(activity) !== null) ||
       !!asString(activity.path) ||
       !!pickString(args, [
         "path",
@@ -539,7 +541,7 @@ function createActivityStatusAdapter(opts) {
     if (enabled) {
       if (label) {
         const preserveErrorLabelCase =
-          activity.isError === true || preserveErrorPhase;
+          activity.isError === true || preserveErrorPhase || intent === "interface.build";
         result.label = sanitizeText(
           preserveErrorLabelCase ? label : lowercaseLeadingWord(label),
           maxLabelChars,

@@ -77,6 +77,7 @@ function createSessionContextService(opts) {
     } catch {
       return lastSnapshot;
     }
+    if (sessionKey !== getActiveSessionKey()) return null;
     const session =
       describeResp && typeof describeResp === "object" && describeResp.session && typeof describeResp.session === "object"
         ? describeResp.session
@@ -139,7 +140,7 @@ function createSessionContextService(opts) {
   }
 
   function broadcastRunActive(runActive) {
-    if (!lastSnapshot) return;
+    if (!lastSnapshot || lastSnapshot.sessionKey !== getActiveSessionKey()) return;
     const snapshot = { ...lastSnapshot, runActive: !!runActive, snapshotAtMs: nowMs() };
     lastSnapshot = snapshot;
     broadcast(snapshot);

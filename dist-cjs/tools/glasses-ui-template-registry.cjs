@@ -530,6 +530,66 @@ const entries = [
     openQuestions: [],
   },
   {
+    name: "drilldown_parent_child",
+    version: 2,
+    status: "specified",
+    lane: "registry_entry_only",
+    disposition: "active",
+    renderableToday: true,
+    dependencies: [],
+    wireKind: { status: "existing", name: "list_surface" },
+    wireTemplateField: null,
+    intent: "Read full release notes from a short list of rows, opening known details locally and returning with Back.",
+    summary: "One parent render carries ready text children; tapping a row pushes its child locally without an agent round trip. Use for reading known details on short lists, not selection questions or details needing fresh data or a tool call. Use @1 for an agent-pushed child.",
+    fieldSet: {
+      closed: true,
+      fields: [
+        { name: "kind", type: "string", requirement: "required", limit: 'const "list_surface"', note: "parent" },
+        { name: "title", type: "string", requirement: "optional", limit: "<=64 chars", note: "must fit one line" },
+        { name: "items", type: "string[]", requirement: "required", limit: "1-8 rows recommended", note: "leave room for the automatic child cue" },
+        { name: "children", type: "array", requirement: "required", limit: "parallel to items; null | text_surface | paged_text_surface; <=3 pages per child; <=8192 total child payload chars", note: "null rows retain selection behavior; children cannot refresh or contain lists" },
+        { name: "update", type: "string", requirement: "optional", limit: "replace | patch | push", note: "parent move follows current stack; first render replace, same parent patch; local child opening needs no second render" },
+      ],
+    },
+    layoutBudgets: {
+      measured: false,
+      source: "Preloaded Child Surface limits and teaching policy (#2535)",
+      budgets: { recommendedMaxRows: 8, maxChildPages: 3, totalChildPayloadMax: 8192 },
+    },
+    lifecycle: {
+      move: "replace",
+      timeoutMs: 300000,
+      staleAfterMs: null,
+      refresh: { tier: "none", intervalMs: null, onFailure: "keep_last" },
+      outcomePolicy: "Tap opens locally; Back restores the parent without an agent turn. Opening is not selection or consent.",
+    },
+    consent: {
+      actuatesOnExpiry: false,
+      actuatesOnTick: false,
+      requiresStaleAfterMs: false,
+      policy: "explicit_turn_only",
+      assertion: "Reading a child is navigation, never an answer or authorization. Silence is never consent.",
+    },
+    example: {
+      synthetic: true,
+      renderableToday: true,
+      note: "Known release notes shipped once; the client owns tap and Back.",
+      spec: {
+        kind: "list_surface",
+        title: "Release notes",
+        items: ["Faster opening", "Clearer navigation"],
+        children: [
+          { kind: "text_surface", title: "Faster opening", body: "Ready details open as soon as you tap the row." },
+          { kind: "paged_text_surface", title: "Clearer navigation", pages: ["A cue marks rows with ready details.", "Back returns to the list so you can keep reading."] },
+        ],
+      },
+    },
+    provenance: { seedGroup: "master_plan_t_table", sources: [{ doc: "https://github.com/OcuClawhub/evenclaw/issues/2535", anchor: "Scope: teaching, registry, eval" }] },
+    codeAnchors: ["extensions/ocuclaw/src/tools/glasses-ui-descriptors.ts — GLASSES_UI_CHILDREN_SCHEMA"],
+    relatedTo: ["drilldown_parent_child@1"],
+    openQuestions: [],
+  },
+  {
     name: "quick_check",
     version: 1,
     status: "specified",
@@ -542,7 +602,7 @@ const entries = [
     intent:
       "A casual agent ask — \"you okay with X?\" — where nothing consequential fires on either answer. The tap is the wearer's ANSWER, never an authorization.",
     summary:
-      "T5's shape, re-scoped by the owner ruling of 2026-08-19 (#1415): the staleness guard survives, the decision surface does not. The card asks one light question and hands the wearer's reply back to the agent as a single conversational turn. Nothing destructive, chargeable, irreversible, or security-sensitive may hang on that reply — Even Terminal's own confirmation surface and the agent host's own permission prompts are separate things that never route through LiveUI (#1417 B5 lock, unchanged). The guard is the whole point of the row: an answer to a question the wearer read ten minutes ago is not an answer to the question being asked now, so a stale tap re-asks.",
+      "T5's shape, re-scoped by the owner ruling of 2026-08-19 (#1415): the staleness guard survives, the decision surface does not. The card asks one light question and hands the wearer's reply back to the agent as a single conversational turn. Nothing destructive, chargeable, irreversible, or security-sensitive may hang on that reply — agent-host confirmation and permission prompts are separate things that never route through LiveUI (#1417 B5 lock, unchanged). The guard is the whole point of the row: an answer to a question the wearer read ten minutes ago is not an answer to the question being asked now, so a stale tap re-asks.",
     fieldSet: {
       closed: true,
       fields: [
@@ -571,7 +631,7 @@ const entries = [
       requiresStaleAfterMs: true,
       policy: "stale_guarded_reconfirm",
       assertion:
-        "A tap is an ANSWER, never an authorization. A stale tap re-asks and never executes. Expiry decides nothing — it parks the question, and silence is never consent. Consequential, destructive, chargeable, irreversible, and security-sensitive decisions never live on this surface: Even Terminal's confirmation surface and host-native permission prompts stay out of LiveUI forever (#1417 B5 lock, upheld by the 2026-08-19 owner ruling).",
+        "A tap is an ANSWER, never an authorization. A stale tap re-asks and never executes. Expiry decides nothing — it parks the question, and silence is never consent. Consequential, destructive, chargeable, irreversible, and security-sensitive decisions never live on this surface: agent-host confirmation and permission prompts stay out of LiveUI forever (#1417 B5 lock, upheld by the 2026-08-19 owner ruling).",
     },
     example: {
       synthetic: true,

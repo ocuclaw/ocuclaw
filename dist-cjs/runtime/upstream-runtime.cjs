@@ -307,6 +307,26 @@ function mapConfiguredCatalogRows(modelsCatalogRows, configSnapshot) {
   return out;
 }
 
+function mapHermesConfiguredCatalogRows(rows, configSnapshot) {
+  const config = extractConfigObject(configSnapshot);
+  const model = config.agents?.defaults?.model;
+  if (model?.primary) return mapConfiguredCatalogRows(rows, configSnapshot);
+  const fallbacks = model?.fallbacks || [];
+  if (!fallbacks.length) return [];
+  return mapConfiguredCatalogRows(rows, {
+    config: {
+      ...config,
+      agents: {
+        ...config.agents,
+        defaults: {
+          ...config.agents.defaults,
+          model: { primary: fallbacks[0], fallbacks },
+        },
+      },
+    },
+  });
+}
+
 function normalizeModelCatalogRows(rows) {
   if (!Array.isArray(rows)) return [];
   const out = [];
@@ -886,6 +906,22 @@ function createUpstreamRuntime(opts = {}) {
       : () => AGENT_PROGRESS_NOTES_DEFAULT;
 
   const onClarify = typeof opts.onClarify === "function" ? opts.onClarify : () => false;
+  const attentionListener = Reflect.get(opts, "onSessionAttention");
+  const onSessionAttention = typeof attentionListener === "function" ? attentionListener : () => {};
+  const displayedHermesApprovals = new Set();
+
+  function refreshSessionAttention() {
+    const key = typeof sessionService.peekSessionKey === "function" ? sessionService.peekSessionKey() : null;
+    if (typeof key !== "string" || !key.startsWith("hermes:")) return;
+    const server = getServer();
+    if (server) {
+      for (const id of displayedHermesApprovals) {
+        server.broadcast(handler.formatApprovalResolved({ id, decision: null }));
+      }
+    }
+    displayedHermesApprovals.clear();
+    Promise.resolve(gatewayBridge.request("sessions.attention", { key })).catch(() => {});
+  }
 
   const onQuestion = typeof opts.onQuestion === "function" ? opts.onQuestion : () => false;
   const onQuestionResolved =
@@ -1094,7 +1130,18 @@ function createUpstreamRuntime(opts = {}) {
   let cachedAgentsCatalogFetchedAt = 0;
   let cachedAgentsCatalogStale = true;
 
-  let cachedAgentsEnvelope = { defaultId: null, mainKey: null, scope: null };
+  let cachedAgentsEnvelope = {
+    defaultId: null,
+    mainKey: null,
+    scope: null,
+    hermesProfileCreate: false,
+    agentCreateSetup: false,
+    hermesProfileEmojiSet: false,
+    hermesProfileSettings: false,
+
+    foreignSessionAdopt: false,
+    hermesFleet: null,
+  };
 
   let agentsListUnsupported = false;
 
@@ -1108,6 +1155,26 @@ function createUpstreamRuntime(opts = {}) {
   const providerOutcomeState = new Map();
   const cachedAuthProfileCounts = new Map();
   const upstreamRunPipeline = new Map();
+
+  const toolProgressBubbles = new Set();
+  function isToolProgressBubble(data, sessionKey) {
+    if (isNarrationCommit(data)) return false;
+    const messageId = normalizeStreamingToken(data.id ?? data.messageId);
+    const runId = normalizeStreamingToken(data.runId);
+    const key = messageId && runId
+      ? JSON.stringify([sessionKey, runId, messageId])
+      : null;
+    if (isToolProgressCommit(data)) {
+      if (key) {
+        toolProgressBubbles.add(key);
+        if (toolProgressBubbles.size > 1024) {
+          toolProgressBubbles.delete(toolProgressBubbles.values().next().value);
+        }
+      }
+      return true;
+    }
+    return key !== null && toolProgressBubbles.has(key);
+  }
   const activeThinkingRuns = new Set();
   const finalizedThinkingRuns = new Map();
   const finalizedThinkingRunTimers = new Map();
@@ -1731,6 +1798,12 @@ function createUpstreamRuntime(opts = {}) {
       defaultId: cachedAgentsEnvelope.defaultId,
       mainKey: cachedAgentsEnvelope.mainKey,
       scope: cachedAgentsEnvelope.scope,
+      hermesProfileCreate: cachedAgentsEnvelope.hermesProfileCreate === true,
+      agentCreateSetup: cachedAgentsEnvelope.agentCreateSetup === true,
+      hermesProfileEmojiSet: cachedAgentsEnvelope.hermesProfileEmojiSet === true,
+      hermesProfileSettings: cachedAgentsEnvelope.hermesProfileSettings === true,
+      foreignSessionAdopt: cachedAgentsEnvelope.foreignSessionAdopt === true,
+      hermesFleet: cachedAgentsEnvelope.hermesFleet || null,
       fetchedAtMs: hasCache ? cachedAgentsCatalogFetchedAt : currentNow,
       stale: !hasCache || cachedAgentsCatalogStale,
       unsupported: agentsListUnsupported,
@@ -1752,6 +1825,12 @@ function createUpstreamRuntime(opts = {}) {
         envelope && typeof envelope.scope === "string" && envelope.scope
           ? envelope.scope
           : null,
+      hermesProfileCreate: envelope && envelope.hermesProfileCreate === true,
+      agentCreateSetup: envelope && envelope.agentCreateSetup === true,
+      hermesProfileEmojiSet: envelope && envelope.hermesProfileEmojiSet === true,
+      hermesProfileSettings: envelope && envelope.hermesProfileSettings === true,
+      foreignSessionAdopt: envelope && envelope.foreignSessionAdopt === true,
+      hermesFleet: envelope && envelope.hermesFleet || null,
     };
     cachedAgentsCatalogFetchedAt = Number.isFinite(fetchedAtMs)
       ? Math.floor(fetchedAtMs)
@@ -1979,7 +2058,9 @@ function createUpstreamRuntime(opts = {}) {
       .then(async (result) => {
         const allModels = normalizeModelCatalogRows(result && result.models);
         const configSnapshot = await gatewayBridge.request("config.get", {});
-        const models = mapConfiguredCatalogRows(allModels, configSnapshot);
+        const models = getActiveBackendKind() === "hermes"
+          ? mapHermesConfiguredCatalogRows(allModels, configSnapshot)
+          : mapConfiguredCatalogRows(allModels, configSnapshot);
         return cacheModelCatalog(models, Date.now(), false);
       })
       .catch((err) => {
@@ -2170,6 +2251,12 @@ function createUpstreamRuntime(opts = {}) {
           defaultId: result && result.defaultId,
           mainKey: result && result.mainKey,
           scope: result && result.scope,
+          hermesProfileCreate: result && result.hermesProfileCreate === true,
+          agentCreateSetup: result && result.agentCreateSetup === true,
+          hermesProfileEmojiSet: result && result.hermesProfileEmojiSet === true,
+          hermesProfileSettings: result && result.hermesProfileSettings === true,
+          foreignSessionAdopt: result && result.foreignSessionAdopt === true,
+          hermesFleet: result && result.hermesFleet || null,
         };
         return cacheAgentsCatalog(agents, envelope, Date.now(), false);
       })
@@ -2246,7 +2333,9 @@ function createUpstreamRuntime(opts = {}) {
 
   async function getAgentsCatalogSnapshot() {
     const snapshot = agentsCatalogSnapshot();
-    if (snapshot.stale && !agentsListUnsupported && openclawConnected) {
+    const fleetRefreshDue = getActiveBackendKind() === "hermes" &&
+      now() - cachedAgentsCatalogFetchedAt >= 15000;
+    if ((snapshot.stale || fleetRefreshDue) && !agentsListUnsupported && openclawConnected) {
       return refreshAgentsCatalog(true);
     }
 
@@ -2281,6 +2370,7 @@ function createUpstreamRuntime(opts = {}) {
   }
 
   function handleSessionChanged(trigger) {
+    refreshSessionAttention();
     if (!openclawConnected) {
       cachedSkillsCatalogStale = true;
       cachedCommandCatalogStale = true;
@@ -2372,7 +2462,7 @@ function createUpstreamRuntime(opts = {}) {
       }
       return 0;
     },
-    getRunActive: () => !!cachedRunActiveSessionKey,
+    getRunActive: () => !!cachedRunActiveSessionKey && sessionService.isCurrentSession(cachedRunActiveSessionKey),
     nowMs: () => Date.now(),
     broadcast: (frame) => {
       const server = getServer();
@@ -2402,6 +2492,70 @@ function createUpstreamRuntime(opts = {}) {
     conversationState.hydrate(sanitizedMessages, agentIdentity.name, data.sessionKey);
     broadcastPages();
   });
+
+  function ingestMirroredRows(rows, info = {}) {
+    const sessionKey = info && info.sessionKey;
+    if (!sessionService.isCurrentSession(sessionKey)) return 0;
+    const author = typeof info.author === "string" && info.author.trim() ? info.author.trim() : null;
+    const origin = typeof info.origin === "string" && info.origin.trim() ? info.origin.trim() : "desktop";
+    let appended = 0;
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (!row || (row.role !== "user" && row.role !== "assistant")) continue;
+      const content =
+        row.role === "assistant" ? sanitizeAssistantContentBlocks(row.content) : row.content;
+      const metadata = { origin };
+      if (typeof row.id === "number" || typeof row.id === "string") metadata.id = row.id;
+      if (Number.isFinite(Number(row.timestamp))) metadata.timestamp = Number(row.timestamp);
+      conversationState.addMessage(row.role, content, row.role === "user" ? author : null, metadata);
+      appended += 1;
+    }
+    if (appended === 0) return 0;
+    emitDebug(
+      "openclaw.message",
+      "mirrored_rows",
+      "info",
+      { sessionKey },
+      () => ({
+        origin,
+        rows: appended,
+        ids: (Array.isArray(rows) ? rows : []).map((row) => (row && row.id) ?? null),
+        roles: (Array.isArray(rows) ? rows : []).map((row) => row && row.role),
+        textChars: (Array.isArray(rows) ? rows : []).reduce(
+          (sum, row) => sum + fullMessageText(row && row.content).length,
+          0,
+        ),
+      }),
+    );
+    broadcastPages();
+    return appended;
+  }
+
+  async function rehydrateHistory(sessionKey, reason = "rehydrate") {
+    if (!sessionService.isCurrentSession(sessionKey)) return false;
+    const result = await gatewayBridge.request("chat.history", { sessionKey, limit: 200 });
+    if (!sessionService.isCurrentSession(sessionKey)) return false;
+    const messages =  (
+      result && Array.isArray(result.messages) ? result.messages : []
+    );
+    const sanitized = messages.map((msg) =>
+      msg && msg.role === "assistant"
+        ? { ...msg, content: sanitizeAssistantContentBlocks(msg.content) }
+        : msg,
+    );
+    const total = result && Number.isFinite(Number(result.total)) ? Number(result.total) : null;
+    conversationState.hydrate(sanitized, agentIdentity.name, sessionKey, {
+      truncatedHead: total !== null && total > sanitized.length,
+    });
+    emitDebug(
+      "openclaw.history",
+      "rehydrated",
+      "info",
+      { sessionKey },
+      () => ({ reason, messageCount: sanitized.length, total }),
+    );
+    broadcastPages();
+    return true;
+  }
 
   onGatewayEvent("thinkingDebug", (data) => {
     if (!sessionService.isCurrentSession(data.sessionKey)) return;
@@ -2507,9 +2661,9 @@ function createUpstreamRuntime(opts = {}) {
     const runId = data.runId || null;
 
     const turnActive = data.turnActive === true;
-    const dropToolProgressPage =
-      typeof data.messageKind === "string" &&
-      data.messageKind.trim().toLowerCase() === "tool_progress";
+    const dropToolProgressPage = isToolProgressBubble(
+      data, data.sessionKey || sessionService.ensureSessionKey(),
+    );
     if (dropToolProgressPage) {
 
       emitDebug(
@@ -2561,7 +2715,7 @@ function createUpstreamRuntime(opts = {}) {
         phase: "end",
         category: "run_complete_synth",
         activityId: `run-complete-synth-${runId}`,
-      });
+      }, data.sessionKey ? null : "unattributed");
     }
 
     const runPipeline = runId && !turnActive ? upstreamRunPipeline.get(runId) : null;
@@ -2709,7 +2863,7 @@ function createUpstreamRuntime(opts = {}) {
     }
   });
 
-  function ingestActivityFrame(data) {
+  function ingestActivityFrame(data, activitySource = null) {
     data = normalizeGatewaySessionEvent(data);
     const taskSessionKey =
       data && typeof data._activeRunSessionKey === "string" && data._activeRunSessionKey.trim()
@@ -2796,7 +2950,7 @@ function createUpstreamRuntime(opts = {}) {
         shouldRefreshProviderUsageInBackground = true;
       }
     }
-    broadcastActivity(activity);
+    broadcastActivity(activity, activitySource);
     if (shouldRefreshProviderUsageInBackground) {
       refreshProviderUsage(true).catch((err) => {
         logger.warn(`[relay] Provider usage refresh failed after rate limit activity: ${err.message}`);
@@ -3180,7 +3334,7 @@ function createUpstreamRuntime(opts = {}) {
       }
     }
 
-    if (isToolProgressCommit(data)) {
+    if (isToolProgressBubble(data, sessionKey)) {
       emitDebug(
         "openclaw.message",
         "tool_progress_stream_withheld",
@@ -3346,6 +3500,11 @@ function createUpstreamRuntime(opts = {}) {
     );
     const server = getServer();
     if (server) {
+      const key = data && data.request && data.request.sessionKey;
+      if (typeof key === "string" && key.startsWith("hermes:")) {
+        if (!sessionService.isCurrentSession(key)) return;
+        displayedHermesApprovals.add(data.id);
+      }
       server.broadcast(handler.formatApproval(data));
     }
   });
@@ -3362,6 +3521,7 @@ function createUpstreamRuntime(opts = {}) {
       });
     }
     if (approvalId) taskApprovalRequests.delete(approvalId);
+    displayedHermesApprovals.delete(approvalId);
     emitDebug(
       "approvals.timeline",
       "approval_resolved",
@@ -3375,6 +3535,32 @@ function createUpstreamRuntime(opts = {}) {
     const server = getServer();
     if (server) {
       server.broadcast(handler.formatApprovalResolved(data));
+    }
+  });
+
+  onGatewayEvent("sessionAttention", (data) => {
+    if (!data || !sessionService.isCurrentSession(data.sessionKey)) return;
+    if (typeof data.runActive === "boolean") {
+      cachedRunActiveSessionKey = data.runActive ? data.sessionKey : null;
+      sessionContextService.broadcastRunActive(data.runActive);
+    }
+    onSessionAttention(data);
+    const server = getServer();
+    if (!server) return;
+    const approvals = Array.isArray(data.approvals) ? data.approvals : [];
+    const live = new Set(approvals.map((entry) => entry.id));
+    for (const id of displayedHermesApprovals) {
+      if (!live.has(id)) {
+
+        server.broadcast(handler.formatApprovalResolved({ id, decision: null }));
+        displayedHermesApprovals.delete(id);
+      }
+    }
+    for (const entry of approvals) {
+      if (entry.expiresAtMs > Date.now() && !displayedHermesApprovals.has(entry.id)) {
+        server.broadcast(handler.formatApproval(entry));
+        displayedHermesApprovals.add(entry.id);
+      }
     }
   });
 
@@ -3457,6 +3643,7 @@ function createUpstreamRuntime(opts = {}) {
     getAgentAvatarDataUriByHash,
     getModelsCatalogSnapshot,
     getAgentsCatalogSnapshot,
+    refreshAgentsCatalog,
     getAgentDisplayName,
     getProviderUsageSnapshot,
     getSkillsCatalogSnapshot,
@@ -3465,7 +3652,10 @@ function createUpstreamRuntime(opts = {}) {
     handleCurrentSessionModelConfigChanged,
     handleCurrentSessionModelConfigCleared,
     handleSessionChanged,
+    refreshSessionAttention,
     ingestActivityFrame,
+    ingestMirroredRows,
+    rehydrateHistory,
     isConnected,
     start() {
       return refreshUpstreamBootstrap("runtime_start");
@@ -3483,6 +3673,7 @@ function createUpstreamRuntime(opts = {}) {
       inFlightCommandCatalogFetch = null;
       inFlightAgentsCatalogFetch = null;
       upstreamRunPipeline.clear();
+      toolProgressBubbles.clear();
     },
     synthesizeResponseStarted,
     trackAcceptedRun,
@@ -3603,4 +3794,4 @@ function createUpstreamRuntime(opts = {}) {
   }
 }
 
-module.exports = { createUpstreamRuntime, STREAMING_REBROADCAST_THROTTLE_MS, normalizeAgentsCatalogRows, parseWorkspaceIdentityFallback, applyIdentityFallback, overlayRawAgentRowsWithFallback };
+module.exports = { createUpstreamRuntime, STREAMING_REBROADCAST_THROTTLE_MS, normalizeAgentsCatalogRows, parseWorkspaceIdentityFallback, applyIdentityFallback, overlayRawAgentRowsWithFallback, buildModelAliasIndex, resolveConfiguredDefaultModelRef, mapConfiguredCatalogRows, mapHermesConfiguredCatalogRows };

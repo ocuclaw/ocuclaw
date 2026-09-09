@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from .receipts import PULL_ERROR_CODES, build_app_presence_body, now_iso
@@ -62,7 +63,56 @@ PROJECTION_KEYS = (
     "authenticatedAppCount",
     "clientVersions",
     "lastTransitionAt",
+    "device",
 )
+
+DEVICE_KEYS = ("connected", "batteryPercent", "charging", "inCase", "observedAt")
+DEVICE_REQUIRED_KEYS = ("connected", "batteryPercent", "inCase", "observedAt")
+
+
+def _normalize_device(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict) or any(key not in value for key in DEVICE_REQUIRED_KEYS):
+        return None
+    connected = value["connected"]
+    battery = value["batteryPercent"]
+    # Additive in the v2 receipt/projection contract so a brief child/parent
+    # version skew reads as unknown charging, never as a broken presence lane.
+    charging = value.get("charging")
+    in_case = value["inCase"]
+    observed_at = value["observedAt"]
+    if connected is not None and not isinstance(connected, bool):
+        return None
+    if isinstance(battery, bool) or (
+        battery is not None
+        and (not isinstance(battery, int) or battery < 0 or battery > 100)
+    ):
+        return None
+    if in_case is not None and not isinstance(in_case, bool):
+        return None
+    if charging is not None and not isinstance(charging, bool):
+        return None
+    if observed_at is not None:
+        if (
+            not isinstance(observed_at, str)
+            or not observed_at.strip()
+            or len(observed_at) > 64
+        ):
+            return None
+        try:
+            parsed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return None
+    if any(item is not None for item in (connected, battery, charging, in_case)) and observed_at is None:
+        return None
+    return {
+        "connected": connected,
+        "batteryPercent": battery,
+        "charging": charging,
+        "inCase": in_case,
+        "observedAt": observed_at,
+    }
 
 
 class PresenceLinkUnavailableError(RuntimeError):
@@ -124,6 +174,9 @@ def normalize_projection(value: Any) -> Optional[Dict[str, Any]]:
         value["lastTransitionAt"], str
     ):
         return None
+    device = _normalize_device(value["device"])
+    if device is None:
+        return None
     # Bounded again on receipt. The relay already caps this list, but the
     # receipt is written synchronously and fsynced on every pull, so the
     # parent does not take the child's word for how big its own disk write
@@ -149,6 +202,7 @@ def normalize_projection(value: Any) -> Optional[Dict[str, Any]]:
         "authenticatedAppCount": count,
         "clientVersions": versions,
         "lastTransitionAt": transition,
+        "device": device,
     }
 
 
@@ -260,6 +314,7 @@ class PresencePump:
                 count=0,
                 versions=[],
                 last_transition_at=now_iso(),
+                device=None,
                 error_code="shutdown",
             )
 
@@ -307,6 +362,7 @@ class PresencePump:
                 count=None,
                 versions=[],
                 last_transition_at=None,
+                device=None,
                 error_code=error_code or "pull_failed",
             )
             return
@@ -315,6 +371,7 @@ class PresencePump:
             count=projection["authenticatedAppCount"],
             versions=projection["clientVersions"],
             last_transition_at=projection["lastTransitionAt"],
+            device=projection["device"],
             error_code=None,
         )
 
@@ -325,6 +382,7 @@ class PresencePump:
         count: Optional[int],
         versions: List[str],
         last_transition_at: Optional[str],
+        device: Any,
         error_code: Optional[str],
     ) -> None:
         body = build_app_presence_body(
@@ -334,6 +392,7 @@ class PresencePump:
             authenticated_app_count=count,
             client_versions=versions,
             last_transition_at=last_transition_at,
+            device=device,
             observation_error_code=error_code,
         )
         try:

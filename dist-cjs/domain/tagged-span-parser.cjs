@@ -1,4 +1,5 @@
 const { computeCodeSpanRegions } = require("./code-span-regions.cjs");
+const { matchInvalidNeuralMarkupAt, matchTrailingInvalidNeuralMarkup } = require("./tagged-span-strip.cjs");
 
 function parseTaggedSpans(accumulatedText, families) {
   const spansByFamily = {};
@@ -10,6 +11,8 @@ function parseTaggedSpans(accumulatedText, families) {
     const vote = fam.matchTrailingPartial(accumulatedText, 0);
     if (vote > holdback) holdback = vote;
   }
+  const invalidNeuralVote = matchTrailingInvalidNeuralMarkup(accumulatedText);
+  if (invalidNeuralVote > holdback) holdback = invalidNeuralVote;
   const scanEnd = accumulatedText.length - holdback;
 
   const codeRegions = computeCodeSpanRegions(accumulatedText);
@@ -76,6 +79,11 @@ function parseTaggedSpans(accumulatedText, families) {
           i += open.consumed;
           continue outer;
         }
+      }
+      const invalidNeuralLength = matchInvalidNeuralMarkupAt(accumulatedText, i);
+      if (invalidNeuralLength > 0) {
+        i += invalidNeuralLength;
+        continue outer;
       }
     }
     cleanText += accumulatedText[i];

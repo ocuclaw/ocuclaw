@@ -218,11 +218,20 @@ function createLiveuiTaskRunController(opts = {}) {
     const version = approvedVersionFromLoad(loaded);
     if (!version) return rejected(taskId, "task_not_ready");
     let firstMessage = taskRunStartMessage(version, loaded.task.settingValues);
-    const preferredTemplateId = loaded && loaded.task &&
-      typeof loaded.task.preferredTemplateId === "string"
-      ? loaded.task.preferredTemplateId
+    const preferredTemplateId = Object.prototype.hasOwnProperty.call(
+      version,
+      "preferredTemplateId",
+    )
+      ? typeof version.preferredTemplateId === "string"
+        ? version.preferredTemplateId
+        : null
+      : loaded && loaded.task && typeof loaded.task.preferredTemplateId === "string"
+        ? loaded.task.preferredTemplateId
+        : null;
+    const preferredTemplateName = typeof version.preferredTemplateName === "string"
+      ? version.preferredTemplateName
       : null;
-    if (preferredTemplateId) {
+    if (preferredTemplateId && preferredTemplateName) {
       let hint = null;
       try { hint = resolveTemplateHint(preferredTemplateId); } catch (_) { hint = null; }
       if (
@@ -230,7 +239,7 @@ function createLiveuiTaskRunController(opts = {}) {
         hint.templateId === preferredTemplateId &&
         typeof hint.name === "string"
       ) {
-        firstMessage += `\n\nPreferred Template (optional visual hint, not a required output): "${hint.name}" (templateId: ${hint.templateId}). You may render it through the Template library, replace it with any other valid LiveUI surface, or ignore it.`;
+        firstMessage += `\n\nPreferred Template (optional visual hint, not a required output): "${preferredTemplateName}" (templateId: ${hint.templateId}). You may render it through the Template library, replace it with any other valid LiveUI surface, or ignore it.`;
       }
     }
     if (!["isolated", "current_session"].includes(version.context)) {
@@ -419,7 +428,7 @@ function createLiveuiTaskRunController(opts = {}) {
     );
     if (
       !run ||
-      run.state !== LIVEUI_TASK_RUN_STATES.starting ||
+      (run.state !== LIVEUI_TASK_RUN_STATES.starting && run.state !== LIVEUI_TASK_RUN_STATES.running) ||
       sessionKey !== run.sessionKey
     ) return false;
     const surfaceId = params && typeof params === "object" && typeof params.surfaceId === "string"
@@ -451,6 +460,14 @@ function createLiveuiTaskRunController(opts = {}) {
       run.state !== LIVEUI_TASK_RUN_STATES.starting ||
       normalizeSessionKey(sessionKey) !== run.sessionKey
     ) return false;
+    endRun("render_failed", { code: "render_failed" });
+    return true;
+  }
+
+  function observeSurfaceRenderFailure(params = {}) {
+    const run = activeRun;
+    if (!run || normalizeSessionKey(params.sessionKey) !== run.sessionKey ||
+        !run.surfaceIds.includes(params.surfaceId)) return false;
     endRun("render_failed", { code: "render_failed" });
     return true;
   }
@@ -509,6 +526,7 @@ function createLiveuiTaskRunController(opts = {}) {
     observeApproval,
     observeTurnIdle,
     observeRenderFailure,
+    observeSurfaceRenderFailure,
     observeSurfaceOutcome,
     observeSessionEnd,
     observeHostLoss,

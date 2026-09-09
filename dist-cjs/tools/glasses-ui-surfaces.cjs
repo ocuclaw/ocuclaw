@@ -5,6 +5,7 @@ const TERMINAL_OUTCOME_RESULTS = Object.freeze([
   "session_reset",
   "preempted",
   "recipe_failed",
+  "render_failed",
 ]);
 
 const TERMINAL_RESULTS = new Set(TERMINAL_OUTCOME_RESULTS);
@@ -54,6 +55,7 @@ const RENDER_FAILURE_CODES = Object.freeze([
 const MAX_TRACKED_CLIENT_FAILURES = 4;
 
 const MAX_TRACKED_SEND_ATTEMPTS = 32;
+const MAX_TRACKED_CHILD_GENERATIONS = 32;
 
 const GLASS_EVENT_ORIGINS = ["gesture", "schedule", "threshold", "system"];
 
@@ -356,7 +358,12 @@ function createSurfaceStore(deps = {}) {
     return {
       sessionKey, kind: kind || null, pending: null, lastContent: null,
 
+      wearerInitiated: false,
+      agentRunEnded: false,
+
       recordedSpec: null,
+
+      preloadedChildGenerations: prior ? prior.preloadedChildGenerations : [],
       state: "visible_pending",
       queuedEvent: prior ? prior.queuedEvent : null,
       exitLatched: prior ? !!prior.exitLatched : false,
@@ -369,6 +376,8 @@ function createSurfaceStore(deps = {}) {
 
       title: prior ? prior.title : null,
       awaitingAgentResponse: false,
+
+      clientPushed: null,
 
       terminationCause: null,
 
@@ -404,11 +413,15 @@ function createSurfaceStore(deps = {}) {
 
   function register(rawSessionKey, surfaceId, meta) {
     const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
+
+    if (meta?.wearerInitiated !== true) markAgentRunEnded(sessionKey, false);
     return new Promise((resolve) => {
       const existing = bySurface.get(surfaceId);
       if (existing) {
 
         existing.pending = resolve;
+        existing.wearerInitiated = meta && meta.wearerInitiated === true;
+        existing.agentRunEnded = false;
         if (meta && meta.kind) existing.kind = meta.kind;
         if (meta && (meta.queueMode === "log" || meta.queueMode === "latest")) {
           existing.queueMode = meta.queueMode;
@@ -432,6 +445,7 @@ function createSurfaceStore(deps = {}) {
       entry.staleAfterMs = meta && Number.isFinite(meta.staleAfterMs) ? meta.staleAfterMs : null;
       if (meta && typeof meta.title === "string") entry.title = meta.title;
       entry.pending = resolve;
+      entry.wearerInitiated = meta && meta.wearerInitiated === true;
       stampAuthoredAndValidated(entry);
       bySurface.set(surfaceId, entry);
       syncStageBusySince();
@@ -537,6 +551,13 @@ function createSurfaceStore(deps = {}) {
     return n;
   }
 
+  function markAgentRunEnded(rawSessionKey, ended = true) {
+    const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
+    for (const entry of bySurface.values()) {
+      if (entry.sessionKey === sessionKey) entry.agentRunEnded = ended;
+    }
+  }
+
   function drainAll(outcome) {
     let n = 0;
     for (const [surfaceId, entry] of [...bySurface]) {
@@ -619,10 +640,11 @@ function createSurfaceStore(deps = {}) {
     syncStageBusySince();
   }
 
-  function breadcrumbFor(rawSessionKey) {
+  function breadcrumbFor(rawSessionKey, depth = undefined) {
     const s = stackBySession.get(normalizeGlassesSessionKey(rawSessionKey));
     if (!s || s.length === 0) return null;
-    const titles = s
+    const levels = Number.isFinite(depth) && depth > 0 ? s.slice(0, depth) : s;
+    const titles = levels
       .map((id) => { const e = bySurface.get(id); return e && typeof e.title === "string" ? e.title : null; })
       .filter((t) => typeof t === "string" && t.length > 0);
     return titles.length ? titles.join(" › ") : null;
@@ -806,6 +828,26 @@ function createSurfaceStore(deps = {}) {
       : null;
   }
 
+  function recordPreloadedChildren(surfaceId, children, recordedChildren = children) {
+    const entry = bySurface.get(surfaceId);
+    if (!entry) return;
+    const slots = Array.isArray(children) ? children : [];
+
+    entry.preloadedChildGenerations = entry.preloadedChildGenerations
+      .map((generation) => generation.filter((child) => slots[child.itemIndex]))
+      .filter((generation) => generation.length);
+    const generation = slots.flatMap((child, itemIndex) =>
+      child && typeof child.surfaceId === "string"
+        ? [{ childId: child.surfaceId, itemIndex, spec: JSON.parse(JSON.stringify(recordedChildren[itemIndex])) }]
+        : [],
+    );
+    if (generation.length) entry.preloadedChildGenerations.push(generation);
+
+    while (entry.preloadedChildGenerations.length > MAX_TRACKED_CHILD_GENERATIONS) {
+      entry.preloadedChildGenerations.shift();
+    }
+  }
+
   function stackSurfaceIds(rawSessionKey) {
     const s = stackBySession.get(normalizeGlassesSessionKey(rawSessionKey));
     return s ? [...s] : [];
@@ -814,25 +856,31 @@ function createSurfaceStore(deps = {}) {
   function applyRender(rawSessionKey, params) {
     const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
     const stack = stackFor(sessionKey);
-    const top = stack[stack.length - 1] || null;
+    const stackTop = stack[stack.length - 1] || null;
 
-    if (!top) {
+    if (!stackTop) {
       const id = mintSurfaceId();
       stack.push(id);
       bySurface.set(id, makeEntry(sessionKey, params && params.kind));
       bindStageSurface(sessionKey, id);
-      return { mode: "root", surfaceId: id };
+      return { mode: "root", surfaceId: id, depth: 1 };
     }
     const update = params && params.update === "patch" ? "patch"
       : params && params.update === "push" ? "push"
       : "replace";
+
+    const topEntry = bySurface.get(stackTop);
+    const reattachParent =
+      update !== "push" && topEntry && topEntry.clientPushed && stack.length >= 2;
+    const top = reattachParent ? stack[stack.length - 2] : stackTop;
+    const depth = reattachParent ? stack.length - 1 : stack.length;
     if (update === "patch") {
 
       const entry = bySurface.get(top);
       if (entry && params && params.kind) entry.kind = params.kind;
       if (entry) entry.state = "visible_pending";
       bindStageSurface(sessionKey, top);
-      return { mode: "patch", surfaceId: top };
+      return { mode: "patch", surfaceId: top, depth };
     }
     if (update === "push") {
       pauseCron(top);
@@ -840,7 +888,7 @@ function createSurfaceStore(deps = {}) {
       stack.push(id);
       bySurface.set(id, makeEntry(sessionKey, params && params.kind));
       bindStageSurface(sessionKey, id);
-      return { mode: "push", surfaceId: id };
+      return { mode: "push", surfaceId: id, depth: stack.length };
     }
 
     const priorTop = bySurface.get(top);
@@ -848,7 +896,59 @@ function createSurfaceStore(deps = {}) {
     stopCron(top, { silent: true });
     bySurface.set(top, makeEntry(sessionKey, params && params.kind, priorTop));
     bindStageSurface(sessionKey, top);
-    return { mode: "replace", surfaceId: top };
+    return { mode: "replace", surfaceId: top, depth };
+  }
+
+  function adoptClientPush(rawSessionKey, childId, meta = {}) {
+    const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
+    const stack = stackFor(sessionKey);
+    const top = stack[stack.length - 1] || null;
+    if (typeof childId !== "string" || !childId) {
+      return { ok: false, code: "child_id_invalid", top };
+    }
+    if (top === childId && bySurface.has(childId)) {
+      return { ok: true, mode: "already_adopted", parentId: stack[stack.length - 2] || null };
+    }
+    if (!top || (typeof meta.parentId === "string" && meta.parentId && meta.parentId !== top)) {
+      return { ok: false, code: "parent_not_top", top };
+    }
+    const parentEntry = bySurface.get(top);
+    const itemIndex = Number.isInteger(meta.itemIndex) && meta.itemIndex >= 0 ? meta.itemIndex : null;
+    const sentChild = parentEntry && parentEntry.preloadedChildGenerations
+      .flat().find((child) => child.childId === childId && child.itemIndex === itemIndex);
+    if (!sentChild) return { ok: false, code: "child_generation_unavailable", top };
+    const childSpec = sentChild.spec;
+    const kind =
+      typeof meta.kind === "string" && meta.kind
+        ? meta.kind
+        : childSpec && typeof childSpec.kind === "string"
+          ? childSpec.kind
+          : null;
+    pauseCron(top);
+    stack.push(childId);
+    const entry = makeEntry(sessionKey, kind);
+    entry.clientPushed = { parentId: top, itemIndex };
+
+    entry.state = "visible_awaiting_agent";
+    if (typeof meta.title === "string") entry.title = meta.title;
+    else if (childSpec && typeof childSpec.title === "string") entry.title = childSpec.title;
+
+    bySurface.set(childId, entry);
+    if (childSpec) {
+      recordSpec(childId, childSpec);
+      recordContent(childId, { __render: true, __spec: childSpec });
+    }
+    bindStageSurface(sessionKey, childId);
+    return { ok: true, mode: "adopted", parentId: top, itemIndex, kind };
+  }
+
+  function adoptedChildFor(rawSessionKey) {
+    const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
+    const stack = stackFor(sessionKey);
+    const top = stack[stack.length - 1] || null;
+    const entry = top ? bySurface.get(top) : null;
+    if (!entry || !entry.clientPushed) return null;
+    return { childId: top, parentId: entry.clientPushed.parentId, itemIndex: entry.clientPushed.itemIndex };
   }
 
   function popBack(rawSessionKey) {
@@ -993,6 +1093,12 @@ function createSurfaceStore(deps = {}) {
         ? report.clientId
         : "unknown";
     const atMs = now();
+    if (report?.deduplicate === true && entry.clientFailures?.recent.some(
+      (item) => item.clientId === clientId && item.seq === seq && item.code === code,
+    )) {
+      return { ok: true, surfaceUuid: entry.uuid, seq, code, clientId,
+        total: entry.clientFailures.total, duplicate: true };
+    }
     if (!entry.clientFailures) {
       entry.clientFailures = { total: 0, byClient: new Map(), recent: [] };
     }
@@ -1027,6 +1133,22 @@ function createSurfaceStore(deps = {}) {
     };
   }
 
+  function validateClientRenderError(surfaceId, report) {
+    const entry = bySurface.get(surfaceId);
+    if (!entry) return { ok: false, reason: "unknown_surface" };
+    if (!RENDER_FAILURE_CODES.includes(report?.code)) return { ok: false, reason: "invalid_code" };
+    if (report?.channel !== "render_error" || report?.authoritative !== true) {
+      return { ok: false, reason: report?.authorityReason || "evidence_only" };
+    }
+    if (!Number.isSafeInteger(report.seq) || report.seq !== entry.lastAttemptedSend?.seq) {
+      return { ok: false, reason: "stale_seq" };
+    }
+    const attempt = entry.sendAttempts.get(report.seq);
+    if (!attempt) return { ok: false, reason: "no_send_attempt" };
+    if (attempt.receiptAtMs !== null) return { ok: false, reason: "already_receipted" };
+    return { ok: true, surfaceUuid: entry.uuid };
+  }
+
   function hasClientReceipt(surfaceUuid, seq) {
     for (const entry of bySurface.values()) {
       if (entry.uuid !== surfaceUuid) continue;
@@ -1050,13 +1172,16 @@ function createSurfaceStore(deps = {}) {
   return {
     storeId,
     register, resolve, hasSurface, isPending, drainSession, drainAll, settlePending,
+    isWearerInitiated: (surfaceId) => bySurface.get(surfaceId)?.wearerInitiated === true,
+    hasAgentRunEnded: (surfaceId) => bySurface.get(surfaceId)?.agentRunEnded === true,
+    markAgentRunEnded,
     stateOf, queueEvent, isExitLatched, onReattached,
-    applyRender, popBack, exit, topSurfaceId, stackDepth, stackSurfaceIds, sessionKeys, sessionForSurface,
+    applyRender, recordPreloadedChildren, adoptClientPush, adoptedChildFor, popBack, exit, topSurfaceId, stackDepth, stackSurfaceIds, sessionKeys, sessionForSurface,
     planStageGrant, commitStageGrant, stageState, activeSessionCount,
     uuidOf, titleOf, markerFor, clearAwaitingResponse, breadcrumbFor, surfaceFactsFor,
     peekEvents, reduceForDelivery, peekDeadLetter, deadLetterEventCount, drainDeadLetter,
     recordSendAttempt, recordClientReceipt, hasClientReceipt, deliveryEvidenceOf,
-    recordClientFailureEvidence, clientFailuresOf,
+    recordClientFailureEvidence, clientFailuresOf, validateClientRenderError,
     recordContent, recordSpec, currentSurfaceSpecForSession,
     _bySurface: bySurface,
   };

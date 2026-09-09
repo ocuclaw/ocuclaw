@@ -20,6 +20,9 @@ const GLASSES_UI_LIMITS = {
   maxItems: 20,
   detailBodyMax: 200,
   totalDetailPayloadMax: 6 * 1024,
+
+  totalChildPayloadMax: 8 * 1024,
+  maxChildPages: 3,
 };
 
 module.exports = { GLASSES_UI_LIMITS, DEFAULT_STAGE_GRACE_MS, MIN_STAGE_GRACE_MS, MAX_STAGE_GRACE_MS, LIVEUI_TEMPLATE_RENDER_TIMEOUT_MAX_MS };

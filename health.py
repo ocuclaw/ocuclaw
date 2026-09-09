@@ -37,11 +37,16 @@ PLATFORM_NAME = "ocuclaw"
 BUNDLE_DIR = Path(__file__).resolve().parent
 DEFAULT_RUNTIME_ENTRY = BUNDLE_DIR / "dist-cjs" / "runtime" / "hermes-runtime-entry.cjs"
 
-CERTIFIED_HERMES_VERSION = "0.20.6"
-CERTIFIED_HERMES_TAG = "v2026.8.27"
-CERTIFIED_HERMES_COMMIT = "5fc308a70719a83cccdbba4c0e39c23f5a8239d5"
-SUPPORTED_HERMES_MIN = (0, 20, 0)
-SUPPORTED_HERMES_MAX_EXCLUSIVE = (0, 21, 0)
+CERTIFIED_HERMES_VERSION = "0.21.0"
+CERTIFIED_HERMES_TAG = "v2026.8.31"
+CERTIFIED_HERMES_COMMIT = "29112bef099274229cadff79cdff7bf7b99c4b77"
+SUPPORTED_HERMES_MIN = (0, 21, 0)
+SUPPORTED_HERMES_MAX_EXCLUSIVE = (0, 22, 0)
+
+# The ONE user id the adapter stamps on every wearer-originated event
+# (adapter.py `_build_message_event` → `build_source`). Continue here (#2509)
+# needs `platforms.ocuclaw.extra.allow_admin_from` to list exactly this id.
+OCUCLAW_WEARER_USER_ID = "ocuclaw-wearer"
 
 OCUCLAW_RELAY_TOKEN_ENV = "OCUCLAW_RELAY_TOKEN"
 OCUCLAW_SONIOX_API_KEY_ENV = "OCUCLAW_SONIOX_API_KEY"
@@ -52,6 +57,36 @@ _SECRET_ENV_TO_KEY = {
     OCUCLAW_SONIOX_API_KEY_ENV: "sonioxApiKey",
     OCUCLAW_EVEN_AI_TOKEN_ENV: "evenAiToken",
 }
+
+
+def continue_here_configured(extra: Any) -> bool:
+    """Whether Hermes will honour the wearer's `/resume <tip> --all` (#2509).
+
+    Reads the platform's ``extra`` block the way Hermes does
+    (``gateway.slash_access.policy_from_extra`` — DM scope, the shape every
+    wearer event carries): gating must be ENABLED (a non-empty
+    ``allow_admin_from``) and the adapter's one fixed user id must be an
+    admin. Turning gating on is platform-wide for ocuclaw and safe only
+    because that single id is the only one the adapter ever sends. The pure
+    fallback mirrors ``_coerce_id_list`` for reads outside a Hermes process
+    (setup-status and doctor runs before the gateway imports resolve).
+    """
+    block = extra if isinstance(extra, Mapping) else {}
+    try:
+        from gateway.slash_access import policy_from_extra
+
+        policy = policy_from_extra(dict(block), "dm")
+        return bool(policy.enabled and policy.is_admin(OCUCLAW_WEARER_USER_ID))
+    except Exception:  # noqa: BLE001 - pure fallback below
+        pass
+    raw = block.get("allow_admin_from")
+    if isinstance(raw, str):
+        ids = [part.strip() for part in raw.split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        ids = [str(part).strip() for part in raw]
+    else:
+        ids = []
+    return OCUCLAW_WEARER_USER_ID in {part for part in ids if part}
 
 
 def parse_version(raw: str) -> Optional[Tuple[int, int, int]]:
@@ -259,6 +294,16 @@ def collect_health_facts(
         except (TypeError, ValueError):
             relay_port_valid = False
 
+    # Agent choice (#2515): the same two leaves `_setup_status` judges, carried
+    # raw so `hermes ocuclaw status` can say WHY the phone's "+" is grey on an
+    # install that predates the question. Non-bool / non-string values are
+    # reported as absent rather than guessed at.
+    gateway_config = raw_config.get("gateway")
+    multiplex_raw = gateway_config.get("multiplex_profiles") if isinstance(gateway_config, dict) else None
+    multiplex_profiles = multiplex_raw if isinstance(multiplex_raw, bool) else None
+    agent_mode_raw = extra.get("agent_mode")
+    agent_mode = agent_mode_raw if agent_mode_raw in ("multiple", "single") else None
+
     plugins = raw_config.get("plugins")
     enabled_plugins = plugins.get("enabled", []) if isinstance(plugins, dict) else []
     uses_default_runtime = not bool(extra.get("runtimeCommand"))
@@ -291,6 +336,9 @@ def collect_health_facts(
         relayBindSafe=ws_bind == HERMES_BUNDLE_DEFAULT_WS_BIND,
         relayPortValid=relay_port_valid,
         evenAiEnabled=bool(extra.get("evenAiEnabled")),
+        continueHereConfigured=continue_here_configured(extra),
+        multiplexProfiles=multiplex_profiles,
+        agentMode=agent_mode,
         secretsPresent=secret_inventory_fn(),
         hermesCliOnPath=shutil.which("hermes") is not None,
         nodeRequired=uses_default_runtime,
@@ -309,6 +357,8 @@ def collect_health_facts(
 
 
 __all__ = [
+    "OCUCLAW_WEARER_USER_ID",
+    "continue_here_configured",
     "CERTIFIED_HERMES_COMMIT",
     "CERTIFIED_HERMES_TAG",
     "CERTIFIED_HERMES_VERSION",

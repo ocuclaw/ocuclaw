@@ -648,6 +648,16 @@ function createGlassesUiCronEngine(deps) {
     isActive(surfaceId) {
       return active.has(surfaceId);
     },
+    sessionKeysForHttpHost(host) {
+      const keys = new Set();
+      for (const state of active.values()) {
+        if (!state.recipe || state.recipe.kind !== "http") continue;
+        let recipeHost = "";
+        try { recipeHost = new URL(state.recipe.url).hostname; } catch (_) {}
+        if (recipeHost === host) keys.add(state.sessionKey);
+      }
+      return [...keys];
+    },
     _debugState(surfaceId) {
       return active.get(surfaceId);
     },

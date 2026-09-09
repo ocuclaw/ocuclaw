@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
+const { normalizeAndValidateCustomSystemPrompt, normalizeCustomSystemPrompt } = require("../domain/custom-system-prompt-limit.cjs");
 
 const DEFAULT_EVEN_AI_ROUTING_MODE = "active";
 const SUPPORTED_EVEN_AI_ROUTING_MODES = Object.freeze([
@@ -42,7 +43,7 @@ function normalizeEvenAiRoutingMode(value) {
 }
 
 function normalizeEvenAiSystemPrompt(value) {
-  return normalizeTrimmedString(value);
+  return normalizeCustomSystemPrompt(value);
 }
 
 function normalizeEvenAiDefaultModel(value) {
@@ -343,13 +344,14 @@ function createEvenAiSettingsStore(opts = {}) {
     },
 
     async setSettings(patch = {}) {
+      const nextSystemPrompt = hasOwn(patch, "systemPrompt")
+        ? normalizeAndValidateCustomSystemPrompt(patch.systemPrompt)
+        : snapshot.systemPrompt;
       const next = {
         routingMode: hasOwn(patch, "routingMode")
           ? normalizeEvenAiRoutingMode(patch.routingMode)
           : snapshot.routingMode,
-        systemPrompt: hasOwn(patch, "systemPrompt")
-          ? normalizeEvenAiSystemPrompt(patch.systemPrompt)
-          : snapshot.systemPrompt,
+        systemPrompt: nextSystemPrompt,
         defaultModel: hasOwn(patch, "defaultModel")
           ? normalizeEvenAiDefaultModel(patch.defaultModel)
           : snapshot.defaultModel,

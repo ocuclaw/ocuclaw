@@ -1,11 +1,11 @@
 # Updating OcuClaw on Hermes
 
-**Guide version:** 2026-08-31 (1.3.18-hermes)
+**Guide version:** 2026-09-05 (1.3.19-hermes)
 
 Use this for an installed, healthy OcuClaw on Hermes moving to a strictly
 higher published bundle version. It is version-neutral: it never names a
 source version and never removes or reinstalls the plugin. There is one
-public GitHub channel; there is no npm or ClawHub selector. Preserve
+access-controlled GitHub channel; there is no npm or ClawHub selector. Preserve
 unexplained local plugin source instead of replacing it without the user's
 decision.
 
@@ -22,8 +22,16 @@ This is the one wording every OcuClaw-on-Hermes surface uses. Quote it; do not
 paraphrase it, and do not reorder its steps.
 
 <!-- ocuclaw:install-block:start -->
-OcuClaw needs Hermes `>=0.20.0,<0.21.0`; the certified baseline is Hermes
-`0.20.6`.
+OcuClaw needs Hermes `>=0.21.0,<0.22.0`; the certified baseline is Hermes
+`0.21.0`.
+
+**Private beta access.** `ocuclaw/ocuclaw` requires an invited GitHub account
+and Git HTTPS authentication on the installing machine (Desktop uses Git too).
+Verify access with `git ls-remote https://github.com/ocuclaw/ocuclaw.git HEAD`
+before installing. “Repository not found” or “could not read Username” means
+confirm your invitation with the beta contact and configure Git authentication
+locally; never paste an access token into setup chat. Repository visibility is
+not changed by this release. Even Hub beta access is a separate invitation.
 
 **Terminal first.** This is the supported path and the one every beta build is
 tested on:
@@ -63,18 +71,22 @@ hermes://plugin/install?repo=ocuclaw/ocuclaw
 ```
 
 installs the same bundle through the Desktop install modal, enabled by default.
-Desktop picks up the OcuClaw presenter immediately, but the agent half still
-only enters the gateway on the gateway's next start — so a Desktop install
-leaves two follow-ups, and the OcuClaw setup card in the Hermes Desktop title
-bar walks you through both:
+OcuClaw ships **one** Desktop UI, and the enabled plugin generates it, so the
+order is: install, then restart the gateway, and the OcuClaw UI appears in the
+Hermes Desktop title bar on the next Desktop launch or reload.
 
-1. The card explains the pending restart and offers **Restart gateway**. Click
-   it, or run `hermes gateway restart` in a terminal — either works. The card
-   reads the gateway's own reported platforms rather than its own web route, so
-   it advances only once the gateway has genuinely loaded OcuClaw.
-2. The card then reads **Pair your glasses**. Run `/ocuclaw-setup` and finish
-   pairing. The card retires on the durable pairing receipt and stays gone,
-   including across a Desktop relaunch.
+1. Restart the gateway — use the native **Restart gateway** button when the
+   OcuClaw card is visible, otherwise `hermes gateway restart` in a terminal. Until it
+   restarts, OcuClaw is installed but not loaded, and there is no OcuClaw
+   Desktop UI yet.
+2. The OcuClaw setup card then appears in the title bar reading
+   **Pair your glasses**. Run `/ocuclaw-setup` and finish pairing. The card
+   retires on the durable pairing receipt and stays gone, including across a
+   Desktop relaunch.
+
+Desktop leaves `display.interface` alone; the terminal-default command above
+applies only to terminal setup. Optional Soniox and Even AI credentials use
+private Desktop forms, with masked terminal prompts available in the TUI.
 
 **Update.** In `hermes plugins update ocuclaw`, `ocuclaw` is the **plugin id** —
 the `name:` field in `plugin.yaml` — and not the `ocuclaw/ocuclaw` repository
@@ -99,10 +111,17 @@ hermes --version
 hermes plugins list
 ```
 
-Hermes must remain within `>=0.20.0,<0.21.0`, and `ocuclaw` must be installed.
+Hermes must remain within `>=0.21.0,<0.22.0`, and `ocuclaw` must be installed.
 Call `{"operation":"status"}` first. If the state is not `configured` or
 `connected`, this is not an update — call `{"operation":"troubleshooting"}` or
 `{"operation":"fresh_install"}` instead.
+
+While you have that receipt, read `status.mandatoryConfiguration.agentModeChosen`.
+An install that predates the agent question reports `false` there, and its
+phone shows a grey new-agent "+" (#2515). Do not let the update finish without
+offering the choice: after U4, call `{"operation":"agent_mode"}` and follow
+it. It adds no second restart — U3 is the restart it needs, so make the
+choice BEFORE U3 when you can.
 
 ## U2 · In-place update
 
@@ -134,18 +153,29 @@ VERIFY:
 
 ```bash
 hermes plugins list
-hermes config get platforms.ocuclaw.extra.evenTerminalEnabled
 hermes config get display.platforms.ocuclaw.tool_progress
+hermes config get platforms.ocuclaw.extra.allow_admin_from
 ```
 
-Require the plugin to be enabled, Even Terminal to report `true`, and tool
-progress to report `false`. If either non-secret posture value drifted,
-CHECKPOINT the matching correction:
+Require the plugin to be enabled, tool progress to report `false`, and
+`allow_admin_from` to list `ocuclaw-wearer`. If a non-secret posture value
+drifted or is missing, CHECKPOINT the matching correction:
 
 ```bash
-hermes config set platforms.ocuclaw.extra.evenTerminalEnabled true
 hermes config set display.platforms.ocuclaw.tool_progress off
+hermes config set platforms.ocuclaw.extra.allow_admin_from '["ocuclaw-wearer"]'
 ```
+
+The `allow_admin_from` key is NEW for existing installs: it enables "Continue
+here" (the glasses pick up a chat started in Hermes Desktop, the CLI or the
+TUI). Every install before it reports `mandatoryConfiguration.adoptConfigured:
+false` and `hermes ocuclaw doctor` prints the `continue_here_not_configured`
+warning until the key is written — write it as part of the update, do not wait
+for the user to hit "Continue here isn't set up on this Hermes". Say plainly
+what it does: it turns Hermes's slash-command gating ON for the OcuClaw
+platform as a whole, which is safe because `ocuclaw-wearer` is the only user id
+the plugin ever sends (the wearer becomes the sole admin; nothing else can reach
+the gate). Preserve any ids already listed and append `ocuclaw-wearer`.
 
 Then follow `Restarting the gateway` once more.
 
@@ -160,7 +190,10 @@ follow `Restarting the gateway` a final time. A no is a finished answer.
 
 Call `{"operation":"doctor"}` for the setup-bundle reconciliation receipt,
 then run the bounded host command `hermes ocuclaw doctor`. Require a configured
-setup and healthy four-leg result. If the Relay Credential is missing, stop and
+setup and healthy four-leg result. If its Setup section shows
+`multiple agents  off · agent mode not chosen yet` with the
+`→ run /ocuclaw-setup in a Hermes chat to choose` line, the agent choice from
+U1 is still owed: call `{"operation":"agent_mode"}` now and follow it. If the Relay Credential is missing, stop and
 enter troubleshooting `CREDENTIAL-MISSING`. An update never creates, imports,
 or prompts for a replacement.
 

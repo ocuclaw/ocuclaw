@@ -19,6 +19,7 @@ function createHermesClarifyRouter(deps = {}) {
 
   const bySurface = new Map();
   const bySession = new Map();
+  const suppressed = new Set();
 
   function forget(entry) {
     if (bySurface.get(entry.surfaceId) === entry) bySurface.delete(entry.surfaceId);
@@ -46,12 +47,12 @@ function createHermesClarifyRouter(deps = {}) {
       onError({ reason: "clarify_unrenderable", id, sessionKey });
       return false;
     }
-    if (!isCurrentSession(sessionKey)) {
-      onError({ reason: "clarify_background_session", id, sessionKey });
-      return false;
-    }
 
+    if (!isCurrentSession(sessionKey)) return true;
     const previous = bySession.get(sessionKey);
+    if (previous && previous.id === id && previous.expiresAtMs > now()) return true;
+    if (suppressed.has(id)) return true;
+    suppressed.clear();
     if (previous) retire(previous, "superseded");
 
     const deadlineSec = positiveSeconds(raw && raw.deadlineSec);
@@ -64,9 +65,11 @@ function createHermesClarifyRouter(deps = {}) {
       selectionMode,
       allowOther: raw && raw.allowOther === true && choices.length > 0,
       deadlineSec,
-      expiresAtMs: now() + deadlineSec * 1000,
+      expiresAtMs: Number.isFinite(raw.expiresAtMs)
+        ? raw.expiresAtMs : now() + deadlineSec * 1000,
       locked: false,
     };
+    if (entry.expiresAtMs <= now()) return false;
     bySurface.set(entry.surfaceId, entry);
     bySession.set(entry.sessionKey, entry);
     inject({
@@ -75,7 +78,7 @@ function createHermesClarifyRouter(deps = {}) {
       kind: "question",
       title: "Hermes",
       question: entry.question,
-      deadlineSec: entry.deadlineSec,
+      deadlineSec: Math.max(1, Math.ceil((entry.expiresAtMs - now()) / 1000)),
       questionIndex: 0,
       questionCount: 0,
       presentation: "adaptive",
@@ -94,6 +97,7 @@ function createHermesClarifyRouter(deps = {}) {
     if (raw && raw.result === "dismissed") {
 
       forget(entry);
+      suppressed.add(entry.id);
       return true;
     }
     if (!raw || (raw.result !== "selected" && raw.result !== "await_text")) return false;
@@ -105,15 +109,18 @@ function createHermesClarifyRouter(deps = {}) {
       if (entry.selectionMode !== "open" && !entry.allowOther) return false;
       entry.locked = true;
       forget(entry);
+      suppressed.add(entry.id);
       if (!awaitText) {
         onError({ reason: "clarify_text_responder_unavailable", surfaceId });
         return false;
       }
       try {
         Promise.resolve(awaitText(entry.id)).catch((error) => {
+          suppressed.delete(entry.id);
           onError({ reason: "clarify_await_text_failed", surfaceId, error });
         });
       } catch (error) {
+        suppressed.delete(entry.id);
         onError({ reason: "clarify_await_text_failed", surfaceId, error });
         return false;
       }
@@ -149,15 +156,18 @@ function createHermesClarifyRouter(deps = {}) {
     }
     entry.locked = true;
     forget(entry);
+    suppressed.add(entry.id);
     if (!respond) {
       onError({ reason: "clarify_responder_unavailable", surfaceId });
       return false;
     }
     try {
       Promise.resolve(respond(entry.id, response)).catch((error) => {
+        suppressed.delete(entry.id);
         onError({ reason: "clarify_respond_failed", surfaceId, error });
       });
     } catch (error) {
+      suppressed.delete(entry.id);
       onError({ reason: "clarify_respond_failed", surfaceId, error });
       return false;
     }
@@ -166,13 +176,32 @@ function createHermesClarifyRouter(deps = {}) {
 
   function forgetAll(reason = "display_changed") {
     for (const entry of Array.from(bySession.values())) retire(entry, reason);
+    suppressed.clear();
+  }
+
+  function reconcile(snapshot) {
+    const sessionKey = cleanText(snapshot && snapshot.sessionKey);
+    if (!sessionKey || !isCurrentSession(sessionKey)) return false;
+    const request = snapshot.clarify;
+    const previous = bySession.get(sessionKey);
+    if (!request) {
+      if (previous) retire(previous, "resolved");
+      suppressed.clear();
+      return true;
+    }
+
+    if (request.awaitingText && Array.isArray(request.choices) && request.choices.length > 0) {
+      if (previous) retire(previous, "await_text");
+      return true;
+    }
+    return handleRequest(request);
   }
 
   function activeSurfaceId(sessionKey) {
     return bySession.get(sessionKey)?.surfaceId || "";
   }
 
-  return { handleRequest, handleOutcome, forgetAll, activeSurfaceId };
+  return { handleRequest, handleOutcome, forgetAll, activeSurfaceId, reconcile };
 }
 
 module.exports = { createHermesClarifyRouter };

@@ -8,29 +8,32 @@ const GLASSES_UI_FIT_BUDGETS = {
   markerX: 548,
   markerGutter: 8,
   titleLaneX: 0,
-  titleOutlineExtraW: 24,
-  contentPadding: 5,
+  titleChipExtraW: 24,
+  cuedChipMaxW: 504,
+  cuedTitleCueGap: 8,
+  contentPadding: 6,
   frameBorderWidth: 1,
 
   narrowContentInnerW: 430,
-  mediumContentInnerW: 520,
-  wideContentInnerW: 552,
+  mediumContentInnerW: 550,
+  wideContentInnerW: 550,
+  captionPriorityInnerW: 540,
   fullReaderMaxVisibleLines: 8,
-  pagedCountGap: 8,
   centeredListMaxItems: 3,
   focusListMaxItems: 6,
   focusListMaxLines: 2,
   checklistUncheckedMark: "[ ] ",
   checklistCheckedMark: "[x] ",
+  childCueSuffix: " ›",
   splitLabelInnerW: 178,
-  splitDetailInnerW: 362,
+  splitDetailInnerW: 359,
   detailSpotlightMaxItems: 2,
   splitRailMaxItems: 5,
   detailsShortMaxLines: 2,
   detailSpotlightVisibleRows: 2,
   splitRailVisibleRows: 5,
   stackedReaderVisibleRows: 2,
-  detailsGap: 4,
+  detailsGap: -1,
   detailSpotlightMinDetailLines: 3,
 };
 
@@ -104,22 +107,25 @@ function linesError(code, field, text, width, maxLines, advice) {
 }
 
 function titleBudgetPx(rightLimit) {
-  const maxOutlineWidth = Math.max(0, 2 * (rightLimit - B.canvasW / 2));
-  return Math.max(0, maxOutlineWidth - B.titleOutlineExtraW);
+  const maxChipWidth = Math.max(0, 2 * (rightLimit - B.canvasW / 2));
+  return Math.max(0, maxChipWidth - B.titleChipExtraW);
 }
 
 function checkTitle(spec) {
   const title = spec.title;
   if (typeof title !== "string" || title.length === 0) return null;
-  let rightLimit = B.titleLaneX + TITLE_LANE_W;
-  if (spec.kind === "paged_text_surface" && Array.isArray(spec.pages)) {
-
-    const countWidth = Math.max(
-      ...spec.pages.map((_page, index) => getTextWidth(`${index + 1}/${spec.pages.length}`)),
+  const cuedCount =
+    spec.kind === "paged_text_surface" ? spec.pages?.length :
+      spec.kind === "list_surface" || spec.kind === "checklist_surface" || spec.kind === "list_with_details_surface"
+        ? spec.items?.length : null;
+  if (Number.isInteger(cuedCount) && cuedCount > 0) {
+    const cueWidth = Math.max(
+      ...Array.from({ length: cuedCount }, (_unused, index) => getTextWidth(`${index + 1}/${cuedCount}`)),
     );
-    rightLimit = B.titleLaneX + TITLE_LANE_W - countWidth - B.pagedCountGap;
+    const budget = B.cuedChipMaxW - B.titleChipExtraW - B.cuedTitleCueGap - cueWidth;
+    return widthError("title_too_long", "title", title, budget, "shorten it");
   }
-  return widthError("title_too_long", "title", title, titleBudgetPx(rightLimit), "shorten it");
+  return widthError("title_too_long", "title", title, titleBudgetPx(B.titleLaneX + TITLE_LANE_W), "shorten it");
 }
 
 function checkTextBody(spec) {
@@ -153,8 +159,13 @@ function worstRowLines(variants, width) {
   return Math.max(...variants.map((row) => wrappedLines(row, width)));
 }
 
-function checkMeasuredList(labels, rowVariants, field) {
-  const variants = labels.map(rowVariants);
+function rowSuffixesFor(spec) {
+  const children = Array.isArray(spec && spec.children) ? spec.children : [];
+  return (i) => (children[i] ? B.childCueSuffix : "");
+}
+
+function checkMeasuredList(labels, rowVariants, field, suffixAt = () => "") {
+  const variants = labels.map((label, i) => rowVariants(label, i));
   const centeredFits =
     labels.length <= B.centeredListMaxItems &&
     variants.every((rows) => worstRowLines(rows, B.narrowContentInnerW) <= 1);
@@ -162,7 +173,22 @@ function checkMeasuredList(labels, rowVariants, field) {
   const focusFits =
     labels.length <= B.focusListMaxItems &&
     variants.every((rows) => worstRowLines(rows, B.mediumContentInnerW) <= B.focusListMaxLines);
-  if (focusFits) return null;
+  if (focusFits) {
+
+    for (let i = 0; i < labels.length; i += 1) {
+      if (!suffixAt(i)) continue;
+      if (worstRowLines(variants[i], B.mediumContentInnerW) <= 1) continue;
+      return linesError(
+        "item_too_long",
+        field(i),
+        variants[i][0],
+        B.mediumContentInnerW,
+        1,
+        "shorten it (a row that opens a child stays on one line)",
+      );
+    }
+    return null;
+  }
   for (let i = 0; i < labels.length; i += 1) {
     const measured = worstRowLines(variants[i], B.wideContentInnerW);
     if (measured <= 1) continue;
@@ -180,10 +206,10 @@ function checkMeasuredList(labels, rowVariants, field) {
   return null;
 }
 
-function detailsLayout(items) {
+function detailsLayout(items, suffixAt = () => "") {
   const bodyOf = (item) => (typeof item.body === "string" ? item.body : "");
   const spotlightDetailLines = items.map((item) => wrappedLines(bodyOf(item), B.wideContentInnerW));
-  const splitLabelLines = items.map((item) => wrappedLines(item.label, B.splitLabelInnerW));
+  const splitLabelLines = items.map((item, i) => wrappedLines(item.label + suffixAt(i), B.splitLabelInnerW));
   const splitDetailLines = items.map((item) => wrappedLines(bodyOf(item), B.splitDetailInnerW));
   let mode = "STACKED_READER";
   if (
@@ -200,7 +226,7 @@ function detailsLayout(items) {
   }
   const labelInnerWidth =
     mode === "DETAIL_SPOTLIGHT"
-      ? B.narrowContentInnerW
+      ? B.wideContentInnerW
       : mode === "SPLIT_RAIL"
         ? B.splitLabelInnerW
         : B.wideContentInnerW;
@@ -212,7 +238,8 @@ function detailsLayout(items) {
         ? B.splitRailVisibleRows
         : B.stackedReaderVisibleRows;
   const lh = lineHeight();
-  const labelOuterHeight = (visibleRows + 1) * lh + EDGE_PIXELS;
+  const labelVisibleLines = mode === "DETAIL_SPOTLIGHT" ? 2 * visibleRows - 1 : visibleRows;
+  const labelOuterHeight = labelVisibleLines * lh + EDGE_PIXELS;
 
   const spotlightDetailHeight =
     Math.max(...spotlightDetailLines, B.detailSpotlightMinDetailLines) * lh + EDGE_PIXELS;
@@ -220,20 +247,20 @@ function detailsLayout(items) {
     mode === "DETAIL_SPOTLIGHT"
       ? spotlightDetailHeight
       : mode === "SPLIT_RAIL"
-        ? 4 * lh + EDGE_PIXELS
-        : POST_HEADER_H - labelOuterHeight - B.detailsGap;
+        ? 5 * lh + EDGE_PIXELS
+        : B.fullReaderMaxVisibleLines * lh - labelOuterHeight - B.detailsGap;
   const detailCapacity = Math.max(1, Math.floor((detailHeight - EDGE_PIXELS) / lh));
   return { mode, labelInnerWidth, detailInnerWidth, detailCapacity, bodyOf };
 }
 
-function checkListWithDetails(items) {
-  const layout = detailsLayout(items);
+function checkListWithDetails(items, suffixAt = () => "") {
+  const layout = detailsLayout(items, suffixAt);
   for (let i = 0; i < items.length; i += 1) {
 
     const labelErr = linesError(
       "item_too_long",
       `items[${i}].label`,
-      items[i].label,
+      items[i].label + suffixAt(i),
       layout.labelInnerWidth,
       1,
       "shorten it",
@@ -256,6 +283,23 @@ function checkGlassesUiFit(spec) {
   if (!spec || typeof spec !== "object") return null;
   const titleErr = checkTitle(spec);
   if (titleErr) return titleErr;
+  const parentErr = checkOwnFit(spec);
+  if (parentErr) return parentErr;
+
+  if (Array.isArray(spec.children)) {
+    for (let i = 0; i < spec.children.length; i += 1) {
+      const child = spec.children[i];
+      if (!child) continue;
+      const childErr = checkGlassesUiFit(child);
+      if (childErr) {
+        return { ...childErr, message: `children[${i}]: ${childErr.message}` };
+      }
+    }
+  }
+  return null;
+}
+
+function checkOwnFit(spec) {
   switch (spec.kind) {
     case "text_surface":
 
@@ -263,8 +307,10 @@ function checkGlassesUiFit(spec) {
       return checkTextBody(spec);
     case "paged_text_surface":
       return checkPages(spec);
-    case "list_surface":
-      return checkMeasuredList(spec.items, (label) => [label], (i) => `items[${i}]`);
+    case "list_surface": {
+      const suffixAt = rowSuffixesFor(spec);
+      return checkMeasuredList(spec.items, (label, i) => [label + suffixAt(i)], (i) => `items[${i}]`, suffixAt);
+    }
     case "checklist_surface":
       return checkMeasuredList(
         spec.items.map((item) => item.label),
@@ -272,7 +318,7 @@ function checkGlassesUiFit(spec) {
         (i) => `items[${i}].label`,
       );
     case "list_with_details_surface":
-      return checkListWithDetails(spec.items);
+      return checkListWithDetails(spec.items, rowSuffixesFor(spec));
     default:
       return null;
   }

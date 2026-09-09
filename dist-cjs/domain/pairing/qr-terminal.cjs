@@ -13,6 +13,17 @@ const QR_TERMINAL_GLYPHS = Object.freeze({
   blank: " ",
 }         );
 
+const QR_TERMINAL_ANSI = Object.freeze({
+
+  light: "\u001b[107m",
+
+  dark: "\u001b[40m",
+
+  reset: "\u001b[0m",
+}         );
+
+const QR_ANSI_CELLS_PER_MODULE = 2;
+
                                                         
 
 const EXCHANGE_ID_PATTERN = /^[0-9a-f]{32}$/;
@@ -120,4 +131,40 @@ function renderQrPayloadToTerminal(
   return renderMatrix(trimmed, invert);
 }
 
-module.exports = { QR_TERMINAL_GLYPHS, serializeQrPayload, parseQrPayload, renderQrPayloadToTerminal };
+function renderMatrixAnsi(matrix                                 )                       {
+  if (matrix.length === 0) return { text: "", columns: 0, rows: 0 };
+  const width = matrix[0].length;
+  const cell = " ".repeat(QR_ANSI_CELLS_PER_MODULE);
+  const lines           = [];
+  for (const row of matrix) {
+    let line = "";
+    let painted                = null;
+    for (let c = 0; c < width; c++) {
+
+      const colour = row[c] === true ? QR_TERMINAL_ANSI.dark : QR_TERMINAL_ANSI.light;
+      if (colour !== painted) {
+        line += colour;
+        painted = colour;
+      }
+      line += cell;
+    }
+    lines.push(line + QR_TERMINAL_ANSI.reset);
+  }
+  return {
+    text: lines.join("\n"),
+    columns: width * QR_ANSI_CELLS_PER_MODULE,
+    rows: matrix.length,
+  };
+}
+
+function renderQrPayloadToTerminalAnsi(
+  payload                  ,
+  options                                             ,
+)                       {
+  const quietZone = options?.quietZone ?? true;
+  const matrix = qrMatrix(serializeQrPayload(payload));
+  const trimmed = quietZone ? matrix : stripBorder(matrix, QR_QUIET_ZONE_MODULES);
+  return renderMatrixAnsi(trimmed);
+}
+
+module.exports = { QR_TERMINAL_GLYPHS, QR_TERMINAL_ANSI, QR_ANSI_CELLS_PER_MODULE, serializeQrPayload, parseQrPayload, renderQrPayloadToTerminal, renderQrPayloadToTerminalAnsi };

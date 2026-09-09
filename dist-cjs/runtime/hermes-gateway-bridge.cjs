@@ -1,9 +1,8 @@
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
 const { METHOD_NOT_FOUND_CODE } = require("../gateway/backend-contract.cjs");
+const { managementRequest, validManagementRequest, managementResult } = require("./hermes-management.cjs");
+const { discardLinkSpillFile, writeLinkSpillFile } = require("./link-attachment-spill.cjs");
 const { buildAgentRequestParams } = require("../gateway/gateway-bridge.cjs");
-const { DEFAULT_HERMES_NAMESPACE, deriveHermesPublicKey, isForeignHermesSessionKey, isHermesSessionKey, mintedHermesSessionKey, parseHermesPublicKey } = require("./hermes-session-keys.cjs");
+const { DEFAULT_HERMES_NAMESPACE, deriveHermesPublicKey, isAdoptableHermesSessionKey, isForeignHermesSessionKey, isHermesSessionKey, mintedHermesSessionKey, parseHermesPublicKey } = require("./hermes-session-keys.cjs");
 const { normalizeHermesActivityToolPayload } = require("./hermes-activity-tool-shim.cjs");
 
 const LINK_DB_METHODS = Object.freeze({
@@ -17,6 +16,8 @@ const LINK_DB_METHODS = Object.freeze({
   chatHistory: "db.chat.history",
   describeSession: "db.sessions.describe",
   compactionInfo: "db.sessions.compactionInfo",
+
+  chatWatermark: "db.chat.watermark",
 });
 
 const HERMES_FEATURE_TOKEN_SESSION_READ_STATE = "session_read_state";
@@ -40,17 +41,25 @@ const LINK_DB_READ_TIMEOUT_MS = 30_000;
 
 const DB_READ_TIMEOUT = Object.freeze({ timeoutMs: LINK_DB_READ_TIMEOUT_MS });
 
+const LINK_ADOPT_TIMEOUT_MS = 20_000;
+const ADOPT_TIMEOUT_MS = Object.freeze({ timeoutMs: LINK_ADOPT_TIMEOUT_MS });
+
 const LINK_BACKEND_EVENT_METHOD = "backend.event";
 
 const LINK_DISPATCH_METHOD = "dispatch.send";
 
 const LINK_GW_METHODS = Object.freeze({
+  hermesManagement: "gw.hermes.management",
   modelsList: "gw.models.list",
   modelsConfigured: "gw.models.configured",
   usageStatus: "gw.usage.status",
   authStatus: "gw.auth.status",
   agentIdentity: "gw.agent.identity",
   profilesList: "gw.profiles.list",
+  profilesCreate: "gw.profiles.create",
+  profilesEmojiSet: "gw.profiles.emoji.set",
+  profilesSettingsGet: "gw.profiles.settings.get",
+  profilesSettingsSet: "gw.profiles.settings.set",
   profilesSoul: "gw.profiles.soul",
   skillsStatus: "gw.skills.status",
   commandsList: "gw.commands.list",
@@ -58,6 +67,10 @@ const LINK_GW_METHODS = Object.freeze({
 
 const LINK_FOREIGN_METHODS = Object.freeze({
   copy: "foreign.sessions.copy",
+
+  adopt: "foreign.sessions.adopt",
+
+  driver: "foreign.sessions.driver",
 });
 
 const LINK_APPROVAL_RESOLVE_METHOD = "approval.resolve";
@@ -349,52 +362,47 @@ function routeDispatchSessionKey(rawKey) {
 
 function createDefaultAttachmentTransport() {
   return {
-    prepare(attachments) {
+
+    async prepare(attachments) {
       const descriptors = [];
       const spilled = [];
-      for (const attachment of attachments) {
-        if (!attachment || typeof attachment !== "object") continue;
-        const descriptor = {};
-        for (const field of [
-          "type",
-          "mimeType",
-          "fileName",
-          "source",
-          "sizeBytes",
-          "widthPx",
-          "heightPx",
-        ]) {
-          if (attachment[field] !== undefined) descriptor[field] = attachment[field];
-        }
-        const content =
-          typeof attachment.content === "string" ? attachment.content : "";
-        if (content.length > LINK_ATTACHMENT_INLINE_MAX_CHARS) {
-          const spillPath = path.join(
-            os.tmpdir(),
-            `ocuclaw-attach-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-          );
+      try {
+        for (const attachment of attachments) {
+          if (!attachment || typeof attachment !== "object") continue;
+          const descriptor = {};
+          for (const field of [
+            "type",
+            "mimeType",
+            "fileName",
+            "source",
+            "sizeBytes",
+            "widthPx",
+            "heightPx",
+          ]) {
+            if (attachment[field] !== undefined) descriptor[field] = attachment[field];
+          }
+          const content =
+            typeof attachment.content === "string" ? attachment.content : "";
+          if (content.length > LINK_ATTACHMENT_INLINE_MAX_CHARS) {
 
-          fs.writeFileSync(spillPath, Buffer.from(content, "base64"), {
-            mode: 0o600,
-            flag: "wx",
-          });
-          descriptor.path = spillPath;
-          spilled.push(spillPath);
-        } else {
-          descriptor.content = content;
+            const spillPath = await writeLinkSpillFile(content);
+            descriptor.path = spillPath;
+            spilled.push(spillPath);
+          } else {
+            descriptor.content = content;
+          }
+          descriptors.push(descriptor);
         }
-        descriptors.push(descriptor);
+      } catch (err) {
+
+        for (const spillPath of spilled) discardLinkSpillFile(spillPath);
+        throw err;
       }
       return {
         descriptors,
         cleanup() {
-          for (const spillPath of spilled) {
-            try {
-              fs.unlinkSync(spillPath);
-            } catch {
 
-            }
-          }
+          for (const spillPath of spilled) discardLinkSpillFile(spillPath);
         },
       };
     },
@@ -414,6 +422,9 @@ function mapListRow(row) {
   const hidden = typeof row.hidden === "boolean" ? row.hidden : null;
   const mapped = {
     key: derived.key,
+    ...(row.agentStatus && typeof row.agentStatus === "object"
+      ? { agentStatus: row.agentStatus }
+      : {}),
 
     updatedAt:
       lastActiveSeconds === null ? 0 : Math.floor(lastActiveSeconds * 1000),
@@ -591,15 +602,52 @@ function createHermesGatewayBridge(opts) {
   const sessionReadStateSupported = () =>
     hermesFeatureTokens.has(HERMES_FEATURE_TOKEN_SESSION_READ_STATE);
 
-  function prepareAttachments(params, linkParams) {
+  async function prepareAttachments(params, linkParams) {
     if (params && Array.isArray(params.attachments) && params.attachments.length > 0) {
-      const prepared = attachmentTransport.prepare(params.attachments);
+      const prepared = await attachmentTransport.prepare(params.attachments);
       if (prepared.descriptors.length > 0) {
         linkParams.attachments = prepared.descriptors;
       }
       return prepared;
     }
     return null;
+  }
+
+  const sendChains = new Map();
+
+  function serializeSend(sessionKey, issue) {
+    const key = typeof sessionKey === "string" && sessionKey ? sessionKey : "";
+    const previous = sendChains.get(key) || Promise.resolve();
+    const run = previous.then(issue);
+
+    const tail = run.then(
+      () => {},
+      () => {},
+    );
+    sendChains.set(key, tail);
+    tail.then(() => {
+
+      if (sendChains.get(key) === tail) sendChains.delete(key);
+    });
+    return run;
+  }
+
+  function issueRequest(method, linkParams) {
+    let pending;
+    try {
+      pending = Promise.resolve(link.request(method, linkParams));
+    } catch (err) {
+
+      pending = Promise.reject(err);
+    }
+
+    pending.catch(() => {});
+    return pending;
+  }
+
+  async function stageAndIssue(params, method, linkParams) {
+    const prepared = await prepareAttachments(params, linkParams);
+    return { prepared, pending: issueRequest(method, linkParams) };
   }
 
   async function dispatchTurn(params) {
@@ -625,6 +673,12 @@ function createHermesGatewayBridge(opts) {
     ) {
       dispatchParams.channelPrompt = params.extraSystemPrompt;
     }
+    if (params && typeof params.promptOwner === "string" && params.promptOwner) {
+      Reflect.set(dispatchParams, "promptOwner", params.promptOwner);
+    }
+    if (params && typeof params.promptLane === "string" && params.promptLane) {
+      Reflect.set(dispatchParams, "promptLane", params.promptLane);
+    }
 
     if (params && typeof params.thinking === "string" && params.thinking) {
       dispatchParams.thinking = params.thinking;
@@ -636,10 +690,12 @@ function createHermesGatewayBridge(opts) {
     if (deliverReply) {
       dispatchParams.deliverReply = deliverReply;
     }
-    const prepared = prepareAttachments(params, dispatchParams);
+    const { prepared, pending } = await serializeSend(route.publicKey, () =>
+      stageAndIssue(params, LINK_DISPATCH_METHOD, dispatchParams),
+    );
     let result;
     try {
-      result = await link.request(LINK_DISPATCH_METHOD, dispatchParams);
+      result = await pending;
     } catch (err) {
 
       if (prepared) prepared.cleanup();
@@ -682,10 +738,14 @@ function createHermesGatewayBridge(opts) {
       const route = routeDispatchSessionKey(
         (params && (params.key || params.sessionKey)) || null,
       );
-      return link.request(LINK_SESSION_METHODS.abort, {
-        sessionKey: route.publicKey,
-        target: route.target,
-      });
+
+      const { pending } = await serializeSend(route.publicKey, () => ({
+        pending: issueRequest(LINK_SESSION_METHODS.abort, {
+          sessionKey: route.publicKey,
+          target: route.target,
+        }),
+      }));
+      return pending;
     },
 
     async "sessions.steer"(params) {
@@ -702,10 +762,12 @@ function createHermesGatewayBridge(opts) {
       };
       const idem = cleanNonEmptyString(params && params.idempotencyKey);
       if (idem) linkParams.idempotencyKey = idem;
-      const prepared = prepareAttachments(params, linkParams);
+      const { prepared, pending } = await serializeSend(route.publicKey, () =>
+        stageAndIssue(params, LINK_SESSION_METHODS.steer, linkParams),
+      );
       let result;
       try {
-        result = await link.request(LINK_SESSION_METHODS.steer, linkParams);
+        result = await pending;
       } catch (err) {
         if (prepared) prepared.cleanup();
         throw err;
@@ -808,8 +870,8 @@ function createHermesGatewayBridge(opts) {
         }
       }
       const defaults = {};
-      if (defaultRef) {
-        defaults.model = { primary: defaultRef, fallbacks };
+      if (defaultRef || fallbacks.length) {
+        defaults.model = { ...(defaultRef ? { primary: defaultRef } : {}), fallbacks };
       }
       defaults.models = {};
       return { config: { agents: { defaults } } };
@@ -908,7 +970,13 @@ function createHermesGatewayBridge(opts) {
         const name = cleanNonEmptyString(profile.name);
         if (!name) continue;
         const displayName = cleanNonEmptyString(profile.displayName);
-        const row = { id: name, name: displayName || name };
+
+        const emoji = cleanNonEmptyString(profile.emoji);
+        const row = {
+          id: name,
+          name: displayName || name,
+          ...(emoji ? { identity: { emoji } } : {}),
+        };
         const model = cleanNonEmptyString(profile.model);
         if (model) {
           const provider = cleanNonEmptyString(profile.provider);
@@ -923,7 +991,100 @@ function createHermesGatewayBridge(opts) {
         defaultId: cleanNonEmptyString(result && result.defaultProfile) || "default",
         mainKey: null,
         scope: null,
+        hermesProfileCreate: result && result.createSupported === true,
+        agentCreateSetup: result && result.setupSupported === true,
+        hermesProfileEmojiSet: true,
+        hermesProfileSettings: result && result.settingsSupported === true,
+
+        foreignSessionAdopt: result && result.adoptSupported === true,
+
+        ...(result && result.desktopFleet ? { hermesFleet: result.desktopFleet } : {}),
       };
+    },
+
+    async "profiles.create"(params) {
+      const name = cleanNonEmptyString(params && params.name);
+      if (!name) throw new Error("profile name is required");
+      let result;
+      try {
+        result = await link.request(LINK_GW_METHODS.profilesCreate, {
+          name, ...(params?.setup != null ? { setup: params.setup, requestId: params.requestId } : {}),
+        });
+      } catch (error) {
+        if (/choose a name other than default/i.test(error?.message || "")) {
+          throw Object.assign(new Error("This profile name is reserved. Choose another name."), { code: "invalid_name" });
+        }
+        throw error;
+      }
+      if (!result || !["created", "partial"].includes(result.status)) {
+        const message = cleanNonEmptyString(result && result.error);
+        throw new Error(message || "Hermes returned an invalid profile-create result");
+      }
+      const rawProfile =
+        result.profile && typeof result.profile === "object" ? result.profile : {};
+      const id = cleanNonEmptyString(rawProfile.id);
+      const profileName = cleanNonEmptyString(rawProfile.name);
+      if (!id || !profileName) {
+        throw new Error("Hermes returned an invalid created profile");
+      }
+      return {
+        status: result.status,
+        profile: { id, name: profileName },
+        restartRequired: true,
+        ...(result.errorMessage ? { errorCode: "setup_incomplete", errorMessage: result.errorMessage } : {}),
+      };
+    },
+
+    async "profiles.emoji.set"(params) {
+      const profileId = cleanNonEmptyString(params && params.profileId);
+      if (!profileId) throw new Error("profile id is required");
+      const rawEmoji = params && params.emoji;
+      const emoji = rawEmoji == null ? null : cleanNonEmptyString(rawEmoji);
+      const result = await link.request(LINK_GW_METHODS.profilesEmojiSet, {
+        profileId,
+        emoji,
+      });
+      if (!result || result.status !== "updated") {
+        const message = cleanNonEmptyString(result && result.error);
+        throw new Error(message || "Hermes returned an invalid emoji-update result");
+      }
+      const rawProfile =
+        result.profile && typeof result.profile === "object" ? result.profile : {};
+      const id = cleanNonEmptyString(rawProfile.id);
+      if (!id || id !== profileId) {
+        throw new Error("Hermes returned an invalid updated profile");
+      }
+      return {
+        status: "updated",
+        backend: "hermes",
+        agentId: id,
+        emoji: cleanNonEmptyString(result.emoji),
+      };
+    },
+
+    async "hermes.management"(params) {
+      const identity = managementRequest(params);
+      if (!validManagementRequest(identity)) throw new Error("Invalid Hermes management request");
+      const result = await link.request(LINK_GW_METHODS.hermesManagement, identity, DB_READ_TIMEOUT);
+      return managementResult(identity, result);
+    },
+
+    async "profiles.settings.get"(params) {
+      const profileId = cleanNonEmptyString(params && params.profileId);
+      if (!profileId) throw new Error("profile id is required");
+      return link.request(LINK_GW_METHODS.profilesSettingsGet, { profileId });
+    },
+
+    async "profiles.settings.set"(params) {
+      const profileId = cleanNonEmptyString(params && params.profileId);
+      if (!profileId) throw new Error("profile id is required");
+      return link.request(LINK_GW_METHODS.profilesSettingsSet, {
+        profileId,
+        emoji: params?.emoji == null ? null : params.emoji,
+        setup: params?.setup,
+        producedAtMs: params?.producedAtMs,
+        expiresAtMs: params?.expiresAtMs,
+      });
     },
 
     async "agents.files.get"(params) {
@@ -1064,6 +1225,67 @@ function createHermesGatewayBridge(opts) {
       return response;
     },
 
+    async "sessions.adopt"(params) {
+      const sourceKey = cleanNonEmptyString(params && params.key);
+      if (!sourceKey) throw new Error("sessions.adopt requires key");
+      if (!isAdoptableHermesSessionKey(sourceKey)) {
+        throw new Error(
+          "sessions.adopt requires a Desktop, CLI or TUI Hermes source key",
+        );
+      }
+      const linkParams = {
+        identity: keyToIdentity(sourceKey),
+        publicKey: sourceKey,
+      };
+      if (params && params.takeOver === true) linkParams.takeOver = true;
+      const result = await link.request(
+        LINK_FOREIGN_METHODS.adopt,
+        linkParams,
+        ADOPT_TIMEOUT_MS,
+      );
+      const response = {
+        status: cleanNonEmptyString(result && result.status) || "accepted",
+        key: copiedSessionPublicKey(result && result.session, ""),
+        adoptedFrom: sourceKey,
+      };
+      if (result && result.session) response.session = result.session;
+      const verdict = cleanNonEmptyString(result && result.verdict);
+      const error = cleanNonEmptyString(result && result.error) || verdict;
+      if (error) response.error = error;
+      if (verdict) response.verdict = verdict;
+      const holdState = cleanNonEmptyString(result && result.holdState);
+      if (holdState) response.holdState = holdState;
+      if (response.status === "accepted" && !response.key) {
+
+        throw new Error("sessions.adopt returned no adopted session key");
+      }
+      return response;
+    },
+
+    async "sessions.driver"(params) {
+      const key = cleanNonEmptyString(params && params.key);
+      if (!key) throw new Error("sessions.driver requires key");
+      const result = await link.request(LINK_FOREIGN_METHODS.driver, {
+        identity: keyToIdentity(key),
+        publicKey: key,
+      });
+      return {
+        status: cleanNonEmptyString(result && result.status) || "ok",
+        key,
+        state: cleanNonEmptyString(result && result.state) || "glasses_drive",
+        holdState: cleanNonEmptyString(result && result.holdState),
+        hold: result && result.hold && typeof result.hold === "object" ? result.hold : null,
+        inflight:
+          result && result.inflight && typeof result.inflight === "object"
+            ? { active: result.inflight.active === true, platform: cleanNonEmptyString(result.inflight.platform) }
+            : { active: false, platform: null },
+        lineage: Array.isArray(result && result.lineage) ? result.lineage.map(String) : [],
+        sessionId: cleanNonEmptyString(result && result.sessionId),
+        hermesHome: cleanNonEmptyString(result && result.hermesHome),
+        watch: result && result.watch && typeof result.watch === "object" ? result.watch : null,
+      };
+    },
+
     async "sessions.list"(params) {
       const linkParams = {};
       const limit = toFiniteNumber(params && params.limit);
@@ -1089,9 +1311,22 @@ function createHermesGatewayBridge(opts) {
       const sessions = [];
       for (const row of rawRows) {
         const mapped = mapListRow(row);
-        if (mapped) sessions.push(mapped);
+        if (mapped) {
+          sessions.push(mapped);
+          if (row.attention && row.attention.sessionKey === mapped.key) {
+            dispatchBackendEvent("sessionAttention", row.attention);
+          }
+        }
       }
       return { sessions };
+    },
+
+    async "sessions.attention"(params) {
+      const key = cleanNonEmptyString(params && params.key);
+      if (!key || !parseHermesPublicKey(key)) throw new Error("sessions.attention requires a Hermes key");
+
+      await translators["sessions.list"]({ search: key, limit: 1 });
+      return { status: "observed" };
     },
 
     async "sessions.search"(params) {
@@ -1261,11 +1496,15 @@ function createHermesGatewayBridge(opts) {
       }
       let structured = null;
       if (Object.keys(options).some((key) => !["confirm_model_selection", "initial"].includes(key))) {
-        structured = await link.request(LINK_SESSION_METHODS.optionsApply, {
-          sessionKey: target.publicKey,
-          target: target.target,
-          options,
-        });
+
+        const { pending } = await serializeSend(target.publicKey, () => ({
+          pending: issueRequest(LINK_SESSION_METHODS.optionsApply, {
+            sessionKey: target.publicKey,
+            target: target.target,
+            options,
+          }),
+        }));
+        structured = await pending;
         if (!structured || structured.status !== "accepted") {
           throw new Error(
             (structured && structured.error) ||
@@ -1309,11 +1548,14 @@ function createHermesGatewayBridge(opts) {
 
     async "chat.history"(params) {
       const limit = toFiniteNumber(params && params.limit);
+
+      const afterId = toFiniteNumber(params && params.afterId);
       const linkParams = {
         identity: keyToIdentity(params && params.sessionKey),
-      };
 
-      if (limit !== null && limit > 0) linkParams.limit = Math.floor(limit);
+        ...(limit !== null && limit > 0 ? { limit: Math.floor(limit) } : {}),
+        ...(afterId !== null && afterId >= 0 ? { afterId: Math.floor(afterId) } : {}),
+      };
       const result = await link.request(LINK_DB_METHODS.chatHistory, linkParams, DB_READ_TIMEOUT);
       const messages = shapeConversationMessages(
         result && result.messages,
@@ -1325,6 +1567,31 @@ function createHermesGatewayBridge(opts) {
       return {
         messages,
         ...(total !== null && total >= 0 ? { total: Math.floor(total) } : {}),
+        ...(result && result.rowIdsUnavailable === true ? { rowIdsUnavailable: true } : {}),
+      };
+    },
+
+    async "chat.watermark"(params) {
+      const key = cleanNonEmptyString(params && params.sessionKey);
+      if (!key) throw new Error("chat.watermark requires sessionKey");
+      const result = await link.request(
+        LINK_DB_METHODS.chatWatermark,
+        { identity: keyToIdentity(key) },
+        DB_READ_TIMEOUT,
+      );
+
+      const rawWatermark = result ? result.watermark : undefined;
+      const watermark = rawWatermark == null ? null : toFiniteNumber(rawWatermark);
+      return {
+        sessionKey: key,
+        sessionId: cleanNonEmptyString(result && result.sessionId),
+        watermark: watermark !== null && watermark >= 0 ? Math.floor(watermark) : null,
+        dbPath: cleanNonEmptyString(result && result.dbPath),
+        hermesHome: cleanNonEmptyString(result && result.hermesHome),
+        inflight:
+          result && result.inflight && typeof result.inflight === "object"
+            ? { active: result.inflight.active === true, platform: cleanNonEmptyString(result.inflight.platform) }
+            : { active: false, platform: null },
       };
     },
 

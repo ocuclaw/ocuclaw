@@ -10,7 +10,7 @@ import re
 import secrets
 import threading
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .pairing_completion import read_pairing_completion
 from .receipts import (
@@ -34,17 +34,29 @@ from .tui_pairing import (
 PLUGIN_DIRNAME = "ocuclaw"
 PLUGIN_FILENAME = "plugin.js"
 PLUGIN_MARKER = "// OCUCLAW-OWNED-DESKTOP-PAIRING-PLUGIN v1"
-# The Desktop half ships at the hybrid `desktop/` entry of the published
-# repository. Hermes Desktop's deep-link install probes `<root>/plugin.js`
-# first and `<root>/desktop/plugin.js` second (0.20.6
-# electron/desktop-plugin-install.ts findDesktopEntry), so this location is
-# what makes the modal render its "Desktop UI" row. The modal copies the
-# CONTENTS of `desktop/` into `<hermes home>/desktop-plugins/<repo>/` — the
-# very path this module reconciles — which is why there is exactly one live
-# copy no matter which install route the user took.
-DESKTOP_HALF_DIRNAME = "desktop"
+# The Desktop source template is INERT build input, deliberately parked
+# outside every Hermes Desktop entry shape (#2084).
+#
+# Hermes 0.21 Desktop discovers runtimes at two exact paths
+# (apps/desktop/src/contrib/runtime-loader.ts diskRoots :242-269):
+#   <hermes home>/desktop-plugins/<folder>/plugin.js   standalone, default-ON
+#   <hermes home>/plugins/<folder>/desktop/plugin.js   unified agent-half
+# and its install-time probe checks `<package root>/plugin.js` first,
+# `<package root>/desktop/plugin.js` second
+# (apps/desktop/electron/desktop-plugin-install.ts findDesktopEntry :178-192).
+# Live plugins are keyed by ENTRY FILE PATH (runtime-loader.ts :283), so while
+# the template shipped at `desktop/` the one `ocuclaw` id had two live copies
+# and whichever loaded last won the UI.
+#
+# `desktop-template/` matches none of those exact segments — the loader's
+# entrySegments are compared literally, not globbed — so the published Agent
+# package carries no loadable Desktop entry at all. The single runtime is
+# rendered by reconcile_pairing_plugin() below, at plugin_path(), and this
+# module stays its sole writer. Moving the template does NOT take it out of
+# Hermes's install-time security scan: that walks the whole package tree.
+DESKTOP_TEMPLATE_DIRNAME = "desktop-template"
 PLUGIN_SOURCE = (
-    Path(__file__).resolve().parent / DESKTOP_HALF_DIRNAME / PLUGIN_FILENAME
+    Path(__file__).resolve().parent / DESKTOP_TEMPLATE_DIRNAME / PLUGIN_FILENAME
 )
 ACTIVATION_CAPABILITY_FILENAME = "ocuclaw.desktop-pairing-activation.json"
 PRESENTER_CAPABILITY_FILENAME = "ocuclaw.desktop-presenter-capability.json"
@@ -61,6 +73,139 @@ _CAPABILITY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
 
 def plugin_path(home: Path) -> Path:
     return Path(home) / "desktop-plugins" / PLUGIN_DIRNAME / PLUGIN_FILENAME
+
+
+# Hermes 0.21 Desktop runtime discovery, mirrored here so OcuClaw can check its
+# own convergence (#2085) without importing anything from the test tree.
+#
+# `apps/desktop/src/contrib/runtime-loader.ts` diskRoots() :242-269 returns two
+# scan roots with LITERAL entry segments — no globbing — and the live-plugin
+# map at :283 is keyed by ENTRY FILE PATH, "unique across both roots". Two
+# entry files therefore mean two live plugins under the one `ocuclaw` id, and
+# whichever loads or reloads last wins the UI. That is the whole #2080 defect.
+#
+# `tests/desktop_loader_candidates.py` is the test-side mirror of this tuple;
+# a test pins the two against each other so neither can drift alone.
+DESKTOP_DISK_ROOTS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("desktop-plugins", ("plugin.js",)),
+    ("plugins", ("desktop", "plugin.js")),
+)
+
+
+def loadable_desktop_runtimes(home: Path) -> List[Path]:
+    """Every OcuClaw Desktop entry file Hermes 0.21 would load from ``home``.
+
+    Walks both ``diskRoots()`` doors the way upstream does — each direct child
+    directory of a scan root joined with that root's literal segments — and
+    keeps the entries that are OcuClaw's: the ones in a folder named
+    ``ocuclaw`` (the folder name IS the plugin identity on disk, and it is what
+    the Hermes install modal derives for repo ``ocuclaw/ocuclaw``) plus any
+    entry carrying the OcuClaw ownership marker, which catches a released
+    hybrid copy that landed under some other folder name.
+    """
+
+    resolved_home = Path(home)
+    found: List[Path] = []
+    for root_name, entry_segments in DESKTOP_DISK_ROOTS:
+        root = resolved_home / root_name
+        try:
+            children = sorted(root.iterdir(), key=lambda path: path.name)
+        except OSError:
+            continue
+        for folder in children:
+            if not folder.is_dir():
+                continue
+            entry = folder.joinpath(*entry_segments)
+            if not entry.is_file():
+                continue
+            if folder.name == PLUGIN_DIRNAME or plugin_owned(entry):
+                found.append(entry)
+    return found
+
+
+def desktop_convergence(home: Optional[Path] = None) -> Dict[str, Any]:
+    """How many OcuClaw Desktop runtimes this profile would actually load.
+
+    ``converged`` is the only shipping state: exactly one entry, and it is the
+    one ``reconcile_pairing_plugin()`` owns. ``duplicate`` is the pre-#2084
+    hybrid layout surviving an update — the Agent package update was supposed
+    to remove the nested runtime entry and did not. ``misplaced`` is the same
+    failure with our own copy missing as well.
+    """
+
+    resolved_home = Path(home) if home is not None else resolve_receipt_home()
+    if resolved_home is None:
+        return {"status": "home_unresolved", "runtimes": [], "extra": []}
+    expected = plugin_path(resolved_home)
+    runtimes = [str(path) for path in loadable_desktop_runtimes(resolved_home)]
+    extra = [path for path in runtimes if path != str(expected)]
+    if len(runtimes) > 1:
+        # Several entries, ours among them, is the surviving-hybrid duplicate.
+        # Several entries, ours ABSENT, is misplaced: "keep this one" must
+        # never point at a file that does not exist.
+        status = "duplicate" if str(expected) in runtimes else "misplaced"
+    elif not runtimes:
+        status = "absent"
+    elif not extra:
+        status = "converged"
+    else:
+        status = "misplaced"
+    return {
+        "status": status,
+        "runtimes": runtimes,
+        "extra": extra,
+        "expected": str(expected),
+    }
+
+
+def desktop_convergence_message(report: Dict[str, Any]) -> Optional[str]:
+    """The operator-facing line for a convergence failure, or ``None``.
+
+    ``absent`` stays silent on purpose: a profile with no runtime at all is
+    already reported by the reconcile receipt's own presenter warning, and
+    saying it twice would train operators to skim past this one.
+    """
+
+    status = report.get("status")
+    if status not in {"duplicate", "misplaced"}:
+        return None
+    expected = report.get("expected")
+    extra = [str(path) for path in report.get("extra") or []]
+    removals = "\n".join(f"    rm {path}" for path in extra)
+    if status == "duplicate":
+        count = len(report.get("runtimes") or [])
+        headline = (
+            f"DUPLICATE OCUCLAW DESKTOP RUNTIME — Hermes Desktop can load "
+            f"{count} copies of the 'ocuclaw' plugin from this profile at "
+            "once, so the status bar position, the calm popup and the pairing "
+            "presenter change depending on which copy loaded last."
+        )
+        keep = f"  Keep this one (OcuClaw renders it): {expected}"
+        fix = (
+            "  Delete the leftover copy from an older OcuClaw version, then "
+            "restart the Hermes gateway:"
+        )
+    else:
+        found = ", ".join(str(path) for path in (report.get("runtimes") or []))
+        headline = (
+            "MISPLACED OCUCLAW DESKTOP RUNTIME — every OcuClaw Desktop "
+            f"runtime Hermes can load from this profile ({found}) is one "
+            "OcuClaw does not manage, so OcuClaw cannot keep it current."
+        )
+        keep = f"  OcuClaw's own runtime is missing from: {expected}"
+        fix = (
+            "  Delete the unmanaged copy, then restart the Hermes gateway so "
+            "OcuClaw renders its own:"
+        )
+    return "\n".join(
+        [
+            headline,
+            keep,
+            fix,
+            removals,
+            "  This OcuClaw update did not converge on its own.",
+        ]
+    )
 
 
 def activation_capability_path(home: Optional[Path] = None) -> Optional[Path]:
@@ -463,7 +608,7 @@ def run_desktop_pairing(
 
 __all__ = [
     "ACTIVATION_CAPABILITY_FILENAME",
-    "DESKTOP_HALF_DIRNAME",
+    "DESKTOP_TEMPLATE_DIRNAME",
     "PRESENTER_CAPABILITY_FILENAME",
     "PRESENTER_CAPABILITY_PLACEHOLDER",
     "THEME_REQUEST_CONFIG_KEY",

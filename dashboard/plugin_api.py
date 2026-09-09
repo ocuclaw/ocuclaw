@@ -3,13 +3,17 @@
 Hermes mounts ``router`` at ``/api/plugins/ocuclaw``.  The sole route derives
 Snapshot v1 remains passive. The separate pairing routes proxy one active
 host-owned setup ceremony to Hermes Desktop without exposing either pairing
-secret to the renderer. This module never imports the runtime adapter.
+secret to the renderer. This module never imports the runtime adapter. Its
+only active health route delegates to the same bounded Doctor lane as the CLI.
 """
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import importlib
 import json
+import logging
 import secrets
 import sys
 import threading
@@ -17,21 +21,29 @@ import types
 import urllib.error
 import urllib.parse
 import urllib.request
+import yaml
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 try:
-    from fastapi import APIRouter, Body, HTTPException
+    from fastapi import APIRouter, Body, Header, HTTPException, Response, WebSocket, status as http_status
 except ImportError as error:
     raise RuntimeError("The OcuClaw dashboard requires Hermes's FastAPI dependency") from error
 
 
 router = APIRouter()
+log = logging.getLogger(__name__)
 
 PLUGIN_NAME = "ocuclaw"
+COMPANION_SNAPSHOT_FILENAME = "companion-snapshot.json"
+COMPANION_SNAPSHOT_SCHEMA = "ocuclaw/companion-snapshot@1"
+COMPANION_SNAPSHOT_MAX_BYTES = 32 * 1024
+GLASSES_STATE_STALE_AFTER_MS = 30_000
+DEVICE_STATE_STALE_AFTER_MS = 120_000
+DEVICE_STATE_CLOCK_SKEW_MS = 60_000
 PLATFORM_RECEIPT_EMPIRICAL_TTL_S = 300.0
-SETUP_GUIDE_VERSION = "2026-08-31 (1.3.18-hermes)"
+SETUP_GUIDE_VERSION = "2026-09-05 (1.3.19-hermes)"
 
 _LEG_ORDER = (
     ("hermesGateway", "Hermes gateway"),
@@ -41,9 +53,42 @@ _LEG_ORDER = (
 )
 _SETUP_STATES = {"configured", "incomplete", "invalid", "unavailable", "unsupported", "unknown"}
 _HEALTH_STATES = {"healthy", "unhealthy", "unknown"}
+_WS_AUTH_WARNING_LOCK = threading.Lock()
+_WS_AUTH_WARNING_SENT = False
+_WS_POLL_SECONDS = 1.0
 
 
-def _load_bundle_modules() -> Tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
+def _warn_push_off_once(reason: str) -> None:
+    """Make a missing private host seam visible without flooding the log."""
+
+    global _WS_AUTH_WARNING_SENT
+    with _WS_AUTH_WARNING_LOCK:
+        if _WS_AUTH_WARNING_SENT:
+            return
+        _WS_AUTH_WARNING_SENT = True
+    log.warning("push off, polling: %s", reason)
+
+
+def _ws_upgrade_authorized(ws: WebSocket) -> bool:
+    """Delegate to Hermes's canonical upgrade gate, failing closed on drift."""
+
+    try:
+        web_server = importlib.import_module("hermes_cli.web_server")
+    except Exception:
+        _warn_push_off_once("hermes_cli.web_server unavailable")
+        return False
+    auth = getattr(web_server, "_ws_auth_ok", None)
+    if not callable(auth):
+        _warn_push_off_once("hermes_cli.web_server._ws_auth_ok unavailable")
+        return False
+    try:
+        return bool(auth(ws))
+    except Exception:
+        _warn_push_off_once("hermes_cli.web_server._ws_auth_ok failed")
+        return False
+
+
+def _load_bundle_modules() -> Tuple[Any, ...]:
     """Load adapter-free bundle modules under the host package or a test namespace."""
     candidates = []
     for name in tuple(sys.modules):
@@ -72,6 +117,10 @@ def _load_bundle_modules() -> Tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
                     "tui_pairing",
                     "desktop_pairing",
                     "pairing_completion",
+                    "doctor",
+                    "dispatch",
+                    "desktop_credentials",
+                    "desktop_fleet",
                 )
             )  # type: ignore[return-value]
         except ImportError:
@@ -97,6 +146,10 @@ def _load_bundle_modules() -> Tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
             "tui_pairing",
             "desktop_pairing",
             "pairing_completion",
+            "doctor",
+            "dispatch",
+            "desktop_credentials",
+            "desktop_fleet",
         )
     )  # type: ignore[return-value]
 
@@ -110,6 +163,10 @@ def _load_bundle_modules() -> Tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
     tui_pairing,
     desktop_pairing,
     pairing_completion,
+    doctor_lane,
+    dispatch_module,
+    desktop_credentials,
+    desktop_fleet,
 ) = _load_bundle_modules()
 
 
@@ -130,18 +187,230 @@ def _now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 
+def _companion_snapshot_path() -> Optional[Path]:
+    """Resolve the Node runtime's passive companion receipt without the adapter."""
+
+    home = receipts.resolve_receipt_home()
+    if home is None:
+        return None
+
+    override = None
+    try:
+        document = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+        if isinstance(document, Mapping):
+            platforms = document.get("platforms")
+            ocuclaw = platforms.get(PLUGIN_NAME) if isinstance(platforms, Mapping) else None
+            extra = ocuclaw.get("extra") if isinstance(ocuclaw, Mapping) else None
+            candidate = extra.get("stateDir") if isinstance(extra, Mapping) else None
+            if isinstance(candidate, str) and candidate.strip():
+                override = candidate.strip()
+    except (FileNotFoundError, OSError, TypeError, ValueError, yaml.YAMLError):
+        # A missing or unreadable config has no trustworthy override. The
+        # adapter uses this same profile-local default.
+        override = None
+
+    state_dir = Path(override).expanduser() if override else home / PLUGIN_NAME
+    return state_dir / COMPANION_SNAPSHOT_FILENAME
+
+
+def _glasses_state_body(
+    state: str,
+    reason: Optional[str],
+    observed_at: str,
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {
+        "contract": "ocuclaw.glasses-state",
+        "contractVersion": 1,
+        "readOnly": True,
+        "state": state,
+        "observedAt": observed_at,
+        "device": _device_state(),
+        "snapshot": None,
+        "storedSessionId": None,
+    }
+    if reason:
+        body["reason"] = reason
+    return body
+
+
+def _native_session_key(public_key: Any) -> Optional[str]:
+    """Invert the bounded public key into Hermes's native gateway key."""
+
+    if not isinstance(public_key, str):
+        return None
+    parts = public_key.split(":")
+    if len(parts) != 3 or parts[0] != "hermes" or not parts[1] or not parts[2]:
+        return None
+    native = f"agent:{parts[1]}:ocuclaw:dm:{parts[2]}"
+    identity = dispatch_module.parse_ocuclaw_session_key(native)
+    if identity != {"ns": parts[1], "chatId": parts[2]}:
+        return None
+    return native
+
+
+def _stored_session_id(home: Optional[Path], public_key: Any) -> Optional[str]:
+    """Resolve one glasses chat to its newest stored Hermes session ID."""
+
+    native = _native_session_key(public_key)
+    if home is None or native is None:
+        return None
+    db_path = home / "state.db"
+    if not db_path.is_file():
+        return None
+    try:
+        from hermes_state import SessionDB
+
+        with SessionDB(db_path=db_path, read_only=True) as db:
+            row = db._conn.execute(
+                "SELECT id FROM sessions WHERE session_key = ? "
+                "ORDER BY COALESCE(last_activity_at, started_at) DESC LIMIT 1",
+                (native,),
+            ).fetchone()
+    except Exception:  # noqa: BLE001 - a missing/unreadable store is a data state
+        log.debug("stored glasses session unavailable", exc_info=True)
+        return None
+    return str(row["id"]) if row is not None else None
+
+
+def _empty_device_state(
+    *, observed_at: Optional[str] = None, age_ms: Optional[int] = None
+) -> Dict[str, Any]:
+    return {
+        "connected": None,
+        "batteryPercent": None,
+        "charging": None,
+        "inCase": None,
+        "observedAt": observed_at,
+        "ageMs": age_ms,
+        "stale": True,
+    }
+
+
+def _timestamp_ms(value: Any) -> Optional[int]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return int(parsed.timestamp() * 1000)
+
+
+def _device_state() -> Dict[str, Any]:
+    """Read the exact-profile app receipt and expose only fresh G2 facts."""
+
+    home = receipts.resolve_receipt_home()
+    fingerprint = receipts.fingerprint_home(home)
+    if home is None or fingerprint is None:
+        return _empty_device_state()
+    record, status, writer_live = receipts.read_app_presence(fingerprint, home=home)
+    if status != "ok" or record is None or writer_live is not True:
+        return _empty_device_state()
+    if record.get("observationErrorCode") is not None:
+        return _empty_device_state()
+
+    receipt_ms = _timestamp_ms(record.get("updated_at"))
+    device = record.get("device")
+    if receipt_ms is None or not isinstance(device, Mapping):
+        return _empty_device_state()
+
+    connected = device.get("connected")
+    battery = device.get("batteryPercent")
+    charging = device.get("charging")
+    in_case = device.get("inCase")
+    observed_at = device.get("observedAt")
+    observed_ms = _timestamp_ms(observed_at)
+    if connected is not None and not isinstance(connected, bool):
+        return _empty_device_state()
+    if isinstance(battery, bool) or (
+        battery is not None
+        and (not isinstance(battery, int) or battery < 0 or battery > 100)
+    ):
+        return _empty_device_state()
+    if in_case is not None and not isinstance(in_case, bool):
+        return _empty_device_state()
+    if charging is not None and not isinstance(charging, bool):
+        return _empty_device_state()
+    if (
+        any(value is not None for value in (connected, battery, charging, in_case))
+        and observed_ms is None
+    ):
+        return _empty_device_state()
+
+    now_ms = _now_ms()
+    if receipt_ms > now_ms + DEVICE_STATE_CLOCK_SKEW_MS or (
+        observed_ms is not None and observed_ms > now_ms + DEVICE_STATE_CLOCK_SKEW_MS
+    ):
+        return _empty_device_state()
+    receipt_age_ms = max(0, now_ms - receipt_ms)
+    age_ms = max(0, now_ms - observed_ms) if observed_ms is not None else None
+    stale = receipt_age_ms > DEVICE_STATE_STALE_AFTER_MS or (
+        age_ms is not None and age_ms > DEVICE_STATE_STALE_AFTER_MS
+    )
+    if stale:
+        return _empty_device_state(observed_at=observed_at, age_ms=age_ms)
+    return {
+        "connected": connected,
+        "batteryPercent": battery,
+        "charging": charging,
+        "inCase": in_case,
+        "observedAt": observed_at,
+        "ageMs": age_ms,
+        "stale": False,
+    }
+
+
+def _constant_time_equal(supplied: Any, expected: Any) -> bool:
+    """Compare two caller-influenced strings without ever raising.
+
+    ``secrets.compare_digest`` refuses a ``str`` carrying non-ASCII with a
+    ``TypeError`` -- and BOTH operands here are caller-influenced: the pairing
+    capability arrives in a request body and the session id arrives in the URL
+    path. Comparing UTF-8 bytes keeps the comparison constant-time over the
+    common prefix while making every hostile shape a plain ``False``, so an
+    unauthorized caller leaves through the 403 refusal instead of a 500
+    traceback.
+    """
+
+    if not isinstance(supplied, str) or not isinstance(expected, str) or not expected:
+        return False
+    return secrets.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+
+
 def _require_presenter_capability(payload: Any) -> str:
+    """The single choke point every pairing ceremony route passes through.
+
+    Total by construction: every input that is not exactly the private
+    capability rendered into the generated Desktop presenter -- absent,
+    wrong type, wrong value, non-ASCII, or correct-but-with-no-receipt-on-disk
+    -- leaves as one 403. Ordinary Hermes authentication is still required to
+    reach this function at all; this is the SECOND, OcuClaw-owned boundary
+    that separates an ordinary authenticated API client from the local
+    Desktop presenter.
+    """
+
     supplied = (
         payload.get("presenterCapability") if isinstance(payload, Mapping) else None
     )
     expected = desktop_pairing.read_presenter_capability()
-    if (
-        not isinstance(supplied, str)
-        or not expected
-        or not secrets.compare_digest(supplied, expected)
-    ):
+    if not _constant_time_equal(supplied, expected):
         raise HTTPException(status_code=403, detail="Desktop presenter unavailable")
-    return expected
+    return str(expected)
+
+
+@router.post("/fleet/snapshot")
+def post_fleet_snapshot(payload: Any = Body(...)) -> Dict[str, Any]:
+    # ctx.rest follows Desktop's active backend. Its per-install presenter
+    # capability must match HERE before any inventory can land on this host.
+    _require_presenter_capability(payload)
+    if not isinstance(payload, dict) or set(payload) != {"presenterCapability", "snapshot"}:
+        raise HTTPException(status_code=400, detail="Invalid fleet publication")
+    try:
+        return desktop_fleet.publish(payload["snapshot"])
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid fleet snapshot") from None
 
 
 def _direct_urlopen(request: urllib.request.Request, timeout: float):
@@ -335,6 +604,7 @@ def _refresh_live_pairing(session: Dict[str, Any]) -> Dict[str, Any]:
             {"v": 1, "op": "state"},
             credential=credential,
             control_secret=control_secret,
+            opener=_DIRECT_HTTP_OPENER,
         )
     except pairing.ControlError:
         return fallback
@@ -388,6 +658,7 @@ def _expire_pairing(session: Dict[str, Any]) -> Dict[str, Any]:
                 {"v": 1, "op": "cancel"},
                 credential=credential,
                 control_secret=control_secret,
+                opener=_DIRECT_HTTP_OPENER,
             )
         except pairing.ControlError:
             pass
@@ -788,13 +1059,190 @@ def get_snapshot() -> Dict[str, Any]:
     )
 
 
+@router.post("/doctor")
+def run_desktop_doctor() -> Dict[str, Any]:
+    """Run the existing five-second Doctor lane after a direct UI click."""
+
+    try:
+        facts = health.collect_health_facts()
+        facts, outcomes = doctor_lane.observe(
+            facts,
+            probed_at=snapshot_module.now_iso(),
+        )
+        canonical = snapshot_module.derive_snapshot(facts)
+        snapshot_module.validate_snapshot_key_set(canonical)
+        state = str((canonical.get("currentHealth") or {}).get("state") or "unknown")
+        if state == "healthy":
+            summary = "Gateway, relay, private route, and phone checks are healthy."
+        elif state == "unhealthy":
+            summary = "Doctor found a connection problem; open setup for the exact recovery step."
+        else:
+            summary = "Doctor finished, but not every connection check had current evidence."
+        return {
+            "contract": "ocuclaw.desktop-doctor",
+            "contractVersion": 1,
+            "ok": state == "healthy",
+            "state": state,
+            "summary": summary,
+            "checks": [
+                {"name": outcome.name, "outcome": outcome.result_code}
+                for outcome in outcomes
+            ],
+        }
+    except Exception:  # noqa: BLE001 - the UI receives a safe bounded result
+        log.exception("desktop Doctor could not complete")
+        return {
+            "contract": "ocuclaw.desktop-doctor",
+            "contractVersion": 1,
+            "ok": False,
+            "state": "unknown",
+            "summary": "Doctor could not finish.",
+            "checks": [],
+        }
+
+
+@router.get("/glasses/state")
+def get_glasses_state(
+    response: Response,
+    if_none_match: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """Return the bounded read-only LiveUI companion receipt.
+
+    Missing and malformed files are data states, not route failures: the
+    Desktop poller must be able to keep its last good view and dim honestly.
+    """
+
+    observed_at = snapshot_module.now_iso()
+    path = _companion_snapshot_path()
+    if path is None:
+        return _glasses_state_body("unavailable", "no_home", observed_at)
+
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(COMPANION_SNAPSHOT_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return _glasses_state_body("missing", "missing", observed_at)
+    except OSError as error:
+        return _glasses_state_body("unavailable", type(error).__name__, observed_at)
+
+    if len(raw) > COMPANION_SNAPSHOT_MAX_BYTES:
+        return _glasses_state_body("invalid", "oversized", observed_at)
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return _glasses_state_body("invalid", "corrupt", observed_at)
+    if not isinstance(body, Mapping):
+        return _glasses_state_body("invalid", "wrong_schema", observed_at)
+    if (
+        body.get("schema") != COMPANION_SNAPSHOT_SCHEMA
+        or body.get("authority") != "read_only"
+        or not isinstance(body.get("liveui"), Mapping)
+    ):
+        return _glasses_state_body("invalid", "wrong_schema", observed_at)
+
+    generated_at_ms = body.get("generatedAtMs")
+    if (
+        isinstance(generated_at_ms, bool)
+        or not isinstance(generated_at_ms, int)
+        or generated_at_ms <= 0
+    ):
+        return _glasses_state_body("invalid", "wrong_schema", observed_at)
+
+    age_ms = max(0, _now_ms() - generated_at_ms)
+    liveui_snapshot = dict(body["liveui"])
+    home = receipts.resolve_receipt_home()
+    stored_session_id = _stored_session_id(home, liveui_snapshot.get("sessionKey"))
+    payload = {
+        "contract": "ocuclaw.glasses-state",
+        "contractVersion": 1,
+        "readOnly": True,
+        "state": "present",
+        "observedAt": observed_at,
+        "generatedAtMs": generated_at_ms,
+        "ageMs": age_ms,
+        "stale": age_ms > GLASSES_STATE_STALE_AFTER_MS,
+        "device": _device_state(),
+        "backend": body.get("backend"),
+        "profile": body.get("profile"),
+        "homeFingerprint": receipts.fingerprint_home(home),
+        "snapshot": liveui_snapshot,
+        "storedSessionId": stored_session_id,
+    }
+    rendered = json.dumps(payload, sort_keys=True)
+    if any(forbidden in rendered for forbidden in ("tokenValue", "rawProfilePath")):
+        raise ValueError("glasses-state payload crossed a forbidden secret boundary")
+
+    etag_seed = json.dumps(
+        {
+            "generatedAtMs": generated_at_ms,
+            "storedSessionId": stored_session_id,
+            "device": {
+                key: value
+                for key, value in payload["device"].items()
+                if key != "ageMs"
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    etag = f'W/"{hashlib.sha256(etag_seed).hexdigest()[:16]}"'
+    response.headers["ETag"] = etag
+    if isinstance(if_none_match, str) and if_none_match == etag:
+        response.status_code = 304
+        return {}
+    return payload
+
+
+def _companion_snapshot_revision() -> Tuple[
+    Optional[Tuple[int, int]], Optional[Tuple[int, int]]
+]:
+    """Return cheap companion + device invalidation tokens."""
+
+    home = receipts.resolve_receipt_home()
+    tokens = []
+    for path in (_companion_snapshot_path(), receipts.app_presence_path(home)):
+        try:
+            stat = path.stat() if path is not None else None
+        except OSError:
+            stat = None
+        tokens.append(None if stat is None else (stat.st_mtime_ns, stat.st_size))
+    return tokens[0], tokens[1]
+
+
+@router.websocket("/glasses/events")
+async def stream_glasses_events(ws: WebSocket) -> None:
+    """Accelerate the mandatory poll when either source receipt changes."""
+
+    if not _ws_upgrade_authorized(ws):
+        await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
+        return
+    await ws.accept()
+    revision = _companion_snapshot_revision()
+    try:
+        while True:
+            try:
+                message = await asyncio.wait_for(ws.receive(), timeout=_WS_POLL_SECONDS)
+            except asyncio.TimeoutError:
+                next_revision = _companion_snapshot_revision()
+                if next_revision != revision:
+                    revision = next_revision
+                    await ws.send_json({"type": "glasses-state-invalidated"})
+                continue
+            if isinstance(message, Mapping) and message.get("type") == "websocket.disconnect":
+                return
+    except asyncio.CancelledError:
+        return
+
+
 @router.get("/setup-card")
 def get_setup_card() -> Dict[str, Any]:
     """Answer the Desktop post-install card. Reaching this route IS the proof.
 
     This route answers exactly ONE question: has pairing completed? ``paired``
     reads the durable completion receipt the phone's authenticated callback
-    writes (``_handle_pairing_completed``), not a renderer-side memory, so the
+    writes (``_handle_pairing_completed``), or the same profile's committed
+    First-Run Proof on an established install that predates that receipt.
+    It never uses renderer-side memory, so the
     card stays retired across Desktop reinstalls and fresh renderer storage.
     Booleans only: no address, token, or capability crosses this boundary, so
     the route needs no presenter capability the way the ceremony routes do.
@@ -814,11 +1262,50 @@ def get_setup_card() -> Dict[str, Any]:
     only once the gateway says OcuClaw is loaded.
     """
 
+    paired = pairing_completion.read_pairing_completion() is not None
+    if not paired:
+        home = receipts.resolve_receipt_home()
+        fingerprint = receipts.fingerprint_home(home)
+        if home is not None and fingerprint is not None:
+            proof, proof_status = receipts.read_first_run_proof(fingerprint, home=home)
+            # Match Snapshot v1's proof predicate: correct profile/schema and
+            # a valid commit timestamp. Presence, a live connection, and an
+            # unfinished Attempt can never retire setup.
+            paired = bool(
+                proof_status == "ok"
+                and isinstance(proof, Mapping)
+                and isinstance(proof.get("provenAt"), str)
+                and snapshot_module.parse_timestamp(proof["provenAt"])
+            )
+
     return {
         "contract": "ocuclaw.desktop-setup-card",
         "contractVersion": 1,
-        "paired": pairing_completion.read_pairing_completion() is not None,
+        "paired": paired,
     }
+
+
+@router.post("/credentials")
+def desktop_credentials_action(payload: Any = Body(...)) -> Dict[str, Any]:
+    """Native form only: never route secret values through an agent tool."""
+    _require_presenter_capability(payload)
+    action = payload.get("action")
+    allowed = {
+        "status": {"action", "presenterCapability"},
+        "open": {"action", "presenterCapability", "selected"},
+        "save": {"action", "presenterCapability", "requestId", "values"},
+        "cancel": {"action", "presenterCapability", "requestId"},
+    }
+    if not isinstance(action, str) or action not in allowed or set(payload) - allowed[action]:
+        return {"state": "invalid_request"}
+    if action == "status":
+        return desktop_credentials.status(direct=True)
+    if action == "open":
+        result = desktop_credentials.request(payload.get("selected"))
+        return desktop_credentials.status(direct=True) if result.get("state") == "pending" else result
+    return desktop_credentials.submit(
+        payload.get("requestId"), payload.get("values"), cancel=action == "cancel"
+    )
 
 
 @router.post("/pairing/claim")
@@ -875,6 +1362,7 @@ def claim_desktop_pairing(payload: Any = Body(...)) -> Dict[str, Any]:
                     "lightTerminal": True,
                 },
                 credential=credential,
+                opener=_DIRECT_HTTP_OPENER,
             )
         except pairing.ControlError:
             status, created = 503, {}
@@ -916,10 +1404,12 @@ def drive_desktop_pairing(
     global _PAIRING_SESSION
     with _PAIRING_LOCK:
         session = _PAIRING_SESSION
-        if session is None or not secrets.compare_digest(str(session["id"]), session_id):
+        if session is None or not _constant_time_equal(session_id, str(session["id"])):
             raise HTTPException(status_code=404, detail="pairing ceremony unavailable")
-        if not secrets.compare_digest(
-            str(session.get("presenterCapability") or ""), presenter_capability
+        # The claim-time binding. Without it a holder of a rotated capability
+        # could drive a ceremony some OTHER presenter claimed.
+        if not _constant_time_equal(
+            presenter_capability, str(session.get("presenterCapability") or "")
         ):
             raise HTTPException(status_code=403, detail="Desktop presenter unavailable")
         if session.get("terminal") is not None:
@@ -944,6 +1434,7 @@ def drive_desktop_pairing(
                 {"v": 1, "op": op},
                 credential=credential,
                 control_secret=str(session["controlSecret"]),
+                opener=_DIRECT_HTTP_OPENER,
             )
         except pairing.ControlError as error:
             raise HTTPException(status_code=503, detail="local relay unavailable") from error
@@ -960,10 +1451,14 @@ def drive_desktop_pairing(
 
 
 __all__ = [
+    "COMPANION_SNAPSHOT_MAX_BYTES",
+    "COMPANION_SNAPSHOT_SCHEMA",
+    "GLASSES_STATE_STALE_AFTER_MS",
     "PLATFORM_RECEIPT_EMPIRICAL_TTL_S",
     "build_dashboard_payload",
     "claim_desktop_pairing",
     "drive_desktop_pairing",
+    "get_glasses_state",
     "get_snapshot",
     "platform_receipt_gate",
     "router",

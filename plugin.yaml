@@ -1,7 +1,7 @@
 manifest_version: 1
 name: ocuclaw
 kind: platform
-version: 2.0.3
+version: 2.0.4
 description: >
   OcuClaw platform adapter for the hermes gateway. Spawns the shared OcuClaw
   Node runtime (glasses/phone relay, Even-AI endpoint, liveui engine) as a
@@ -36,3 +36,10 @@ provides_hooks:
   - on_stream_start
   - on_stream_delta
   - on_stream_end
+  # Registered ONLY on hosts whose hook vocabulary has it (0.20.6+). Carries
+  # the wearer's per-utterance language pick into Hermes' built-in STT
+  # backends, which re-resolve language from their own config load and so
+  # cannot see the overlay the `stt.transcribe` RPC hands the dispatcher.
+  # Scoped to one in-flight OcuClaw transcription by a contextvar — every
+  # other transcription on the gateway passes through untouched.
+  - pre_transcription

@@ -1,5 +1,5 @@
 const nodePath = require("node:path");
-const { isDistillerSessionKey, sanitizeTitle, buildExcerpt, buildDistillerAgentParams, internalTranscriptFilename, DISTILLER_SESSION_PREFIX, EXCERPT_FENCE, EXCERPT_FENCE_END, extractAssistantTitleFromMessages, splitModelRef } = require("./session-title-distiller-helpers.cjs");
+const { isDistillerSessionKey, sanitizeTitle, buildExcerpt, buildDistillerAgentParams, internalTranscriptFilename, DISTILLER_SESSION_PREFIX, EXCERPT_FENCE, EXCERPT_FENCE_END, extractAssistantTitleFromMessages } = require("./session-title-distiller-helpers.cjs");
 const { isUserOrigin } = require("./session-title-record.cjs");
 
 const PROMPT_INSTRUCTION =
@@ -190,18 +190,14 @@ function createSessionTitleDistiller(deps) {
     const { idempotencyKey, distillerKey, message, model } = buildDistillerInput(opts);
 
     const runParams = {
-      sessionKey: distillerKey,
-      message,
-      idempotencyKey,
-      deliver: false,
-      lane: "background",
+      ...buildDistillerAgentParams({
+        sessionKey: distillerKey,
+        idempotencyKey,
+        message,
+        model,
+      }),
       lightContext: true,
     };
-    const ref = splitModelRef(model);
-    if (ref) {
-      if (ref.provider) runParams.provider = ref.provider;
-      runParams.model = ref.model;
-    }
     dbg("relay.session", "distiller_run_started", "debug", { sessionKey }, () => ({ chars: message.length, idempotencyKey, via: "subagent" }));
 
     let runRes;

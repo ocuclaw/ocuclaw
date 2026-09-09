@@ -1,6 +1,6 @@
 # Troubleshooting OcuClaw on Hermes
 
-**Guide version:** 2026-08-31 (1.3.18-hermes)
+**Guide version:** 2026-09-05 (1.3.19-hermes)
 
 This guidance was loaded through the `ocuclaw_setup` tool. Keep using the
 loaded setup skill for command, secret, checkpoint, and restart rules, and use
@@ -10,12 +10,12 @@ matching observed evidence. Diagnose read-only before a mutation. Never widen
 
 ## HERMES-GATE-REFUSED
 
-`hermes --version` must report a version in `>=0.20.0,<0.21.0`. When the host
+`hermes --version` must report a version in `>=0.21.0,<0.22.0`. When the host
 still exposes the certified platform-registration API, the recovery row remains
 registered outside that hard range, but its checks and adapter refuse startup.
 Treat that row as best-effort on an unsupported, ABI-drifted host; the version
 mismatch or plugin-load error remains visible in the Hermes gateway log.
-Do not work around the gate or say "0.20.0 or later". Updating Hermes is outside
+Do not work around the gate or say "0.21.0 or later". Updating Hermes is outside
 the OcuClaw plugin update phase and needs the user's separate decision.
 
 ## RELAY-PORT-CLAIMED
@@ -229,24 +229,22 @@ hermes config get gateway.multiplex_profiles
 hermes profile list
 ```
 
-Enter when multiplex is true and more than one profile is listed, or when the
-gateway log says `gateway.multiplex_profiles is ON with` multiple served
-profiles. A wearer sees no reply while rejected turns log `Unauthorized user:`.
+Enter for an actual rejected secondary-profile turn (`Unauthorized user:`),
+not merely because multiple profiles exist. Confirm the running engine is
+supported and the installed bundle matches the candidate. OcuClaw 2.0.4 uses
+`build_source` to retain the shared relay-authenticated adapter; Hermes 0.21
+resolves this provenance for authorization and approval delivery.
 
-The restrictive posture is the exact gateway-process environment assignment
-`OCUCLAW_ALLOWED_USERS=ocuclaw-wearer`. The value is a comma-separated list of
-user ids; OcuClaw phone/glasses turns use `ocuclaw-wearer`. The broad
-alternative, `OCUCLAW_ALLOW_ALL_USERS=true`, is authz-open and must be an
-explicit operator decision, never the recommendation or default.
+Check the selected profile is in the served allowlist and was admitted before
+the last gateway restart. A just-created profile is pending until restart and
+reconnect confirm its route. Use the same creation receipt to retry partial
+setup; never create a second profile to hide the first failure.
 
-Hermes 0.20's `hermes config set` routes only token/API-key-shaped environment
-keys to its environment store, so it cannot persist either authorization key
-truthfully. Do not pretend otherwise and do not hand-edit `.env` or yaml. Ask
-the gateway operator to add the restrictive assignment to the deployment's
-existing environment-management surface, then restart the gateway once.
-VERIFY that the boot warning naming both missing variables is absent and send
-a phone-origin turn to a secondary profile. A real `Unauthorized user:` line
-means the assignment did not reach the gateway process; stop for its operator.
+Do not introduce `OCUCLAW_ALLOW_ALL_USERS` or change sender authorization to
+paper over a stale bundle or broken transport provenance. Reproduce one
+phone-origin turn on the supported candidate. If it still fails, collect
+bounded sanitized evidence through the normal bug-report path; never report
+multiple-agent setup complete without a successful routed turn.
 
 ## TERM-HELP
 
@@ -268,7 +266,7 @@ already recorded. Show it to the user and confirm it contains no secrets or
 network addresses:
 
 ```text
-OcuClaw Hermes beta report — guide 2026-08-31 (1.3.18-hermes)
+OcuClaw Hermes beta report — guide 2026-09-05 (1.3.19-hermes)
 Hermes version:
 OcuClaw bundle version (from plugin.yaml/list output):
 Backend: hermes

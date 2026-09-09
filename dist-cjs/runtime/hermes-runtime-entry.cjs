@@ -1,11 +1,11 @@
 const { createHermesControlLink, LINK_EXIT_CODES, LINK_HANDSHAKE_TIMEOUT_MS } = require("./hermes-control-link.cjs");
 const { createHermesGatewayBridge, LINK_BACKEND_EVENT_METHOD, LINK_PROFILE_METHODS } = require("./hermes-gateway-bridge.cjs");
 const { createHermesHostHooks, LINK_HOST_HOOK_METHOD } = require("./hermes-host-hooks.cjs");
-const { buildHermesLiveUiHelloPayload, createHermesLiveUiBridge } = require("./hermes-liveui-bridge.cjs");
+const { buildHermesLiveUiHelloPayload, createHermesLiveUiBridge, mergeLiveConfig } = require("./hermes-liveui-bridge.cjs");
 const { createHermesPresencePush } = require("./hermes-presence-push.cjs");
+const { createHermesSttLane } = require("./hermes-stt-lane.cjs");
 const { createHermesPairingCompletionPush } = require("./hermes-pairing-completion-push.cjs");
 const { createHermesRuntimeReadiness } = require("./hermes-runtime-readiness.cjs");
-const { createEvenTerminalRuntimeWiring } = require("./even-terminal/runtime-wiring.cjs");
 const { DEFAULT_HERMES_NAMESPACE, hermesDefaultSessionKeyPrefix, hermesSupportedSessionKeyPrefixes, parseHermesPublicKey } = require("./hermes-session-keys.cjs");
 const { createRelay } = require("./relay-core.cjs");
 const { HERMES_BUNDLE_DEFAULT_WS_PORT } = require("../config/runtime-config.cjs");
@@ -72,15 +72,10 @@ const link = createHermesControlLink({
 const { bridge: gatewayBridge, dispatchBackendEvent } =
   createHermesGatewayBridge({ link, logger });
 const hostHooks = createHermesHostHooks({ logger });
-const readiness = createHermesRuntimeReadiness({ dispatchBackendEvent, logger });
-let activeEvenTerminalWiring = null;
-let activeRelay = null;
 
-function disposeActiveEvenTerminalWiring() {
-  if (!activeEvenTerminalWiring) return;
-  activeEvenTerminalWiring.dispose();
-  activeEvenTerminalWiring = null;
-}
+const sttLane = createHermesSttLane({ link, logger });
+const readiness = createHermesRuntimeReadiness({ dispatchBackendEvent, logger });
+let activeRelay = null;
 linkMethods[LINK_BACKEND_EVENT_METHOD] = (params) => {
   const name = params && typeof params.name === "string" ? params.name : "";
   if (!name) {
@@ -107,21 +102,18 @@ link.onClose(() => {
 
   readiness.announceDisconnected("link_closed");
   activeRelay?.stopLiveuiExecutorRegistry();
-  disposeActiveEvenTerminalWiring();
-  process.exit(LINK_EXIT_CODES.clean);
+  void sttLane.upload.dispose().finally(() => process.exit(LINK_EXIT_CODES.clean));
 });
 
 process.on("SIGTERM", () => {
   logger.info("[hermes-link] SIGTERM; exiting");
   readiness.announceDisconnected("sigterm");
   activeRelay?.stopLiveuiExecutorRegistry();
-  disposeActiveEvenTerminalWiring();
-  process.exit(LINK_EXIT_CODES.clean);
+  void sttLane.upload.dispose().finally(() => process.exit(LINK_EXIT_CODES.clean));
 });
 process.on("SIGINT", () => {
   activeRelay?.stopLiveuiExecutorRegistry();
-  disposeActiveEvenTerminalWiring();
-  process.exit(LINK_EXIT_CODES.clean);
+  void sttLane.upload.dispose().finally(() => process.exit(LINK_EXIT_CODES.clean));
 });
 
 function bootRelay(ackPayload) {
@@ -150,15 +142,6 @@ function bootRelay(ackPayload) {
     typeof config.wsBind === "string" && config.wsBind
       ? config.wsBind
       : "127.0.0.1";
-  const evenTerminalWiring = createEvenTerminalRuntimeWiring({
-    enabled: config.evenTerminalEnabled === true,
-    logger,
-    stateDir:
-      typeof config.stateDir === "string" && config.stateDir
-        ? config.stateDir
-        : undefined,
-  });
-  activeEvenTerminalWiring = evenTerminalWiring;
   let relay;
   const profileNamespace = (context = {}) => {
     const parsed = parseHermesPublicKey(
@@ -197,8 +180,7 @@ function bootRelay(ackPayload) {
       options,
     });
   };
-  try {
-    relay = createRelay({
+  relay = createRelay({
       port,
       host,
       token: typeof config.relayToken === "string" ? config.relayToken : "",
@@ -217,6 +199,11 @@ function bootRelay(ackPayload) {
 
       getConnectionHealthDocument: () =>
         link.request("connectionHealth.snapshot", {}),
+
+      getHermesSttCapabilities: () => sttLane.getCapabilities(),
+
+      hermesSttTranscribe: (request) => sttLane.transcribe(request),
+      hermesSttUpload: sttLane.upload,
       hermesVersion:
         ackPayload && typeof ackPayload.hermesVersion === "string"
           ? ackPayload.hermesVersion
@@ -227,6 +214,8 @@ function bootRelay(ackPayload) {
       setOcuClawProfileOptions: setHermesProfileOptions,
       externalDebugToolsEnabled:
         config.externalDebugToolsEnabled !== false,
+      debugAutoArm: config.debugAutoArm === true,
+      getGlassesUiLiveConfig: () => mergeLiveConfig(config && config.glassesUiLive),
       allowDebugUpload: config.allowDebugUpload === true,
       debugUploadMaxZipBytes: config.debugUploadMaxZipBytes,
       debugUploadCapturePreset: config.debugUploadCapturePreset,
@@ -258,19 +247,9 @@ function bootRelay(ackPayload) {
           ref === "default" ? DEFAULT_HERMES_NAMESPACE : ref,
         );
       },
-      ...evenTerminalWiring.relayOptions,
       logger,
-    });
-    activeRelay = relay;
-
-    evenTerminalWiring.attachBeforeStart(relay);
-  } catch (err) {
-    evenTerminalWiring.dispose();
-    if (activeEvenTerminalWiring === evenTerminalWiring) {
-      activeEvenTerminalWiring = null;
-    }
-    throw err;
-  }
+  });
+  activeRelay = relay;
 
   link.setDebugEmitter((category, event, data) => {
     emitDebug(category, event, data);
@@ -278,7 +257,6 @@ function bootRelay(ackPayload) {
   });
   return Promise.resolve(relay.start())
     .then(() => {
-      void evenTerminalWiring.startDiscovery();
       logger.info(`[hermes-runtime] relay listening on ws://${host}:${port}`);
       const liveui = createHermesLiveUiBridge({
         relay,
@@ -292,18 +270,16 @@ function bootRelay(ackPayload) {
       relay.setLiveuiGlassesLibraryController(liveui.glassesLibrary);
       Object.assign(linkMethods, liveui.methods);
 
+      hostHooks.on("agent_end", (_event, ctx) => {
+        if (typeof relay.noteSessionMirrorTurnEnd !== "function") return;
+        Promise.resolve(relay.noteSessionMirrorTurnEnd(ctx && ctx.sessionKey)).catch(() => {});
+      });
+
       const presence = createHermesPresencePush({ relay, link, logger });
       Object.assign(linkMethods, presence.methods);
       presence.push();
       createHermesPairingCompletionPush({ relay, link, logger });
       return relay;
-    })
-    .catch((err) => {
-      evenTerminalWiring.dispose();
-      if (activeEvenTerminalWiring === evenTerminalWiring) {
-        activeEvenTerminalWiring = null;
-      }
-      throw err;
     });
 }
 

@@ -244,7 +244,10 @@ function upstreamMessageIdentity(msg) {
 function formatEntry(entry) {
 
   if (entry.role === NOTICE_ROLE) return entry.text;
-  if (entry.role === "user") return `• ${entry.text}`;
+
+  if (entry.role === "user") {
+    return entry.name ? `• ${entry.name}: ${entry.text}` : `• ${entry.text}`;
+  }
   const name = entry.name || agentName;
   return `${name}: ${entry.text}`;
 }

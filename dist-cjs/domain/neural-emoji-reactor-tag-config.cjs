@@ -13,7 +13,6 @@ const EMOJI_TAG_FAMILY_CONFIG = {
     const closeIdx = input.indexOf(">", at + OPEN_PREFIX.length);
     if (closeIdx === -1) return null;
     const rawEmoji = input.slice(at + OPEN_PREFIX.length, closeIdx);
-    if (/\s/.test(rawEmoji)) return null;
     return {
       consumed: closeIdx - at + 1,
       spanInit: { emoji: rawEmoji },

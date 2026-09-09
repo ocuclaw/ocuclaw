@@ -10,6 +10,7 @@ const PREFS_KEYS = new Set([
   "enabled",
   "defaultContext",
   "defaultExecutor",
+
   "pauseApps",
   "digest",
 ]);
@@ -139,7 +140,7 @@ function createLiveuiPrefs(opts = {}) {
 const LIVEUI_DISABLED_CODE = "liveui_disabled";
 
 const LIVEUI_DISABLED_MESSAGE =
-  "LiveUI is switched off by the owner in Settings -> LiveUI.";
+  "LiveUI is switched off by the owner in the phone's LiveUI panel (top bar).";
 
 function liveuiDisabledResult() {
   return {

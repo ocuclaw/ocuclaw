@@ -6,6 +6,16 @@ const LINK_TRUNCATION_HEAD_CHARS = 2_048;
 
 const LINK_HANDSHAKE_TIMEOUT_MS = 10_000;
 
+const LINK_WRITE_MAX_BYTES = 4 * 1_048_576;
+const LINK_ADMISSION_LIMIT = 128;
+
+function deliveryError(code, issued) {
+  const err = new Error(code);
+  err.code = code;
+  err.delivery = issued ? "uncertain" : "not_sent";
+  return err;
+}
+
 const LINK_DEBUG_CATEGORY = "hermes.link";
 
 const LINK_PROTOCOL = Object.freeze({
@@ -105,7 +115,10 @@ function createNdjsonLineSplitter(opts) {
     }
   }
 
-  return { feed };
+  return {
+    feed,
+    clear() { pending = Buffer.alloc(0); discardingBytes = 0; },
+  };
 }
 
 function summarizeFrame(frame, originalBytes) {
@@ -152,6 +165,38 @@ function createHermesControlLink(opts) {
   }
   const closeHandlers = [];
   let handshake = null;
+  let writeQueue = [];
+  let queuedBytes = 0;
+  let blocked = false;
+  let activeHandlers = 0;
+
+  function removeQueued(id) {
+    writeQueue = writeQueue.filter((item) => {
+      if (item.id !== id) return true;
+      queuedBytes -= item.bytes;
+      return false;
+    });
+  }
+
+  function pumpWrites() {
+    while (!closed && !blocked && writeQueue.length) {
+      const item = writeQueue.shift();
+      queuedBytes -= item.bytes;
+      const entry = pendingRequests.get(item.id);
+      if (entry) entry.issued = true;
+      try {
+        const accepted = output.write(item.line);
+        if (!closed) blocked = !accepted;
+      } catch (_) {
+        onEnd();
+      }
+    }
+  }
+
+  function onDrain() {
+    blocked = false;
+    pumpWrites();
+  }
 
   function mirror(event, data) {
     try {
@@ -162,8 +207,15 @@ function createHermesControlLink(opts) {
   }
 
   function writeFrame(frame) {
-    if (closed) return false;
+    if (closed) throw deliveryError("control link closed", false);
     const encoded = encodeLinkFrame(frame);
+    const bytes = Buffer.byteLength(encoded.line, "utf8");
+    if (writeQueue.length >= LINK_ADMISSION_LIMIT ||
+        queuedBytes + (output.writableLength || 0) + bytes > LINK_WRITE_MAX_BYTES) {
+
+      if (frame.type !== LINK_PROTOCOL.rpcRequest) onEnd();
+      throw deliveryError("link_overloaded", false);
+    }
     if (encoded.truncated) {
       counters.truncatedOutbound += 1;
       logger.warn(
@@ -172,7 +224,12 @@ function createHermesControlLink(opts) {
     }
     counters.framesOut += 1;
     mirror("frame_out", summarizeFrame(frame, encoded.originalBytes));
-    output.write(encoded.line);
+    writeQueue.push({
+      line: encoded.line, bytes,
+      id: frame.type === LINK_PROTOCOL.rpcRequest ? frame.id : null,
+    });
+    queuedBytes += bytes;
+    pumpWrites();
     return !encoded.truncated;
   }
 
@@ -187,29 +244,42 @@ function createHermesControlLink(opts) {
   }
 
   async function handleRequest(frame) {
-    const method = typeof frame.method === "string" ? frame.method : "";
-    const handler = Object.prototype.hasOwnProperty.call(methods, method)
-      ? methods[method]
-      : null;
-    if (!handler) {
-      respondError(
-        frame.id,
-        RPC_METHOD_NOT_FOUND_CODE,
-        `method not found: ${method || "<missing>"}`,
-      );
+    if (closed) return;
+    if (activeHandlers >= LINK_ADMISSION_LIMIT) {
+      onEnd();
       return;
     }
+    activeHandlers += 1;
     try {
-      const result = await handler(frame.params);
-      writeFrame({
-        v: LINK_PROTOCOL_VERSION,
-        type: LINK_PROTOCOL.rpcResponse,
-        id: frame.id,
-        ok: true,
-        result: result === undefined ? null : result,
-      });
-    } catch (err) {
-      respondError(frame.id, -32000, err && err.message ? err.message : String(err));
+      const method = typeof frame.method === "string" ? frame.method : "";
+      const handler = Object.prototype.hasOwnProperty.call(methods, method)
+        ? methods[method]
+        : null;
+      if (!handler) {
+        respondError(
+          frame.id,
+          RPC_METHOD_NOT_FOUND_CODE,
+          `method not found: ${method || "<missing>"}`,
+        );
+        return;
+      }
+      try {
+        const result = await handler(frame.params);
+        if (closed) return;
+        writeFrame({
+          v: LINK_PROTOCOL_VERSION,
+          type: LINK_PROTOCOL.rpcResponse,
+          id: frame.id,
+          ok: true,
+          result: result === undefined ? null : result,
+        });
+      } catch (err) {
+        if (!closed) respondError(frame.id, -32000, err && err.message ? err.message : String(err));
+      }
+    } catch (_) {
+      onEnd();
+    } finally {
+      activeHandlers -= 1;
     }
   }
 
@@ -241,6 +311,7 @@ function createHermesControlLink(opts) {
   }
 
   function handleFrame(frame) {
+    if (closed) return;
     counters.framesIn += 1;
     mirror("frame_in", summarizeFrame(frame, 0));
     if (frame.v !== LINK_PROTOCOL_VERSION) {
@@ -252,6 +323,7 @@ function createHermesControlLink(opts) {
         );
         err.exitCode = LINK_EXIT_CODES.protocolMismatch;
         handshake.reject(err);
+        onEnd(false);
       } else {
         logger.warn(
           `[hermes-link] dropping frame with protocol version ${frame.v}`,
@@ -318,10 +390,32 @@ function createHermesControlLink(opts) {
     splitter.feed(chunk);
   }
 
-  function onEnd() {
+  function onInputClose() {
+    onEnd();
+    input.off("error", onEnd);
+  }
+
+  function onOutputClose() {
+    onEnd();
+    output.off("error", onEnd);
+  }
+
+  function onEnd(notifyClose = true) {
     if (closed) return;
     closed = true;
     ready = false;
+    input.off("data", onData);
+    input.off("end", onEnd);
+    output.off("drain", onDrain);
+    output.off("finish", onEnd);
+
+    writeQueue = [];
+    queuedBytes = 0;
+    blocked = false;
+    splitter.clear();
+    timedOutRequestIds.clear();
+    if (!input.destroyed) input.destroy();
+    if (!output.destroyed) output.destroy();
     mirror("link_closed", { reason: "input_eof" });
     if (handshake) {
       const err = new Error("control link closed before handshake completed");
@@ -329,10 +423,10 @@ function createHermesControlLink(opts) {
       handshake.reject(err);
     }
     for (const entry of pendingRequests.values()) {
-      entry.reject(new Error("control link closed"));
+      entry.reject(deliveryError("control link closed", entry.issued));
     }
     pendingRequests.clear();
-    for (const handler of closeHandlers) {
+    for (const handler of notifyClose === false ? [] : closeHandlers) {
       try {
         handler();
       } catch (_) {
@@ -348,7 +442,12 @@ function createHermesControlLink(opts) {
         : LINK_HANDSHAKE_TIMEOUT_MS;
     input.on("data", onData);
     input.on("end", onEnd);
-    input.on("close", onEnd);
+    input.once("close", onInputClose);
+    input.on("error", onEnd);
+    output.on("drain", onDrain);
+    output.on("error", onEnd);
+    output.once("close", onOutputClose);
+    output.on("finish", onEnd);
     const helloPromise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         const err = new Error(
@@ -357,6 +456,8 @@ function createHermesControlLink(opts) {
         err.exitCode = LINK_EXIT_CODES.handshakeTimeout;
         handshake = null;
         reject(err);
+
+        onEnd(false);
       }, timeoutMs);
       handshake = {
         resolve(payload) {
@@ -371,25 +472,33 @@ function createHermesControlLink(opts) {
         },
       };
     });
-    writeFrame({
-      v: LINK_PROTOCOL_VERSION,
-      type: LINK_PROTOCOL.hello,
-      payload: {
-        pid: process.pid,
-        runtimeName: "ocuclaw-runtime",
-        ...helloPayload,
-      },
-    });
+    try {
+      writeFrame({
+        v: LINK_PROTOCOL_VERSION,
+        type: LINK_PROTOCOL.hello,
+        payload: {
+          pid: process.pid,
+          runtimeName: "ocuclaw-runtime",
+          ...helloPayload,
+        },
+      });
+    } catch (err) {
+      if (handshake) handshake.reject(err);
+      onEnd(false);
+    }
     return helloPromise;
   }
 
   function request(method, params, requestOpts = undefined) {
     if (closed) {
-      return Promise.reject(new Error("control link closed"));
+      return Promise.reject(deliveryError("control link closed", false));
     }
     if (!ready) {
-      return Promise.reject(new Error("control link not ready"));
+      return Promise.reject(deliveryError("control link not ready", false));
     }
+    const signal = requestOpts && requestOpts.signal;
+    if (signal && signal.aborted) return Promise.reject(deliveryError("link_request_cancelled", false));
+    if (pendingRequests.size >= LINK_ADMISSION_LIMIT) return Promise.reject(deliveryError("link_overloaded", false));
     const rawTimeout = requestOpts ? requestOpts.timeoutMs : undefined;
     const timeoutMs =
       Number.isFinite(rawTimeout) && rawTimeout > 0 ? Math.floor(rawTimeout) : 0;
@@ -397,13 +506,25 @@ function createHermesControlLink(opts) {
     return new Promise((resolve, reject) => {
       let timer = null;
       const clearTimer = () => {
+        if (signal) signal.removeEventListener("abort", onAbort);
         if (timer !== null) {
           clearTimeout(timer);
           timer = null;
         }
       };
+      const cancel = (err) => {
+        const entry = pendingRequests.get(id);
+        if (!entry) return;
+        err.delivery = entry.issued ? "uncertain" : "not_sent";
+        pendingRequests.delete(id);
+        removeQueued(id);
+        if (entry.issued) rememberTimedOutRequest(id);
+        entry.reject(err);
+      };
+      const onAbort = () => cancel(deliveryError("link_request_cancelled", false));
 
       pendingRequests.set(id, {
+        issued: false,
         resolve: (value) => {
           clearTimer();
           resolve(value);
@@ -413,38 +534,41 @@ function createHermesControlLink(opts) {
           reject(err);
         },
       });
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           timer = null;
           if (!pendingRequests.has(id)) return;
-          pendingRequests.delete(id);
 
-          rememberTimedOutRequest(id);
           counters.requestTimeouts += 1;
           mirror("request_timeout", { id, method, timeoutMs });
           logger.warn(
             `[hermes-link] ${method} timed out after ${timeoutMs}ms (peer alive, no response)`,
           );
-          reject(createLinkRequestTimeoutError(method, timeoutMs));
+          cancel(createLinkRequestTimeoutError(method, timeoutMs));
         }, timeoutMs);
 
         if (timer && typeof timer.unref === "function") timer.unref();
       }
-      const delivered = writeFrame({
-        v: LINK_PROTOCOL_VERSION,
-        type: LINK_PROTOCOL.rpcRequest,
-        id,
-        method,
-        params,
-      });
-      if (!delivered) {
-        const entry = pendingRequests.get(id);
-        pendingRequests.delete(id);
-        if (entry) entry.reject(new Error("link_frame_truncated"));
-        else {
-          clearTimer();
-          reject(new Error("link_frame_truncated"));
+      try {
+        const delivered = writeFrame({
+          v: LINK_PROTOCOL_VERSION,
+          type: LINK_PROTOCOL.rpcRequest,
+          id,
+          method,
+          params,
+        });
+        if (!delivered) {
+          const entry = pendingRequests.get(id);
+          pendingRequests.delete(id);
+          if (entry) entry.reject(new Error("link_frame_truncated"));
+          else {
+            clearTimer();
+            reject(new Error("link_frame_truncated"));
+          }
         }
+      } catch (err) {
+        cancel(err);
       }
     });
   }
@@ -459,9 +583,6 @@ function createHermesControlLink(opts) {
   }
 
   function stop() {
-    input.off("data", onData);
-    input.off("end", onEnd);
-    input.off("close", onEnd);
     onEnd();
   }
 
@@ -472,7 +593,9 @@ function createHermesControlLink(opts) {
     onClose,
     setDebugEmitter,
     isReady: () => ready,
-    getCounters: () => ({ ...counters }),
+    getCounters: () => ({ ...counters, queuedBytes, queuedFrames: writeQueue.length,
+      streamBytes: output.writableLength || 0, blocked, pendingRequests: pendingRequests.size,
+      activeHandlers, maxWriteBytes: LINK_WRITE_MAX_BYTES, admissionLimit: LINK_ADMISSION_LIMIT }),
   };
 }
 

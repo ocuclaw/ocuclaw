@@ -2,11 +2,14 @@ const DEFAULT_SAFE_KEYS = new Set([
   "page", "pageCount", "selectedIndex", "cursor", "index", "count", "lane",
   "slotState", "ms", "durationMs", "seq", "ok", "enabled", "connected",
   "battery", "batteryLevel", "from", "to", "lines", "width", "height", "kind",
-  "severity", "state", "phase",
+  "severity", "state", "phase", "captureEpoch",
 ]);
 
 const SAFE_KEYS = {
   "sdk.frames": new Set([
+
+    "clientLaunchId", "writerId", "method", "sdkOutcome", "waitOutcome",
+    "appDisposition", "disposition",
     "writeSeq", "chars", "lineCount", "selectedLane", "selectedCanonicalIndex",
     "virtualPageCount", "slotIntent", "slotRunId", "indicator", "bodyHash",
     "statusEmojiDecisionBranch", "streamingEmojiVariant", "startsWithNewline",
@@ -162,7 +165,7 @@ function redactData(cat, data, mode) {
 function redactEvents(events, opts) {
   const mode = opts && opts.mode ? opts.mode : "structural";
   return events.map((evt) => {
-    const out = {
+    const out      = {
       ts: evt.ts,
       cat: evt.cat,
       event: evt.event,
@@ -174,6 +177,8 @@ function redactEvents(events, opts) {
     if (typeof evt.sessionKey === "string" && evt.sessionKey) {
       out.sessionKey = evt.sessionKey;
     }
+    if (typeof evt.reportSessionKey === "string" && evt.reportSessionKey) out.reportSessionKey = evt.reportSessionKey;
+    if (Number.isSafeInteger(evt.phoneSeq) && evt.phoneSeq > 0) out.phoneSeq = evt.phoneSeq;
     if (typeof evt.runId === "string" && evt.runId) {
       out.runId = evt.runId;
     }
@@ -181,8 +186,15 @@ function redactEvents(events, opts) {
 
       out.screen = evt.screen;
     }
+    if (evt.source === "phone") out.source = "phone";
+    if (Number.isFinite(evt.clientTsMs)) out.clientTsMs = Math.floor(evt.clientTsMs);
+    if (evt.source === "phone" && typeof evt.clientId === "string") out.clientId = evt.clientId;
     return out;
   });
 }
 
-module.exports = { redactEvents, structuralPlaceholder, SAFE_KEYS, DEFAULT_SAFE_KEYS };
+function redactDiagnosticData(data                         , mode = "off") {
+  return redactData("client.diagnostics", data, mode);
+}
+
+module.exports = { redactEvents, redactDiagnosticData, structuralPlaceholder, SAFE_KEYS, DEFAULT_SAFE_KEYS };

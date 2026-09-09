@@ -1,20 +1,27 @@
 const SPAN_START_MARK = "\x01";
 const SPAN_END_MARK = "\x02";
+const EXACT_BEAT_MARKER = "<beat/>";
+
+const BEAT_MARKER_SENTINEL = "\uE000".repeat(EXACT_BEAT_MARKER.length);
 
 function applyMarkdownWithSpans(parsed, prefix, conversationState) {
   const { cleanText, spansByFamily } = parsed;
+  const markdownInput = cleanText.replaceAll(EXACT_BEAT_MARKER, BEAT_MARKER_SENTINEL);
   const familyNames = Object.keys(spansByFamily);
   const totalSpans = familyNames.reduce(
     (sum, name) => sum + spansByFamily[name].length,
     0,
   );
   if (totalSpans === 0) {
-    const { text } = conversationState._markdownToPlainText(cleanText, {
+    const { text } = conversationState._markdownToPlainText(markdownInput, {
       stripReplyTags: true,
     });
     const empty = {};
     for (const name of familyNames) empty[name] = [];
-    return { text: `${prefix}${text}`, spansByFamily: empty };
+    return {
+      text: `${prefix}${text.replaceAll(BEAT_MARKER_SENTINEL, EXACT_BEAT_MARKER)}`,
+      spansByFamily: empty,
+    };
   }
 
   const events = [];
@@ -30,11 +37,11 @@ function applyMarkdownWithSpans(parsed, prefix, conversationState) {
   let markedText = "";
   let cursor = 0;
   for (const ev of events) {
-    markedText += cleanText.slice(cursor, ev.offset);
+    markedText += markdownInput.slice(cursor, ev.offset);
     cursor = ev.offset;
     markedText += ev.isEnd ? SPAN_END_MARK : SPAN_START_MARK;
   }
-  markedText += cleanText.slice(cursor);
+  markedText += markdownInput.slice(cursor);
 
   const { text: rawPost } = conversationState._markdownToPlainText(markedText, {
     stripReplyTags: true,
@@ -65,7 +72,10 @@ function applyMarkdownWithSpans(parsed, prefix, conversationState) {
     else target.start = prefixLen + postPos;
   }
 
-  return { text: `${prefix}${stripped}`, spansByFamily: result };
+  return {
+    text: `${prefix}${stripped.replaceAll(BEAT_MARKER_SENTINEL, EXACT_BEAT_MARKER)}`,
+    spansByFamily: result,
+  };
 }
 
 module.exports = { applyMarkdownWithSpans };

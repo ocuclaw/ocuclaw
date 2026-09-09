@@ -260,10 +260,15 @@ async function executeHttpRecipe(params, opts) {
   }
 
   const allowHosts = opts && Array.isArray(opts.allowHosts) ? opts.allowHosts : null;
-  if (allowHosts) {
+  const hostCheck = opts && typeof opts.hostCheck === "function"
+    ? opts.hostCheck
+    : allowHosts
+      ? (host) => isHttpHostAllowed(host, allowHosts) ? "listed" : "not_allowed"
+      : null;
+  if (hostCheck) {
     let initialHost = "";
     try { initialHost = new URL(url).hostname; } catch (_) {}
-    if (!isHttpHostAllowed(initialHost, allowHosts)) {
+    if (hostCheck(initialHost) !== "listed") {
       return { error: `http recipe destination not in allowlist: ${initialHost || url}` };
     }
   }
@@ -326,10 +331,10 @@ async function executeHttpRecipe(params, opts) {
           }
         }
 
-        if (allowHosts) {
+        if (hostCheck) {
           let nextHost = "";
           try { nextHost = new URL(nextUrl).hostname; } catch (_) {}
-          if (!isHttpHostAllowed(nextHost, allowHosts)) {
+          if (hostCheck(nextHost) !== "listed") {
             return { error: `http recipe redirect destination not in allowlist: ${nextHost || nextUrl}` };
           }
         }
@@ -400,8 +405,15 @@ async function executeHttpRecipe(params, opts) {
   }
 }
 
-const DEFAULT_SYSTEM_PROMPT = (maxChars, previousBody) =>
+const DISPLAY_FRAMING_PROMPT = (maxChars, previousBody) =>
   `You are a tick worker producing a single short line of text for a head-mounted display surface. Reply with ONLY the new value to display, no preamble, no quotes, no JSON. Maximum ${maxChars} characters. Previous value: ${JSON.stringify(previousBody || "")}.`;
+
+function composeSystemPrompt(agentPrompt, maxChars, previousBody) {
+  const framing = DISPLAY_FRAMING_PROMPT(maxChars, previousBody);
+  return typeof agentPrompt === "string" && agentPrompt.trim()
+    ? `${agentPrompt.trim()}\n\n${framing}`
+    : framing;
+}
 
 function stripModelProviderPrefix(modelRef) {
   if (typeof modelRef !== "string") return "";
@@ -414,7 +426,7 @@ async function runAnthropicApi(params, deps) {
   if (!params.apiKey) return { error: "anthropic-api: missing api key" };
   const model = stripModelProviderPrefix(params.model);
   const max_tokens = Number.isFinite(params.maxOutputTokens) ? params.maxOutputTokens : 200;
-  const systemPrompt = params.systemPrompt || DEFAULT_SYSTEM_PROMPT(max_tokens * 4, params.previousBody);
+  const systemPrompt = composeSystemPrompt(params.systemPrompt, max_tokens * 4, params.previousBody);
   const timeoutMs = Number.isFinite(params.timeoutMs) ? params.timeoutMs : 30_000;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -456,7 +468,7 @@ async function runOpenAiCompat(params, deps) {
   if (!params.baseUrl) return { error: "openai-compat: missing baseUrl" };
   const model = stripModelProviderPrefix(params.model);
   const max_tokens = Number.isFinite(params.maxOutputTokens) ? params.maxOutputTokens : 200;
-  const systemPrompt = params.systemPrompt || DEFAULT_SYSTEM_PROMPT(max_tokens * 4, params.previousBody);
+  const systemPrompt = composeSystemPrompt(params.systemPrompt, max_tokens * 4, params.previousBody);
   const timeoutMs = Number.isFinite(params.timeoutMs) ? params.timeoutMs : 30_000;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);

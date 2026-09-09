@@ -240,21 +240,23 @@ function formatWorkerRestartUncertainAck(requestId) {
 }
 
 function formatProtocolHelloAck(payload = {}) {
+  const value = { ...payload };
   const ack = {
     type: APP_PROTOCOL.protocolHelloAck,
-    protocolVersion: payload.protocolVersion || "v2",
-    supportedProtocolVersions: Array.isArray(payload.supportedProtocolVersions)
-      ? payload.supportedProtocolVersions
+    protocolVersion: value.protocolVersion || "v2",
+    supportedProtocolVersions: Array.isArray(value.supportedProtocolVersions)
+      ? value.supportedProtocolVersions
       : ["v2"],
-    reason: payload.reason || null,
+    reason: value.reason || null,
     deprecatedV1: false,
   };
-  if (typeof payload.pluginVersion === "string" && payload.pluginVersion) ack.pluginVersion = payload.pluginVersion;
-  if (typeof payload.requiresClientVersion === "string" && payload.requiresClientVersion) ack.requiresClientVersion = payload.requiresClientVersion;
-  if (typeof payload.pluginId === "string" && payload.pluginId) ack.pluginId = payload.pluginId;
-  const workerEpoch = parseNonNegativeInteger(payload.workerEpoch);
+  if (typeof value.pluginVersion === "string" && value.pluginVersion) ack.pluginVersion = value.pluginVersion;
+  if (typeof value.requiresClientVersion === "string" && value.requiresClientVersion) ack.requiresClientVersion = value.requiresClientVersion;
+  if (typeof value.pluginId === "string" && value.pluginId) ack.pluginId = value.pluginId;
+  if (typeof value.backendKind === "string" && value.backendKind) ack.backendKind = value.backendKind;
+  const workerEpoch = parseNonNegativeInteger(value.workerEpoch);
   if (workerEpoch !== null) ack.workerEpoch = workerEpoch;
-  if (Array.isArray(payload.workerFeatures)) ack.workerFeatures = payload.workerFeatures;
+  if (Array.isArray(value.workerFeatures)) ack.workerFeatures = value.workerFeatures;
   return JSON.stringify(ack);
 }
 

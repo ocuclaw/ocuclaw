@@ -6,15 +6,17 @@ const { activeBackendDisplayName, getActiveBackendKind } = require("../gateway/b
 const { createDisplayToggleTracker } = require("./display-toggle-states.cjs");
 const { decideTitleWrite, isUserOrigin } = require("./session-title-record.cjs");
 const { createDistillerBudget } = require("./session-title-distiller-budget.cjs");
-const { isEtSessionKey } = require("./even-terminal/session-key.cjs");
-const { DEFAULT_HERMES_NAMESPACE, isForeignHermesSessionKey, isHermesSessionKey, parseHermesPublicKey } = require("./hermes-session-keys.cjs");
+const { DEFAULT_HERMES_NAMESPACE, isAdoptableHermesSessionKey, isAdoptedHermesSessionKey, isForeignHermesSessionKey, isHermesSessionKey, parseHermesPublicKey } = require("./hermes-session-keys.cjs");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
 const { gatewaySessionKeyFor } = require("./openclaw-session-key.cjs");
+const { GREETING_SEND_HOLD_DEADLINE_MS, createGreetingSendGate } = require("./greeting-send-gate.cjs");
 
 const SESSION_FIRST_USER_CACHE_FILE = "session-first-user-cache.json";
 const SESSION_TITLE_CACHE_FILE = "session-title-cache.json";
 const SESSION_PIN_CACHE_FILE = "ocuclaw-session-pins.json";
 const SESSION_AGENT_CACHE_FILE = "ocuclaw-session-agents.json";
+
+const SESSION_ADOPT_CACHE_FILE = "ocuclaw-session-adopt-origins.json";
 const PIN_CAP_PER_KIND = 20;
 
 const NEW_SESSION_GREETING_PROMPT =
@@ -92,6 +94,12 @@ function resolveSessionAgentCachePath(stateDir) {
   const resolvedStateDir = normalizeStateDir(stateDir);
   if (!resolvedStateDir) return null;
   return path.join(resolvedStateDir, SESSION_AGENT_CACHE_FILE);
+}
+
+function resolveSessionAdoptCachePath(stateDir) {
+  const resolvedStateDir = normalizeStateDir(stateDir);
+  if (!resolvedStateDir) return null;
+  return path.join(resolvedStateDir, SESSION_ADOPT_CACHE_FILE);
 }
 
 function deriveAgentIdFromFullKey(fullKey) {
@@ -182,8 +190,41 @@ function summarizeChatHistoryIdentity(messages) {
 function createSessionService(opts = {}) {
   const logger = normalizeLogger(opts.logger);
   const gatewayBridge = opts.gatewayBridge;
+  const getOcuClawProfileOptions = Reflect.get(opts, "getOcuClawProfileOptions");
   const conversationState = opts.conversationState;
   const emitDebug = typeof opts.emitDebug === "function" ? opts.emitDebug : () => {};
+  const configuredGreetingHoldDeadlineMs = Reflect.get(opts, "greetingHoldDeadlineMs");
+  const greetingHoldDeadlineMs =
+    Number.isFinite(configuredGreetingHoldDeadlineMs) && configuredGreetingHoldDeadlineMs > 0
+      ? Math.floor(configuredGreetingHoldDeadlineMs)
+      : GREETING_SEND_HOLD_DEADLINE_MS;
+  const greetingSendGate = createGreetingSendGate({
+    deadlineMs: greetingHoldDeadlineMs,
+    onRelease({ sessionKey, reason, heldMs, heldSends }) {
+      const severity =
+        reason === "greeting_end" ? "info" : reason === "session_reset" ? "debug" : "warn";
+      if (reason === "deadline" || reason === "upstream_disconnected") {
+        logger.warn(
+          `[relay] New-session greeting hold released: sessionKey=${sessionKey} reason=${reason} heldMs=${heldMs} heldSends=${heldSends}`,
+        );
+      }
+      if (
+        reason === "greeting_end" ||
+        reason === "deadline" ||
+        reason === "upstream_disconnected" ||
+        reason === "session_reset" ||
+        reason === "greeting_send_rejected"
+      ) {
+        emitDebug(
+          "relay.protocol",
+          "greeting_hold_released",
+          severity,
+          { sessionKey },
+          () => ({ reason, heldMs, heldSends }),
+        );
+      }
+    },
+  });
   const getAgentName =
     typeof opts.getAgentName === "function" ? opts.getAgentName : () => null;
   const getAgentDisplayName =
@@ -221,12 +262,6 @@ function createSessionService(opts = {}) {
   const isPinnedFirstUserMessageKey =
     typeof opts.isPinnedFirstUserMessageKey === "function"
       ? opts.isPinnedFirstUserMessageKey
-      : null;
-  const etHistoryProvider =
-    typeof opts.etHistoryProvider === "function" ? opts.etHistoryProvider : null;
-  const etTranscriptSearchProvider =
-    typeof opts.etTranscriptSearchProvider === "function"
-      ? opts.etTranscriptSearchProvider
       : null;
 
   let currentSessionKey = null;
@@ -268,9 +303,6 @@ function createSessionService(opts = {}) {
       ? configuredGetDefaultSessionAgentRef
       : () => "";
 
-  const etSessionProvider =
-    typeof opts.etSessionProvider === "function" ? opts.etSessionProvider : () => [];
-
   const sessionLimit = opts.sessionLimit || 100;
 
   const persistFirstUserMessages = opts.persistFirstUserMessages !== false;
@@ -301,6 +333,8 @@ function createSessionService(opts = {}) {
 
   const firstSentUserMessageBySession = loadFirstSentUserMessageCache();
 
+  const locallyObservedFirstUserMessageKeys = new Set();
+
   const sessionTitleCachePath = resolveSessionTitleCachePath(opts.stateDir);
 
   const sessionTitleByKey = loadSessionTitleCache();
@@ -314,6 +348,12 @@ function createSessionService(opts = {}) {
   const sessionPinCachePath = resolveSessionPinCachePath(opts.stateDir);
 
   const sessionPinByKey = loadSessionPinCache();
+
+  const sessionAdoptCachePath = resolveSessionAdoptCachePath(
+    opts && typeof opts === "object" ? Reflect.get(opts, "stateDir") : null,
+  );
+
+  const sessionAdoptOriginByKey = loadSessionAdoptCache();
 
   const sessionAgentCachePath = resolveSessionAgentCachePath(opts.stateDir);
 
@@ -492,6 +532,9 @@ function createSessionService(opts = {}) {
       modelProvider: normalized.modelProvider,
       model: normalized.model,
       thinkingLevel: normalizeThinkingLevel(row && row.thinkingLevel),
+      effectiveThinkingLevel: normalizeThinkingLevel(
+        row && (row.effectiveThinkingLevel || row.thinkingLevel || row.thinkingDefault),
+      ),
       reasoningLevel: normalizeReasoningLevel(row && row.reasoningLevel),
       verboseLevel: normalizeVerboseLevel(row && row.verboseLevel),
       fastMode: !!(row && row.fastMode === true),
@@ -661,6 +704,26 @@ function createSessionService(opts = {}) {
       const resolved = await fetchCurrentSessionRow(sessionKey);
       const row = resolved && resolved.row ? resolved.row : null;
       if (!row) {
+
+        const identity = parseHermesPublicKey(sessionKey);
+        if (
+          gatewayBridge.kind === "hermes" && identity?.kind === "minted" &&
+          typeof getOcuClawProfileOptions === "function"
+        ) {
+          const profile = await getOcuClawProfileOptions({ sessionKey });
+          if (
+            profile && (!profile.status || profile.status === "accepted") &&
+            (profile.reasoningLevel === "on" || profile.reasoningLevel === "off")
+          ) {
+            const config = {
+              ...cachedSessionModelConfig(sessionKey),
+              reasoningLevel: profile.reasoningLevel,
+            };
+            sessionModelConfigCache.set(sessionKey, config);
+            notifySessionModelConfigIfCurrent(sessionKey, config);
+            return config;
+          }
+        }
         return cachedSessionModelConfig(sessionKey);
       }
       const config = buildSessionModelConfig(sessionKey, row);
@@ -809,34 +872,15 @@ function createSessionService(opts = {}) {
     return setSessionModelConfig(ensureSessionKey(), patch);
   }
 
-  function mergeEtSessionRows(baseRows) {
-    const rows = Array.isArray(baseRows) ? baseRows.slice() : [];
-    let etRows = [];
-    try {
-      etRows = etSessionProvider() || [];
-    } catch (err) {
-      etRows = [];
-    }
-    const seen = new Set(rows.map((s) => s && s.key));
-    for (const row of etRows) {
-      if (!row || typeof row.key !== "string" || seen.has(row.key)) continue;
-      seen.add(row.key);
-      rows.push(row);
-    }
-    return rows;
-  }
-
   async function getSessions() {
     if (cachedSessions && Date.now() - cachedSessionsFetchedAt < sessionCacheTtlMs) {
-
-      return mergeEtSessionRows(cachedSessions);
+      return cachedSessions;
     }
     if (inFlightSessionsFetch) {
       return inFlightSessionsFetch;
     }
     if (!isUpstreamConnected()) {
-
-      return mergeEtSessionRows(cachedSessions || []);
+      return cachedSessions || [];
     }
 
     inFlightSessionsFetch = (async () => {
@@ -878,6 +922,7 @@ function createSessionService(opts = {}) {
             pinnedAtMs: pinMeta.pinnedAtMs,
             agentId: agentFields.agentId,
             agentName: agentFields.agentName,
+            ...adoptedOriginFields(key),
             activityDescription: rowActivityDescription(row),
             ...rowViewStateFields(row),
           };
@@ -917,11 +962,12 @@ function createSessionService(opts = {}) {
             pinnedAtMs: pinMeta.pinnedAtMs,
             agentId: agentFields.agentId,
             agentName: agentFields.agentName,
+            ...adoptedOriginFields(pendingSessionListKey),
           });
         }
       }
 
-      return mergeEtSessionRows(cacheSessions(sessions));
+      return cacheSessions(sessions);
     })();
 
     return inFlightSessionsFetch.finally(() => {
@@ -936,6 +982,9 @@ function createSessionService(opts = {}) {
 
   function rowViewStateFields(row) {
     const fields = {};
+    if (row && row.agentStatus && typeof row.agentStatus === "object") {
+      fields.agentStatus = row.agentStatus;
+    }
     if (row && typeof row.unread === "boolean") fields.unread = row.unread;
     if (row && typeof row.hidden === "boolean") fields.hidden = row.hidden;
     return fields;
@@ -1009,6 +1058,7 @@ function createSessionService(opts = {}) {
         pinnedAtMs: pinMeta.pinnedAtMs,
         agentId: agentFields.agentId,
         agentName: agentFields.agentName,
+        ...adoptedOriginFields(key),
         activityDescription: rowActivityDescription(row),
         ...rowViewStateFields(row),
       });
@@ -1043,8 +1093,45 @@ function createSessionService(opts = {}) {
     return { key };
   }
 
+  async function adoptForeignSession(sourceKey, options = {}) {
+    if (typeof sourceKey !== "string" || !sourceKey.trim()) {
+      throw new Error("adoptForeignSession requires a session key");
+    }
+    if (!isAdoptableHermesSessionKey(sourceKey)) {
+      throw new Error("adoptForeignSession requires a Desktop, CLI or TUI Hermes session key");
+    }
+    if (!isUpstreamConnected()) {
+      throw new Error("gateway not connected");
+    }
+    const params = { key: sourceKey.trim() };
+    if (options && options.takeOver === true) params.takeOver = true;
+    const result = await gatewayBridge.request("sessions.adopt", params);
+    const status =
+      result && typeof result.status === "string" ? result.status : "accepted";
+    if (status !== "accepted") {
+      const err = new Error(
+        (result && (result.verdict || result.error)) || `sessions.adopt ${status}`,
+      );
+
+      if (result && typeof result.holdState === "string" && result.holdState.trim()) {
+        err.holdState = result.holdState.trim();
+      }
+      throw err;
+    }
+    const key = extractShortKey(result && result.key);
+    if (!key) {
+      throw new Error("sessions.adopt returned no session key");
+    }
+    if (rememberAdoptedOrigin(key, sourceKey.trim())) invalidateSessionsCache();
+    return { key };
+  }
+
   function resolveSessionAgentFields(shortKey, fullKey) {
-    const agentId = getSessionAgentId(shortKey, fullKey);
+
+    const agentId =
+      getActiveBackendKind() === "hermes"
+        ? sessionAgentSelectorId(shortKey)
+        : getSessionAgentId(shortKey, fullKey);
     if (!agentId) {
       return { agentId: null, agentName: null };
     }
@@ -1064,10 +1151,43 @@ function createSessionService(opts = {}) {
     return prefixIndex >= 0 ? fullKey.slice(prefixIndex) : fullKey;
   }
 
+  function supportedMutationShortKey(key) {
+    if (typeof key !== "string") return "";
+    const trimmed = key.trim();
+    if (!trimmed) return "";
+    const scoped = /^agent:([a-z0-9][a-z0-9_-]*):(.+)$/i.exec(trimmed);
+    const shortKey = scoped ? scoped[2] : trimmed;
+    const lower = shortKey.toLowerCase();
+    const prefix = SUPPORTED_SESSION_KEY_PREFIXES_LOWER.find((candidate) =>
+      candidate && lower.startsWith(candidate),
+    );
+    if (!prefix || shortKey.length <= prefix.length) return "";
+    if (isHermesSessionKey(shortKey) && !parseHermesPublicKey(shortKey)) return "";
+    return shortKey;
+  }
+
+  function isSessionMutationKeyForKind(kind, key) {
+    if (kind !== "ocuclaw" && kind !== "evenai") return false;
+    const shortKey = supportedMutationShortKey(key);
+    if (!shortKey || isForeignHermesSessionKey(shortKey)) return false;
+    return kind === "evenai"
+      ? isEvenAiSessionKey(shortKey)
+      : !isEvenAiSessionKey(shortKey);
+  }
+
+  async function resolveSessionMutationKey(kind, key) {
+    if (!isSessionMutationKeyForKind(kind, key)) {
+      throw new Error("unsupported_session_key");
+    }
+    const canonicalKey = await resolveSessionCanonicalKey(key.trim());
+    if (!isSessionMutationKeyForKind(kind, canonicalKey)) {
+      throw new Error("unsupported_session_key");
+    }
+    return canonicalKey;
+  }
+
   function hasSupportedSessionKeyPrefix(key) {
-    if (typeof key !== "string" || key.length === 0) return false;
-    const keyLower = key.toLowerCase();
-    return SUPPORTED_SESSION_KEY_PREFIXES_LOWER.some((prefix) => keyLower.includes(prefix));
+    return supportedMutationShortKey(key) !== "";
   }
 
   function isEvenAiSessionKey(key) {
@@ -1232,6 +1352,60 @@ function createSessionService(opts = {}) {
     }
   }
 
+  function loadSessionAdoptCache() {
+    if (!sessionAdoptCachePath) return new Map();
+    try {
+      if (!fs.existsSync(sessionAdoptCachePath)) return new Map();
+      const parsed = JSON.parse(fs.readFileSync(sessionAdoptCachePath, "utf8"));
+      const out = new Map();
+      for (const [key, value] of Object.entries(parsed ?? {})) {
+        if (isAdoptedHermesSessionKey(key) && typeof value === "string" && isAdoptableHermesSessionKey(value)) {
+          out.set(key, value);
+        }
+      }
+      return out;
+    } catch {
+      return new Map();
+    }
+  }
+
+  function persistSessionAdoptCache() {
+    if (!sessionAdoptCachePath) return;
+    try {
+      fs.mkdirSync(path.dirname(sessionAdoptCachePath), { recursive: true });
+      fs.writeFileSync(
+        sessionAdoptCachePath,
+        JSON.stringify(Object.fromEntries(sessionAdoptOriginByKey.entries())),
+        "utf8",
+      );
+    } catch (err) {
+      logger.error(`[relay] Failed to persist session adopt-origin cache: ${err.message}`);
+    }
+  }
+
+  function rememberAdoptedOrigin(adoptKey, sourceKey) {
+    const key = typeof adoptKey === "string" ? adoptKey.trim() : "";
+    const source = typeof sourceKey === "string" ? sourceKey.trim() : "";
+    if (!key || !source || !isAdoptedHermesSessionKey(key) || !isAdoptableHermesSessionKey(source)) {
+      return false;
+    }
+    if (sessionAdoptOriginByKey.get(key) === source) return true;
+    sessionAdoptOriginByKey.set(key, source);
+    persistSessionAdoptCache();
+    return true;
+  }
+
+  function getAdoptedOrigin(sessionKey) {
+    const key = typeof sessionKey === "string" ? sessionKey.trim() : "";
+    return key ? sessionAdoptOriginByKey.get(key) || null : null;
+  }
+
+  function adoptedOriginFields(sessionKey) {
+    if (!isAdoptedHermesSessionKey(sessionKey)) return {};
+    const origin = getAdoptedOrigin(sessionKey);
+    return { adopted: true, ...(origin ? { adoptedFrom: origin } : {}) };
+  }
+
   function persistSessionPinCache() {
     if (!sessionPinCachePath) return;
     try {
@@ -1376,9 +1550,7 @@ function createSessionService(opts = {}) {
 
   function setSessionPinned(kind, sessionKey, pinned) {
     if (
-      !sessionKey ||
-      isForeignHermesSessionKey(sessionKey) ||
-      (kind !== "ocuclaw" && kind !== "evenai")
+      !isSessionMutationKeyForKind(kind, sessionKey)
     ) {
       return { ok: false, reason: "invalid" };
     }
@@ -1502,6 +1674,7 @@ function createSessionService(opts = {}) {
       }
       try {
         await deleteSingleSession(kind, key);
+        greetingSendGate.evict(key);
         sessionPinByKey.delete(key);
         sessionTitleByKey.delete(key);
         firstSentUserMessageBySession.delete(key);
@@ -1520,12 +1693,6 @@ function createSessionService(opts = {}) {
   async function searchTranscripts(kind, query, searchOpts = {}) {
     const needle = (typeof query === "string" ? query.trim() : "").toLowerCase();
     if (!needle) return { snippets: [], truncated: false, refreshing: false };
-    if (kind === "terminal") {
-      if (!etTranscriptSearchProvider) {
-        return { snippets: [], truncated: false, refreshing: false };
-      }
-      return etTranscriptSearchProvider(query, searchOpts);
-    }
     const maxSnippets = 50;
     const isHermesRuntime = DEFAULT_SESSION_KEY_PREFIX
       .trim()
@@ -1657,7 +1824,7 @@ function createSessionService(opts = {}) {
 
   async function deleteSingleSession(kind, key) {
 
-    const canonicalKey = await resolveSessionCanonicalKey(key);
+    const canonicalKey = await resolveSessionMutationKey(kind, key);
     await gatewayBridge.request("sessions.delete", {
       key: canonicalKey,
       deleteTranscript: true,
@@ -1833,6 +2000,7 @@ function createSessionService(opts = {}) {
     if (firstSentUserMessageBySession.has(sessionKey)) return;
 
     firstSentUserMessageBySession.set(sessionKey, normalized);
+    locallyObservedFirstUserMessageKeys.add(sessionKey);
     pruneFirstSentUserMessageCache();
     persistFirstSentUserMessageCache();
 
@@ -1841,6 +2009,55 @@ function createSessionService(opts = {}) {
       firstUserMessage: normalized,
     });
     pruneFirstUserMessageCache();
+  }
+
+  function recordHistoryFirstUserMessage(sessionKey, messages, options = {}) {
+    const key = extractShortKey(sessionKey);
+    if (!key || !isAdoptedHermesSessionKey(key)) return false;
+    if (options && options.truncatedHead === true) return false;
+    const imported = normalizeSessionText(extractFirstUserMessage(messages));
+    if (!imported) return false;
+
+    const existing = firstSentUserMessageBySession.get(key);
+    if (existing && !locallyObservedFirstUserMessageKeys.has(key)) {
+
+      const cached = firstUserMessageCache.get(key);
+      if (!cached || cached.firstUserMessage !== existing) {
+        firstUserMessageCache.set(key, {
+          updatedAt: Number.MAX_SAFE_INTEGER,
+          firstUserMessage: existing,
+        });
+        pruneFirstUserMessageCache();
+      }
+      return false;
+    }
+    if (existing === imported) {
+      locallyObservedFirstUserMessageKeys.delete(key);
+      return false;
+    }
+
+    firstSentUserMessageBySession.set(key, imported);
+    locallyObservedFirstUserMessageKeys.delete(key);
+    pruneFirstSentUserMessageCache();
+    persistFirstSentUserMessageCache();
+    firstUserMessageCache.set(key, {
+      updatedAt: Number.MAX_SAFE_INTEGER,
+      firstUserMessage: imported,
+    });
+    pruneFirstUserMessageCache();
+    invalidateSessionsCache();
+    emitDebug(
+      "relay.session",
+      "session_first_message_imported",
+      "info",
+      { sessionKey: key },
+      () => ({
+        sessionKey: key,
+        replacedLocal: typeof existing === "string" && existing.length > 0,
+        length: imported.length,
+      }),
+    );
+    return true;
   }
 
   function getSessionTitle(sessionKey) {
@@ -1854,7 +2071,7 @@ function createSessionService(opts = {}) {
   }
 
   function setSessionTitle(sessionKey, title, opts) {
-    if (typeof sessionKey !== "string" || !sessionKey.trim()) {
+    if (!isSessionMutationKeyForKind("ocuclaw", sessionKey)) {
       return { ok: false, code: "invalid_session_key" };
     }
     if (typeof title !== "string" || !title.trim()) {
@@ -1904,7 +2121,7 @@ function createSessionService(opts = {}) {
       );
     }
     if (!skipUpstreamMirror && isUpstreamConnected()) {
-      resolveSessionCanonicalKey(sessionKey)
+      resolveSessionMutationKey("ocuclaw", sessionKey)
         .then((canonicalKey) =>
 
           gatewayBridge.request(
@@ -1930,6 +2147,9 @@ function createSessionService(opts = {}) {
 
   async function setUserSessionTitle(sessionKey, title) {
     if (!isHermesSessionKey(sessionKey)) {
+      if (!isSessionMutationKeyForKind("ocuclaw", sessionKey)) {
+        return { ok: false, code: "session_not_renamable" };
+      }
       return setSessionTitle(sessionKey, title, { userSet: true });
     }
     if (isForeignHermesSessionKey(sessionKey)) {
@@ -1949,7 +2169,12 @@ function createSessionService(opts = {}) {
     if (!isUpstreamConnected()) {
       throw new Error("Hermes backend is disconnected");
     }
-    const canonicalKey = await resolveSessionCanonicalKey(sessionKey);
+    let canonicalKey;
+    try {
+      canonicalKey = await resolveSessionMutationKey("ocuclaw", sessionKey);
+    } catch {
+      return { ok: false, code: "session_not_renamable" };
+    }
     const patched = await gatewayBridge.request(
       "sessions.patch",
       gatewaySessionPatchRequest(sessionKey, {
@@ -2051,11 +2276,13 @@ function createSessionService(opts = {}) {
 
   function clearLogicalSessionState(sessionKey) {
     if (typeof sessionKey !== "string" || !sessionKey.trim()) return;
+    greetingSendGate.evict(sessionKey);
     clearSessionTitle(sessionKey);
     displayToggleTracker.clear(sessionKey);
     distillerBudget.clear(sessionKey);
 
     const hadMarker = firstSentUserMessageBySession.delete(sessionKey);
+    locallyObservedFirstUserMessageKeys.delete(sessionKey);
     firstUserMessageCache.delete(sessionKey);
     if (hadMarker) persistFirstSentUserMessageCache();
     neuralSessionNamesEnabledByKey.delete(sessionKey);
@@ -2144,7 +2371,8 @@ function createSessionService(opts = {}) {
       return cached.firstUserMessage;
     }
 
-    if (strictFirstUserMessage) {
+    const adoptedLane = isAdoptedHermesSessionKey(sessionKey);
+    if (strictFirstUserMessage && !adoptedLane) {
       firstUserMessageCache.set(sessionKey, { updatedAt, firstUserMessage: "" });
       pruneFirstUserMessageCache();
       return "";
@@ -2157,9 +2385,20 @@ function createSessionService(opts = {}) {
           sessionKey,
           limit: 200,
         });
-        firstUserMessage = extractFirstUserMessage(
-          result && Array.isArray(result.messages) ? result.messages : [],
-        );
+        const messages =
+          result && Array.isArray(result.messages) ? result.messages : [];
+        if (adoptedLane) {
+          const historyTotal =
+            result && Number.isFinite(result.total) ? Math.floor(result.total) : null;
+          recordHistoryFirstUserMessage(sessionKey, messages, {
+            truncatedHead: historyTotal !== null && historyTotal > messages.length,
+          });
+          const pinned = firstSentUserMessageBySession.get(sessionKey);
+          if (pinned) return pinned;
+        }
+        if (!strictFirstUserMessage) {
+          firstUserMessage = extractFirstUserMessage(messages);
+        }
       } catch (err) {
         emitDebug(
           "relay.session",
@@ -2172,7 +2411,7 @@ function createSessionService(opts = {}) {
         );
       }
     }
-    if (!firstUserMessage) {
+    if (!firstUserMessage && !strictFirstUserMessage) {
       firstUserMessage = extractFirstUserMessage(fallbackMessages);
     }
     firstUserMessageCache.set(sessionKey, { updatedAt, firstUserMessage });
@@ -2193,6 +2432,7 @@ function createSessionService(opts = {}) {
   function handleUpstreamStatusChange(connected) {
     if (!connected) {
       inFlightSessionsFetch = null;
+      greetingSendGate.releaseAll("upstream_disconnected");
     }
   }
 
@@ -2202,7 +2442,7 @@ function createSessionService(opts = {}) {
       sessionKey.length > 0 &&
       (
         isForeignHermesSessionKey(sessionKey) ||
-        (!hasSupportedSessionKeyPrefix(sessionKey) && !isEtSessionKey(sessionKey))
+        !hasSupportedSessionKeyPrefix(sessionKey)
       )
     ) {
       emitDebug(
@@ -2221,6 +2461,10 @@ function createSessionService(opts = {}) {
 
     const generation = ++sessionSelectionGeneration;
     const stillCurrent = () => generation === sessionSelectionGeneration;
+    if (currentSessionKey && !sameSessionKey(currentSessionKey, sessionKey)) {
+
+      Promise.resolve(markSessionRead(currentSessionKey)).catch(() => {});
+    }
 
     const markPendingSessionList =
       opts.markPendingSessionList === true &&
@@ -2246,38 +2490,7 @@ function createSessionService(opts = {}) {
 
     let outcome = null;
 
-    if (isEtSessionKey(sessionKey) && etHistoryProvider) {
-      try {
-        const rows = await etHistoryProvider(sessionKey);
-
-        const etAgentName = /^et:codex:/.test(sessionKey) ? "Codex" : "Claude";
-        outcome = {
-          hydrate: true,
-          rows: Array.isArray(rows) ? rows : [],
-          agentName: etAgentName,
-          truncatedHead: false,
-        };
-      } catch (err) {
-        emitDebug(
-          "relay.session",
-          "session_history_load_failed",
-          "warn",
-          { sessionKey, lane: "et" },
-          () => ({
-            sessionKey,
-            lane: "et",
-            message: caughtMessage(err),
-            code: caughtCode(err),
-          }),
-        );
-        outcome = {
-          hydrate: true,
-          rows: [],
-          agentName: /^et:codex:/.test(sessionKey) ? "Codex" : "Claude",
-          failed: true,
-        };
-      }
-    } else if (isUpstreamConnected()) {
+    if (isUpstreamConnected()) {
       try {
         const result = await gatewayBridge.request("chat.history", {
           sessionKey,
@@ -2353,6 +2566,12 @@ function createSessionService(opts = {}) {
         truncatedHead: outcome.truncatedHead === true,
         historyUnavailable: outcome.failed === true,
       });
+
+      if (outcome.failed !== true) {
+        recordHistoryFirstUserMessage(sessionKey, outcome.rows, {
+          truncatedHead: outcome.truncatedHead === true,
+        });
+      }
     }
 
     const pages = conversationState.getPages();
@@ -2369,6 +2588,7 @@ function createSessionService(opts = {}) {
     const sendResetCommand = Reflect.get(opts, "sendResetCommand") !== false;
     const materializeImmediately =
       Reflect.get(opts, "materializeImmediately") !== false;
+    if (currentSessionKey) greetingSendGate.evict(currentSessionKey);
     const hasAgentRef = Reflect.has(opts, "agentRef");
     const { sessionKey, agentRef } = mintSessionKey({
       agentRef: hasAgentRef ? Reflect.get(opts, "agentRef") : "",
@@ -2376,6 +2596,9 @@ function createSessionService(opts = {}) {
     });
 
     sessionSelectionGeneration += 1;
+    if (currentSessionKey) {
+      Promise.resolve(markSessionRead(currentSessionKey)).catch(() => {});
+    }
     invalidateSessionsCache();
     if (onSessionStateReset) {
       onSessionStateReset();
@@ -2423,6 +2646,8 @@ function createSessionService(opts = {}) {
       const resetGatewayKey = resetAgentId
         ? gatewaySessionKeyFor(sessionKey, resetAgentId)
         : sessionKey;
+
+      greetingSendGate.arm(sessionKey);
       gatewayBridge
         .sendMessage(
           `/new ${activeNewSessionGreetingPrompt()}`,
@@ -2430,8 +2655,19 @@ function createSessionService(opts = {}) {
           null,
           resetGatewayKey !== sessionKey ? { agentId: resetAgentId } : undefined,
         )
+        .then((ack) => {
+          const status =
+            ack && typeof ack.status === "string" ? ack.status.trim().toLowerCase() : "";
+
+          if (status && status !== "accepted" && status !== "queued") {
+            greetingSendGate.evict(sessionKey, "greeting_send_rejected");
+            return;
+          }
+          greetingSendGate.noteGreetingRun(sessionKey, ack && ack.runId, "accepted");
+        })
         .catch((err) => {
           logger.error(`[relay] Failed to send /new for new session: ${err.message}`);
+          greetingSendGate.evict(sessionKey);
         });
     }
     return { sessionKey, pages };
@@ -2518,14 +2754,25 @@ function createSessionService(opts = {}) {
     pendingInitialConfigSessionKeys.delete(sessionKey);
   }
 
+  function dispatchUserSend(sessionKey, send) {
+    return greetingSendGate.dispatch(sessionKey, send);
+  }
+
+  function observeGreetingActivity(sessionKey, phase, runId, origin) {
+    return greetingSendGate.onActivity(sessionKey, phase, runId, origin);
+  }
+
   return {
     ensureSessionKey,
     peekSessionKey,
     createDetachedSessionKey,
     recordFirstSentUserMessage,
+    recordHistoryFirstUserMessage,
     flushFirstSentUserMessageCache,
     invalidateSessionsCache,
     handleUpstreamStatusChange,
+    dispatchUserSend,
+    observeGreetingActivity,
     getSessionModelConfig,
     getCurrentSessionModelConfig,
     setSessionModelConfig,
@@ -2540,6 +2787,9 @@ function createSessionService(opts = {}) {
     discardDraftSession,
     getSessions,
     copyForeignSession,
+    adoptForeignSession,
+    rememberAdoptedOrigin,
+    getAdoptedOrigin,
     getSessionTitle,
     getSessionTitleRecord,
     getSessionsByExactKeys,

@@ -62,6 +62,35 @@ CONTROL_PATH = "/_ocuclaw/pair/control/v1"
 AUTH_HEADER = "x-ocuclaw-pair-control-auth"
 SECRET_HEADER = "x-ocuclaw-pair-control-secret"
 
+
+def _build_direct_http_opener():
+    """Build the credentialed loopback transport without ambient proxies."""
+
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+_DIRECT_HTTP_OPENER = _build_direct_http_opener()
+
+
+def _valid_control_url(value: Any) -> bool:
+    """Accept only the relay's explicit loopback control endpoint."""
+
+    try:
+        parsed = urllib.parse.urlsplit(str(value))
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    return (
+        parsed.scheme == "http"
+        and parsed.hostname in {"127.0.0.1", "::1"}
+        and parsed.username is None
+        and parsed.password is None
+        and port is not None
+        and parsed.path == CONTROL_PATH
+        and not parsed.query
+        and not parsed.fragment
+    )
+
 #: The env key of the managed Relay Credential (adapter.OCUCLAW_RELAY_TOKEN_ENV).
 RELAY_TOKEN_ENV = "OCUCLAW_RELAY_TOKEN"
 
@@ -719,8 +748,11 @@ def _post(
     credential: str,
     control_secret: Optional[str] = None,
     timeout: float = 10.0,
+    opener: Any = None,
 ) -> Tuple[int, Dict[str, Any]]:
     """POST one control request. Returns (status, parsed-body)."""
+    if not _valid_control_url(url):
+        raise ControlError("Refused a non-loopback OcuClaw pairing control URL.")
     body = json.dumps(payload).encode("utf-8")
     headers = {
         "content-type": "application/json",
@@ -730,7 +762,11 @@ def _post(
         headers[SECRET_HEADER] = control_secret
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        # The Relay Credential is reusable. Even for a loopback URL, the default
+        # urllib opener can hand every header to HTTP_PROXY/http_proxy. Keep this
+        # transport direct so ambient process configuration cannot redirect it.
+        transport = opener if opener is not None else _DIRECT_HTTP_OPENER
+        with transport.open(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8", "replace")
             return int(response.status), _parse(raw)
     except urllib.error.HTTPError as exc:
@@ -861,6 +897,218 @@ def _outcome_text(state: str, failure: Any, credential_exposure: str) -> str:
     return "\n  " + _FAILURE_TEXT.get(reason, _GENERIC_FAILURE) + "\n"
 
 
+#: Environment variables that name the terminal's character set, most specific
+#: first. This is POSIX precedence: ``LC_ALL`` overrides everything, ``LC_CTYPE``
+#: overrides ``LANG`` for character handling specifically.
+_LOCALE_VARS = ("LC_ALL", "LC_CTYPE", "LANG")
+
+
+def _looks_utf8(value: Optional[str]) -> bool:
+    """Whether [value] names UTF-8, in any of the spellings seen in the wild."""
+    if not value:
+        return False
+    normalized = value.lower().replace("-", "").replace("_", "")
+    return "utf8" in normalized
+
+
+def terminal_declares_unicode(
+    stream: TextIO,
+    environ: Optional[Mapping[str, str]] = None,
+) -> bool:
+    """Whether the ENVIRONMENT claims a UTF-8 terminal.
+
+    Two separate questions, both of which must answer yes: what Python will
+    encode with (``stream.encoding``), and what the locale says the terminal
+    reads. Unknown reads as no.
+
+    This is only ever a claim. #2505 was found in a container whose
+    ``LC_CTYPE`` said ``C.UTF-8`` while the xterm displaying it was in Latin-1
+    and painted the pairing QR as mojibake — the environment was set correctly
+    and the terminal still could not read what we wrote. So this is the
+    FALLBACK; :func:`probe_terminal_unicode` asks the terminal itself and its
+    answer wins whenever it can be obtained.
+    """
+    env = os.environ if environ is None else environ
+    encoding = getattr(stream, "encoding", None)
+    if not _looks_utf8(encoding if isinstance(encoding, str) else None):
+        return False
+    for name in _LOCALE_VARS:
+        value = env.get(name)
+        if value:
+            # First one set wins, per POSIX precedence — a UTF-8 LANG does not
+            # rescue an LC_ALL that names something else.
+            return _looks_utf8(value)
+    return False
+
+
+#: Written by the probe. Two UTF-8 bytes (C3 A9) that are ALSO two printable
+#: Latin-1 characters ("Ã©"), so the two modes differ by cursor advance: one
+#: column when decoded as UTF-8, two when decoded as single bytes. A character
+#: whose trailing bytes are Latin-1 CONTROLS would advance one column either
+#: way and tell us nothing — which is exactly what the half-block glyphs the QR
+#: is drawn with do, and why they fail silently.
+_PROBE_CHAR = "é"
+
+#: How long to wait for the terminal to answer. A terminal that does not
+#: implement the cursor report simply never answers, and every millisecond
+#: here is one the wearer spends looking at a blank screen.
+_PROBE_TIMEOUT_S = 0.3
+
+
+def probe_terminal_unicode(
+    stdin: TextIO,
+    stdout: TextIO,
+    *,
+    timeout_s: float = _PROBE_TIMEOUT_S,
+) -> Optional[bool]:
+    """Ask the TERMINAL whether it decodes UTF-8. ``None`` when it will not say.
+
+    Writes one two-byte UTF-8 character and asks where the cursor ended up
+    (``ESC [ 6 n``, the standard cursor-position report). A terminal in UTF-8
+    mode advances one column; a terminal reading those bytes singly paints two
+    characters and advances two. Nothing else distinguishes the two modes from
+    inside the process — the environment can and does lie.
+
+    The probe writes to a freshly erased line and erases it again afterwards,
+    so nothing survives on screen. It puts the terminal in raw mode to read the
+    reply and restores the previous settings unconditionally.
+
+    Every failure returns ``None`` rather than a guess: not a terminal, no
+    termios, no reply in time, an unparseable reply, or an advance that is
+    neither one nor two. The caller falls back to the environment's claim.
+
+    Caveat: while waiting, the reply is read from stdin. A keystroke typed
+    ahead in that window is consumed. This runs once, immediately before the
+    pairing block, at a point where there is nothing yet to type.
+    """
+    try:
+        import select
+        import termios
+        import tty
+    except ImportError:  # pragma: no cover - POSIX-only, as Hermes is
+        return None
+
+    try:
+        if not (stdin.isatty() and stdout.isatty()):
+            return None
+        fd = stdin.fileno()
+        saved = termios.tcgetattr(fd)
+    except Exception:  # noqa: BLE001 - an unaskable terminal is unknown
+        return None
+
+    try:
+        tty.setraw(fd)
+        stdout.write("\r\x1b[2K" + _PROBE_CHAR + "\x1b[6n")
+        stdout.flush()
+        reply = ""
+        while "R" not in reply:
+            ready, _, _ = select.select([fd], [], [], timeout_s)
+            if not ready:
+                return None
+            chunk = os.read(fd, 32)
+            if not chunk:
+                return None
+            reply += chunk.decode("ascii", "replace")
+            if len(reply) > 64:
+                return None
+    except Exception:  # noqa: BLE001 - a terminal that misbehaves is unknown
+        return None
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+            # Erase the probe whether or not it was answered.
+            stdout.write("\r\x1b[2K")
+            stdout.flush()
+        except Exception:  # noqa: BLE001 - nothing left to restore it with
+            pass
+
+    match = re.search(r"\x1b\[[0-9]+;([0-9]+)R", reply)
+    if match is None:
+        return None
+    advance = int(match.group(1)) - 1
+    if advance == 1:
+        return True
+    if advance == 2:
+        return False
+    return None
+
+
+def terminal_supports_unicode(
+    stream: TextIO,
+    environ: Optional[Mapping[str, str]] = None,
+    stdin: Optional[TextIO] = None,
+) -> bool:
+    """Whether the terminal will DECODE what we encode as UTF-8.
+
+    The terminal's own answer wins. Only when it will not answer does the
+    environment's claim decide — see :func:`terminal_declares_unicode` for why
+    that claim is not trusted first.
+
+    Unknown, either way, reads as no. A false yes prints an unscannable code
+    and says nothing; a false no prints a working manual path and explains
+    itself.
+    """
+    encoding = getattr(stream, "encoding", None)
+    if not _looks_utf8(encoding if isinstance(encoding, str) else None):
+        # We could not even emit UTF-8, so what the terminal reads is moot.
+        return False
+    if stdin is not None:
+        probed = probe_terminal_unicode(stdin, stream)
+        if probed is not None:
+            return probed
+    return terminal_declares_unicode(stream, environ)
+
+
+def terminal_supports_color(
+    stream: TextIO,
+    environ: Optional[Mapping[str, str]] = None,
+) -> bool:
+    """Whether ANSI SGR colour is usable on [stream].
+
+    Honours ``NO_COLOR`` (https://no-color.org) and the ``dumb`` terminal, both
+    of which are explicit statements by the operator or the environment that
+    escape sequences are unwelcome. A non-TTY never gets colour.
+    """
+    env = os.environ if environ is None else environ
+    if env.get("NO_COLOR"):
+        return False
+    term = (env.get("TERM") or "").strip().lower()
+    if term in ("", "dumb"):
+        return False
+    try:
+        return bool(stream.isatty())
+    except Exception:  # noqa: BLE001 - an unaskable stream gets no escapes
+        return False
+
+
+def terminal_columns(fallback: int = 0) -> int:
+    """Usable terminal width, or [fallback] when it cannot be determined.
+
+    ``shutil.get_terminal_size`` already consults ``COLUMNS`` and then the
+    device itself, and substitutes its own default when both fail. That default
+    is a guess, and guessing wide enough to print a QR that then wraps is the
+    one outcome worth avoiding, so a failure here returns [fallback] instead.
+    """
+    try:
+        columns = int(shutil.get_terminal_size().columns)
+    except Exception:  # noqa: BLE001 - an unmeasurable terminal is unknown
+        return fallback
+    return columns if columns > 0 else fallback
+
+
+def _terminal_capabilities(
+    stream: TextIO,
+    environ: Optional[Mapping[str, str]] = None,
+    stdin: Optional[TextIO] = None,
+) -> Dict[str, Any]:
+    """The terminal description sent with a create request."""
+    return {
+        "unicode": terminal_supports_unicode(stream, environ, stdin),
+        "color": terminal_supports_color(stream, environ),
+        "columns": terminal_columns(),
+    }
+
+
 def run_pair(
     address: str,
     *,
@@ -935,7 +1183,15 @@ def run_pair(
     try:
         status, created = post_fn(
             url,
-            {"v": 1, "op": "create", "address": address, "lightTerminal": light_terminal},
+            {
+                "v": 1,
+                "op": "create",
+                "address": address,
+                "lightTerminal": light_terminal,
+                # The host renders the block, but only this side can see the
+                # terminal it will be printed on (#2505).
+                "terminal": _terminal_capabilities(out, None, inp),
+            },
             credential=credential,
         )
     except ControlError as exc:

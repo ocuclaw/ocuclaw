@@ -5,6 +5,7 @@ const { APP_PROTOCOL, WORKER_FEATURES, estimateJsonByteLength, formatProtocolHel
 const { createWorkerMessageSendQueue } = require("./relay-worker-queue.cjs");
 const { createRelayWorkerHealthMonitor } = require("./relay-worker-health.cjs");
 const { createApprovalReplayCache } = require("./relay-worker-approval-replay-cache.cjs");
+const { createLiveuiRenderErrorAuthority } = require("./liveui-render-error-authority.cjs");
 const { createRelayClientNudgeController } = require("./relay-client-nudge-controller.cjs");
 const { constantTimeEqual } = require("../domain/constant-time-equal.cjs");
 const { PAIRING_CONTROL_MAX_REQUEST_BODY_BYTES, PAIRING_MAX_REQUEST_BODY_BYTES, isPairingControlPath, isPairingEndpointPath } = require("../domain/pairing/pairing-endpoint-address.cjs");
@@ -14,6 +15,8 @@ const { normalizeLogger } = require("../domain/logger-adapter.cjs");
 const WebSocket = WebSocketModule.default || WebSocketModule.WebSocket || WebSocketModule;
 const WebSocketServer = WebSocketModule.WebSocketServer || WebSocketModule.Server || WebSocket.Server;
 const SEND_BUFFER_HIGH_WATER_BYTES = 262_144;
+
+const SEND_BUFFER_RETRY_MS = 50;
 
 const SEND_BUFFER_HIGH_WATER_SHED_MS = 30_000;
 
@@ -52,6 +55,7 @@ function createRelayWorkerTransport(options = {}) {
       ? Math.floor(options.listenRetryMaxAttempts)
       : 5;
   let manifest = null;
+  let backendKind = "openclaw";
   let httpServer = null;
   let wss = null;
   let nextClientId = 1;
@@ -90,6 +94,7 @@ function createRelayWorkerTransport(options = {}) {
   let loopDelayMonitor = null;
   const clients = new Map();
   const protocolState = new Map();
+  const liveuiRenderErrors = createLiveuiRenderErrorAuthority({ now });
   const outboundQueues = new Map();
 
   const sendBufferOverWaterSince = new Map();
@@ -206,6 +211,8 @@ function createRelayWorkerTransport(options = {}) {
         postCoalescable: [],
         bestEffort: [],
         draining: false,
+        retryTimer: null,
+        pressureWarned: false,
       };
       outboundQueues.set(clientId, queue);
     }
@@ -331,32 +338,60 @@ function createRelayWorkerTransport(options = {}) {
   function drainClientQueue(clientId) {
     const ws = clients.get(clientId);
     const q = outboundQueues.get(clientId);
-    if (!ws || !q || q.draining || ws.readyState !== WebSocket.OPEN) return;
+    if (!ws || !q || q.draining || q.retryTimer !== null || ws.readyState !== WebSocket.OPEN) return;
+    const isCurrent = () => clients.get(clientId) === ws &&
+      outboundQueues.get(clientId) === q && ws.readyState === WebSocket.OPEN;
     q.draining = true;
     queueMicrotask(() => {
       try {
-        let frame;
-        while ((frame = nextQueuedFrame(q))) {
-          ws.send(frame);
+        while (isCurrent() && hasQueuedFrames(q)) {
+
           if (Number.isFinite(ws.bufferedAmount) && ws.bufferedAmount > SEND_BUFFER_HIGH_WATER_BYTES) {
-            emitDebug("worker_client_send_buffer_high_water", "warn", {
-              clientId,
-              bufferedAmountBytes: ws.bufferedAmount,
-            });
+            if (!q.pressureWarned) {
+              q.pressureWarned = true;
+              emitDebug("worker_client_send_buffer_high_water", "warn", {
+                clientId,
+                bufferedAmountBytes: ws.bufferedAmount,
+              });
+            }
             break;
           }
+          q.pressureWarned = false;
+          ws.send(nextQueuedFrame(q));
         }
       } finally {
         q.draining = false;
-        if (hasQueuedFrames(q)) setTimeout(() => drainClientQueue(clientId), 0);
+        if (isCurrent() && hasQueuedFrames(q)) {
+          q.retryTimer = setTimeout(() => {
+            if (!isCurrent()) return;
+            q.retryTimer = null;
+            drainClientQueue(clientId);
+          }, SEND_BUFFER_RETRY_MS);
+          if (typeof q.retryTimer.unref === "function") q.retryTimer.unref();
+        }
       }
     });
+  }
+
+  function clearClientQueue(clientId) {
+    const q = outboundQueues.get(clientId);
+    if (q && q.retryTimer !== null) clearTimeout(q.retryTimer);
+    outboundQueues.delete(clientId);
+  }
+
+  function connectedAppIds() {
+    return [...clients.entries()]
+      .filter(([id, ws]) => ws.readyState === WebSocket.OPEN && isAppClient(id))
+      .map(([id]) => id);
   }
 
   function broadcastApp(frame, options = {}) {
     const type = options.knownType !== undefined
       ? options.knownType
       : parseMessageType(frame);
+    const liveuiFrame = type === "glasses_ui_render" || type === "glasses_ui_surface_update"
+      ? parseFrame(frame) : null;
+    if (liveuiFrame) liveuiRenderErrors.record(liveuiFrame, connectedAppIds());
     const hasLedgerClient = type === APP_PROTOCOL.pages && [...protocolState.values()].some(
       (state) => state.clientKind === "app" &&
         Array.isArray(state.clientCapabilities) &&
@@ -371,7 +406,10 @@ function createRelayWorkerTransport(options = {}) {
         state.clientCapabilities.includes("ledgerV1");
       if (type === APP_PROTOCOL.entries && !supportsLedgerV1) continue;
       if (type === APP_PROTOCOL.pages && suppressPagesForLedgerClients && supportsLedgerV1) continue;
-      enqueueFrame(clientId, frame, options);
+
+      const outgoing = liveuiFrame
+        ? JSON.stringify({ ...liveuiFrame, renderErrorClientId: clientId }) : frame;
+      enqueueFrame(clientId, outgoing, options);
     }
   }
 
@@ -515,6 +553,7 @@ function createRelayWorkerTransport(options = {}) {
       pluginVersion: manifest.pluginVersion,
       requiresClientVersion: manifest.requiresClientVersion,
       pluginId: manifest.pluginId,
+      backendKind,
       workerEpoch: manifest.workerEpoch,
       workerFeatures: WORKER_FEATURES,
     }));
@@ -735,6 +774,11 @@ function createRelayWorkerTransport(options = {}) {
       clientId,
       raw,
       requestId: normalizeRequestId(parsed.requestId),
+      ...(parsed.type === "glasses_ui_render_error" ? {
+        liveuiRenderErrorAuthority: isAppClient(clientId)
+          ? liveuiRenderErrors.check(clientId, parsed, connectedAppIds())
+          : { eligible: false, reason: "not_app_client" },
+      } : {}),
       operation: parseMessageType(parsed),
       workerEpoch: manifest.workerEpoch,
       queuedAtMs: now(),
@@ -1004,6 +1048,9 @@ function createRelayWorkerTransport(options = {}) {
 
   async function start(nextManifest) {
     manifest = nextManifest;
+    backendKind = typeof nextManifest.backendKind === "string" && nextManifest.backendKind
+      ? nextManifest.backendKind
+      : "openclaw";
     nudgeController = createRelayClientNudgeController({
       thresholds: manifest.nudge || {},
       isAppClient,
@@ -1091,8 +1138,9 @@ function createRelayWorkerTransport(options = {}) {
       });
       ws.on("close", (code, reason) => {
         clients.delete(clientId);
+        liveuiRenderErrors.forgetClient(clientId);
         protocolState.delete(clientId);
-        outboundQueues.delete(clientId);
+        clearClientQueue(clientId);
         sendBufferOverWaterSince.delete(clientId);
         if (nudgeController) nudgeController.deleteClient(clientId);
         const closeReasonStr =
@@ -1281,7 +1329,7 @@ function createRelayWorkerTransport(options = {}) {
     for (const ws of clients.values()) ws.terminate();
     clients.clear();
     protocolState.clear();
-    outboundQueues.clear();
+    for (const clientId of outboundQueues.keys()) clearClientQueue(clientId);
     sendBufferOverWaterSince.clear();
     if (nudgeController) nudgeController.clear();
     nudgeController = null;

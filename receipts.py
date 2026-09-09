@@ -71,7 +71,7 @@ FIRST_RUN_PROOF_FILENAME = "ocuclaw.first-run-proof.json"
 GATEWAY_STATE_FILENAME = "gateway_state.json"
 STATE_DIRNAME = "state"
 
-APP_PRESENCE_SCHEMA_VERSION = 1
+APP_PRESENCE_SCHEMA_VERSION = 2
 FIRST_RUN_PROOF_SCHEMA_VERSION = 1
 
 RECEIPT_FILE_MODE = 0o600
@@ -766,11 +766,12 @@ def build_app_presence_body(
     client_versions: Any,
     last_transition_at: Optional[str],
     observation_error_code: Optional[str],
+    device: Any = None,
     pid: Optional[int] = None,
     start_time: Optional[int] = None,
     updated_at: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """The exact v1 body from #1273 §8 — no more, no less.
+    """The exact v2 body: app presence plus bounded G2 device truth.
 
     There is deliberately no ``appConnected`` field: ``authenticatedAppCount
     > 0`` already derives phone health, and a second field for the same fact
@@ -780,6 +781,16 @@ def build_app_presence_body(
     versions = []
     if isinstance(client_versions, (list, tuple)):
         versions = [str(item) for item in client_versions if isinstance(item, str)]
+    device_body = {
+        "connected": None,
+        "batteryPercent": None,
+        "charging": None,
+        "inCase": None,
+        "observedAt": None,
+    }
+    if isinstance(device, Mapping):
+        for key in device_body:
+            device_body[key] = device.get(key)
     return {
         "schemaVersion": APP_PRESENCE_SCHEMA_VERSION,
         "profileFingerprint": profile_fingerprint,
@@ -793,6 +804,7 @@ def build_app_presence_body(
         "authenticatedAppCount": authenticated_app_count,
         "clientVersions": versions,
         "lastTransitionAt": last_transition_at,
+        "device": device_body,
         "observationErrorCode": observation_error_code,
     }
 

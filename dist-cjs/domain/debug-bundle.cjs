@@ -1,11 +1,12 @@
-const { bucketEventsToFiles, renderBundleReadme } = require("./debug-bundle-format.cjs");
+const { bucketEventsToFiles, renderBundleReadme, isIncidentEvent } = require("./debug-bundle-format.cjs");
 const { redactEvents } = require("./debug-bundle-redaction.cjs");
 const { zipFiles, sha256Hex } = require("./debug-bundle-zip.cjs");
 const { strToU8 } = require("fflate");
+const { countLanes } = require("./debug-retention.cjs");
 
 const LIVEUI_LANE = ["glasses.lifecycle", "openclaw.message", "evenai"];
 const SCHEMA_VERSION = 1;
-const FORMAT_VERSION = 1;
+const FORMAT_VERSION = 2;
 
 const CATEGORY_SERIALIZED_BYTES_CAP = 4_194_304;
 
@@ -42,10 +43,17 @@ function assembleBundle(dumpResult, opts) {
 
   let events = redactEvents(dumpResult.events, { mode: opts.redactionMode });
   let ringCapped = opts.ringCappedWindow;
+  const zipOmitted = { phone: 0, relay: 0 };
+  opts = { ...opts, zipOmitted };
 
   const dropOldest = () => {
-    events.sort((a, b) => a.ts - b.ts || (a.seq || 0) - (b.seq || 0));
-    events = events.slice(Math.ceil(events.length * 0.1));
+    events.sort((a, b) => Number(isIncidentEvent(a)) - Number(isIncidentEvent(b)) || a.ts - b.ts || (a.seq || 0) - (b.seq || 0));
+    const detailCount = events.filter(event => !isIncidentEvent(event)).length;
+    const removed = Math.min(Math.ceil(events.length * 0.1), detailCount || events.length);
+    const counts = countLanes(events.slice(0, removed));
+    zipOmitted.phone += counts.phone;
+    zipOmitted.relay += counts.relay;
+    events = events.slice(removed);
 
     ringCapped = true;
   };
@@ -64,15 +72,33 @@ function assembleBundle(dumpResult, opts) {
 
 function buildArtifacts(events, dumpResult, appliedQuery, opts, ringCapped) {
 
-  const { files, summary } = bucketEventsToFiles({
+  const { files, summary, retainedEvents, omittedEvents } = bucketEventsToFiles({
     events,
     ringEvents: dumpResult.ringEvents,
     ringCapacity: dumpResult.ringCapacity,
     appliedQuery,
     perCategoryBytesCap: CATEGORY_SERIALIZED_BYTES_CAP,
   });
+  const finalCounts = countLanes(retainedEvents);
+  const categoryOmitted = countLanes(omittedEvents);
+  const inputCounts = countLanes(dumpResult.events || []);
+  const lanes = {};
+  for (const name of ["relay", "phone"]) {
+    const source = opts.lanes?.[name] || { status: name === "phone" ? "missing" : "ok" };
+    const laneRows = retainedEvents.filter((event) => (event.source === "phone" ? "phone" : "relay") === name);
+    let fromMs = null; let toMs = null;
+    for (const event of laneRows) {
+      if (Number.isFinite(event.ts)) {
+        fromMs = fromMs === null ? event.ts : Math.min(fromMs, event.ts);
+        toMs = toMs === null ? event.ts : Math.max(toMs, event.ts);
+      }
+    }
+    lanes[name] = { ...source, events: finalCounts[name], selectedEvents: inputCounts[name],
+      categoryOmitted: categoryOmitted[name], zipOmitted: opts.zipOmitted[name], fromMs, toMs,
+      detailUnavailableEvents: laneRows.filter(event => event.data?.detailUnavailable === true).length };
+  }
 
-  const lane = events
+  const lane = retainedEvents
     .filter((e) => LIVEUI_LANE.includes(e.cat))
     .sort((a, b) => a.ts - b.ts || (a.seq || 0) - (b.seq || 0));
   if (lane.length) {
@@ -118,6 +144,10 @@ function buildArtifacts(events, dumpResult, appliedQuery, opts, ringCapped) {
     );
   }
 
+  for (const [name, content] of opts.clientDiagnostics?.files || []) {
+    files.set(name, content);
+    summary.totalBytes += strToU8(content).length;
+  }
   const contentNames = [...files.keys()].filter((n) => n !== "metadata.json").sort();
   const concat = contentNames.map((n) => files.get(n)).join("");
   const contentSha256 = sha256Hex(strToU8(concat));
@@ -134,6 +164,9 @@ function buildArtifacts(events, dumpResult, appliedQuery, opts, ringCapped) {
       ringCappedWindow: ringCapped,
     },
     ring: { events: dumpResult.ringEvents, capacity: dumpResult.ringCapacity },
+    lanes,
+    retentionAccountingVersion: 1,
+    phoneDiagnostics: opts.clientDiagnostics?.metadata || { status: "missing" },
     totalBytes: summary.totalBytes,
     contentSha256,
     build: opts.build,

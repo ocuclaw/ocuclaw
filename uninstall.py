@@ -14,6 +14,15 @@ command independent of Hermes discovery and plugin metadata.  A verified
 live Managed Serve Route is a preflight stop: the operator receives the
 already-approved narrow teardown command and reruns the uninstall after
 applying it.  Routes whose ownership is not proven are left alone.
+
+Since #2084 the product also owns a second lifecycle Hermes does not manage:
+the generated standalone Desktop runtime at
+``<HERMES_HOME>/desktop-plugins/ocuclaw/plugin.js``.  Hermes Desktop scans that
+directory itself, so generic ``hermes plugins remove ocuclaw`` removes the
+Agent package and leaves that runtime loading.  This module is therefore the
+only complete removal path, and it carries the recovery for the case where
+generic removal already ran: :data:`ORPHAN_RECOVERY_SOURCE`, a self-contained
+interpreter-level program that needs none of this package.
 """
 
 from __future__ import annotations
@@ -52,6 +61,7 @@ SECRET_KEYS: Sequence[str] = (
 # dedicated <HERMES_HOME>/ocuclaw directory rather than trusting an arbitrary
 # configured path as ownership proof.
 RUNTIME_STATE_FILES: Sequence[str] = (
+    "companion-snapshot.json",
     "debug-arm.json",
     "even-ai-settings.json",
     "even-terminal-transcript-cache.json",
@@ -73,8 +83,18 @@ RUNTIME_STATE_FILES: Sequence[str] = (
 RUNTIME_STATE_DIRS: Sequence[str] = ("internal-agent-runs",)
 
 # Exact files written beneath <HERMES_HOME>/state by the Python adapter.
+#
+# Every OcuClaw writer that can land in this directory must appear here or be
+# named as a documented retention in the removal contract; nothing owned may be
+# left behind by accident. The list therefore includes the hidden lock sidecars
+# the receipt state machines create next to their receipts
+# (`relay_credential._generation_lock`, `receipts.receipt_state_lock`), which
+# are OcuClaw-owned files even though no product state ever reaches them.
 PROFILE_STATE_FILES: Sequence[str] = (
+    ".ocuclaw.relay-credential.json.lock",
     "ocuclaw.app-presence.json",
+    "ocuclaw.desktop-credentials.json",
+    "ocuclaw.desktop-credentials.lock",
     "ocuclaw.desktop-pairing-activation.json",
     "ocuclaw.desktop-presenter-capability.json",
     "ocuclaw.first-run-phone-candidate.json",
@@ -220,6 +240,13 @@ def _rmtree_owned(path: Path, *, attempts: int = 3) -> None:
 
 
 def _remove_dir(path: Path, removed: list[str], failures: list[str]) -> None:
+    # An already-absent directory is not a removal. `_remove_file` has always
+    # said so by swallowing FileNotFoundError without recording anything; the
+    # rmtree helper below treats the same condition as success, so without
+    # this guard a rerun's receipt claims to have removed a directory that was
+    # not there.
+    if _path_absent(path):
+        return
     try:
         _rmtree_owned(path)
         removed.append(str(path))
@@ -228,6 +255,78 @@ def _remove_dir(path: Path, removed: list[str], failures: list[str]) -> None:
             failures.append(str(path))
     except OSError:
         failures.append(str(path))
+
+
+def _desktop_runtime_path(home: Path) -> Path:
+    """The one generated standalone Desktop runtime (#2084 topology)."""
+
+    return home / "desktop-plugins" / PLUGIN_NAME / "plugin.js"
+
+
+def _nested_desktop_runtime_path(home: Path) -> Path:
+    """The pre-#2084 unified-half entry, still a live Hermes 0.21 door."""
+
+    return home / "plugins" / PLUGIN_NAME / "desktop" / "plugin.js"
+
+
+def _desktop_entry_owned(path: Path) -> bool:
+    from .desktop_pairing import plugin_owned
+
+    return plugin_owned(path)
+
+
+def _remove_owned_desktop_runtime(
+    path: Path, removed: list[str], failures: list[str]
+) -> None:
+    """Remove the proven-owned runtime, its own temporaries, and its folder.
+
+    ``desktop_pairing._write_private_plugin`` renders through a private
+    ``.plugin.js.<pid>.<token>.tmp`` sibling and replaces atomically, so an
+    interrupted reconcile can leave one behind. Those names are written by
+    this product and by nothing else, so they are owned artifacts too — and
+    leaving one would also keep the generated folder alive. The folder itself
+    is removed only when it ends up empty, which preserves any unrecognised
+    sibling exactly as ``desktop_pairing.remove_owned_plugin`` does.
+    """
+
+    _remove_file(path, removed, failures)
+    parent = path.parent
+    try:
+        leftovers = sorted(parent.glob(f".{path.name}.*.tmp"))
+    except OSError:
+        leftovers = []
+    for leftover in leftovers:
+        if leftover.is_symlink() or not leftover.is_file():
+            continue
+        _remove_file(leftover, removed, failures)
+    try:
+        parent.rmdir()
+    except OSError:
+        # A foreign sibling keeps the directory. The owned file is gone.
+        return
+    removed.append(str(parent))
+
+
+def _owned_desktop_runtime_absent(home: Path) -> bool:
+    """No OcuClaw-owned entry sits at either Hermes 0.21 Desktop loader door.
+
+    ``apps/desktop/src/contrib/runtime-loader.ts`` ``diskRoots()`` scans exactly
+    ``<home>/desktop-plugins/<folder>/plugin.js`` and
+    ``<home>/plugins/<folder>/desktop/plugin.js`` and keys live plugins by entry
+    file path, so those two paths are the whole loadable surface. A *foreign*
+    file at either door is deliberately not a failure: uninstall preserves it,
+    and the receipt reports it as preserved rather than pretending it is ours.
+    """
+
+    # One enumeration, not a third mirror: desktop_pairing owns the door walk
+    # (#2085), and it also catches a marker-owned copy sitting under a foreign
+    # folder name — which is still loadable, so it must still fail this check.
+    from .desktop_pairing import loadable_desktop_runtimes
+
+    for entry in loadable_desktop_runtimes(home):
+        if _desktop_entry_owned(entry):
+            return False
+    return True
 
 
 def _host_install_metadata_absent(home: Path) -> bool:
@@ -543,6 +642,162 @@ def _tombstone_recovery_command(path: Path) -> str:
     )
 
 
+# The self-contained orphan-recovery program.
+#
+# Generic `hermes plugins remove ocuclaw` deletes the Agent checkout and with
+# it every `hermes ocuclaw ...` verb, while the generated standalone Desktop
+# runtime under `<home>/desktop-plugins/ocuclaw/` keeps loading — that door is
+# default-ON and belongs to no Hermes package. Recovery therefore cannot be an
+# OcuClaw command; it must be a program the user can paste with nothing but a
+# Python interpreter, which is the same interpreter-level precedent as
+# `_tombstone_recovery_command` below.
+#
+# It refuses to act while the Agent plugin is still installed (the supported
+# uninstall owns that case), proves the first-line ownership marker before
+# touching the runtime, refuses symlinked or redirected paths, preserves
+# anything foreign, and is safe to run twice. It removes the generated runtime
+# and the private presenter capability that exists only to authorize it —
+# nothing else — and says so.
+#
+# Written with double quotes only, so `shlex.join` renders one clean
+# single-quoted shell argument that the docs can carry verbatim.
+ORPHAN_RECOVERY_SOURCE = r'''import json, os, pathlib, sys
+
+MARKER = "// OCUCLAW-OWNED-DESKTOP-PAIRING-PLUGIN v1"
+home = pathlib.Path(os.environ.get("HERMES_HOME") or (pathlib.Path.home() / ".hermes"))
+home = home.expanduser().absolute()
+runtime = home / "desktop-plugins" / "ocuclaw" / "plugin.js"
+capability = home / "state" / "ocuclaw.desktop-presenter-capability.json"
+checkout = home / "plugins" / "ocuclaw"
+removed = []
+kept = []
+
+def direct(path, chain):
+    try:
+        if any(item.is_symlink() for item in chain):
+            return False
+        return path.absolute() == path.resolve(strict=False)
+    except OSError:
+        return False
+
+def runtime_state():
+    if not direct(runtime, (home, runtime.parent.parent, runtime.parent, runtime)):
+        return "unsafe path"
+    if not runtime.is_file():
+        return "absent"
+    try:
+        with runtime.open("r", encoding="utf-8") as stream:
+            first = stream.readline().rstrip("\n")
+    except (OSError, UnicodeError):
+        return "unreadable"
+    return "owned" if first == MARKER else "not OcuClaw-owned"
+
+def capability_state():
+    if not direct(capability, (home, capability.parent, capability)):
+        return "unsafe path"
+    if not capability.is_file():
+        return "absent"
+    try:
+        payload = json.loads(capability.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return "unreadable"
+    if not isinstance(payload, dict) or set(payload) != {"v", "capability"}:
+        return "not OcuClaw-owned"
+    if payload.get("v") != 1 or not isinstance(payload.get("capability"), str):
+        return "not OcuClaw-owned"
+    return "owned"
+
+if checkout.exists():
+    sys.stdout.write("refused: the OcuClaw Agent plugin is still installed at " + str(checkout) + "\n")
+    sys.stdout.write("Run `hermes ocuclaw uninstall` instead. This command only removes an orphan left behind by generic Hermes plugin removal.\n")
+    raise SystemExit(2)
+
+state = runtime_state()
+if state == "owned":
+    runtime.unlink()
+    removed.append(str(runtime))
+    for leftover in sorted(runtime.parent.glob(".plugin.js.*.tmp")):
+        if leftover.is_file() and not leftover.is_symlink():
+            leftover.unlink()
+            removed.append(str(leftover))
+    try:
+        runtime.parent.rmdir()
+        removed.append(str(runtime.parent))
+    except OSError:
+        pass
+elif state != "absent":
+    kept.append(str(runtime) + " (" + state + ")")
+
+if state in ("owned", "absent"):
+    state = capability_state()
+    if state == "owned":
+        capability.unlink()
+        removed.append(str(capability))
+    elif state != "absent":
+        kept.append(str(capability) + " (" + state + ")")
+
+for item in removed:
+    sys.stdout.write("removed: " + item + "\n")
+for item in kept:
+    sys.stdout.write("preserved: " + item + "\n")
+if not removed and not kept:
+    sys.stdout.write("no OcuClaw-owned Hermes Desktop orphan found under " + str(home) + "\n")
+sys.stdout.write("This command removes only the generated Desktop runtime and its private presenter capability. Any other OcuClaw state under " + str(home / "state") + " is removed only by `hermes ocuclaw uninstall`.\n")
+raise SystemExit(1 if kept else 0)
+'''
+
+
+def desktop_orphan_recovery_command(interpreter: Optional[str] = None) -> str:
+    """The documented, copy-pasteable orphan recovery command.
+
+    ``interpreter`` defaults to ``python3`` so the string is identical in the
+    docs on every machine; callers that must run it in *this* process's
+    interpreter pass ``sys.executable``.
+    """
+
+    args = [interpreter or "python3", "-c", ORPHAN_RECOVERY_SOURCE]
+    return (
+        subprocess.list2cmdline(args) if sys.platform == "win32" else shlex.join(args)
+    )
+
+
+def desktop_removal_notice(home: Optional[Path] = None) -> Dict[str, Any]:
+    """Observe the generated Desktop runtime for removal guidance. Read-only.
+
+    Honest placement note: a genuine orphan can only exist once the Agent
+    package is gone, and with it every `hermes ocuclaw ...` verb — so no
+    OcuClaw command can be running to detect it. The reachable, useful half is
+    therefore the *pre-removal warning*, which `doctor` prints while the
+    plugin still exists. The orphan branch stays here because the same
+    observation answers both questions and is worth pinning by test.
+    """
+
+    resolved = Path(home) if home is not None else _default_home()
+    if resolved is None:
+        return {"state": "unresolved", "agentInstalled": False, "orphaned": False}
+    resolved = _resolved(resolved)
+    runtime = _desktop_runtime_path(resolved)
+    try:
+        agent_installed = (resolved / "plugins" / PLUGIN_NAME).exists()
+    except OSError:
+        agent_installed = False
+    if _path_absent(runtime):
+        state = "absent"
+    elif _desktop_entry_owned(runtime):
+        state = "owned"
+    else:
+        state = "foreign"
+    notice: Dict[str, Any] = {
+        "state": state,
+        "runtimePath": str(runtime),
+        "agentInstalled": agent_installed,
+        "orphaned": state == "owned" and not agent_installed,
+    }
+    if notice["orphaned"]:
+        notice["recoveryCommand"] = desktop_orphan_recovery_command()
+    return notice
+
+
 def run_uninstall(
     *,
     assume_yes: bool = False,
@@ -773,6 +1028,18 @@ def run_uninstall(
         _remove_dir(runtime / name, removed, failures)
 
     runtime_clean = _runtime_state_absent(runtime)
+    if runtime_clean:
+        # `<HERMES_HOME>/ocuclaw` is the dedicated runtime directory the safety
+        # guard above already refused to proceed without. Emptied of every
+        # owned file it goes too, so a complete uninstall leaves no OcuClaw
+        # directory behind; an unrecognised file keeps it, exactly like the
+        # generated Desktop folder.
+        try:
+            runtime.rmdir()
+        except OSError:
+            pass
+        else:
+            removed.append(str(runtime))
     if owns_setup_bundle:
         _remove_file(setup_bundle, removed, failures)
         _remove_file(
@@ -783,13 +1050,18 @@ def run_uninstall(
     if owns_pairing_widget:
         _remove_file(pairing_widget, removed, failures)
     if owns_desktop_pairing_plugin:
-        _remove_file(desktop_pairing_plugin, removed, failures)
+        _remove_owned_desktop_runtime(desktop_pairing_plugin, removed, failures)
 
     route: Dict[str, Any]
     classification = observed.get("serveClassification")
     if classification == "absent" and route_owned and route_path is not None:
         owned_route_path = Path(route_path)
         _remove_file(owned_route_path, removed, failures)
+        # `receipts.route_receipt_lock` serializes on a sidecar next to the
+        # receipt precisely so it survives the receipt being replaced by
+        # rename. That makes it an owned OcuClaw file the receipt removal would
+        # otherwise strand; it holds no state, so it goes with its receipt.
+        _remove_file(owned_route_path.with_suffix(".lock"), removed, failures)
         route = (
             {"action": "receipt_removed", "reason": "route_absent"}
             if _path_absent(owned_route_path)
@@ -914,7 +1186,13 @@ def run_uninstall(
     tombstone = target.with_name(f".{PLUGIN_NAME}-uninstalling")
     plugin_renamed = False
     host_plugin_remove_accepted = False
-    if not failures:
+    # A rerun over an already-removed checkout is the same
+    # FileNotFoundError-as-success rule every owned-state removal above uses.
+    # Without it the rename would fail, the receipt would report
+    # `plugin-checkout-rename`, and the restore branch would put OcuClaw's
+    # registration back into a profile that no longer has the plugin.
+    checkout_already_removed = _path_absent(target) and _path_absent(tombstone)
+    if not failures and not checkout_already_removed:
         if not _path_absent(tombstone):
             failures.append("plugin-tombstone-present")
         else:
@@ -989,6 +1267,11 @@ def run_uninstall(
     final_checks = {
         **pre_plugin_checks,
         "hostPluginMetadataAbsent": _host_install_metadata_absent(resolved_home),
+        # The acceptance question for #2086, asked of the loader's own two
+        # doors rather than of the paths this run happens to have touched.
+        # Checked last because the nested door lives inside the checkout that
+        # is removed above.
+        "ownedDesktopRuntimeAbsent": _owned_desktop_runtime_absent(resolved_home),
         "pluginAbsent": _path_absent(target),
         "pluginResidualAbsent": _path_absent(tombstone),
     }
@@ -1066,7 +1349,10 @@ __all__ = [
     "EXIT_OK",
     "EXIT_PROBLEM",
     "EXIT_USAGE",
+    "ORPHAN_RECOVERY_SOURCE",
     "PROFILE_STATE_FILES",
     "RUNTIME_STATE_FILES",
+    "desktop_orphan_recovery_command",
+    "desktop_removal_notice",
     "run_uninstall",
 ]

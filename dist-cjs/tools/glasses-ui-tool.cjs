@@ -9,6 +9,7 @@ const { validateTemplate } = require("./glasses-ui-template.cjs");
 const { fillLiveuiTemplate } = require("./glasses-ui-template-slots.cjs");
 const { createGlassesUiCronEngine } = require("./glasses-ui-cron.cjs");
 const { createLiveuiPrefs, defaultLiveuiPrefsInput, isLiveuiSwitchedOff, liveuiDisabledError, liveuiDisabledResult } = require("./glasses-ui-prefs.cjs");
+const { createLiveuiGrantsStore, normalizeGrantHost } = require("./glasses-ui-grants.cjs");
 const { executeHttpRecipe, executeLlmRecipe, executeSystemStatsRecipe, normalizeHttpAllowHosts, isHttpHostAllowed } = require("./glasses-ui-recipes.cjs");
 const { createPendingRenderMap, createSurfaceStore, isTerminalOutcome, normalizeGlassesSessionKey } = require("./glasses-ui-surfaces.cjs");
 
@@ -24,7 +25,7 @@ const { lintGlassesUiPlan, projectValidateOnlyChannels } = require("./glasses-ui
 
 const { buildHostCapabilityManifest, deriveReadingProfile, deriveRenderContext, emptyUiStateFacts, projectDelivery, projectUiStateChannels } = require("./glasses-ui-state-snapshot.cjs");
 const { writeCompanionSnapshot } = require("./glasses-ui-companion-snapshot.cjs");
-const { getKindDescriptor, listKindStrings, buildOneOfBranches } = require("./glasses-ui-descriptors.cjs");
+const { getKindDescriptor, listKindStrings, buildOneOfBranches, GLASSES_UI_CHILDREN_SCHEMA } = require("./glasses-ui-descriptors.cjs");
 const { DEFAULT_STAGE_GRACE_MS } = require("./glasses-ui-limits.cjs");
 const { checkGlassesUiFit } = require("./glasses-ui-fit.cjs");
 
@@ -62,13 +63,45 @@ function effectiveIntervalFloorMs(tierMinMs) {
   return Math.max(tierMinMs, DEFAULT_PAINT_FLOOR_MS);
 }
 
-function validateRefreshSpec(refresh, glassesUiLiveCfg, surfaceKind = undefined) {
+function resolveEffectiveHostCheck(cfgInput, grantsStore) {
+  const cfg = cfgInput && typeof cfgInput === "object" ? cfgInput : {};
+  const operatorHosts = normalizeHttpAllowHosts(cfg.httpAllowHosts);
+
+  const ownerDelegated = cfg.httpHostPolicy === "owner-grants";
+  let grantsInvalid = false;
+  if (ownerDelegated && grantsStore && typeof grantsStore.load === "function") {
+    try {
+      grantsInvalid = !!grantsStore.load().grantsInvalid;
+    } catch (_) {
+      grantsInvalid = true;
+    }
+  }
+  return (hostname) => {
+    if (isHttpHostAllowed(hostname, operatorHosts)) return "listed";
+    if (!ownerDelegated || grantsInvalid) return "not_allowed";
+    if (grantsStore && typeof grantsStore.isDenied === "function" && grantsStore.isDenied(hostname)) {
+      return "denied";
+    }
+    if (grantsStore && typeof grantsStore.isGranted === "function" && grantsStore.isGranted(hostname)) {
+      return "listed";
+    }
+    return "consent";
+  };
+}
+
+function validateRefreshSpec(
+  refresh,
+  glassesUiLiveCfg,
+  surfaceKind = undefined,
+  options = {},
+) {
   if (refresh === undefined || refresh === null) return { ok: true, refresh: undefined };
   if (typeof refresh !== "object" || Array.isArray(refresh)) {
     return { ok: false, code: "refresh_invalid_recipe", message: "refresh must be an object" };
   }
   const cfg = glassesUiLiveCfg && typeof glassesUiLiveCfg === "object" ? glassesUiLiveCfg : {};
-  if (cfg.enabled === false) {
+  const shapeOnly = options && options.shapeOnly === true;
+  if (!shapeOnly && cfg.enabled === false) {
     return { ok: false, code: "refresh_disabled", message: "glassesUiLive is disabled by operator config" };
   }
   const recipe = refresh.recipe;
@@ -81,23 +114,36 @@ function validateRefreshSpec(refresh, glassesUiLiveCfg, surfaceKind = undefined)
   }
 
   const sanitizedRecipe = { kind };
+  let httpHost = "";
+  let httpHostDecision = "listed";
   const bounded = (raw, min, max) => {
     if (!Number.isFinite(raw)) return null;
     if (raw < min || raw > max) return undefined;
     return Math.floor(raw);
   };
   if (kind === "http") {
-    if (cfg.httpEnabled === false) return { ok: false, code: "refresh_disabled", message: "http recipes disabled" };
+    if (!shapeOnly && cfg.httpEnabled === false) return { ok: false, code: "refresh_disabled", message: "http recipes disabled" };
     if (typeof recipe.url !== "string" || !recipe.url.trim()) {
       return { ok: false, code: "refresh_invalid_recipe", message: "http recipe requires url (non-empty string)" };
     }
-
-    const allowHosts = normalizeHttpAllowHosts(cfg.httpAllowHosts);
-    let recipeHost = "";
-    try { recipeHost = new URL(recipe.url).hostname; } catch (_) {}
-    if (!isHttpHostAllowed(recipeHost, allowHosts)) {
-      return { ok: false, code: "refresh_host_not_allowed", message: `http recipe host not in allowlist: ${recipeHost || recipe.url.trim()}` };
+    let parsedUrl = null;
+    try { parsedUrl = new URL(recipe.url); } catch (_) {}
+    if (
+      !parsedUrl ||
+      (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") ||
+      !parsedUrl.hostname
+    ) {
+      return {
+        ok: false,
+        code: "refresh_invalid_recipe",
+        message: "http recipe url must be an absolute http(s) URL with a hostname",
+      };
     }
+    httpHost = parsedUrl.hostname;
+    const hostCheck = typeof options.hostCheck === "function"
+      ? options.hostCheck
+      : resolveEffectiveHostCheck(cfg, options.grantsStore);
+    httpHostDecision = shapeOnly ? "listed" : hostCheck(httpHost);
     sanitizedRecipe.url = recipe.url;
     if (recipe.method !== undefined) {
       const method = typeof recipe.method === "string" ? recipe.method.trim().toUpperCase() : "";
@@ -120,15 +166,17 @@ function validateRefreshSpec(refresh, glassesUiLiveCfg, surfaceKind = undefined)
       if (v !== null) sanitizedRecipe.outputCapBytes = v;
     }
   } else if (kind === "llm") {
-    if (cfg.llmEnabled === false) return { ok: false, code: "refresh_disabled", message: "llm recipes disabled" };
+    if (!shapeOnly && cfg.llmEnabled === false) return { ok: false, code: "refresh_disabled", message: "llm recipes disabled" };
     if (typeof recipe.prompt !== "string" || !recipe.prompt.trim()) {
       return { ok: false, code: "refresh_invalid_recipe", message: "llm recipe requires prompt (non-empty string)" };
     }
-    if (typeof recipe.model === "string" && recipe.model.trim() && cfg.allowAgentModelOverride !== true) {
+    if (!shapeOnly && typeof recipe.model === "string" && recipe.model.trim() && cfg.allowAgentModelOverride !== true) {
       return { ok: false, code: "refresh_llm_model_override_denied", message: "agent model override denied by operator config" };
     }
-    sanitizedRecipe.prompt = recipe.prompt;
-    if (typeof recipe.systemPrompt === "string") sanitizedRecipe.systemPrompt = recipe.systemPrompt;
+    sanitizedRecipe.prompt = recipe.prompt.slice(0, GLASSES_UI_REFRESH_LIMITS.templateMaxChars);
+    if (typeof recipe.systemPrompt === "string") {
+      sanitizedRecipe.systemPrompt = recipe.systemPrompt.slice(0, GLASSES_UI_REFRESH_LIMITS.templateMaxChars);
+    }
     if (typeof recipe.model === "string") sanitizedRecipe.model = recipe.model;
     if (recipe.maxOutputTokens !== undefined) {
       const v = bounded(recipe.maxOutputTokens, GLASSES_UI_REFRESH_LIMITS.maxOutputTokensMin, GLASSES_UI_REFRESH_LIMITS.maxOutputTokensMax);
@@ -327,7 +375,7 @@ function validateRefreshSpec(refresh, glassesUiLiveCfg, surfaceKind = undefined)
     sanitizedTargets.path = targets.path.trim();
   }
 
-  return {
+  const sanitizedRefresh = {
     ok: true,
     refresh: {
       recipe: sanitizedRecipe,
@@ -340,6 +388,23 @@ function validateRefreshSpec(refresh, glassesUiLiveCfg, surfaceKind = undefined)
         : GLASSES_UI_REFRESH_LIMITS.maxConsecutiveFailuresDefault,
     },
   };
+  if (kind === "http" && !shapeOnly && httpHostDecision !== "listed") {
+    if (httpHostDecision === "consent") {
+      return {
+        ok: false,
+        code: "refresh_host_consent_required",
+        host: httpHost,
+        message: `phone owner approval required for http recipe host: ${httpHost}`,
+        refresh: sanitizedRefresh.refresh,
+      };
+    }
+    return {
+      ok: false,
+      code: "refresh_host_not_allowed",
+      message: `http recipe host not allowed: ${httpHost}`,
+    };
+  }
+  return sanitizedRefresh;
 }
 
 const updateSchemaForToolParams = {
@@ -532,6 +597,8 @@ const glassesUiParametersSchema = {
         "each no longer than 600 characters. Page flips stay local; tap returns the current page.",
     },
 
+    children: GLASSES_UI_CHILDREN_SCHEMA,
+
     refresh: refreshSchemaForToolParams,
 
     update: updateSchemaForToolParams,
@@ -574,12 +641,76 @@ function validateGlassesUiSpec(input) {
         `got ${JSON.stringify(obj.kind)}`,
     };
   }
+
+  const descriptorAny = descriptor;
+  if (obj.children !== undefined && !descriptorAny.supportsChildren) {
+    return {
+      ok: false,
+      code: "children_unsupported",
+      message: `children is only supported on list_surface and list_with_details_surface; got ${JSON.stringify(obj.kind)}`,
+    };
+  }
+  if (obj.children !== undefined && obj.refresh !== undefined) {
+    return {
+      ok: false,
+      code: "refresh_children_conflict",
+      message: "children and refresh cannot ride one render: a refresh tick rewrites items and would misalign the children array",
+    };
+  }
   const result = descriptor.validateSpec(obj);
   if (!result || result.ok !== true) return result;
 
   const fitErr = checkGlassesUiFit(result.spec);
   if (fitErr) return fitErr;
   return result;
+}
+
+const GLASSES_UI_TOOL_LAYER_FIELDS = Object.freeze([
+  "refresh", "update", "timeoutMs", "staleAfterMs", "queueMode",
+]);
+
+function validateRenderControlFields(input) {
+  const spec = input && typeof input === "object" ? input : {};
+  if (spec.update !== undefined && !["patch", "replace", "push"].includes(spec.update)) {
+    return { ok: false, code: "update_invalid", message: "update must be patch, replace, or push" };
+  }
+  if (spec.validateOnly !== undefined && typeof spec.validateOnly !== "boolean") {
+    return { ok: false, code: "validate_only_invalid", message: "validateOnly must be boolean" };
+  }
+  return { ok: true };
+}
+
+function validateGlassesUiInjectSpec(input, glassesUiLiveCfg = undefined, options = {}) {
+  const validation = validateGlassesUiSpec(input);
+  if (!validation.ok) return validation;
+
+  if (input.refresh !== undefined) {
+    const hasRuntimePolicy = glassesUiLiveCfg && typeof glassesUiLiveCfg === "object";
+    let refreshValidation;
+    if (hasRuntimePolicy) {
+
+      refreshValidation = validateRefreshSpec(input.refresh, glassesUiLiveCfg, input.kind, {
+        hostCheck: typeof options.hostCheck === "function" ? options.hostCheck : undefined,
+      });
+    } else {
+
+      refreshValidation = validateRefreshSpec(input.refresh, {}, input.kind, { shapeOnly: true });
+    }
+    if (!refreshValidation.ok) return refreshValidation;
+  }
+
+  const windowValidation = validateWindowFields(input);
+  if (!windowValidation.ok) return windowValidation;
+  const queueValidation = validateQueueMode(input);
+  if (!queueValidation.ok) return queueValidation;
+  const controlValidation = validateRenderControlFields(input);
+  if (!controlValidation.ok) return controlValidation;
+
+  const spec = { ...validation.spec };
+  for (const key of GLASSES_UI_TOOL_LAYER_FIELDS) {
+    if (Object.hasOwn(input, key)) spec[key] = input[key];
+  }
+  return { ok: true, spec };
 }
 
 const { randomUUID } = require("node:crypto");
@@ -654,6 +785,7 @@ function createGlassesUiToolHandler(deps) {
         : undefined;
 
   let liveuiPrefsStore = null;
+  let liveuiGrantsStore = null;
   let cachedLiveuiPrefs = null;
   let cachedLiveuiPrefsAtMs = 0;
   function getLiveuiPrefsStore() {
@@ -661,6 +793,22 @@ function createGlassesUiToolHandler(deps) {
       liveuiPrefsStore = createLiveuiPrefs({ libraryDir: injectedLibraryRoot() });
     }
     return liveuiPrefsStore;
+  }
+  function getLiveuiGrantsStore() {
+    if (!liveuiGrantsStore) {
+      const injected = Reflect.get(deps, "grantsStore");
+      liveuiGrantsStore = injected || createLiveuiGrantsStore({
+        dir: injectedLibraryRoot(),
+        now: typeof deps.now === "function" ? deps.now : undefined,
+      });
+    }
+    return liveuiGrantsStore;
+  }
+  function currentHostCheck(cfg) {
+    return resolveEffectiveHostCheck(
+      cfg,
+      cfg && cfg.httpHostPolicy === "owner-grants" ? getLiveuiGrantsStore() : null,
+    );
   }
   function currentLiveuiPrefs() {
     const nowMs = Date.now();
@@ -853,16 +1001,30 @@ function createGlassesUiToolHandler(deps) {
     const joined = segments.join(" › ");
     if (joined.length <= charBudget) return joined;
 
-    return joined.slice(0, charBudget);
+    const clipped = joined.slice(0, charBudget);
+
+    return /[\uD800-\uDBFF]$/.test(clipped) ? clipped.slice(0, -1) : clipped;
   }
 
   function emitMarker(sessionKey, surfaceId) {
     if (!surfaceId) return;
     const normalizedSessionKey = normalizeGlassesSessionKey(sessionKey);
     if (surfaceStore.topSurfaceId(normalizedSessionKey) !== surfaceId) return;
-    const marker = surfaceStore.markerFor(surfaceId);
+    const marker = displayedMarkerFor(surfaceId);
     if (!marker) return;
     paintFloor.enqueue({ surfaceId, sessionKey: normalizedSessionKey, patch: { marker } });
+  }
+
+  function displayedMarkerFor(surfaceId) {
+    const marker = surfaceStore.markerFor(surfaceId);
+    if (marker !== "inflight") return marker;
+    const sessionKey = surfaceStore.sessionForSurface(surfaceId);
+    if (!sessionKey || typeof deps.isAgentTurnBusy !== "function") return marker;
+    try {
+      return deps.isAgentTurnBusy(sessionKey) ? "processing" : marker;
+    } catch (_) {
+      return marker;
+    }
   }
 
   const newSurfaceId =
@@ -898,6 +1060,18 @@ function createGlassesUiToolHandler(deps) {
 
       const isRender = !!(patch && patch.__render);
       if (isRender) {
+        surfaceStore.recordPreloadedChildren(surfaceId, patch.__spec?.children,
+          patch.__recordedSpec?.children || patch.__spec?.children);
+
+        const adoptedChild = surfaceStore.adoptedChildFor(sessionKey);
+        if (adoptedChild && adoptedChild.parentId === surfaceId &&
+            !patch.__spec?.children?.[adoptedChild.itemIndex]) {
+          surfaceStore.popBack(sessionKey);
+          navDepthBySession.set(sessionKey, surfaceStore.stackDepth(sessionKey));
+          emitLifecycle("child_dropped_by_parent_render", "debug", {
+            sessionKey, parent: surfaceId, child: adoptedChild.childId, itemIndex: adoptedChild.itemIndex,
+          });
+        }
         surfaceStore.recordSpec(
           surfaceId,
           patch.__recordedSpec && typeof patch.__recordedSpec === "object"
@@ -931,9 +1105,8 @@ function createGlassesUiToolHandler(deps) {
     monotonicNowMs: () => performance.now(),
     executeRecipe: async (recipe, ctx) => {
       if (recipe.kind === "http") {
-
         const cfg = deps.getGlassesUiLiveConfig ? deps.getGlassesUiLiveConfig() : {};
-        return executeHttpRecipe(recipe, { allowHosts: normalizeHttpAllowHosts(cfg.httpAllowHosts) });
+        return executeHttpRecipe(recipe, { hostCheck: currentHostCheck(cfg) });
       }
       if (recipe.kind === "system-stats") return executeSystemStatsRecipe(recipe);
       if (recipe.kind === "llm" && typeof deps.executeLlmRecipe === "function") {
@@ -975,7 +1148,7 @@ function createGlassesUiToolHandler(deps) {
         __depth: params.depth,
         __spec: params.spec,
         __recordedSpec: params.spec,
-        __marker: surfaceStore.markerFor(params.surfaceId),
+        __marker: displayedMarkerFor(params.surfaceId),
       },
     }),
     resolveLlmCtx: (state) => {
@@ -1138,6 +1311,7 @@ function createGlassesUiToolHandler(deps) {
         seq: msg.seq,
         code: msg.code,
         clientId: msg.clientId,
+        deduplicate: true,
       });
       if (!result.ok) {
 
@@ -1153,7 +1327,7 @@ function createGlassesUiToolHandler(deps) {
       }
       const delivery = surfaceStore.deliveryEvidenceOf(msg.surfaceId);
       const state = delivery ? deliveryLadderState(delivery.evidence) : null;
-      emitLifecycle("render_failure_evidence", "debug", {
+      if (!result.duplicate) emitLifecycle("render_failure_evidence", "debug", {
         surfaceId: msg.surfaceId,
         sessionKey: surfaceStore.sessionForSurface(msg.surfaceId),
         surfaceUuid: result.surfaceUuid,
@@ -1164,13 +1338,40 @@ function createGlassesUiToolHandler(deps) {
         rung: state ? state.rung : null,
       });
 
-      feedbackLedger.record({
+      if (!result.duplicate) feedbackLedger.record({
         sessionKey: surfaceStore.sessionForSurface(msg.surfaceId),
         class: "render_error",
         code: result.code,
         surfaceUuid: result.surfaceUuid,
         seq: result.seq,
       });
+      if (msg.channel !== "render_error") return;
+      const verdict = surfaceStore.validateClientRenderError(msg.surfaceId, msg);
+      if (!verdict.ok) {
+        emitLifecycle("render_error_held", "debug", {
+          surfaceId: msg.surfaceId, seq: msg.seq, clientId: msg.clientId,
+          code: msg.code, reason: verdict.reason,
+        });
+        return;
+      }
+      const sessionKey = surfaceStore.sessionForSurface(msg.surfaceId);
+      const outcome = {
+        result: "render_failed", code: msg.code, clientId: msg.clientId,
+        seq: msg.seq, origin: "client_render", actor: "client",
+      };
+
+      emitLifecycle("render_error_terminal", "warn", {
+        surfaceId: msg.surfaceId, sessionKey, seq: msg.seq,
+        clientId: msg.clientId, code: msg.code,
+      });
+      let merged = outcome;
+      if (cronEngine.isActive(msg.surfaceId)) {
+        capturedCronOutcome.set(msg.surfaceId, (cronOutcome) => { merged = cronOutcome; });
+        cronEngine.stop(msg.surfaceId, outcome, undefined);
+        capturedCronOutcome.delete(msg.surfaceId);
+      }
+      if (!surfaceStore.resolve(msg.surfaceId, merged)) surfaceStore.queueEvent(msg.surfaceId, merged, undefined);
+      releaseTerminalTop(msg.surfaceId, merged, "render_error");
     });
   }
 
@@ -1260,13 +1461,17 @@ function createGlassesUiToolHandler(deps) {
       const glassesUiLiveCfg = deps.getGlassesUiLiveConfig
         ? deps.getGlassesUiLiveConfig()
         : { enabled: true };
-      refreshValidation = validateRefreshSpec(spec.refresh, glassesUiLiveCfg, spec.kind);
+      refreshValidation = validateRefreshSpec(spec.refresh, glassesUiLiveCfg, spec.kind, {
+        hostCheck: currentHostCheck(glassesUiLiveCfg),
+      });
       push(refreshValidation);
     }
     const windowValidation = validateWindowFields(spec);
     const queueValidation = validateQueueMode(spec);
+    const controlValidation = validateRenderControlFields(spec);
     push(windowValidation);
     push(queueValidation);
+    push(controlValidation);
 
     const specValidated = Boolean(validation && validation.ok);
     const lint = specValidated
@@ -1312,7 +1517,7 @@ function createGlassesUiToolHandler(deps) {
   function runValidateOnly(params) {
     const spec = (params && params.spec) || {};
     const sessionKey = normalizeGlassesSessionKey(
-      typeof params.sessionKey === "string" && params.sessionKey.trim()
+      params && typeof params.sessionKey === "string" && params.sessionKey.trim()
         ? params.sessionKey.trim()
         : "main",
     );
@@ -1364,16 +1569,75 @@ function createGlassesUiToolHandler(deps) {
     return { maxConcurrentSurfacesPerHost, stageGraceMs };
   }
 
+  const heldConsentRenders = new Map();
+
+  const liveuiGrantsListeners = new Set();
+  function notifyLiveuiGrantsChanged() {
+    for (const listener of liveuiGrantsListeners) {
+      try {
+        listener();
+      } catch (_) {
+
+      }
+    }
+  }
+  function mayFilePendingGrant(params) {
+    return !!params && params.spec && params.spec.validateOnly !== true;
+  }
+  function discardHeldConsentRenders(host) {
+    for (const [key, held] of heldConsentRenders) {
+      if (held.host === host) heldConsentRenders.delete(key);
+    }
+  }
+  function holdConsentRender(host, params, validation, refresh) {
+
+    discardHeldConsentRenders(host);
+    while (heldConsentRenders.size >= 5) {
+      heldConsentRenders.delete(heldConsentRenders.keys().next().value);
+    }
+    const heldSpec = {
+      ...JSON.parse(JSON.stringify(validation.spec)),
+      refresh: JSON.parse(JSON.stringify(refresh)),
+    };
+    for (const key of ["update", "timeoutMs", "staleAfterMs", "queueMode"]) {
+      if (Object.prototype.hasOwnProperty.call(params.spec, key)) heldSpec[key] = params.spec[key];
+    }
+    const key = `${params.sessionKey}\u0000${host}`;
+    heldConsentRenders.set(key, {
+      host,
+      params: {
+        sessionKey: params.sessionKey,
+        depth: params.depth,
+        spec: heldSpec,
+        wearerInitiated: params.wearerInitiated === true,
+      },
+    });
+  }
+  function startHeldConsentRenders(host) {
+    const held = [...heldConsentRenders.values()].filter((entry) => entry.host === host);
+    discardHeldConsentRenders(host);
+    for (const entry of held) {
+      void runDynamicUi(entry.params).catch((err) => {
+        emitLifecycle("held_render_start_failed", "warn", {
+          sessionKey: entry.params.sessionKey,
+          host,
+          code: err && typeof err.code === "string" ? err.code : "render_failed",
+        });
+      });
+    }
+  }
+
   async function runDynamicUi(params) {
+    if (currentLiveuiPrefs().prefs.enabled === false) return liveuiDisabledResult();
+    const sessionKey = normalizeGlassesSessionKey(
+      params && typeof params.sessionKey === "string" && params.sessionKey.trim()
+        ? params.sessionKey.trim()
+        : "main",
+    );
 
     if (params && params.spec && params.spec.validateOnly === true) {
       return runValidateOnly(params);
     }
-    const sessionKey = normalizeGlassesSessionKey(
-      typeof params.sessionKey === "string" && params.sessionKey.trim()
-        ? params.sessionKey.trim()
-        : "main",
-    );
     const validation = validateGlassesUiSpec(params.spec);
     if (!validation.ok) {
       emitLifecycle("render_rejected", "warn", {
@@ -1406,8 +1670,45 @@ function createGlassesUiToolHandler(deps) {
     let refreshValidated;
     if (params.spec && params.spec.refresh !== undefined) {
       const glassesUiLiveCfg = deps.getGlassesUiLiveConfig ? deps.getGlassesUiLiveConfig() : { enabled: true };
-      const v = validateRefreshSpec(params.spec.refresh, glassesUiLiveCfg, params.spec.kind);
+      const v = validateRefreshSpec(params.spec.refresh, glassesUiLiveCfg, params.spec.kind, {
+        hostCheck: currentHostCheck(glassesUiLiveCfg),
+      });
       if (!v.ok) {
+        if (v.code === "refresh_host_consent_required" && mayFilePendingGrant(params)) {
+          const windowCheck = validateWindowFields(params.spec);
+          const queueCheck = validateQueueMode(params.spec);
+          if (!windowCheck.ok || !queueCheck.ok) {
+            const rejected = !windowCheck.ok ? windowCheck : queueCheck;
+            const err = new Error(`${rejected.code}: ${rejected.message}`);
+            err.code = rejected.code;
+            throw err;
+          }
+          const recipe = v.refresh.recipe;
+          const filed = getLiveuiGrantsStore().filePending({
+            host: v.host,
+            method: typeof recipe.method === "string" ? recipe.method : "GET",
+            hasHeaders: !!recipe.headers && Object.keys(recipe.headers).length > 0,
+            hasBody: typeof recipe.body === "string" && recipe.body.length > 0,
+          });
+          if (filed && filed.ok === true) {
+            holdConsentRender(v.host, { ...params, sessionKey }, validation, v.refresh);
+            emitLifecycle("render_held_for_host_consent", "info", {
+              sessionKey,
+              host: v.host,
+              filed: filed.filed === true,
+            });
+            if (filed.filed === true) notifyLiveuiGrantsChanged();
+            return {
+              status: "held",
+              code: "refresh_host_consent_required",
+              host: v.host,
+              message: "The phone owner can approve this site and the surface will start automatically.",
+            };
+          }
+          const err = new Error(`${filed.code}: host approval request could not be filed`);
+          err.code = filed.code;
+          throw err;
+        }
         emitLifecycle("render_rejected", "warn", {
           surfaceId: null,
           sessionKey,
@@ -1581,6 +1882,7 @@ function createGlassesUiToolHandler(deps) {
 
     const promise = surfaceStore.register(sessionKey, surfaceId, {
       kind: validation.spec.kind,
+      wearerInitiated: params.wearerInitiated === true,
       staleAfterMs: windowFields.staleAfterMs,
       queueMode: queueModeField.queueMode,
       title: typeof validation.spec.title === "string" ? validation.spec.title : undefined,
@@ -1600,7 +1902,11 @@ function createGlassesUiToolHandler(deps) {
       }
     }
 
-    const wireDepth = Math.max(1, surfaceStore.stackDepth(sessionKey));
+    openedChildBySurface.delete(surfaceId);
+    const wireDepth = Math.max(
+      1,
+      Number.isFinite(applied.depth) ? applied.depth : surfaceStore.stackDepth(sessionKey),
+    );
 
     const validationAny = validation;
     const validationSpec = validationAny.spec;
@@ -1612,8 +1918,21 @@ function createGlassesUiToolHandler(deps) {
     if (declaredWindow.staleAfterMs !== undefined) recordedSpec.staleAfterMs = declaredWindow.staleAfterMs;
     if (queueModeField.queueMode !== undefined) recordedSpec.queueMode = queueModeField.queueMode;
     if (refreshValidated !== undefined) recordedSpec.refresh = refreshValidated;
-    const breadcrumb = surfaceStore.breadcrumbFor(sessionKey);
+    const breadcrumb = surfaceStore.breadcrumbFor(sessionKey, wireDepth);
     if (breadcrumb) validation.spec.title = clipBreadcrumb(breadcrumb);
+
+    const wireSpec = { ...validation.spec };
+    if (Array.isArray(validation.spec.children)) {
+      const gen = declarationSeq;
+      wireSpec.children = validation.spec.children.map((child, i) => {
+        if (!child) return null;
+        const wired = { ...child, surfaceId: `${surfaceId}:c${i}-${gen}` };
+        if (typeof child.title === "string" && typeof validation.spec.title === "string") {
+          wired.title = clipBreadcrumb(`${validation.spec.title} › ${child.title}`);
+        }
+        return wired;
+      });
+    }
     paintFloor.enqueue({
       surfaceId,
       sessionKey,
@@ -1621,9 +1940,9 @@ function createGlassesUiToolHandler(deps) {
       patch: {
         __render: true,
         __depth: wireDepth,
-        __spec: validation.spec,
+        __spec: wireSpec,
         __recordedSpec: recordedSpec,
-        __marker: surfaceStore.markerFor(surfaceId),
+        __marker: displayedMarkerFor(surfaceId),
       },
     });
 
@@ -1715,12 +2034,16 @@ function createGlassesUiToolHandler(deps) {
         extra,
       );
     const wrapUpHandle = setTimeoutFn(() => {
-      if (surfaceStore.resolve(surfaceId, windowExpiredOutcome())) {
+
+      const openedChild = openedChildBySurface.get(surfaceId);
+      if (surfaceStore.resolve(surfaceId, windowExpiredOutcome(openedChild ? { opened_child: openedChild } : undefined))) {
         emitLifecycle("window_expired", "debug", {
           surfaceId,
           sessionKey,
           windowMs: effectiveWindowMs,
           via: "wrap_up_timer",
+
+          openedChild: openedChild || null,
 
           declarationId,
           staleAfterMs: declaredStaleAfterMs,
@@ -1795,8 +2118,24 @@ function createGlassesUiToolHandler(deps) {
 
   const navDepthBySession = new Map();
 
+  const openedChildBySurface = new Map();
+
   function handleNavEvent(rawSessionKey, ev) {
     const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
+
+    if (ev.depth === 0 && ev.action !== "push_local") {
+      const storeDepthBefore = surfaceStore.stackDepth(sessionKey);
+      const matched = storeDepthBefore > 0 && surfaceStore.topSurfaceId(sessionKey) === ev.surfaceId;
+      if (matched) reapSession(sessionKey, { result: "dismissed" });
+      emitLifecycle("nav_reconcile", "debug", {
+        sessionKey, evSurfaceId: ev.surfaceId, evDepth: 0,
+        newDepth: matched ? 0 : storeDepthBefore,
+        lastDepth: storeDepthBefore, storeDepthBefore,
+        popCount: matched ? storeDepthBefore : 0,
+        resumedParent: null, reason: matched ? "chat_return" : "stale_chat_return",
+      });
+      return;
+    }
     const newDepth = Number.isFinite(ev.depth) ? Math.max(1, Math.floor(ev.depth)) : 1;
     const lastDepth = navDepthBySession.get(sessionKey) || surfaceStore.stackDepth(sessionKey) || 1;
     const storeDepthBefore = surfaceStore.stackDepth(sessionKey);
@@ -1814,7 +2153,9 @@ function createGlassesUiToolHandler(deps) {
     if (
       popCount === 0 &&
       storeDepthBefore > 1 &&
-      surfaceStore.topSurfaceId(sessionKey) === ev.surfaceId
+      surfaceStore.topSurfaceId(sessionKey) === ev.surfaceId &&
+
+      ev.action !== "push_local"
     ) {
 
       resumedParent = surfaceStore.popBack(sessionKey);
@@ -1824,17 +2165,52 @@ function createGlassesUiToolHandler(deps) {
     if (popCount > 0 && resumedParent) {
       emitMarker(sessionKey, resumedParent);
     }
+
+    let adopt = null;
+    if (ev.action === "push_local" && typeof ev.childSurfaceId === "string" && ev.childSurfaceId) {
+      const itemIndex = Number.isInteger(ev.itemIndex) && ev.itemIndex >= 0 ? ev.itemIndex : null;
+      adopt = surfaceStore.adoptClientPush(sessionKey, ev.childSurfaceId, {
+        parentId: ev.surfaceId,
+        itemIndex,
+      });
+      if (adopt.ok && adopt.mode === "adopted") {
+
+        openedChildBySurface.set(ev.surfaceId, { surfaceId: ev.childSurfaceId, itemIndex });
+
+        surfaceStore.queueEvent(
+          ev.childSurfaceId,
+          {
+            result: "opened",
+            selected_index: itemIndex,
+            child_surface_id: ev.childSurfaceId,
+            origin: "gesture",
+            actor: "wearer",
+          },
+          { origin: "gesture", actor: "wearer" },
+        );
+        emitLifecycle("child_opened_local", "info", {
+          sessionKey,
+          parent: ev.surfaceId,
+          child: ev.childSurfaceId,
+          itemIndex,
+          kind: adopt.kind,
+        });
+      }
+    }
     emitLifecycle("nav_reconcile", "debug", {
       sessionKey,
       evSurfaceId: ev.surfaceId,
       evDepth: ev.depth,
+      evAction: typeof ev.action === "string" ? ev.action : null,
+      evChildSurfaceId: typeof ev.childSurfaceId === "string" ? ev.childSurfaceId : null,
       newDepth,
       lastDepth,
       storeDepthBefore,
       popCount,
       resumedParent,
+      adopt,
     });
-    navDepthBySession.set(sessionKey, newDepth);
+    navDepthBySession.set(sessionKey, adopt && !adopt.ok ? surfaceStore.stackDepth(sessionKey) : newDepth);
   }
 
   function reapSession(rawSessionKey, outcome) {
@@ -1843,6 +2219,10 @@ function createGlassesUiToolHandler(deps) {
     const reaped = surfaceStore.drainSession(sessionKey, outcome);
     surfaceStore.exit(sessionKey);
     navDepthBySession.delete(sessionKey);
+
+    for (const parentId of [...openedChildBySurface.keys()]) {
+      if (!surfaceStore.sessionForSurface(parentId)) openedChildBySurface.delete(parentId);
+    }
     return reaped;
   }
 
@@ -1860,6 +2240,13 @@ function createGlassesUiToolHandler(deps) {
     if (stackDepthBefore <= 0) return false;
     let resumedParent = null;
     if (stackDepthBefore === 1) {
+
+      let ownerlessSurface = false;
+      if ((surfaceStore.isWearerInitiated(surfaceId) || surfaceStore.hasAgentRunEnded(surfaceId)) &&
+          !facts?.awaitingAgentResponse &&
+          typeof deps.isAgentTurnBusy === "function") {
+        try { ownerlessSurface = deps.isAgentTurnBusy(sessionKey) === false; } catch (_) {  }
+      }
       const latchedOutcome =
         outcome && typeof outcome === "object" && !Array.isArray(outcome)
           ? {
@@ -1870,10 +2257,12 @@ function createGlassesUiToolHandler(deps) {
             }
           : outcome;
       reapSession(sessionKey, outcome);
-      exitLatchBySession.set(sessionKey, {
-        surfaceId,
-        outcome: latchedOutcome || { result: "dismissed" },
-      });
+      if (!ownerlessSurface) {
+        exitLatchBySession.set(sessionKey, {
+          surfaceId,
+          outcome: latchedOutcome || { result: "dismissed" },
+        });
+      }
     } else {
       resumedParent = surfaceStore.popBack(sessionKey);
       navDepthBySession.set(sessionKey, surfaceStore.stackDepth(sessionKey));
@@ -1999,6 +2388,29 @@ function createGlassesUiToolHandler(deps) {
     return { ...deleted, clearedPreferredTemplateTaskIds };
   }
 
+  function liveuiGrantsSnapshot() {
+    const cfg = typeof deps.getGlassesUiLiveConfig === "function"
+      ? deps.getGlassesUiLiveConfig() || {}
+      : {};
+    const httpHostPolicy = cfg.httpHostPolicy === "owner-grants"
+      ? "owner-grants"
+      : "operator-only";
+    const state = getLiveuiGrantsStore().load();
+    const lists = httpHostPolicy === "owner-grants"
+      ? {
+          pending: state.pending.map((row) => ({ ...row })),
+          granted: state.granted.map((row) => ({ ...row })),
+          denied: state.denied.map((row) => ({ ...row })),
+        }
+      : { pending: [], granted: [], denied: [] };
+    return {
+      httpHostPolicy,
+      digest: state.digest,
+      ...(state.grantsInvalid ? { grantsInvalid: state.grantsInvalid } : {}),
+      ...lists,
+    };
+  }
+
   publicApi = {
     storeId,
     runDynamicUi,
@@ -2023,12 +2435,77 @@ function createGlassesUiToolHandler(deps) {
       cronEngine.syncRefreshPause();
       return { status: "accepted", prefs: after, clearedSessionKeys };
     },
+    liveuiGrantsSnapshot,
+
+    onLiveuiGrantsChanged(listener) {
+      if (typeof listener !== "function") return () => {};
+      liveuiGrantsListeners.add(listener);
+      return () => liveuiGrantsListeners.delete(listener);
+    },
+
+    liveuiHostCheck() {
+      const cfg = typeof deps.getGlassesUiLiveConfig === "function"
+        ? deps.getGlassesUiLiveConfig() || {}
+        : {};
+      return currentHostCheck(cfg);
+    },
+    applyLiveuiGrantIntent(intent) {
+      const snapshotBefore = liveuiGrantsSnapshot();
+      if (snapshotBefore.httpHostPolicy !== "owner-grants") {
+        return {
+          status: "rejected",
+          code: "grants_policy_operator_only",
+          snapshot: snapshotBefore,
+        };
+      }
+      const applied = getLiveuiGrantsStore().apply(intent);
+      if (!applied || applied.ok !== true) {
+        return {
+          status: "rejected",
+          code: applied && typeof applied.code === "string"
+            ? applied.code
+            : "grants_write_failed",
+          snapshot: liveuiGrantsSnapshot(),
+        };
+      }
+      const normalized = normalizeGrantHost(intent && intent.host);
+      const host = normalized.ok ? normalized.host : "";
+      let clearedSessionKeys = [];
+      if (intent.action === "deny" || intent.action === "remove") {
+        discardHeldConsentRenders(host);
+        clearedSessionKeys = cronEngine.sessionKeysForHttpHost(host)
+          .filter((key) => surfaceStore.stackDepth(key) > 0);
+        for (const key of clearedSessionKeys) {
+          publicApi.drainSession(key, {
+            result: "preempted",
+            reason: "refresh_host_revoked",
+          });
+        }
+      } else if (intent.action === "allow") {
+        startHeldConsentRenders(host);
+      }
+      return {
+        status: "accepted",
+        ...((intent.action === "deny" || intent.action === "remove")
+          ? { clearedSessionKeys }
+          : {}),
+        snapshot: liveuiGrantsSnapshot(),
+      };
+    },
     liveuiStatus() {
       const cfg = typeof deps.getGlassesUiLiveConfig === "function"
         ? deps.getGlassesUiLiveConfig() || {}
         : {};
       const stage = readStageConfig();
       const prefs = currentLiveuiPrefs().prefs;
+      const grants = liveuiGrantsSnapshot();
+      const tickAuth = deps.host === "hermes"
+        ? "ok"
+        : cfg.llmDisabledReason === "no_backend"
+          ? "no_backend"
+          : (typeof deps.resolveLlmApiKey === "function" && deps.resolveLlmApiKey(cfg.tickModel || ""))
+            ? "ok"
+            : "missing_key";
       return {
         host: deps.host === "hermes" ? "hermes" : "openclaw",
         enabled: prefs.enabled !== false,
@@ -2036,8 +2513,14 @@ function createGlassesUiToolHandler(deps) {
         refreshEnabled: cfg.enabled !== false,
         httpEnabled: cfg.httpEnabled === true,
         allowedDomains: Array.isArray(cfg.httpAllowHosts) ? cfg.httpAllowHosts.length : 0,
+        httpHostPolicy: grants.httpHostPolicy,
+        ownerGrants: grants.httpHostPolicy === "owner-grants" ? grants.granted.length : 0,
+        tickAuth,
+        ...(grants.grantsInvalid ? { grantsInvalid: grants.grantsInvalid } : {}),
         llmEnabled: cfg.llmEnabled === true,
         allowAgentModelOverride: cfg.allowAgentModelOverride === true,
+        tickModel: typeof cfg.tickModel === "string" && cfg.tickModel ? cfg.tickModel : null,
+        tickBackend: typeof cfg.tickBackend === "string" && cfg.tickBackend ? cfg.tickBackend : null,
         surfaces: surfaceStore.activeSessionCount(),
         maxSurfaces: stage.maxConcurrentSurfacesPerHost,
         stageGraceMs: stage.stageGraceMs,
@@ -2344,6 +2827,7 @@ function createGlassesUiToolHandler(deps) {
       const released = top ? releaseTerminalTop(top, outcome, "agent_end") : false;
 
       exitLatchBySession.delete(normalizedSessionKey);
+      surfaceStore.markAgentRunEnded(normalizedSessionKey);
       return released;
     },
     drainAll(outcome) {
@@ -2486,7 +2970,7 @@ function createGlassesUiToolHandler(deps) {
           title: facts.title,
           state: facts.state,
           terminationCause: facts.terminationCause,
-          marker: surfaceStore.markerFor(topSurfaceId),
+          marker: displayedMarkerFor(topSurfaceId),
           queueMode: facts.queueMode,
           staleAfterMs: facts.staleAfterMs,
           content: facts.content,
@@ -2497,7 +2981,7 @@ function createGlassesUiToolHandler(deps) {
         stack,
         stackDepth: surfaceStore.stackDepth(sessionKey),
         breadcrumb: surfaceStore.breadcrumbFor(sessionKey),
-        marker: surfaceStore.markerFor(topSurfaceId),
+        marker: displayedMarkerFor(topSurfaceId),
         pendingRender: facts.pendingRender,
 
         listening: facts.pendingRender,
@@ -2523,6 +3007,13 @@ function createGlassesUiToolHandler(deps) {
       const top = surfaceStore.topSurfaceId(sessionKey);
       if (top) emitMarker(sessionKey, top);
     },
+    refreshMarkerForAgentTurn(sessionKey) {
+      const normalizedSessionKey = normalizeGlassesSessionKey(sessionKey);
+      const top = surfaceStore.topSurfaceId(normalizedSessionKey);
+      if (top && surfaceStore.markerFor(top) === "inflight") {
+        emitMarker(normalizedSessionKey, top);
+      }
+    },
     sessionForSurface(surfaceId) {
       return surfaceStore.sessionForSurface(surfaceId);
     },
@@ -2543,7 +3034,7 @@ const GET_GLASSES_UI_STATE_TOOL_DESCRIPTION = [
   "Returns refs and counts, not the wearer's on-glass text. You get:",
   "  active        — surfaceUuid, kind, titleChars, state, marker, queueMode.",
   "  stack         — depth plus one ref per level (root first).",
-  "  marker        — listening | inflight | parked.",
+  "  marker        — listening | inflight | processing | parked.",
   "  listening     — whether a render is still awaiting a wearer response.",
   "  parkedEventCount / deadLetterCount — wearer taps waiting to reach you.",
   "  cron          — { active, paused, ticks, lastRender } for a refreshing surface.",
@@ -2605,7 +3096,9 @@ const GLASSES_UI_TOOL_DESCRIPTION = [
   "result: selected|back|dismissed|window_expired|timeout|recipe_failed|",
   "glasses_disconnected. window_expired is NOT an error: taps park, patch to",
   "collect. timeoutMs default 90000; 300000-600000 to decide. refresh",
-  "self-updates. back = revise: re-render or pivot; selected = follow up or ack.",
+  "self-updates. HTTP refresh_host_consent_required holds for phone approval,",
+  "then starts automatically; do not retry or ask again. back = revise: re-render",
+  "or pivot; selected = follow up or ack.",
   "Authoring depth (tiers, recipes, {{path|filter}}, examples): load the",
   "\"glasses-ui\" skill.",
 ].join("\n");
@@ -2815,11 +3308,12 @@ function registerGlassesUiTool(api, service, opts = {}) {
         : null,
     isAgentTurnBusy: (sessionKey) => {
       try {
-        return typeof service.isAgentTurnBusy === "function"
-          ? !!service.isAgentTurnBusy(sessionKey)
-          : false;
+        const busy = typeof service.isAgentTurnBusy === "function"
+          ? service.isAgentTurnBusy(sessionKey)
+          : null;
+        return typeof busy === "boolean" ? busy : null;
       } catch (_) {
-        return false;
+        return null;
       }
     },
     publishCompanionSnapshot: (machine) =>
@@ -2899,6 +3393,9 @@ function registerGlassesUiTool(api, service, opts = {}) {
       }
       handler.handleNavEvent(sessionKey, ev);
     };
+    const onAgentTurnChanged = ({ sessionKey }) => {
+      if (sessionKey) handler.refreshMarkerForAgentTurn(sessionKey);
+    };
     scopeRecord = {
       handler,
       refs: 0,
@@ -2910,6 +3407,7 @@ function registerGlassesUiTool(api, service, opts = {}) {
         onAppClientDisconnect: onDisconnect,
         onLogicalSessionReset,
         onGlassesUiNavEvent: onNavEvent,
+        onAgentTurnChanged,
       },
     };
     scopeHost[HANDLER_SCOPE_SYMBOL] = scopeRecord;
@@ -2921,6 +3419,9 @@ function registerGlassesUiTool(api, service, opts = {}) {
     }
     if (typeof service.onGlassesUiNavEvent === "function") {
       service.onGlassesUiNavEvent(onNavEvent);
+    }
+    if (typeof service.onAgentTurnChanged === "function") {
+      service.onAgentTurnChanged(onAgentTurnChanged);
     }
   } else if (scopeRecord && scopeRecord.relayCallbacks) {
 
@@ -2945,6 +3446,9 @@ function registerGlassesUiTool(api, service, opts = {}) {
     }
     if (callbacks.onGlassesUiNavEvent && typeof service.onGlassesUiNavEvent === "function") {
       service.onGlassesUiNavEvent(callbacks.onGlassesUiNavEvent);
+    }
+    if (callbacks.onAgentTurnChanged && typeof service.onAgentTurnChanged === "function") {
+      service.onAgentTurnChanged(callbacks.onAgentTurnChanged);
     }
   }
 
@@ -3185,4 +3689,4 @@ function registerGlassesUiTool(api, service, opts = {}) {
   };
 }
 
-module.exports = { GLASSES_UI_LIMITS, GLASSES_UI_REFRESH_LIMITS, GLASSES_UI_WINDOW_LIMITS, GLASSES_UI_QUEUE_MODES, DEFAULT_RENDER_GLASSES_UI_TIMEOUT_MS, glassesUiParametersSchema, GLASSES_UI_TOOL_DESCRIPTION, GET_GLASSES_UI_STATE_TOOL_DESCRIPTION, getGlassesUiStateParametersSchema, validateGlassesUiSpec, validateRefreshSpec, summarizeLiveuiTemplateSpec, createPendingRenderMap, createSurfaceStore, createGlassesUiToolHandler, getRegisteredLiveuiGlassesLibraryController, registerGlassesUiTool, isEvenAiAgentSession };
+module.exports = { GLASSES_UI_LIMITS, GLASSES_UI_REFRESH_LIMITS, GLASSES_UI_WINDOW_LIMITS, GLASSES_UI_QUEUE_MODES, DEFAULT_RENDER_GLASSES_UI_TIMEOUT_MS, glassesUiParametersSchema, GLASSES_UI_TOOL_DESCRIPTION, GET_GLASSES_UI_STATE_TOOL_DESCRIPTION, getGlassesUiStateParametersSchema, GLASSES_UI_TOOL_LAYER_FIELDS, validateGlassesUiInjectSpec, validateGlassesUiSpec, validateRefreshSpec, resolveEffectiveHostCheck, summarizeLiveuiTemplateSpec, createPendingRenderMap, createSurfaceStore, createGlassesUiToolHandler, getRegisteredLiveuiGlassesLibraryController, registerGlassesUiTool, isEvenAiAgentSession };

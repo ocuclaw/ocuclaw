@@ -39,6 +39,7 @@ function buildWakeMessage(ref) {
 
 function createAgentTurnTracker(deps = {}) {
   const now = typeof deps.now === "function" ? deps.now : Date.now;
+  const onChange = typeof deps.onChange === "function" ? deps.onChange : () => {};
   const busyDecayMs = Number.isFinite(deps.busyDecayMs)
     ? deps.busyDecayMs
     : DEFAULT_AGENT_TURN_BUSY_DECAY_MS;
@@ -107,6 +108,7 @@ function createAgentTurnTracker(deps = {}) {
     if (typeof sessionKey !== "string" || !sessionKey) return;
     refreshBusy(sessionKey);
     if (runId) noteRun(sessionKey, runId);
+    onChange(sessionKey, true);
   }
 
   function onActivity(sessionKey, phase, runId = null) {
@@ -123,10 +125,12 @@ function createAgentTurnTracker(deps = {}) {
         else entry.live.clear();
 
       }
+      onChange(sessionKey, false);
       return;
     }
     refreshBusy(sessionKey);
     if (runId) noteRun(sessionKey, runId);
+    onChange(sessionKey, true);
   }
 
   function isBusy(sessionKey) {

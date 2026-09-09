@@ -38,14 +38,22 @@ const DEFAULT_LIVEUI_CONFIG = Object.freeze({
   tickApiBaseUrl: "",
   allowAgentModelOverride: false,
   tickMaxOutputTokens: 200,
-  httpEnabled: false,
+  httpEnabled: true,
+  httpHostPolicy: "owner-grants",
   httpAllowHosts: [],
-  llmEnabled: false,
+  llmEnabled: true,
   maxConcurrentSurfacesPerHost: 4,
   stageGraceMs: DEFAULT_STAGE_GRACE_MS,
 
   includeLastRenderInOutcome: false,
 });
+
+function mergeLiveConfig(raw) {
+  return {
+    ...DEFAULT_LIVEUI_CONFIG,
+    ...(raw && typeof raw === "object" ? raw : {}),
+  };
+}
 
 function silentLogger() {
   return { info() {}, warn() {}, error() {}, debug() {} };
@@ -252,7 +260,7 @@ function createHermesLiveUiBridge(opts = {}) {
       runtimeConfig && runtimeConfig.glassesUiLive && typeof runtimeConfig.glassesUiLive === "object"
         ? runtimeConfig.glassesUiLive
         : {};
-    return { ...DEFAULT_LIVEUI_CONFIG, ...cfg };
+    return mergeLiveConfig(cfg);
   }
 
   function renderTimeoutMs() {
@@ -349,11 +357,12 @@ function createHermesLiveUiBridge(opts = {}) {
         : null,
     isAgentTurnBusy: (sessionKey) => {
       try {
-        return typeof relay.isAgentTurnBusy === "function"
-          ? !!relay.isAgentTurnBusy(sessionKey)
-          : false;
+        const busy = typeof relay.isAgentTurnBusy === "function"
+          ? relay.isAgentTurnBusy(sessionKey)
+          : null;
+        return typeof busy === "boolean" ? busy : null;
       } catch {
-        return false;
+        return null;
       }
     },
     publishCompanionSnapshot: (machine) => {
@@ -375,6 +384,38 @@ function createHermesLiveUiBridge(opts = {}) {
     now: typeof injectedNow === "function" ? injectedNow : undefined,
     describeToolApprovalBehaviour,
   });
+
+  const publishConnectedAppSnapshot = () => {
+    const sessionKey =
+      typeof relay.getConnectedAppActiveSessionKey === "function"
+        ? relay.getConnectedAppActiveSessionKey()
+        : null;
+    if (!sessionKey) return;
+    try {
+      handler.publishCompanionSnapshot(sessionKey);
+    } catch (err) {
+      logger.warn(
+        `[hermes-liveui] companion snapshot refresh failed: ${err && err.message ? err.message : err}`,
+      );
+    }
+  };
+  const unsubscribeAppState =
+    typeof relay.onAppPresenceChanged === "function"
+      ? relay.onAppPresenceChanged(publishConnectedAppSnapshot)
+      : () => {};
+  const unsubscribeAgentTurn =
+    typeof relay.onAgentTurnChanged === "function"
+      ? relay.onAgentTurnChanged(({ sessionKey }) => {
+          if (sessionKey) handler.refreshMarkerForAgentTurn(sessionKey);
+          publishConnectedAppSnapshot();
+        })
+      : () => {};
+  publishConnectedAppSnapshot();
+
+  const companionRefreshTimer = setInterval(publishConnectedAppSnapshot, 15_000);
+  if (companionRefreshTimer && typeof companionRefreshTimer.unref === "function") {
+    companionRefreshTimer.unref();
+  }
 
   if (typeof relay.onAppClientDisconnect === "function") {
     relay.onAppClientDisconnect(({ sessionKey } = {}) => {
@@ -430,16 +471,22 @@ function createHermesLiveUiBridge(opts = {}) {
     const normalized = normalizeHermesLiveUiSessionKey(sessionKey);
     const stackDepth = handler.surfaceStackDepth(normalized);
     const settledPending = handler.settleSession(normalized, { result: "aborted" });
+
+    const releasedTerminalTop = handler.releaseTerminalTopOnAgentEnd(
+      normalized,
+      { result: "aborted", origin: "system" },
+    );
     emitLifecycle("agent_end_settle", "debug", {
       sessionKey: normalized,
       stackDepth,
       settledPending,
       settlement: settledPending > 0 ? "aborted" : null,
+      releasedTerminalTop,
       storeId: handler.storeId,
 
       ...readAgentRunId(relay, normalized, ctx, event),
     });
-    handler.parkMarkerOnAgentEnd(normalized);
+    if (!releasedTerminalTop) handler.parkMarkerOnAgentEnd(normalized);
     resetDepth(normalized);
   }
 
@@ -518,10 +565,19 @@ function createHermesLiveUiBridge(opts = {}) {
     const sessionKey = normalizeSessionKeyFromParams(params);
     const fragments = [];
     let voicemailAckToken = null;
+    const queuedOwnership =
+      typeof relay.consumePromptTurnOwnership === "function"
+        ? relay.consumePromptTurnOwnership(sessionKey)
+        : null;
+    const promptOwner =
+      params && (params.promptOwner === "ocuclaw" || params.promptOwner === "even-ai")
+        ? params.promptOwner
+        : queuedOwnership && queuedOwnership.owner;
     const channelTwo = composeChannelTwoFragment({
       startEnabled: displayStates(relay, "getDisplayStartStates", sessionKey),
       currentEnabled: displayStates(relay, "getDisplayCurrentStates", sessionKey),
       glassesConnected: boolFromRelay(relay, "hasConnectedAppClient", true),
+      includeNeuralGuidance: promptOwner !== "even-ai",
     });
     if (channelTwo) fragments.push({ kind: "channel_two", text: channelTwo });
     try {
@@ -712,6 +768,11 @@ function createHermesLiveUiBridge(opts = {}) {
     tasks,
     resolveLlmApiKey,
     executeLlmRecipe,
+    dispose() {
+      clearInterval(companionRefreshTimer);
+      unsubscribeAppState();
+      unsubscribeAgentTurn();
+    },
     _debugState() {
       return {
         activeCalls: activeCalls.size,
@@ -721,4 +782,4 @@ function createHermesLiveUiBridge(opts = {}) {
   };
 }
 
-module.exports = { DEFAULT_LIVEUI_CONFIG, LIVEUI_TOOL_NAME, LIVEUI_TOOLSET, LINK_LIVEUI_METHODS, normalizeHermesLiveUiSessionKey, buildHermesLiveUiToolDescriptor, buildHermesLiveUiStateToolDescriptor, buildHermesLiveUiTemplateToolDescriptor, buildHermesLiveUiTaskToolDescriptor, LIVEUI_STATE_TOOL_NAME, buildHermesLiveUiHelloPayload, createHermesLiveUiBridge };
+module.exports = { DEFAULT_LIVEUI_CONFIG, LIVEUI_TOOL_NAME, LIVEUI_TOOLSET, LINK_LIVEUI_METHODS, normalizeHermesLiveUiSessionKey, buildHermesLiveUiToolDescriptor, buildHermesLiveUiStateToolDescriptor, buildHermesLiveUiTemplateToolDescriptor, buildHermesLiveUiTaskToolDescriptor, LIVEUI_STATE_TOOL_NAME, buildHermesLiveUiHelloPayload, createHermesLiveUiBridge, mergeLiveConfig };

@@ -59,14 +59,25 @@ function projectLiveuiTaskIndexRows(listedItems, organization) {
       isLiveuiLibraryItemVisible(organization, "task", item.itemId),
     )
     .slice(0, LIVEUI_TASK_INDEX_MAX_ROWS)
-    .map((item) => ({
-      name: collapseWhitespace(item.name),
-      description: collapseWhitespace(
-        typeof item.description === "string"
-          ? item.description
-          : item.cosmetic && item.cosmetic.description,
-      ),
-    }))
+    .map((item) => {
+      const approved = item.approved && typeof item.approved === "object"
+        ? item.approved
+        : item.versions && item.versions.approved;
+      return {
+        name: collapseWhitespace(
+          approved && typeof approved.name === "string"
+            ? approved.name
+            : item.name,
+        ),
+        description: collapseWhitespace(
+          approved && typeof approved.description === "string"
+            ? approved.description
+            : typeof item.description === "string"
+              ? item.description
+              : item.cosmetic && item.cosmetic.description,
+        ),
+      };
+    })
     .filter((row) => row.name);
 }
 

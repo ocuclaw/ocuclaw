@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import shlex
+from collections import deque
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,8 @@ LINK_TRUNCATION_HEAD_CHARS = 2_048
 LINK_HANDSHAKE_TIMEOUT_S = 10.0
 LINK_TERMINATE_GRACE_S = 5.0
 LINK_DEBUG_CATEGORY = "hermes.link"
+LINK_WRITE_MAX_BYTES = 4 * 1_048_576
+LINK_ADMISSION_LIMIT = 128
 
 FRAME_HELLO = "link.hello"
 FRAME_HELLO_ACK = "link.hello.ack"
@@ -64,6 +67,17 @@ class LinkHandshakeError(LinkError):
 
 class LinkClosedError(LinkError):
     """Operation attempted on a closed/dead link."""
+
+    def __init__(self, message: str, delivery: str = "not_sent") -> None:
+        super().__init__(message)
+        self.delivery = delivery
+
+
+class LinkOverloadedError(LinkError):
+    """Rejected before admission; no command bytes were issued."""
+
+    code = "link_overloaded"
+    delivery = "not_sent"
 
 
 class LinkRpcError(LinkError):
@@ -195,6 +209,7 @@ class LinkProcess:
         self._cwd = cwd
         self._log = log or logger
         self._on_exit = on_exit
+        self._exit_notified = False
 
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._hello_payload: Optional[Dict[str, Any]] = None
@@ -206,6 +221,12 @@ class LinkProcess:
         self._pending: Dict[str, asyncio.Future] = {}
         self._reader_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
+        self._writer_task: Optional[asyncio.Task] = None
+        self._wait_task: Optional[asyncio.Task] = None
+        self._handler_tasks: set[asyncio.Task] = set()
+        self._write_queue: deque = deque()
+        self._queued_bytes = 0
+        self._issued: set[str] = set()
         self._request_handlers: Dict[str, Callable[[Any], Awaitable[Any]]] = {}
         self.counters = {
             "frames_in": 0,
@@ -251,6 +272,7 @@ class LinkProcess:
         )
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._pump_stderr())
+        self._wait_task = asyncio.create_task(self._wait_child())
         try:
             await asyncio.wait_for(
                 self._hello_event.wait(), timeout=self._handshake_timeout_s
@@ -260,17 +282,24 @@ class LinkProcess:
             raise LinkHandshakeError(
                 f"child sent no {FRAME_HELLO} within {self._handshake_timeout_s}s"
             ) from None
+        except asyncio.CancelledError:
+            await self.terminate()
+            raise
         if self._handshake_error is not None:
             err = self._handshake_error
             await self.terminate()
             raise err
-        self._send_frame(
-            {
-                "v": LINK_PROTOCOL_VERSION,
-                "type": FRAME_HELLO_ACK,
-                "payload": dict(self._hello_ack_payload),
-            }
-        )
+        try:
+            self._send_frame(
+                {
+                    "v": LINK_PROTOCOL_VERSION,
+                    "type": FRAME_HELLO_ACK,
+                    "payload": dict(self._hello_ack_payload),
+                }
+            )
+        except LinkError:
+            await self.terminate()
+            raise
         self._ready = True
         return self._hello_payload or {}
 
@@ -279,6 +308,8 @@ class LinkProcess:
     ) -> Any:
         if not self.ready:
             raise LinkClosedError("control link not ready")
+        if len(self._pending) >= LINK_ADMISSION_LIMIT:
+            raise LinkOverloadedError("link_overloaded")
         request_id = f"p{self._next_request_id}"
         self._next_request_id += 1
         future: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -291,14 +322,22 @@ class LinkProcess:
         }
         if params is not None:
             frame["params"] = params
-        delivered = self._send_frame(frame)
-        if not delivered:
-            self._pending.pop(request_id, None)
-            raise LinkRpcError(None, "link_frame_truncated")
         try:
+            delivered = self._send_frame(frame)
+            if not delivered:
+                raise LinkRpcError(None, "link_frame_truncated")
             return await asyncio.wait_for(future, timeout=timeout_s)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            exc.delivery = "uncertain" if request_id in self._issued else "not_sent"
+            raise
         finally:
             self._pending.pop(request_id, None)
+            self._issued.discard(request_id)
+            self._remove_queued(request_id)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()  # send failure may have concurrently closed the link
 
     async def terminate(self) -> Optional[int]:
         """Bounded teardown: SIGTERM, wait the grace period, then SIGKILL.
@@ -310,6 +349,7 @@ class LinkProcess:
         proc = self._proc
         if proc is None:
             return None
+        self._finish(proc.returncode, notify=False)
         if proc.returncode is None:
             try:
                 proc.terminate()
@@ -328,9 +368,13 @@ class LinkProcess:
                     pass
                 await proc.wait()
         self._finish(proc.returncode)
-        for task in (self._reader_task, self._stderr_task):
-            if task is not None:
+        tasks = [self._reader_task, self._stderr_task, self._writer_task,
+                 self._wait_task, *self._handler_tasks]
+        tasks = [task for task in tasks if task is not None and task is not asyncio.current_task()]
+        for task in tasks:
+            if not task.done():
                 task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         return proc.returncode
 
     # -- internals -----------------------------------------------------------
@@ -339,9 +383,14 @@ class LinkProcess:
         """Write a frame; returns False when the truncation rule replaced it
         with a marker (the peer sees an explicit marker, never a split)."""
         proc = self._proc
-        if proc is None or proc.stdin is None or proc.returncode is not None:
+        if self._closed or proc is None or proc.stdin is None or proc.returncode is not None:
             raise LinkClosedError("control link closed")
         raw, truncated = encode_link_frame(frame)
+        if (len(self._write_queue) >= LINK_ADMISSION_LIMIT or
+                self._queued_bytes + proc.stdin.transport.get_write_buffer_size() + len(raw) > LINK_WRITE_MAX_BYTES):
+            if frame.get("type") != FRAME_RPC_REQUEST:
+                self._finish(proc.returncode)
+            raise LinkOverloadedError("link_overloaded")
         if truncated:
             self.counters["truncated_outbound"] += 1
             self._log.warning(
@@ -350,8 +399,60 @@ class LinkProcess:
                 LINK_MAX_LINE_BYTES,
             )
         self.counters["frames_out"] += 1
-        proc.stdin.write(raw)
+        request_id = frame.get("id") if frame.get("type") == FRAME_RPC_REQUEST else None
+        owner = asyncio.current_task() if request_id is not None else None
+        cancellations = owner.cancelling() if owner is not None else 0
+        self._write_queue.append((request_id, raw, owner, cancellations))
+        self._queued_bytes += len(raw)
+        if self._writer_task is None or self._writer_task.done():
+            self._writer_task = asyncio.create_task(self._write_frames())
         return not truncated
+
+    def _remove_queued(self, request_id: str) -> None:
+        retained = deque()
+        for item in self._write_queue:
+            if item[0] == request_id:
+                self._queued_bytes -= len(item[1])
+            else:
+                retained.append(item)
+        self._write_queue = retained
+
+    async def _write_frames(self) -> None:
+        assert self._proc is not None and self._proc.stdin is not None
+        writer = self._proc.stdin
+        try:
+            while self._write_queue and not self._closed:
+                request_id, raw, owner, cancellations = self._write_queue.popleft()
+                self._queued_bytes -= len(raw)
+                future = self._pending.get(request_id)
+                # A drain wake may run before the cancelled request's finally
+                # block. Never issue its queued command during that race.
+                # Compare with admission: a task may have handled an earlier
+                # cancellation and deliberately issue a new cleanup RPC.
+                if ((owner is not None and owner.cancelling() > cancellations) or
+                        (future is not None and future.done())):
+                    continue
+                if request_id in self._pending:
+                    self._issued.add(request_id)
+                writer.write(raw)
+                del raw  # the transport owns any unwritten bytes
+                await writer.drain()
+        except (BrokenPipeError, ConnectionError, OSError):
+            self._finish(self.returncode)
+
+    async def _wait_child(self) -> None:
+        assert self._proc is not None
+        await self._proc.wait()
+        self._finish(self._proc.returncode)
+        self._notify_exit(self._proc.returncode)
+
+    def writer_state(self) -> Dict[str, Any]:
+        writer = self._proc.stdin if self._proc else None
+        return {"queued_bytes": self._queued_bytes, "queued_frames": len(self._write_queue),
+                "stream_bytes": writer.transport.get_write_buffer_size() if writer else 0,
+                "pending_requests": len(self._pending), "active_handlers": len(self._handler_tasks),
+                "max_write_bytes": LINK_WRITE_MAX_BYTES, "admission_limit": LINK_ADMISSION_LIMIT,
+                "writer_running": self._writer_task is not None and not self._writer_task.done()}
 
     async def _read_stdout(self) -> None:
         proc = self._proc
@@ -360,11 +461,19 @@ class LinkProcess:
             on_line=self._handle_line,
             on_oversize=self._handle_oversize,
         )
-        while True:
-            chunk = await proc.stdout.read(65536)
-            if not chunk:
-                break
-            splitter.feed(chunk)
+        try:
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                if not self._closed:
+                    splitter.feed(chunk)
+                # After failure keep draining/discarding until exit. Cancelling
+                # this reader early can deadlock Process.wait() on a full pipe.
+        except (ConnectionError, OSError):
+            pass  # A failed reader has the same terminal meaning as EOF.
+        finally:
+            self._finish(proc.returncode, notify=False)
         # EOF is the death signal (ADR-0003).
         returncode = None
         try:
@@ -372,6 +481,7 @@ class LinkProcess:
         except asyncio.TimeoutError:
             pass
         self._finish(returncode)
+        self._notify_exit(returncode)
 
     async def _pump_stderr(self) -> None:
         proc = self._proc
@@ -402,6 +512,8 @@ class LinkProcess:
         )
 
     def _handle_line(self, line: bytes) -> None:
+        if self._closed:
+            return
         try:
             frame = json.loads(line)
         except ValueError:
@@ -443,7 +555,12 @@ class LinkProcess:
             self._handle_response(frame)
             return
         if frame_type == FRAME_RPC_REQUEST:
-            asyncio.get_running_loop().create_task(self._handle_request(frame))
+            if len(self._handler_tasks) >= LINK_ADMISSION_LIMIT:
+                self._finish(self.returncode)
+                return
+            task = asyncio.create_task(self._handle_request(frame))
+            self._handler_tasks.add(task)
+            task.add_done_callback(self._handler_tasks.discard)
             return
         self.counters["protocol_errors"] += 1
         self._log.warning("[ocuclaw] unknown control-link frame type %r", frame_type)
@@ -465,6 +582,8 @@ class LinkProcess:
         )
 
     async def _handle_request(self, frame: Dict[str, Any]) -> None:
+        if self._closed:
+            return
         method = frame.get("method")
         handler = self._request_handlers.get(method or "")
         response: Dict[str, Any] = {
@@ -488,23 +607,46 @@ class LinkProcess:
                 response["error"] = {"code": -32000, "message": str(exc)}
         try:
             self._send_frame(response)
-        except LinkClosedError:
-            pass
+        except (LinkClosedError, LinkOverloadedError):
+            self._finish(self.returncode)
 
-    def _finish(self, returncode: Optional[int]) -> None:
+    def _finish(self, returncode: Optional[int], *, notify: bool = True) -> None:
         if self._closed:
+            if notify:
+                self._notify_exit(returncode)
             return
         self._closed = True
         self._ready = False
-        for future in self._pending.values():
+        self._write_queue.clear()
+        self._queued_bytes = 0
+        current = asyncio.current_task()
+        for task in (self._writer_task, *self._handler_tasks):
+            if task is not None and task is not current:
+                task.cancel()
+        if self._proc is not None and self._proc.stdin is not None:
+            # close() flushes and can hang behind a dead reader; abort discards
+            # uncertain bytes and gives the child EOF without waiting for drain.
+            if not self._proc.stdin.is_closing():
+                self._proc.stdin.transport.abort()
+        for request_id, future in self._pending.items():
             if not future.done():
-                future.set_exception(LinkClosedError("control link closed"))
+                future.set_exception(LinkClosedError("control link closed",
+                    "uncertain" if request_id in self._issued else "not_sent"))
         self._pending.clear()
+        # request() retires issued ids in its finally block. Preserve them until
+        # then so cancellation racing this close cannot claim "not_sent".
         if self._hello_event is not None and not self._hello_event.is_set():
             self._handshake_error = LinkHandshakeError(
                 f"child exited (code={returncode}) before handshake completed"
             )
             self._hello_event.set()
+        if notify:
+            self._notify_exit(returncode)
+
+    def _notify_exit(self, returncode: Optional[int]) -> None:
+        if self._exit_notified:
+            return
+        self._exit_notified = True
         if self._on_exit is not None:
             try:
                 self._on_exit(returncode)
@@ -555,8 +697,8 @@ CHILD_ENV_ALLOWLIST: Tuple[str, ...] = (
     "OPENCLAW_SERVICE_VERSION",
     "OPENCLAW_VERSION",
     # `os.homedir()` — POSIX reads $HOME, Windows %USERPROFILE%. The child
-    # anchors state under it (relay-core debug-bundle dir, even-terminal
-    # discovery/history roots), so an unset value silently relocates state.
+    # anchors relay-core state under it, so an unset value silently relocates
+    # state.
     "HOME",
     "USERPROFILE",
     # `os.tmpdir()` — TMPDIR on POSIX, TEMP/TMP on Windows. The gateway bridge

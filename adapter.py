@@ -58,10 +58,11 @@ import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from .cli import register_cli_commands
+from .session_status import SessionStatusObserver
 from .control_link import (
     HERMES_BUNDLE_DEFAULT_WS_BIND,
     HERMES_BUNDLE_DEFAULT_WS_PORT,
@@ -96,6 +97,7 @@ from .dispatch import (
     streaming_event,
     strip_stream_cursor,
     uncorrelated_message_event,
+    validate_prompt_metadata,
 )
 from .first_run import (
     PhoneTurnCandidateGate,
@@ -142,17 +144,27 @@ from .receipts import (
     write_app_presence,
 )
 from .session_rpc import (
+    DB_METHOD_CHAT_WATERMARK,
     DEFAULT_SESSION_NAMESPACE,
     OCUCLAW_CHAT_TYPE_SEGMENT,
     OCUCLAW_PLATFORM_SEGMENT,
+    NotAdoptableError,
     ProfileSessionRpc,
     default_state_db_path,
     session_read_state_supported,
 )
-from . import serve
+from .stt_rpc import (
+    PRE_TRANSCRIPTION_HOOK_NAME,
+    SttRpc,
+    pre_transcription_hook,
+)
+from . import desktop_credentials, even_ai_route, serve
 from . import health as health_collect
+from .health import OCUCLAW_WEARER_USER_ID, continue_here_configured
 from .desktop_pairing import (
     THEME_REQUEST_CONFIG_KEY as DESKTOP_THEME_CONFIG_KEY,
+    desktop_convergence,
+    desktop_convergence_message,
     plugin_owned as desktop_plugin_owned,
     plugin_path as desktop_plugin_path,
     read_desktop_theme_request,
@@ -215,6 +227,24 @@ def _is_hermes_home_channel_onboarding_notice(text: str) -> bool:
         and "Type /sethome to make this chat your home channel" in normalized
     )
 
+
+def _gateway_auth_recovery_message(text: str) -> str:
+    """Give the native auth-error reply a recovery destination, without OAuth I/O."""
+    normalized = str(text or "").strip()
+    # Hermes sanitizes errors for plugin chat surfaces before calling send(),
+    # so its canonical reply no longer identifies the failing provider. Keep
+    # that attribution honest instead of guessing Codex from profile defaults.
+    if normalized == (
+        "⚠️ Provider authentication failed. Check the configured credentials; "
+        "raw provider details are in the gateway logs."
+    ):
+        return (
+            "Provider sign-in needs attention. Reconnect your provider in "
+            "Hermes on the gateway host, then retry this message. If agents "
+            "share that login, check each affected agent."
+        )
+    return text
+
 # Hermes-specific config ingress totality for
 # platforms.ocuclaw.extra.evenAiRoutingMode. This is the canonical set ONLY:
 # the four historical aliases the already-public shared parser still accepts
@@ -248,7 +278,9 @@ STREAM_HOOKS_MODULE = "agent.plugin_stream_hooks"
 # Declared in plugin.yaml, registered ONLY where the host's hook vocabulary
 # has them. The manifest states what this build may use; the probe decides
 # what it actually wires.
-CONDITIONAL_HOOK_NAMES = (INTERIM_HOOK_NAME,) + STREAM_HOOK_NAMES
+CONDITIONAL_HOOK_NAMES = (
+    (INTERIM_HOOK_NAME,) + STREAM_HOOK_NAMES + (PRE_TRANSCRIPTION_HOOK_NAME,)
+)
 STREAM_REASONING_DELTAS_CONFIG_PATH = ("plugins", "stream_reasoning_deltas")
 
 # Feature tokens advertised to the Node child (and from there to the client's
@@ -268,6 +300,13 @@ OCUCLAW_HERMES_FEATURES_ENV = "OCUCLAW_HERMES_FEATURES"
 # Set once by register(); read by _setup_status() and the child env builder.
 STREAM_HOOKS_AVAILABLE = False
 INTERIM_HOOK_AVAILABLE = False
+# Set once by register(). Deliberately NOT a feature token: the token channel
+# advertises lanes the CLIENT branches on, and the phone's STT settings behave
+# identically either way — with the hook the wearer's language reaches Hermes's
+# eight built-in backends, without it only the command/plugin lanes honour it
+# (stt_rpc `_dispatch_overlay`). Nothing on the wire changes, so nothing on the
+# wire announces it; this boolean is for `hermes doctor`-grade diagnosis.
+PRE_TRANSCRIPTION_HOOK_AVAILABLE = False
 _REGISTERED_OPTIONAL_FEATURES: Tuple[str, ...] = ()
 
 
@@ -303,6 +342,18 @@ def _probe_optional_hook_support() -> Tuple[bool, bool]:
         and all(name in names for name in STREAM_HOOK_NAMES)
     )
     return stream, interim
+
+
+def _pre_transcription_hook_supported() -> bool:
+    """True when this host's hook vocabulary carries ``pre_transcription``.
+
+    Probed for the same reason the stream hooks are (`register_hook` warns and
+    STORES an unknown name rather than refusing it, hermes_cli/plugins.py:3259)
+    — registering blind would log a warning on every host older than the seam
+    and wire a callback that can never fire. Arrived with the STT dispatcher's
+    hook seam; absent at the 0.20.0 baseline.
+    """
+    return PRE_TRANSCRIPTION_HOOK_NAME in _valid_hook_names()
 
 
 def _stream_reasoning_deltas_configured() -> bool:
@@ -598,12 +649,23 @@ def _hermes_feature_tokens() -> Tuple[str, ...]:
 # Supported Hermes range for this bundle build. The complete Backend Adapter
 # admission and SessionDB contract is certified against this exact upstream
 # release. In-minor patches remain admissible, but the release watcher creates
-# an immediate recertification obligation for every first-seen 0.20.x patch.
-CERTIFIED_HERMES_VERSION = "0.20.6"
-CERTIFIED_HERMES_TAG = "v2026.8.27"
-CERTIFIED_HERMES_COMMIT = "5fc308a70719a83cccdbba4c0e39c23f5a8239d5"
-SUPPORTED_HERMES_MIN = (0, 20, 0)
-SUPPORTED_HERMES_MAX_EXCLUSIVE = (0, 21, 0)
+# an immediate recertification obligation for every first-seen 0.21.x patch.
+CERTIFIED_HERMES_VERSION = "0.21.0"
+CERTIFIED_HERMES_TAG = "v2026.8.31"
+CERTIFIED_HERMES_COMMIT = "29112bef099274229cadff79cdff7bf7b99c4b77"
+SUPPORTED_HERMES_MIN = (0, 21, 0)
+SUPPORTED_HERMES_MAX_EXCLUSIVE = (0, 22, 0)
+
+# Hermes owns these bytes for every OcuClaw-platform session. Keep the section
+# constant: callbacks are re-rendered after 0.21 prompt invalidation/compaction,
+# while this product contract must remain byte-identical at every lifecycle
+# boundary. OpenClaw uses the matching shared-runtime constant instead.
+OCUCLAW_READABILITY_SECTION_ID = "ocuclaw.readability"
+OCUCLAW_READABILITY_SYSTEM_PROMPT = (
+    "For small-screen readability, prefer compact paragraphs and complete "
+    "sentences. Keep formatting simple; avoid tables, code fences, and long "
+    "unbroken strings unless needed."
+)
 
 BUNDLE_DIR = Path(__file__).resolve().parent
 DEFAULT_RUNTIME_ENTRY = BUNDLE_DIR / "dist-cjs" / "runtime" / "hermes-runtime-entry.cjs"
@@ -625,13 +687,15 @@ SETUP_TOOL_DESCRIPTION = (
     "enable_stream_reasoning_deltas and enable_desktop_theme — and only with "
     "confirm: true after the operator has said yes."
 )
-SETUP_GUIDE_VERSION = "2026-08-31 (1.3.18-hermes)"
+SETUP_GUIDE_VERSION = "2026-09-05 (1.3.19-hermes)"
 SETUP_SKILL_LOAD_POINTER = (
     "If the OcuClaw Setup Assistant skill is not loaded in this conversation, "
     "load it via `/ocuclaw-setup` before mutating anything."
 )
 SETUP_REFERENCE_FILES = {
+    "install_lifecycle": ("install-lifecycle.md", "Installation and lifecycle recovery"),
     "fresh_install": ("fresh-install.md", "Fresh install"),
+    "agent_mode": ("agent-mode.md", "Choose single or multiple agents"),
     "credential_reset": ("relay-credential-reset.md", "Reset relay credential"),
     "update": ("update.md", "Update OcuClaw"),
     "troubleshooting": ("troubleshooting.md", "Troubleshooting"),
@@ -640,12 +704,19 @@ SETUP_REFERENCE_FILES = {
 }
 SETUP_STREAM_DELTAS_OPERATION = "enable_stream_reasoning_deltas"
 SETUP_DESKTOP_THEME_OPERATION = "enable_desktop_theme"
+SETUP_EVEN_AI_ROUTE_OPERATION = "even_ai_route"
 SETUP_WRITING_OPERATIONS = (
     SETUP_STREAM_DELTAS_OPERATION,
     SETUP_DESKTOP_THEME_OPERATION,
 )
-SETUP_READ_ONLY_OPERATIONS = ("status", "doctor", *SETUP_REFERENCE_FILES.keys())
+SETUP_READ_ONLY_OPERATIONS = (
+    "status",
+    "doctor",
+    SETUP_EVEN_AI_ROUTE_OPERATION,
+    *SETUP_REFERENCE_FILES.keys(),
+)
 SETUP_INTERACTIVE_OPERATIONS = (
+    "request_credentials",
     "pair_phone",
     "wait_phone_origin",
     "arm_first_run_proof",
@@ -654,6 +725,7 @@ SETUP_INTERACTIVE_OPERATIONS = (
 SETUP_OPERATIONS = (
     "status",
     "doctor",
+    SETUP_EVEN_AI_ROUTE_OPERATION,
     *SETUP_INTERACTIVE_OPERATIONS,
     *SETUP_REFERENCE_FILES.keys(),
     *SETUP_WRITING_OPERATIONS,
@@ -668,7 +740,9 @@ SETUP_TOOL_SCHEMA = {
                 "type": "string",
                 "enum": list(SETUP_OPERATIONS),
                 "description": (
-                    "Setup operation. pair_phone opens the direct, model-bypassing "
+                    "Setup operation. request_credentials opens a private Desktop "
+                    "form for one optional integration at a time; never supply secret values. "
+                    "pair_phone opens the direct, model-bypassing "
                     "Hermes TUI or Desktop QR and four-word ceremony; "
                     "wait_phone_origin blocks for a completed phone turn; "
                     "welcome_round_trip blocks for the managed welcome dismissal. "
@@ -688,6 +762,14 @@ SETUP_TOOL_SCHEMA = {
                     "repaints their Desktop. Ignored by every read-only "
                     "operation."
                 ),
+            },
+            "integrations": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["soniox", "evenAi"]},
+                "minItems": 1,
+                "maxItems": 1,
+                "uniqueItems": True,
+                "description": "For request_credentials: exactly one integration the user chose at this checkpoint. Ask about Soniox and Even AI separately. No secret values.",
             },
             "phoneCandidateId": {
                 "type": "string",
@@ -806,6 +888,8 @@ NARRATION_COMMIT_MEMORY = 16
 # How many origin stamps stay remembered per run (#1619). One per narration
 # sentence; the same bound as the commit ledger, for the same reason.
 NARRATION_ORIGIN_MEMORY = 16
+# Keep completed fork identities long enough to reject queued stream hooks too.
+BACKGROUND_HOOK_TURN_MEMORY = 512
 # Hermes' StreamConsumer marks a commentary send with this metadata key
 # (0.20.5+). It is a SECOND narration signal, independent of the hook, and
 # both feed the same normalized-text set.
@@ -845,6 +929,50 @@ STREAM_END_FINALIZE_REASON = "response_started"
 RUNTIME_READY_TIMEOUT_S = 30.0
 
 FOREIGN_COPY_METHOD = "foreign.sessions.copy"
+# Continue here (#2509): adopt a Desktop/CLI/TUI transcript onto a freshly
+# minted glasses lane via the PUBLIC `/resume <tip> --all` slash command.
+FOREIGN_ADOPT_METHOD = "foreign.sessions.adopt"
+# `OCUCLAW_WEARER_USER_ID` (health.py) is the ONE user id this adapter stamps
+# on every wearer-originated event (`build_source` in `_build_message_event`).
+# `allow_admin_from` must list exactly this id for `/resume --all` to be
+# sanctioned; it also turns slash gating ON for the ocuclaw platform
+# (slash_access.py `enabled=bool(admin_ids)`), safe only because this is the
+# sole id the adapter ever sends.
+ADOPT_CHAT_ID_PREFIX = "adopt-"
+# Hermes answers a slash turn in well under a second; the DB is polled at
+# ADOPT_POLL_S until the routing shows the tip, or the reply names a refusal,
+# or this budget runs out (verdict `adopt_timeout`, no row changed).
+ADOPT_TIMEOUT_S = 10.0
+ADOPT_POLL_S = 0.1
+# Live Desktop/TUI leases on the lineage lock the adopt (RULED: DESKTOP_HOLD =
+# hard lock, Take-over only — the caller passes takeOver:true, T2 #2510).
+DESKTOP_HOLD_SURFACES = frozenset({"desktop", "tui"})
+DESKTOP_TURN_MARKER_RELPATH = ("desktop", "interrupted_turns.json")
+DESKTOP_LEASE_REGISTRY_RELPATH = ("runtime", "active_sessions.json")
+# Single-driver lock (T2 #2510). One driver at a time on an adopted chat:
+# GLASSES_DRIVE — no live Desktop/TUI lease on the lineage; DESKTOP_HOLD — a
+# pid-alive lease names a lineage id (Desktop ran this chat and still owns
+# its runtime — its NEXT turn answers from in-memory history, so a glasses
+# turn would be silently dropped from Desktop's context); DESKTOP_WORKING —
+# a turn marker names a lineage id (a Desktop turn is running right now).
+# LOCK in both Desktop states (RULED); unlock on lease clear or Take-over.
+DRIVER_STATE_GLASSES = "glasses_drive"
+DRIVER_STATE_DESKTOP_HOLD = "desktop_hold"
+DRIVER_STATE_DESKTOP_WORKING = "desktop_working"
+FOREIGN_DRIVER_METHOD = "foreign.sessions.driver"
+# Tier 0 in-flight fail-safe: `on_session_end` skips interrupted early
+# returns (run_agent.py:9158), so an in-flight mark that never sees its end
+# expires on its own. Every pre_llm_call / tool hook refreshes the stamp, so
+# the TTL bounds ONE silent gap (a single model call or tool run), not a turn.
+INFLIGHT_TTL_S = 600.0
+# Hermes's own durable-lease wait notice (run_agent.py:8839-8851). It reaches
+# the app as `activity origin=status state=lifecycle` with the text in
+# `detail` and no label — the status presenter drops label-less lifecycle
+# notices (T0 step 8: the wearer saw nothing for 56 s). Stamping the label +
+# rank here makes the wait visible on the header and the phone.
+DESKTOP_LEASE_WAIT_PREFIX = "⏳"
+DESKTOP_LEASE_WAIT_STATUS_KEY = "desktop_lease_wait"
+DESKTOP_LEASE_WAIT_LABEL = "Waiting for Desktop"
 APPROVAL_RESOLVE_METHOD = "approval.resolve"
 SLASH_CONFIRM_PRESENT_METHOD = "slash.confirm.present"
 SLASH_CONFIRM_RESOLVE_METHOD = "slash.confirm.resolve"
@@ -1032,6 +1160,148 @@ def _hermes_home() -> Optional[Path]:
         return None
 
 
+# `adopt_configured(extra)` — the adapter-side name for the health lane's
+# posture read (one implementation; setup status, doctor findings and the
+# adopt verb must never disagree on what "configured" means).
+adopt_configured = continue_here_configured
+
+
+def _pid_alive_here(pid: Any) -> bool:
+    """Our own liveness probe (``kill(pid, 0)``). Dead-pid leases persist on
+    disk (the Mac holds pid 34644, dead); Hermes's public reader prunes them,
+    but the lock must never depend on that side effect alone."""
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid_int <= 0:
+        return False
+    try:
+        os.kill(pid_int, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def desktop_hold_details(
+    home: Optional[Path], lineage: List[str]
+) -> Optional[Dict[str, Any]]:
+    """What Desktop/TUI currently holds on a lineage, from Hermes's own files.
+
+    ``{"state": "working", ...}`` — a turn marker exists
+    (``desktop/interrupted_turns.json``, tui_gateway/turn_marker.py: written
+    at turn start, cleared at turn end, keyed by the session id Desktop
+    resumed — ``session["session_key"]`` IS the DB session id there) AND a
+    live Desktop/TUI lease backs it. A marker is a promise to resume, not
+    proof of a process: a Desktop killed MID-turn leaves the marker on disk
+    forever (real-Desktop e2e follow-up, map #2507), and nobody is driving
+    then — no in-memory history exists that a glasses turn could fall out of
+    (Desktop reloads the transcript from the DB on relaunch). So a marker
+    with no live lease is IGNORED (free, ``None``), never ``working`` and
+    never ``hold``. This is safe against turn-start ordering: Hermes acquires
+    the lease when the session opens (tui_gateway/server.py
+    ``_claim_active_session_slot``) and writes the marker only at turn start
+    (``record_turn_start``), so a live Desktop always holds its lease before
+    any marker of its own exists.
+    ``{"state": "hold", ...}`` — a live (pid-alive) Desktop/TUI active-session
+    lease names one of the lineage ids (``runtime/active_sessions.json`` via
+    the public ``active_session_registry_snapshot`` reader, which prunes dead
+    pids; ``_pid_alive_here`` re-checks with our own ``kill(pid, 0)``).
+    ``None`` — free, or unknowable (an unreadable registry never locks the
+    wearer out; the Node watches re-read on every file event and, while the
+    lane is held, on a bounded liveness tick that re-runs this probe). Never
+    a private read of ``session_turn_leases`` (RULED).
+    """
+    if home is None or not lineage:
+        return None
+    ids = {str(value) for value in lineage if value}
+    marker_hit: Optional[Dict[str, Any]] = None
+    marker = Path(home).joinpath(*DESKTOP_TURN_MARKER_RELPATH)
+    try:
+        with open(marker, encoding="utf-8") as handle:
+            entries = json.load(handle)
+        if isinstance(entries, dict):
+            for key, value in entries.items():
+                if key in ids and isinstance(value, dict):
+                    marker_hit = {"sessionId": str(key), "since": value.get("started_at")}
+                    break
+    except FileNotFoundError:
+        pass
+    except Exception:  # noqa: BLE001 - best-effort marker read
+        logger.debug("[ocuclaw] turn marker unreadable at %s", marker, exc_info=True)
+    lease = _live_desktop_lease(home, ids)
+    if marker_hit is not None:
+        if lease is None:
+            logger.debug(
+                "[ocuclaw] turn marker for %s has no live Desktop lease — Desktop died mid-turn; ignoring it",
+                marker_hit["sessionId"],
+            )
+        else:
+            return {
+                "state": "working",
+                "sessionId": marker_hit["sessionId"],
+                "surface": lease["surface"],
+                "pid": lease.get("pid"),
+                "since": marker_hit["since"],
+            }
+    return lease
+
+
+def _live_desktop_lease(home: Path, ids: Set[str]) -> Optional[Dict[str, Any]]:
+    """The first pid-alive Desktop/TUI lease naming one of ``ids`` as a
+    ``hold`` detail, or ``None`` (free or unknowable)."""
+    try:
+        from hermes_cli.active_sessions import active_session_registry_snapshot
+
+        for entry in active_session_registry_snapshot(registry_home=home):
+            if not isinstance(entry, dict):
+                continue
+            surface = str(entry.get("surface") or "").strip().lower()
+            session_id = str(entry.get("session_id") or "")
+            if surface not in DESKTOP_HOLD_SURFACES or session_id not in ids:
+                continue
+            if not _pid_alive_here(entry.get("pid")):
+                continue
+            return {
+                "state": "hold",
+                "sessionId": session_id,
+                "surface": surface,
+                "pid": entry.get("pid"),
+                "since": entry.get("started_at"),
+            }
+    except Exception:  # noqa: BLE001 - unknown liveness never locks the wearer out
+        logger.debug("[ocuclaw] active-session registry unreadable", exc_info=True)
+    return None
+
+
+def desktop_hold_state(home: Optional[Path], lineage: List[str]) -> Optional[str]:
+    """``"working"`` / ``"hold"`` / ``None`` — see ``desktop_hold_details``."""
+    details = desktop_hold_details(home, lineage)
+    return str(details["state"]) if details else None
+
+
+def driver_state_for(hold: Optional[Dict[str, Any]]) -> str:
+    """Hold details → wire driver state (LOCK in both Desktop states)."""
+    if not hold:
+        return DRIVER_STATE_GLASSES
+    if hold.get("state") == "working":
+        return DRIVER_STATE_DESKTOP_WORKING
+    return DRIVER_STATE_DESKTOP_HOLD
+
+
+def is_desktop_lease_wait_notice(status_key: Any, content: Any) -> bool:
+    """Hermes's durable-lease wait notice (run_agent.py:8839-8851): the
+    lifecycle status whose text opens with the hourglass."""
+    return (
+        str(status_key or "") == "lifecycle"
+        and str(content or "").lstrip().startswith(DESKTOP_LEASE_WAIT_PREFIX)
+    )
+
+
 def _namespace_for_profile(profile: Any) -> str:
     return namespace_for_profile(profile)
 
@@ -1141,6 +1411,24 @@ def _on_stream_end_hook(**kwargs: Any) -> None:
             adapter.handle_stream_end(kwargs)
         except Exception:  # noqa: BLE001 — a hook raise must never break turns
             logger.exception("[ocuclaw] on_stream_end glue failed")
+
+
+def _on_pre_transcription_hook(**kwargs: Any) -> Optional[Dict[str, str]]:
+    """Hermes ``pre_transcription`` transform (0.20.6+). The seam that carries
+    the wearer's language pick into Hermes's BUILT-IN STT backends, which
+    re-resolve language from their own config load and so cannot see the
+    in-memory overlay the `stt.transcribe` RPC hands the dispatcher.
+
+    Unlike every other hook above this does NOT fan out to `_ADAPTERS`: its
+    scope is one in-flight `stt.transcribe` call, not a platform instance. The
+    STT lane publishes that call's picks on a contextvar around its own
+    dispatch and this callback reads exactly that — so a transcription no
+    OcuClaw handler started (an iMessage voice note, `hermes voice`, another
+    platform's audio) finds the context unset and passes through untouched,
+    with or without a live adapter. The isolation lives in `stt_rpc`, next to
+    the contextvar it depends on; this is only the registration shim.
+    """
+    return pre_transcription_hook(**kwargs)
 
 
 def _on_pre_llm_call_hook(**kwargs: Any) -> Optional[Dict[str, str]]:
@@ -1612,11 +1900,11 @@ def resolve_adapter_settings(config: Any) -> Dict[str, Any]:
         # support capture + phone handoff gates. These are chosen defaults,
         # not relay-core's historical missing-option inversion.
         "externalDebugToolsEnabled": _bool("externalDebugToolsEnabled", True),
+        "debugAutoArm": _bool("debugAutoArm", False),
         "allowDebugUpload": _bool("allowDebugUpload", True),
         "debugUploadMaxZipBytes": debug_upload_max_zip_bytes,
         "debugUploadCapturePreset": _list("debugUploadCapturePreset"),
         "debugBundleSaveDir": str(extra.get("debugBundleSaveDir") or ""),
-        "evenTerminalEnabled": _bool("evenTerminalEnabled", False),
         "evenAiEnabled": _bool("evenAiEnabled", False),
         "evenAiToken": str(extra.get("evenAiToken") or "").strip(),
         "evenAiSystemPrompt": str(extra.get("evenAiSystemPrompt") or "").strip(),
@@ -1648,11 +1936,11 @@ def _child_runtime_config(settings: Dict[str, Any]) -> Dict[str, Any]:
         "glassesUiLive": settings["glassesUiLive"],
         "renderGlassesUiTimeoutMs": settings["renderGlassesUiTimeoutMs"],
         "externalDebugToolsEnabled": settings["externalDebugToolsEnabled"],
+        "debugAutoArm": settings["debugAutoArm"],
         "allowDebugUpload": settings["allowDebugUpload"],
         "debugUploadMaxZipBytes": settings["debugUploadMaxZipBytes"],
         "debugUploadCapturePreset": settings["debugUploadCapturePreset"],
         "debugBundleSaveDir": settings["debugBundleSaveDir"],
-        "evenTerminalEnabled": settings["evenTerminalEnabled"],
         "evenAiEnabled": settings["evenAiEnabled"],
         "evenAiToken": settings["evenAiToken"],
         "evenAiSystemPrompt": settings["evenAiSystemPrompt"],
@@ -2071,6 +2359,42 @@ def _setup_status(facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         facts if facts is not None else _collect_health_facts()
     )
     raw_config, config_readable = _setup_raw_config()
+    # Guide readiness is independent of connection health. Read only this
+    # non-secret, profile-scoped leaf; a running gateway cannot prove it.
+    display: Any = raw_config
+    for key in ("display", "platforms", "ocuclaw"):
+        display = display.get(key) if isinstance(display, dict) else None
+    tool_progress = display.get("tool_progress") if isinstance(display, dict) else None
+    tool_progress_off = config_readable and (
+        tool_progress is False or tool_progress == "off"
+    )
+    gateway = raw_config.get("gateway")
+    multiplex = gateway.get("multiplex_profiles") if isinstance(gateway, dict) else None
+    mode_config: Any = raw_config
+    for key in ("platforms", "ocuclaw", "extra"):
+        mode_config = mode_config.get(key) if isinstance(mode_config, dict) else None
+    agent_mode = mode_config.get("agent_mode") if isinstance(mode_config, dict) else None
+    agent_mode_chosen = config_readable and isinstance(multiplex, bool) and (
+        (agent_mode == "multiple" and multiplex is True)
+        or (agent_mode == "single" and multiplex is False)
+    )
+    # Continue here (#2509): `platforms.ocuclaw.extra.allow_admin_from` must
+    # list the adapter's one wearer id, on fresh AND existing installs — the
+    # setup skill writes it; every beta without it hits `admin_not_configured`.
+    adopt_ok = config_readable and adopt_configured(mode_config)
+    status["mandatoryConfiguration"] = {
+        "state": (
+            "verified"
+            if tool_progress_off and agent_mode_chosen and adopt_ok
+            else "missing"
+            if config_readable
+            else "unknown"
+        ),
+        "toolProgressOff": tool_progress_off,
+        "agentModeChosen": agent_mode_chosen,
+        "agentMode": agent_mode if agent_mode_chosen else None,
+        "adoptConfigured": adopt_ok,
+    }
     plugins = raw_config.get("plugins")
     stream_reasoning_deltas_set = (
         isinstance(plugins, dict)
@@ -2088,6 +2412,7 @@ def _setup_status(facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "registered": list(_hermes_feature_tokens()),
     }
     status["desktopTheme"] = _desktop_theme_status(raw_config, config_readable)
+    status["desktopCredentials"] = desktop_credentials.status()
     status["sessionReadState"] = bool(session_read_state_supported())
     return status
 
@@ -2248,7 +2573,9 @@ def _run_setup_pairing_action() -> Dict[str, Any]:
     )
 
 
-def _setup_journey(snapshot: Any, attempt: Any) -> Dict[str, str]:
+def _setup_journey(
+    snapshot: Any, attempt: Any, mandatory_configuration: Any = None
+) -> Dict[str, str]:
     snap = snapshot if isinstance(snapshot, dict) else {}
     setup = snap.get("setup") if isinstance(snap.get("setup"), dict) else {}
     health = (
@@ -2271,6 +2598,12 @@ def _setup_journey(snapshot: Any, attempt: Any) -> Dict[str, str]:
         checkpoint = "welcome-round-trip"
     elif setup.get("state") != "configured":
         checkpoint = "prerequisites-and-configuration"
+    elif not isinstance(mandatory_configuration, dict) or mandatory_configuration.get("toolProgressOff") is not True:
+        checkpoint = "mandatory-configuration"
+    elif mandatory_configuration.get("agentModeChosen") is False:
+        checkpoint = "mandatory-configuration"
+    elif mandatory_configuration.get("adoptConfigured") is False:
+        checkpoint = "mandatory-configuration"
     elif any(
         (legs.get(name) or {}).get("state") != "healthy"
         for name in ("hermesGateway", "ocuclawRelay")
@@ -2388,6 +2721,19 @@ def _setup_tool_handler_impl(args: Dict[str, Any], **_kwargs: Any) -> str:
         return json.dumps(
             _desktop_theme_operation_receipt(args or {}), sort_keys=True
         )
+    if operation == SETUP_EVEN_AI_ROUTE_OPERATION:
+        return json.dumps(_setup_even_ai_route_receipt(), sort_keys=True)
+    if operation == "request_credentials":
+        if set(args) - {"operation", "integrations"}:
+            result = {"state": "invalid_request"}
+        elif _current_hermes_interface() != "desktop":
+            result = {"state": "desktop_required"}
+        elif not _desktop_plugin_presence()[1]:
+            result = {"state": "desktop_unavailable"}
+        else:
+            result = desktop_credentials.request(args.get("integrations"))
+        return json.dumps({"ok": result.get("state") == "pending", "operation": operation,
+                           "desktopCredentials": result}, sort_keys=True)
     attempt_session_key = session_key if phone_session else None
     pairing_action = None
     if operation == "pair_phone":
@@ -2518,6 +2864,7 @@ def _setup_tool_handler_impl(args: Dict[str, Any], **_kwargs: Any) -> str:
         receipt["journey"] = _setup_journey(
             snapshot_v1,
             receipt["firstRunProofAttempt"],
+            receipt["status"]["mandatoryConfiguration"],
         )
     if first_run_action is not None:
         receipt["firstRunProofAction"] = first_run_action
@@ -2557,6 +2904,50 @@ def _setup_tool_handler_impl(args: Dict[str, Any], **_kwargs: Any) -> str:
             "content": content,
         }
     return json.dumps(receipt, sort_keys=True)
+
+
+def _setup_even_ai_route_receipt() -> Dict[str, Any]:
+    """Expose the read-only live :8443 classifier to the setup assistant."""
+    raw_config, readable = _setup_raw_config()
+    if not readable:
+        return {
+            "ok": False,
+            "operation": SETUP_EVEN_AI_ROUTE_OPERATION,
+            "error": {
+                "code": "config_unreadable",
+                "message": "Hermes configuration could not be read; no route will be changed.",
+            },
+        }
+    node: Any = raw_config
+    for key in ("platforms", "ocuclaw", "extra"):
+        if not isinstance(node, Mapping):
+            node = {}
+            break
+        node = node.get(key, {})
+    raw_port = (
+        node.get("wsPort", HERMES_BUNDLE_DEFAULT_WS_PORT)
+        if isinstance(node, Mapping)
+        else None
+    )
+    if (
+        not isinstance(raw_port, int)
+        or isinstance(raw_port, bool)
+        or not 1 <= raw_port <= 65535
+    ):
+        return {
+            "ok": False,
+            "operation": SETUP_EVEN_AI_ROUTE_OPERATION,
+            "error": {
+                "code": "relay_port_unknown",
+                "message": "Hermes relay port is unreadable; no route will be changed.",
+            },
+        }
+    decision = even_ai_route.plan_live(relay_port=raw_port)
+    return {
+        "ok": decision.state != "refused",
+        "operation": SETUP_EVEN_AI_ROUTE_OPERATION,
+        "route": decision._asdict(),
+    }
 
 
 def _admitted_adapter_factory(config: Any):
@@ -2617,8 +3008,8 @@ def register(ctx: Any) -> None:
         # handle_dispatch.
         "allow_update_command": False,
         "platform_hint": (
-            "Replies are shown on a 576x288 glasses display. Keep them terse "
-            "and display-friendly."
+            "This session is delivered through OcuClaw on an Even G2 576x288 "
+            "display."
         ),
         "env_enablement_fn": _env_enablement,
     }
@@ -2628,6 +3019,21 @@ def register(ctx: Any) -> None:
         if supported:
             raise
         raise RuntimeError(_unsupported_hermes_message(version)) from exc
+    if supported:
+        register_system_prompt_section = getattr(
+            ctx, "register_system_prompt_section", None
+        )
+        if not callable(register_system_prompt_section):
+            raise RuntimeError(
+                "ocuclaw plugin requires ctx.register_system_prompt_section "
+                f"(hermes {version} exposes no registered prompt surface)"
+            )
+        register_system_prompt_section(
+            OCUCLAW_READABILITY_SECTION_ID,
+            OCUCLAW_READABILITY_SYSTEM_PROMPT,
+            position="after_memory",
+            max_chars=4000,
+        )
     register_skill = getattr(ctx, "register_skill", None)
     setup_skill_registered = False
     if callable(register_skill):
@@ -2719,6 +3125,23 @@ def register(ctx: Any) -> None:
                 )
         except Exception as exc:  # noqa: BLE001 - registration stays fail-soft
             logger.warning("[ocuclaw] Desktop pairing presenter reconciliation failed: %s", exc)
+        # #2085: reconciling our own runtime says nothing about what ELSE
+        # Hermes Desktop can load. An Agent update converges the 0.21 hybrid
+        # layout only because the package update removes the nested
+        # `plugins/ocuclaw/desktop/plugin.js` entry; if that did not happen,
+        # two live plugins share the one `ocuclaw` id and last-loaded-wins
+        # decides the UI. Enumerate both diskRoots() doors and say so loudly,
+        # naming the exact file to delete. Registration still continues —
+        # refusing to register would cost the user the whole platform over a
+        # stale UI copy — but the line must be impossible to skim past.
+        try:
+            convergence_message = desktop_convergence_message(desktop_convergence())
+            if convergence_message:
+                logger.error("[ocuclaw] %s", convergence_message)
+        except Exception as exc:  # noqa: BLE001 - registration stays fail-soft
+            logger.warning(
+                "[ocuclaw] Desktop runtime convergence check failed: %s", exc
+            )
     if not supported:
         logger.warning("[ocuclaw] %s", _unsupported_hermes_message(version))
         # The recovery platform row and diagnostic setup function are the only
@@ -2730,12 +3153,14 @@ def register(ctx: Any) -> None:
     # register once at plugin load; the handler fans out to live adapters.
     global _POST_APPROVAL_RESPONSE_HOOK_AVAILABLE
     global STREAM_HOOKS_AVAILABLE, INTERIM_HOOK_AVAILABLE
+    global PRE_TRANSCRIPTION_HOOK_AVAILABLE
     global _REGISTERED_OPTIONAL_FEATURES
     register_hook = getattr(ctx, "register_hook", None)
     # Probe BEFORE registering: hermes stores unknown hook names with a
     # warning instead of refusing them, so registering blind would spam the
     # log on every 0.20.0 host and advertise a feature that can never fire.
     STREAM_HOOKS_AVAILABLE, INTERIM_HOOK_AVAILABLE = _probe_optional_hook_support()
+    PRE_TRANSCRIPTION_HOOK_AVAILABLE = _pre_transcription_hook_supported()
     _REGISTERED_OPTIONAL_FEATURES = ()
     with _LIVEUI_LOCK:
         _LIVEUI_REGISTER_TOOL = register_tool if callable(register_tool) else None
@@ -2767,6 +3192,17 @@ def register(ctx: Any) -> None:
             register_hook(STREAM_HOOK_NAMES[1], _on_stream_delta_hook)
             register_hook(STREAM_HOOK_NAMES[2], _on_stream_end_hook)
             _REGISTERED_OPTIONAL_FEATURES += (FEATURE_TOKEN_STREAM_HOOKS,)
+        if PRE_TRANSCRIPTION_HOOK_AVAILABLE:
+            # Registered gateway-wide, but inert by construction: the callback
+            # answers only while the `stt.transcribe` RPC has published the
+            # current call's picks on its contextvar (stt_rpc
+            # `_scoped_call_tweaks`), and returns None — no kwargs read, no
+            # dispatch changed — for every other transcription on this host.
+            # Unlike the on_stream_* family it flips no process-wide provider
+            # call shape: `_apply_pre_transcription_hook` is `has_hook`-gated
+            # per dispatch, so the only cost to a non-OcuClaw transcription is
+            # one dict probe and one no-op call.
+            register_hook(PRE_TRANSCRIPTION_HOOK_NAME, _on_pre_transcription_hook)
         _POST_APPROVAL_RESPONSE_HOOK_AVAILABLE = True
     else:
         _POST_APPROVAL_RESPONSE_HOOK_AVAILABLE = False
@@ -2823,6 +3259,9 @@ def _build_adapter(config: Any):
         # Avoid StreamConsumer oversize splits — glasses paging owns long
         # text; a 60k-char message stays far under the 1 MiB link frame cap.
         MAX_MESSAGE_LENGTH = 60000
+        # Native connection controls identify the actual administrative adapter,
+        # never a platform name supplied by a remote management request.
+        _ocuclaw_management_path = True
 
         def __init__(self, platform_config, platform) -> None:
             # Hermes 0.20 constructs secondary-profile adapters under a
@@ -2841,6 +3280,7 @@ def _build_adapter(config: Any):
             self._ledger = DispatchLedger(
                 stale_turn_seconds=self._settings["staleTurnSeconds"],
             )
+            self._session_status = SessionStatusObserver()
             self._phone_turn_candidate_gate = PhoneTurnCandidateGate()
             self._multiplex_enabled = False
             self._served_profile_homes: Dict[str, Path] = {}
@@ -2857,11 +3297,28 @@ def _build_adapter(config: Any):
                     self, "_session_store", None
                 ),
             )
+            # Continue here (#2509): one-shot waiters keyed by the minted adopt
+            # chat id — `send()` hands the `/resume` slash reply to the waiting
+            # handler instead of the wearer — and the tips being adopted right
+            # now (a second tap on the same row is `own_lane_busy`).
+            self._adopt_waiters: Dict[str, asyncio.Future] = {}
+            self._adopting_tips: set = set()
+            # Tier 0 in-flight signal (T2 #2510): session_id → {at, platform}
+            # for EVERY platform this gateway runs (fed by pre_llm_call /
+            # tool hooks BEFORE their ocuclaw platform filter, cleared by
+            # on_session_end, TTL-expired as the fail-safe). Zero idle cost:
+            # no timer — expiry is checked lazily on read.
+            self._inflight: Dict[str, Dict[str, Any]] = {}
+            self._inflight_lock = threading.Lock()
             # W07 models/status/config read plane (gw.* lanes).
             self._gw_rpc = GwRpc(
                 namespace=self._namespace,
                 routing_provider=self._profile_routing_snapshot,
+                adopt_supported_provider=self.adopt_configured,
             )
+            self._gw_rpc._management_adapter = self
+            # STT lane (#1938): what the connected Hermes can transcribe with.
+            self._stt_rpc = SttRpc()
             self._loop: Optional[asyncio.AbstractEventLoop] = None
             self._janitor_task: Optional[asyncio.Task] = None
             self._first_run_welcome_task: Optional[asyncio.Task] = None
@@ -2924,6 +3381,7 @@ def _build_adapter(config: Any):
             # resolved ONCE per stream (a SessionDB RPC per delta is not a
             # budget) and the coalescer buffer lives here too.
             self._stream_contexts: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            self._background_hook_turns: Dict[Tuple[str, str], None] = {}
             # Reconcile epoch per run. post_api_request is authoritative and
             # runs INLINE on the agent thread, so it can beat deltas that are
             # still sitting in the plugin hook queue; bumping the epoch fences
@@ -3081,10 +3539,29 @@ def _build_adapter(config: Any):
             # the handshake completes).
             for method, handler in self._session_rpc.handlers().items():
                 link.register_request_handler(method, handler)
+            # Observe the existing authorized profile fan-out; never broaden
+            # its namespace or session visibility rules for status tracking.
+            link.register_request_handler("db.sessions.list", self.handle_status_sessions_list)
             for method, handler in self._gw_rpc.handlers().items():
+                link.register_request_handler(method, handler)
+            from .restart_rpc import RestartRpc
+            self._restart_rpc = RestartRpc(self, self._gw_rpc)
+            link.register_request_handler("gw.hermes.management", self._restart_rpc.handle)
+            for method, handler in self._stt_rpc.handlers().items():
                 link.register_request_handler(method, handler)
             link.register_request_handler(
                 FOREIGN_COPY_METHOD, self.handle_foreign_copy
+            )
+            link.register_request_handler(
+                FOREIGN_ADOPT_METHOD, self.handle_foreign_adopt
+            )
+            link.register_request_handler(
+                FOREIGN_DRIVER_METHOD, self.handle_foreign_driver
+            )
+            # Overrides the bare session_rpc handler: the mirror needs the
+            # tier-0 in-flight verdict next to the watermark (#2513).
+            link.register_request_handler(
+                DB_METHOD_CHAT_WATERMARK, self.handle_chat_watermark
             )
             link.register_request_handler(
                 APPROVAL_RESOLVE_METHOD, self.handle_approval_resolve
@@ -3275,8 +3752,17 @@ def _build_adapter(config: Any):
         # -- outbound transport (StreamConsumer + gateway sends) -------------
 
         async def send(self, chat_id, content, reply_to=None, metadata=None):
-            text = strip_stream_cursor(content)
+            text = _gateway_auth_recovery_message(strip_stream_cursor(content))
             message_id = self._next_message_id()
+            adopt_waiter = self._adopt_waiters.get(str(chat_id))
+            if adopt_waiter is not None:
+                # The `/resume` slash reply on an adopt lane belongs to the
+                # adopt handler (its refusal classifier), never to the wearer:
+                # the lane is not the active session yet and Hermes persists
+                # no slash reply, so nothing is lost by not emitting it.
+                if not adopt_waiter.done():
+                    adopt_waiter.set_result(text)
+                return SendResult(success=True, message_id=message_id)
             if _is_hermes_home_channel_onboarding_notice(text):
                 # OcuClaw owns its session picker and cron delivery routes.
                 # Hermes emits this one-time platform notice as a second
@@ -3617,17 +4103,23 @@ def _build_adapter(config: Any):
                     success=False,
                     error="clarify delivery requires a public session key",
                 )
+            presentation = {
+                "id": clean_id,
+                "sessionKey": public_key,
+                "question": clean_question,
+                "choices": clean_choices,
+                "multiSelect": multi_select,
+                "allowOther": bool(clean_choices),
+                "deadlineSec": deadline_s,
+                "expiresAtMs": int((time.time() + deadline_s) * 1000),
+            }
+            try:
+                self._session_status.observe_clarify(str(session_key), presentation)
+            except Exception:  # observation must not change native delivery
+                pass
             delivery = self._emit_event(
                 "clarify",
-                {
-                    "id": clean_id,
-                    "sessionKey": public_key,
-                    "question": clean_question,
-                    "choices": clean_choices,
-                    "multiSelect": multi_select,
-                    "allowOther": bool(clean_choices),
-                    "deadlineSec": deadline_s,
-                },
+                presentation,
                 swallow_errors=False,
             )
             if delivery is None:
@@ -3659,7 +4151,7 @@ def _build_adapter(config: Any):
             except AmbiguousOutboundNamespaceError as exc:
                 return SendResult(success=False, error=str(exc))
             session_key = self._session_key_for_chat(chat_id, ns=ns)
-            text = content if finalize else strip_stream_cursor(content)
+            text = _gateway_auth_recovery_message(content if finalize else strip_stream_cursor(content))
             message_id = str(message_id)
             closure = None
             task = None
@@ -3776,6 +4268,24 @@ def _build_adapter(config: Any):
             record = self._ledger.touch(session_key)
             if record is not None and self._ledger.take_lifecycle_start(record):
                 self._emit_event("activity", lifecycle_start_activity(record))
+            if is_desktop_lease_wait_notice(status_key, content):
+                # The durable-lease wait (another Hermes process — Desktop —
+                # holds the turn lease, up to 1800 s). Labelled + ranked so
+                # the wearer sees "Waiting for Desktop" instead of a bare
+                # placeholder (T0 step 8; #2510 backstop).
+                self._emit_event(
+                    "activity",
+                    status_activity(
+                        identity,
+                        "lifecycle",
+                        str(content or ""),
+                        status_key=DESKTOP_LEASE_WAIT_STATUS_KEY,
+                        record=record,
+                        label=DESKTOP_LEASE_WAIT_LABEL,
+                        candidate_rank="narration",
+                    ),
+                )
+                return SendResult(success=True, message_id=f"status:{DESKTOP_LEASE_WAIT_STATUS_KEY}")
             self._emit_event(
                 "activity",
                 status_activity(
@@ -3806,6 +4316,11 @@ def _build_adapter(config: Any):
             if not chat_id:
                 self._discard_attachment_spills(attachments)
                 raise ValueError("dispatch.send requires target.chatId")
+            try:
+                prompt_metadata = validate_prompt_metadata(p)
+            except ValueError:
+                self._discard_attachment_spills(attachments)
+                raise
             message = p.get("message")
             message = message if isinstance(message, str) else ""
             has_attachments = isinstance(attachments, list) and any(
@@ -3947,6 +4462,8 @@ def _build_adapter(config: Any):
                     idempotency_key=ledger_idem,
                     session_state=session_state,
                     has_media=bool(media_urls),
+                    prompt_owner=prompt_metadata[0] if prompt_metadata else None,
+                    prompt_lane=prompt_metadata[1] if prompt_metadata else None,
                 )
                 records.append(record)
                 if record.state == STATE_ACTIVE:
@@ -3964,6 +4481,13 @@ def _build_adapter(config: Any):
                     media_urls=media_urls,
                     media_types=media_types,
                 )
+                if prompt_metadata is not None:
+                    prompt_owner, prompt_lane = prompt_metadata
+                    # Internal metadata for later prompt-lane work. Hermes's
+                    # MessageEvent model input still reads only channel_prompt,
+                    # so this prefactor changes no model-visible bytes.
+                    setattr(event, "_ocuclaw_prompt_owner", prompt_owner)
+                    setattr(event, "_ocuclaw_prompt_lane", prompt_lane)
                 # BasePlatformAdapter invokes on_processing_complete with this
                 # object after final delivery. Keep the D9 identity on it so
                 # that boundary can close only its own record.
@@ -4188,6 +4712,60 @@ def _build_adapter(config: Any):
             if not identity:
                 return None
             return f"hermes:{identity['ns']}:{identity['chatId']}"
+
+        async def handle_status_sessions_list(self, params: Any) -> Dict[str, Any]:
+            result = await self._session_rpc.list_sessions(params)
+            reasoning_by_namespace: Dict[str, Optional[str]] = {}
+            for row in result.get("sessions", []):
+                native_key = str(row.get("sessionKey") or "")
+                public_key = self._public_key_for_native_session(native_key)
+                if not public_key:
+                    continue  # foreign sessions retain their existing read-only contract
+                # Native /reasoning show|hide persists a profile display setting,
+                # not a session DB column. Read it fresh on every hydration (also
+                # after /new), through the same namespace guard as profile options.
+                identity = parse_ocuclaw_session_key(native_key)
+                ns = identity["ns"]
+                if ns not in reasoning_by_namespace:
+                    try:
+                        options = await self.handle_profile_options_get({"ns": ns})
+                        level = options.get("reasoningLevel")
+                        reasoning_by_namespace[ns] = level if level in {"on", "off"} else None
+                    except Exception:
+                        reasoning_by_namespace[ns] = None
+                if reasoning_by_namespace[ns] is not None:
+                    row["reasoningLevel"] = reasoning_by_namespace[ns]
+                try:
+                    from tools.clarify_gateway import get_pending_for_session
+
+                    now_ms = int(time.time() * 1000)
+                    with self._approval_lock:
+                        approvals = [
+                            {
+                                "id": entry["id"],
+                                "requestId": entry["requestId"],
+                                "expiresAtMs": entry["expiresAtMs"],
+                                "request": {
+                                    "sessionKey": public_key,
+                                    "command": entry["command"] or entry["description"] or "approval required",
+                                    "ask": entry["description"] or "approval required",
+                                    "host": "hermes",
+                                    "security": "high",
+                                    "allowedDecisions": list(entry["allowedDecisions"]),
+                                },
+                            }
+                            for entry in self._approvals_by_id.values()
+                            if entry["sessionKey"] == native_key and entry["expiresAtMs"] > now_ms
+                        ]
+                    row.update(self._session_status.snapshot(
+                        native_key, public_key,
+                        working=self._ledger.is_busy(native_key),
+                        approvals=approvals,
+                        pending_lookup=get_pending_for_session,
+                    ))
+                except Exception:  # observer failure must never fail the native session list
+                    row["agentStatus"] = {"observedAtMs": int(time.time() * 1000), "unknown": True}
+            return result
 
         def _unregister_all_approval_notifiers(self) -> None:
             with self._approval_lock:
@@ -4985,11 +5563,33 @@ def _build_adapter(config: Any):
                 return
             self._emit_approval_resolved(entry, decision)
 
+        def _background_hook_turn(self, kwargs: Dict[str, Any]) -> bool:
+            key = (
+                str(kwargs.get("session_id") or "").strip(),
+                str(kwargs.get("turn_id") or "").strip(),
+            )
+            with self._thinking_lock:
+                return key in self._background_hook_turns
+
+        def _remember_background_hook_turn(self, kwargs: Dict[str, Any]) -> None:
+            key = (
+                str(kwargs.get("session_id") or "").strip(),
+                str(kwargs.get("turn_id") or "").strip(),
+            )
+            if not all(key):
+                return
+            with self._thinking_lock:
+                self._background_hook_turns[key] = None
+                while len(self._background_hook_turns) > BACKGROUND_HOOK_TURN_MEMORY:
+                    self._background_hook_turns.pop(next(iter(self._background_hook_turns)))
+
         def _turn_activity_context(
             self, kwargs: Dict[str, Any], hook_label: str
         ) -> Optional[Tuple[str, Any]]:
             platform = str(kwargs.get("platform") or "").strip()
             if platform and platform != PLATFORM_NAME:
+                return None
+            if self._background_hook_turn(kwargs):
                 return None
             session_id = str(kwargs.get("session_id") or "").strip()
             if not session_id:
@@ -6274,7 +6874,70 @@ def _build_adapter(config: Any):
                 return result
             return str(type(value).__name__)
 
+        # -- tier 0 in-flight signal (T2 #2510) ----------------------------
+
+        def _inflight_mark(self, kwargs: Dict[str, Any]) -> None:
+            """pre_llm_call for ANY platform: the session is in flight here.
+            Background forks share the parent's session_id (they carry
+            parent_session_id) — never let a fork mark or clear the parent."""
+            session_id = str((kwargs or {}).get("session_id") or "").strip()
+            if not session_id or str((kwargs or {}).get("parent_session_id") or "").strip():
+                return
+            with self._inflight_lock:
+                self._inflight[session_id] = {
+                    "at": time.monotonic(),
+                    "platform": str((kwargs or {}).get("platform") or ""),
+                }
+
+        def _inflight_touch(self, kwargs: Dict[str, Any]) -> None:
+            """Tool hooks refresh the stamp so a long tool run inside a turn
+            never outlives the TTL on its own."""
+            session_id = str((kwargs or {}).get("session_id") or "").strip()
+            if not session_id:
+                return
+            with self._inflight_lock:
+                entry = self._inflight.get(session_id)
+                if entry is not None:
+                    entry["at"] = time.monotonic()
+
+        def _inflight_clear(self, kwargs: Dict[str, Any]) -> None:
+            """on_session_end for ANY platform (= the durable lease release
+            for a turn that reached finalize). Fork ends are ignored."""
+            session_id = str((kwargs or {}).get("session_id") or "").strip()
+            if not session_id or self._background_hook_turn(kwargs):
+                return
+            with self._inflight_lock:
+                self._inflight.pop(session_id, None)
+
+        def inflight_snapshot(self) -> Dict[str, Dict[str, Any]]:
+            """Live (non-expired) in-flight sessions; expired marks are
+            dropped on read — the fail-safe for ends that never fire."""
+            now = time.monotonic()
+            with self._inflight_lock:
+                expired = [
+                    key
+                    for key, entry in self._inflight.items()
+                    if now - float(entry.get("at") or 0.0) > INFLIGHT_TTL_S
+                ]
+                for key in expired:
+                    self._inflight.pop(key, None)
+                return {
+                    key: {"platform": entry.get("platform") or "", "ageS": now - float(entry.get("at") or now)}
+                    for key, entry in self._inflight.items()
+                }
+
+        def inflight_platform(self, lineage: List[str]) -> Optional[str]:
+            """The platform running a turn on any lineage id right now, or
+            None. Empty string means "in flight, platform unknown"."""
+            live = self.inflight_snapshot()
+            for session_id in lineage or []:
+                entry = live.get(str(session_id))
+                if entry is not None:
+                    return str(entry.get("platform") or "")
+            return None
+
         def handle_pre_tool_call(self, kwargs: Dict[str, Any]) -> None:
+            self._inflight_touch(kwargs)
             context = self._tool_activity_context(kwargs)
             if context is None:
                 return
@@ -6290,9 +6953,34 @@ def _build_adapter(config: Any):
             args = kwargs.get("args")
             if isinstance(args, dict):
                 payload["args"] = self._sanitize_tool_activity_args(args)
+                if tool_name == "render_glasses_ui":
+                    # Preserve only bounded existing routing facts, never the
+                    # interface body/items. Unknown or omitted values fail closed
+                    # in the shared activity adapter.
+                    routing_valid = (
+                        ("validateOnly" not in args or isinstance(args["validateOnly"], bool))
+                        and ("update" not in args or args["update"] in ("patch", "replace", "push"))
+                    )
+                    if routing_valid and args.get("kind") in (
+                        "text_surface", "list_surface", "list_with_details_surface",
+                        "checklist_surface", "paged_text_surface",
+                    ):
+                        payload["args"]["kind"] = args["kind"]
+                    if isinstance(args.get("validateOnly"), bool):
+                        payload["args"]["validateOnly"] = args["validateOnly"]
+                    if args.get("update") in ("patch", "replace", "push"):
+                        payload["args"]["update"] = args["update"]
+                    if self._tool_activity_args_json_bytes(payload["args"]) > TOOL_ACTIVITY_MAX_ARGS_JSON_BYTES:
+                        payload["args"] = {
+                            key: payload["args"][key]
+                            for key in ("kind", "validateOnly", "update")
+                            if key in payload["args"]
+                        }
+                        payload["args"]["_truncated"] = True
             self._emit_event("activity", payload)
 
         def handle_post_tool_call(self, kwargs: Dict[str, Any]) -> None:
+            self._inflight_touch(kwargs)
             context = self._tool_activity_context(kwargs)
             if context is None:
                 return
@@ -6544,11 +7232,29 @@ def _build_adapter(config: Any):
                 ).strip().lower()
             except Exception:
                 tool_progress = "all"
+            # Use Hermes' own precedence/default rules; reasoning_style changes
+            # formatting only and must never be advertised as OcuClaw on.full.
+            reasoning_options: Dict[str, str] = {}
+            try:
+                from gateway.display_config import resolve_display_setting
+                import yaml
+
+                # The native loader intentionally returns {} on read/parse
+                # failure. Verify availability before treating its default as
+                # observed state; still use its resolved, managed-overlay cfg.
+                raw = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+                if raw is None or isinstance(raw, dict):
+                    shown = resolve_display_setting(cfg, PLATFORM_NAME, "show_reasoning")
+                    if isinstance(shown, bool):
+                        reasoning_options["reasoningLevel"] = "on" if shown else "off"
+            except Exception:
+                pass  # Unavailable readback is not evidence that reasoning is off.
             return {
                 "defaultModel": f"{provider}/{model}" if provider and model else model,
                 "defaultThinking": thinking,
                 "defaultFastMode": service_tier in {"fast", "priority"},
                 "conversationToolProgress": tool_progress != "off",
+                **reasoning_options,
             }
 
         def _apply_profile_options_sync(
@@ -6966,12 +7672,23 @@ def _build_adapter(config: Any):
             )
 
         def handle_pre_llm_call(self, _kwargs: Dict[str, Any]) -> Optional[str]:
+            # Native background-review forks deliberately share the parent's
+            # session_id and platform for cache warmth. pre_llm_call supplies
+            # their parent_session_id; later hooks carry the distinct turn_id.
+            # Never inject foreground context into a fork, or let its delayed
+            # completion close the next foreground dispatch in that session.
+            # Tier 0 (T2 #2510) marks BEFORE the platform filter: a Telegram
+            # or Desktop-routed turn on an adopted lineage is in flight too.
+            self._inflight_mark(_kwargs or {})
+            platform = str((_kwargs or {}).get("platform") or "").strip()
+            if platform and platform != PLATFORM_NAME:
+                return None
+            if str((_kwargs or {}).get("parent_session_id") or "").strip():
+                self._remember_background_hook_turn(_kwargs)
+                return None
             try:
                 from gateway.session_context import get_session_env
             except Exception:  # noqa: BLE001
-                return None
-            platform = str((_kwargs or {}).get("platform") or "").strip()
-            if platform and platform != PLATFORM_NAME:
                 return None
             session_key = str(get_session_env("HERMES_SESSION_KEY", "") or "").strip()
             if not session_key:
@@ -6980,9 +7697,14 @@ def _build_adapter(config: Any):
             if identity is None:
                 return None
             try:
+                prompt_params = {"sessionKey": session_key}
+                record = self._ledger.head(session_key)
+                if record is not None and record.prompt_owner and record.prompt_lane:
+                    prompt_params["promptOwner"] = record.prompt_owner
+                    prompt_params["promptLane"] = record.prompt_lane
                 result = self._request_link_threadsafe(
                     LIVEUI_PROMPT_METHOD,
-                    {"sessionKey": session_key},
+                    prompt_params,
                     timeout_s=LIVEUI_PROMPT_LINK_TIMEOUT_S,
                 )
             except Exception:  # noqa: BLE001
@@ -7130,10 +7852,238 @@ def _build_adapter(config: Any):
                 "session": session,
             }
 
+        # -- Continue here (adopt) — #2509 ----------------------------------
+
+        def adopt_configured(self) -> bool:
+            """Live read of the platform's `allow_admin_from` posture."""
+            config = getattr(self, "config", None)
+            extra = getattr(config, "extra", None)
+            return adopt_configured(extra if isinstance(extra, dict) else {})
+
+        @staticmethod
+        def _adopt_rejection(verdict: str, **extra: Any) -> Dict[str, Any]:
+            out = {"status": "rejected", "error": verdict, "verdict": verdict}
+            out.update({k: v for k, v in extra.items() if v is not None})
+            return out
+
+        def _adopt_reply_verdict(self, reply: str, tip: str) -> Optional[str]:
+            """Map Hermes's own `/resume` reply to a verdict — by rendering the
+            SAME i18n keys through Hermes's translator, never by matching
+            English prose. Success is never decided here (the DB decides)."""
+            text = str(reply or "").strip()
+            if not text:
+                return None
+            try:
+                from agent.i18n import t
+            except Exception:  # noqa: BLE001 - no translator, no text verdict
+                return None
+            candidates = {
+                "blocked_not_owner": ("gateway.resume.blocked_not_owner", {"name": tip}),
+                "not_found": ("gateway.resume.not_found", {"name": tip}),
+                "already_on": ("gateway.resume.already_on", {"name": tip}),
+                "switch_failed": ("gateway.resume.switch_failed", {}),
+            }
+            for verdict, (key, kwargs) in candidates.items():
+                try:
+                    if text == str(t(key, **kwargs)).strip():
+                        return verdict
+                except Exception:  # noqa: BLE001
+                    continue
+            return None
+
+        async def handle_foreign_adopt(self, params: Any) -> Dict[str, Any]:
+            """Adopt a Desktop/CLI/TUI transcript onto a fresh glasses lane.
+
+            Mechanism (map #2507, RULED sanctioned): mint ``adopt-<uuid>``,
+            send ``/resume <tip> --all`` through this adapter's own message
+            path (``_build_message_event`` + ``handle_message``) so Hermes's
+            public ``switch_session`` re-keys the transcript onto the minted
+            lane; then read the verdict from the DB (``adopt_outcome``) — the
+            reply text only classifies refusals via Hermes's own i18n keys.
+
+            Verdicts (``error`` == ``verdict`` on the wire, App.kt labels them):
+            ``admin_not_configured`` · ``desktop_busy`` (``holdState``:
+            working|hold) · ``own_lane_busy`` · ``blocked_not_owner`` ·
+            ``not_found`` · ``adopt_timeout`` — plus the pre-DB refusals
+            ``minted_identity_refused`` / ``adopt_requires_default_namespace``
+            / ``platform_row_not_adoptable`` / ``source_not_adoptable``.
+            """
+            p = params if isinstance(params, dict) else {}
+            identity = p.get("identity") if isinstance(p.get("identity"), dict) else {}
+            take_over = p.get("takeOver") is True
+            if identity.get("chatId"):
+                return self._adopt_rejection("minted_identity_refused")
+            ns = str(identity.get("ns") or self._namespace)
+            if ns != DEFAULT_SESSION_NAMESPACE:
+                return self._adopt_rejection("adopt_requires_default_namespace")
+            if not self.adopt_configured():
+                return self._adopt_rejection("admin_not_configured")
+            try:
+                source = await asyncio.to_thread(
+                    self._session_rpc.resolve_adopt_source, identity
+                )
+            except NotAdoptableError as exc:
+                return self._adopt_rejection(str(exc) or "source_not_adoptable")
+            except ValueError as exc:
+                return self._adopt_rejection("not_found", detail=str(exc))
+            tip = str(source["tip"])
+            lineage = [str(value) for value in source.get("lineage") or [tip]]
+            if tip in self._adopting_tips:
+                return self._adopt_rejection("own_lane_busy", tip=tip)
+            inflight_platform = self.inflight_platform(lineage)
+            if inflight_platform is not None:
+                # Tier 0: a turn on this lineage is running inside THIS
+                # gateway (any platform) — `/resume` mid-turn would re-key a
+                # live agent. Retry when it ends.
+                return self._adopt_rejection(
+                    "own_lane_busy", tip=tip, detail=inflight_platform or None
+                )
+            if not take_over:
+                hold = await asyncio.to_thread(
+                    desktop_hold_state, self._profile_home_for_options(ns), lineage
+                )
+                if hold is not None:
+                    return self._adopt_rejection("desktop_busy", holdState=hold, tip=tip)
+
+            chat_id = f"{ADOPT_CHAT_ID_PREFIX}{uuid.uuid4().hex}"
+            adopt_key = self._session_key_for_chat(chat_id, ns=ns)
+            loop = asyncio.get_running_loop()
+            waiter: asyncio.Future = loop.create_future()
+            self._adopt_waiters[chat_id] = waiter
+            self._adopting_tips.add(tip)
+            reply_text = ""
+            outcome: Dict[str, Any] = {"adopted": False, "predecessors": []}
+            try:
+                event = self._build_message_event(chat_id, f"/resume {tip} --all")
+                await self.handle_message(event)
+                deadline = loop.time() + ADOPT_TIMEOUT_S
+                while True:
+                    outcome = await asyncio.to_thread(
+                        self._session_rpc.adopt_outcome, adopt_key, tip
+                    )
+                    if outcome.get("adopted"):
+                        break
+                    if waiter.done() and not reply_text:
+                        reply_text = str(waiter.result() or "")
+                        verdict = self._adopt_reply_verdict(reply_text, tip)
+                        if verdict is not None:
+                            return self._adopt_rejection(
+                                verdict, tip=tip, detail=reply_text
+                            )
+                    if loop.time() >= deadline:
+                        return self._adopt_rejection(
+                            "adopt_timeout", tip=tip, detail=reply_text or None
+                        )
+                    await asyncio.sleep(ADOPT_POLL_S)
+            finally:
+                self._adopt_waiters.pop(chat_id, None)
+                self._adopting_tips.discard(tip)
+            # The fresh stub Hermes ended (`session_switch`, 0 messages) is
+            # presentation noise on the same key: hide it with the public flag.
+            hidden = await asyncio.to_thread(
+                self._session_rpc.hide_sessions,
+                [row["id"] for row in outcome.get("predecessors") or []],
+            )
+            session = outcome.get("session") or {}
+            return {
+                "status": "accepted",
+                "sessionId": tip,
+                "session": session,
+                "adoptKey": adopt_key,
+                "chatId": chat_id,
+                "adoptedFrom": str(p.get("publicKey") or ""),
+                "predecessors": outcome.get("predecessors") or [],
+                "hiddenPredecessors": hidden,
+            }
+
+        async def handle_foreign_driver(self, params: Any) -> Dict[str, Any]:
+            """Who drives a glasses lane right now (single-driver lock, #2510).
+
+            ``{identity, publicKey}`` (a minted lane — the adopt key
+            ``hermes:main:adopt-<uuid>`` or any ocuclaw chat) →
+            ``{status:"ok", state, holdState, hold, inflight, lineage,
+            sessionId, hermesHome, watch}``. ``state`` is
+            ``glasses_drive`` / ``desktop_hold`` / ``desktop_working``
+            from Hermes's own files (``desktop_hold_details``); ``inflight``
+            is tier 0 (a turn running in THIS gateway on the lineage);
+            ``hermesHome`` + ``watch`` name the two files Node watches
+            (directory watches: the marker is unlinked/replaced, the
+            registry is written via ``os.replace``). Read on demand only —
+            Node calls this at arm time and per file event, never on a
+            timer. An unknown key answers ``glasses_drive`` with an empty
+            lineage: unknowable never locks the wearer out.
+            """
+            p = params if isinstance(params, dict) else {}
+            identity = p.get("identity") if isinstance(p.get("identity"), dict) else {}
+            ns = str(identity.get("ns") or self._namespace)
+            chat_id = str(identity.get("chatId") or "").strip()
+            home = self._profile_home_for_options(ns)
+            lineage: List[str] = []
+            session_id: Optional[str] = None
+            if chat_id:
+                session_key = self._session_key_for_chat(chat_id, ns=ns)
+                try:
+                    lineage = await asyncio.to_thread(
+                        self._session_rpc.lineage_for_key, session_key
+                    )
+                except Exception:  # noqa: BLE001 - unknowable never locks
+                    logger.debug(
+                        "[ocuclaw] driver lineage unavailable for %s", session_key, exc_info=True
+                    )
+                    lineage = []
+                session_id = lineage[0] if lineage else None
+            hold = await asyncio.to_thread(desktop_hold_details, home, lineage)
+            inflight_platform = self.inflight_platform(lineage)
+            return {
+                "status": "ok",
+                "publicKey": str(p.get("publicKey") or ""),
+                "sessionId": session_id,
+                "lineage": lineage,
+                "state": driver_state_for(hold),
+                "holdState": hold.get("state") if hold else None,
+                "hold": hold,
+                "inflight": {
+                    "active": inflight_platform is not None,
+                    "platform": inflight_platform,
+                },
+                "hermesHome": str(home) if home is not None else None,
+                "watch": {
+                    "markerDir": DESKTOP_TURN_MARKER_RELPATH[0],
+                    "markerFile": DESKTOP_TURN_MARKER_RELPATH[1],
+                    "leaseDir": DESKTOP_LEASE_REGISTRY_RELPATH[0],
+                    "leaseFile": DESKTOP_LEASE_REGISTRY_RELPATH[1],
+                },
+            }
+
+        async def handle_chat_watermark(self, params: Any) -> Dict[str, Any]:
+            """``db.chat.watermark`` with the tier-0 in-flight verdict (#2513).
+
+            The Desktop→glasses mirror reads this once per debounced WAL
+            event: ``watermark`` (``MAX(messages.id)`` on the lane's tip)
+            says whether rows landed; ``inflight`` says whether THIS gateway
+            is the one writing them (the wearer's own turn — those rows are
+            already on the glasses, so the mirror advances silently instead
+            of re-rendering them). Never called on a timer.
+            """
+            result = await self._session_rpc.chat_watermark(params)
+            session_id = str(result.get("sessionId") or "")
+            inflight_platform = (
+                self.inflight_platform([session_id]) if session_id else None
+            )
+            result["inflight"] = {
+                "active": inflight_platform is not None,
+                "platform": inflight_platform,
+            }
+            return result
+
         # -- turn completion (hermes on_session_end, sync, worker thread) ----
 
         def handle_session_end(self, kwargs: Dict[str, Any]) -> None:
+            # Tier 0 (T2 #2510) clears BEFORE the platform filter.
+            self._inflight_clear(kwargs)
             if str(kwargs.get("platform") or "") != PLATFORM_NAME:
+                return
+            if self._background_hook_turn(kwargs):
                 return
             session_id = str(kwargs.get("session_id") or "")
             if not session_id:
@@ -7652,7 +8602,7 @@ def _build_adapter(config: Any):
                 chat_id=str(chat_id),
                 chat_name="OcuClaw Glasses",
                 chat_type=OCUCLAW_CHAT_TYPE_SEGMENT,
-                user_id="ocuclaw-wearer",
+                user_id=OCUCLAW_WEARER_USER_ID,
                 user_name="OcuClaw",
             )
             # The profile was selected by the authenticated OcuClaw session,
@@ -7687,6 +8637,11 @@ def _build_adapter(config: Any):
             *,
             swallow_errors: bool = True,
         ) -> Optional[Any]:
+            if name == "activity":
+                try:
+                    self._session_status.observe_activity(payload)
+                except Exception:  # status is observational, never part of delivery success
+                    pass
             return self._emit_frame(
                 BACKEND_EVENT_METHOD,
                 {"name": name, "payload": payload},

@@ -1,4 +1,5 @@
 const { MESSAGE_EMOJI_ALLOWLIST, MESSAGE_EMOJI_ALLOWLIST_SET } = require("./message-emoji-allowlist.cjs");
+const { stripInvalidNeuralMarkup } = require("./tagged-span-strip.cjs");
 
 const EMOJI_CLUSTER_SEGMENTER = new Intl.Segmenter(undefined, {
   granularity: "grapheme",
@@ -10,6 +11,11 @@ const EMOJI_CLUSTER_FALLBACK_RE =
   /(?:\p{Extended_Pictographic}|[\u{1F1E6}-\u{1F1FF}\u{1F3FB}-\u{1F3FF}\u20E3\u{E0020}-\u{E007F}])/u;
 const LEFTOVER_EMOJI_CONTROL_RE =
   /[\uFE0E\uFE0F\u20E3\u{1F3FB}-\u{1F3FF}\u{E0020}-\u{E007F}]/gu;
+
+const NEURAL_MARKUP_TAG_RE =
+  /<\/?(?:emoji(?::[^<>\r\n]*)?|dwell|skim|beat)(?:\s[^<>\r\n]*)?\s*\/?>/giu;
+const TRAILING_NEURAL_MARKUP_RE =
+  /<\/?(?:emoji(?::[^<>\r\n]*)?|dwell|skim|beat)[^<>\r\n]*$/giu;
 
 function createOptionalRegex(pattern, flags) {
   try {
@@ -215,4 +221,12 @@ function filterRawEmojiText(text) {
   return filterEmojiText(text, "raw");
 }
 
-module.exports = { MESSAGE_EMOJI_ALLOWLIST, MESSAGE_EMOJI_ALLOWLIST_SET, filterDisplayEmojiText, filterRawEmojiText };
+function filterPlainAssistantOutputText(text) {
+  if (typeof text !== "string" || !text) return "";
+  const withoutMarkup = stripInvalidNeuralMarkup(text)
+    .replace(NEURAL_MARKUP_TAG_RE, "")
+    .replace(TRAILING_NEURAL_MARKUP_RE, "");
+  return filterRawEmojiText(withoutMarkup);
+}
+
+module.exports = { MESSAGE_EMOJI_ALLOWLIST, MESSAGE_EMOJI_ALLOWLIST_SET, filterDisplayEmojiText, filterRawEmojiText, filterPlainAssistantOutputText };
