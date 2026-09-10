@@ -1,6 +1,6 @@
 # Updating OcuClaw on Hermes
 
-**Guide version:** 2026-09-05 (1.3.19-hermes)
+**Guide version:** 2026-09-10 (1.3.20-hermes)
 
 Use this for an installed, healthy OcuClaw on Hermes moving to a strictly
 higher published bundle version. It is version-neutral: it never names a
@@ -25,13 +25,12 @@ paraphrase it, and do not reorder its steps.
 OcuClaw needs Hermes `>=0.21.0,<0.22.0`; the certified baseline is Hermes
 `0.21.0`.
 
-**Private beta access.** `ocuclaw/ocuclaw` requires an invited GitHub account
-and Git HTTPS authentication on the installing machine (Desktop uses Git too).
-Verify access with `git ls-remote https://github.com/ocuclaw/ocuclaw.git HEAD`
-before installing. “Repository not found” or “could not read Username” means
-confirm your invitation with the beta contact and configure Git authentication
-locally; never paste an access token into setup chat. Repository visibility is
-not changed by this release. Even Hub beta access is a separate invitation.
+**Repository access.** `ocuclaw/ocuclaw` is a public repository and needs no
+invitation or GitHub sign-in to clone. Git must still be installed and working
+on the installing machine (Desktop uses Git too). Verify with
+`git ls-remote https://github.com/ocuclaw/ocuclaw.git HEAD` before installing;
+never paste an access token into setup chat. Even Hub beta access is a separate
+invitation, and the software itself is still beta.
 
 **Terminal first.** This is the supported path and the one every beta build is
 tested on:

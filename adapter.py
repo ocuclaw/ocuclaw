@@ -687,7 +687,7 @@ SETUP_TOOL_DESCRIPTION = (
     "enable_stream_reasoning_deltas and enable_desktop_theme — and only with "
     "confirm: true after the operator has said yes."
 )
-SETUP_GUIDE_VERSION = "2026-09-05 (1.3.19-hermes)"
+SETUP_GUIDE_VERSION = "2026-09-10 (1.3.20-hermes)"
 SETUP_SKILL_LOAD_POINTER = (
     "If the OcuClaw Setup Assistant skill is not loaded in this conversation, "
     "load it via `/ocuclaw-setup` before mutating anything."

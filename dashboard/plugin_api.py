@@ -43,7 +43,7 @@ GLASSES_STATE_STALE_AFTER_MS = 30_000
 DEVICE_STATE_STALE_AFTER_MS = 120_000
 DEVICE_STATE_CLOCK_SKEW_MS = 60_000
 PLATFORM_RECEIPT_EMPIRICAL_TTL_S = 300.0
-SETUP_GUIDE_VERSION = "2026-09-05 (1.3.19-hermes)"
+SETUP_GUIDE_VERSION = "2026-09-10 (1.3.20-hermes)"
 
 _LEG_ORDER = (
     ("hermesGateway", "Hermes gateway"),
@@ -885,6 +885,12 @@ def _safe_action(
     if code == "apply_serve_route":
         relay_port = facts.get("serveRelayPort")
         if isinstance(relay_port, bool) or not isinstance(relay_port, int):
+            return None
+        if facts.get("serveTlsCertAvailable") == "no":
+            # Same withholding as the CLI (#2672): this tailnet cannot issue
+            # the certificate the route needs, so the command would apply and
+            # then carry nothing. The finding still names the admin-console
+            # fix; what is withheld is the copyable dud.
             return None
         return {
             "label": "Copy exact route repair",

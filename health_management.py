@@ -28,19 +28,59 @@ DEADLINE = 90
 _running = {}
 _reserved = set()
 _mutex = threading.RLock()
-NATIVE = {
-    "hermes_state.py": "696fd2d37d66a599228f5b1be5d5b76423b744149c83a2fbd59bf3f45a5f3891",
-    "hermes_cli/doctor.py": "2712f867aac2ec735af5071d56dfe605e9f669635f734078600ed4e71b333bd9",
-    "hermes_cli/security_audit.py": "2069853058cecab6767b47298b69c45347e531595fdd1a4a92ae5dfe748b855c",
-}
+# Native builds whose internals this adapter has actually been read against.
+# Each entry is ONE build and matches all-or-nothing: a tree mixing files from
+# two of them is not a build anyone certified, so it is refused.
+#
+# This is the health feature's own gate and is deliberately narrower than the
+# adapter's version range — it says "these exact internals were audited", not
+# "this version is supported". It is NOT a certified-identity pin site; the
+# project baseline (CERTIFIED_HERMES_COMMIT/TAG/VERSION and friends) stays where
+# test_pin_coherence.py holds it.
+NATIVE_BUILDS = (
+    {  # Hermes 0.21.0 — release v2026.8.31, anchor 29112bef
+        "hermes_state.py": "696fd2d37d66a599228f5b1be5d5b76423b744149c83a2fbd59bf3f45a5f3891",
+        "hermes_cli/doctor.py": "2712f867aac2ec735af5071d56dfe605e9f669635f734078600ed4e71b333bd9",
+        "hermes_cli/security_audit.py": "2069853058cecab6767b47298b69c45347e531595fdd1a4a92ae5dfe748b855c",
+    },
+    {  # Hermes 0.21.1 — release v2026.9.7, anchor 2237be35. The Sep 2026
+       # decomposition (upstream PR #102117) rewrote all three files:
+       #   doctor.py           check bodies moved to hermes_cli.doctor_*, the
+       #                       printing primitives to doctor_report, and most
+       #                       checks lost their section title — handled in
+       #                       health_diagnostic_worker.capture_doctor.
+       #   security_audit.py   _http_post_json/_http_get_json merged into one
+       #                       _http_json; _discover_components, run_audit and
+       #                       the Finding/Vulnerability shape are unchanged.
+       #   hermes_state.py     decomposed, but the surface used here is intact:
+       #                       SessionDB(db_path, read_only=True), ._conn with a
+       #                       sqlite3.Row factory, .close(), and a mode=ro open
+       #                       that does no schema init and takes no write lock.
+       #                       `sessions` only gained columns
+       #                       (compression_recovery_deadline, tool_names) and
+       #                       `session_model_usage` is byte-identical, so every
+       #                       column these queries name still means what it did.
+        "hermes_state.py": "9353e4fa0a8353b3e50b1945a87a898cf88b647ef726a4bab8ce5f65dffec431",
+        "hermes_cli/doctor.py": "8c852b643dc40cb781870cd723ca8497ecffb509668e8b5b3248e7977418f7b2",
+        "hermes_cli/security_audit.py": "fea5b62d8fef337474d921e634f9fa226c228ec391a6d7f5b682bc2422fb34d3",
+    },
+)
 
 
 def native_root():
     import hermes_constants
     root = Path(hermes_constants.__file__).resolve().parent
-    if any(hashlib.sha256((root / path).read_bytes()).hexdigest() != digest for path, digest in NATIVE.items()):
-        raise NotImplementedError()
-    return root
+    seen = {}
+    for build in NATIVE_BUILDS:
+        for path in build:
+            if path not in seen:
+                try:
+                    seen[path] = hashlib.sha256((root / path).read_bytes()).hexdigest()
+                except OSError:
+                    seen[path] = None
+        if all(seen[path] == digest for path, digest in build.items()):
+            return root
+    raise NotImplementedError()
 
 
 def capabilities():

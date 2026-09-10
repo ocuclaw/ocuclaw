@@ -229,6 +229,13 @@ REPAIR_TEXT: Dict[str, str] = {
         "Check that Tailscale is running and this host is reachable on the "
         "tailnet, then run `hermes ocuclaw doctor` again."
     ),
+    "enable_tailnet_https_certs": (
+        "Turn on MagicDNS and HTTPS Certificates for this tailnet in the "
+        "Tailscale admin console, under DNS, then run "
+        "`hermes ocuclaw doctor` again. OcuClaw's route terminates TLS with "
+        "this node's own certificate, and a tailnet that cannot issue one "
+        "accepts the route and then fails every connection through it."
+    ),
     "pair_phone_app": (
         "Pair the OcuClaw phone app with this host from the Setup Assistant."
     ),
@@ -286,6 +293,21 @@ _PROBE_OUTCOME_GLOSS = {
     doctor_lane.OUTCOME_UNREACHABLE: "the configured route did not answer",
     doctor_lane.OUTCOME_TIMEOUT: "the check ran out of its allotted time",
     doctor_lane.OUTCOME_FAILED: "the check could not complete, so it observed nothing",
+    doctor_lane.OUTCOME_TLS_HANDSHAKE_FAILED: (
+        "the route answered but refused the TLS handshake, which is what a "
+        "tailnet without HTTPS Certificates does"
+    ),
+    doctor_lane.OUTCOME_CERT_AVAILABLE: (
+        "this tailnet can issue the TLS certificate the Serve route needs"
+    ),
+    doctor_lane.OUTCOME_CERT_UNAVAILABLE: (
+        "this tailnet cannot issue a TLS certificate for this node, so the "
+        "Serve route would accept and then fail"
+    ),
+    doctor_lane.OUTCOME_CERT_UNKNOWN: (
+        "the certificate precondition could not be determined, so nothing is "
+        "claimed about it"
+    ),
     doctor_lane.OUTCOME_BUDGET_EXHAUSTED: (
         "the five-second probe budget was gone before this check could start"
     ),
@@ -972,6 +994,24 @@ def _render_serve(
                 "command is printed for it yet. Check that Tailscale is "
                 "running, then run `hermes ocuclaw doctor` again."
             )
+        elif facts.get("serveTlsCertAvailable") == "no":
+            # The command would apply cleanly and then not work: `serve
+            # status` would classify the route `ready` while every connection
+            # through it died in a TLS alert. Printing it with a warning
+            # attached would still hand the user a line to paste, and a
+            # pasted line is what they act on. So it is withheld, and the two
+            # clicks that make it work are printed instead (#2672).
+            lines.append("")
+            lines.append(
+                "  This tailnet cannot issue the TLS certificate the route "
+                "needs, so no command is printed yet. Applying it would look "
+                "like it worked and then fail every connection."
+            )
+            lines.append(
+                "  Turn on MagicDNS and HTTPS Certificates for this tailnet "
+                "in the Tailscale admin console, under DNS, then run "
+                "`hermes ocuclaw doctor` again for the exact command."
+            )
         elif not prescribe:
             lines.append("")
             lines.append(
@@ -1283,6 +1323,13 @@ def prescription_eligible(
         return False
     if facts.get("serveReason") in _serve_mod().WEB_OCCUPIED_REASONS:
         # Tailscale would refuse the command, so it is not printed.
+        return False
+    if facts.get("serveTlsCertAvailable") == "no":
+        # Tailscale would ACCEPT the command and the route would still not
+        # carry a byte, because `--tls-terminated-tcp` needs a certificate
+        # this tailnet cannot issue. Withholding it here also keeps the
+        # ownership receipt from recording a proposal for a command nobody
+        # was shown (#2672).
         return False
     return True
 

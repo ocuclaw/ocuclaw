@@ -178,7 +178,9 @@ class RelayCredentialResetResult:
     """Secret-free outcome of the all-device reset state machine.
 
     Credentials are deliberately absent: callers may render or serialize this
-    object without creating a new disclosure surface.
+    object without creating a new disclosure surface. ``detail`` carries the
+    secret-free reason a refusal happened, so a reader is not left inventing
+    one.
     """
 
     success: bool
@@ -187,11 +189,20 @@ class RelayCredentialResetResult:
     gateway_restarted: bool = False
     replacement_auth: str = "not_checked"
     previous_auth: str = "not_checked"
+    detail: str = ""
 
 
 @dataclass(frozen=True)
 class _GatewayRestartPlan:
     timeout_s: float
+
+
+@dataclass(frozen=True)
+class _GatewayRestartAssessment:
+    """One restart decision, plus why a missing plan was refused."""
+
+    plan: Optional[_GatewayRestartPlan]
+    reason: str = ""
 
 
 def generate_relay_credential() -> str:
@@ -245,31 +256,98 @@ def _persist_relay_credential_generation(
     )
 
 
-def _prepare_gateway_restart() -> Optional[_GatewayRestartPlan]:
+def _live_systemd_gateway_unit() -> Optional[Tuple[str, str]]:
+    """Ask systemd directly which gateway unit is installed and active.
+
+    Only the default scope is probed, because that is the one
+    ``hermes gateway restart`` selects. A plan built from any other unit would
+    name a lifecycle the restart is not going to drive.
+    """
+    try:
+        from hermes_cli.gateway import (  # type: ignore
+            _probe_systemd_service_running,
+            get_systemd_unit_path,
+        )
+
+        selected_system, service_running = _probe_systemd_service_running()
+        if not service_running:
+            return None
+        unit_path = str(get_systemd_unit_path(system=selected_system))
+    except Exception:  # noqa: BLE001 - an unreadable probe stays a refusal
+        return None
+    return unit_path, "system" if selected_system else "user"
+
+
+def _assess_gateway_restart() -> _GatewayRestartAssessment:
     """Resolve restart authority and retain one bounded lifecycle plan."""
     timeout_s = _gateway_restart_timeout_s()
     if timeout_s is None:
-        return None
+        return _GatewayRestartAssessment(
+            None, "the gateway restart lifecycle has no resolvable bound"
+        )
     if sys.platform == "win32":
         # Hermes 0.20's Windows restart path is detached even when no Scheduled
         # Task is installed. Its bound must still be resolved before persistence.
-        return _GatewayRestartPlan(timeout_s)
+        return _GatewayRestartAssessment(_GatewayRestartPlan(timeout_s))
     try:
         from hermes_cli.gateway import get_gateway_runtime_snapshot  # type: ignore
 
         snapshot = get_gateway_runtime_snapshot()
+        manager = str(getattr(snapshot, "manager", "") or "an unknown manager")
         service_installed = bool(getattr(snapshot, "service_installed", False))
         process_mismatch = bool(
             getattr(snapshot, "has_process_service_mismatch", True)
         )
+        service_scope = str(getattr(snapshot, "service_scope", "") or "")
     except Exception:  # noqa: BLE001 - ambiguity must stop before persistence
-        return None
-    if not service_installed or process_mismatch:
-        return None
-    service_scope = str(getattr(snapshot, "service_scope", "") or "")
+        return _GatewayRestartAssessment(
+            None, "the Hermes gateway runtime snapshot could not be read"
+        )
+    if not service_installed:
+        # Hermes 0.21.0 tests is_container() before systemd support, and its
+        # cgroup-v2 fallback matches every host that merely runs Docker, so a
+        # systemd-supervised gateway is labelled "docker (foreground)" with no
+        # service at all. The unit systemd reports active outranks that label
+        # (fixed upstream in NousResearch/hermes-agent#105351, after 0.21.0).
+        unit = _live_systemd_gateway_unit()
+        if unit is None:
+            return _GatewayRestartAssessment(
+                None,
+                f"snapshot reports {manager}; no systemd gateway unit is "
+                "installed and active",
+            )
+        unit_path, unit_scope = unit
+        if unit_scope == "system" and os.geteuid() != 0:
+            return _GatewayRestartAssessment(
+                None,
+                f"snapshot reports {manager}; systemd unit {unit_path} exists "
+                "and is active, but it is system scope and this command is not "
+                "running as root",
+            )
+        return _GatewayRestartAssessment(_GatewayRestartPlan(timeout_s))
+    if process_mismatch:
+        return _GatewayRestartAssessment(
+            None,
+            f"snapshot reports {manager}; the running gateway is not the "
+            "process its installed service supervises",
+        )
     if service_scope == "system" and os.geteuid() != 0:
-        return None
-    return _GatewayRestartPlan(timeout_s)
+        return _GatewayRestartAssessment(
+            None,
+            f"snapshot reports {manager}; a system-scope service restart "
+            "requires root",
+        )
+    return _GatewayRestartAssessment(_GatewayRestartPlan(timeout_s))
+
+
+def _prepare_gateway_restart() -> Optional[_GatewayRestartPlan]:
+    """Return the bounded lifecycle plan, or None when there is none."""
+    return _assess_gateway_restart().plan
+
+
+def _gateway_restart_refusal_reason() -> str:
+    """Re-derive why the lifecycle was refused, for the operator's message."""
+    return _assess_gateway_restart().reason
 
 
 def _gateway_restart_is_bounded() -> bool:
@@ -437,7 +515,13 @@ def reset_relay_credential(
         except Exception:  # noqa: BLE001 - stop before persistence on ambiguity
             restart_plan = None
         if restart_plan is None:
-            return RelayCredentialResetResult(False, "restart_unsupported")
+            try:
+                refusal_reason = _gateway_restart_refusal_reason()
+            except Exception:  # noqa: BLE001 - a missing reason is not a failure
+                refusal_reason = ""
+            return RelayCredentialResetResult(
+                False, "restart_unsupported", detail=refusal_reason
+            )
         prepared_timeout_s = restart_plan.timeout_s
 
         def restart_fn() -> bool:  # type: ignore[no-redef]
@@ -608,8 +692,10 @@ def _render_reset_result(result: RelayCredentialResetResult) -> str:
         f"replacementAuth={result.replacement_auth}, "
         f"previousAuth={result.previous_auth}."
     )
+    detail = str(result.detail or "").strip().rstrip(".")
+    reason = f" Reason: {detail}." if detail else ""
     message = messages.get(result.code, "Reset did not complete safely.")
-    return "\n  " + message + evidence + "\n"
+    return "\n  " + message + reason + evidence + "\n"
 
 
 @contextmanager

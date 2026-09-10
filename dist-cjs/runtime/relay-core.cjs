@@ -30,6 +30,7 @@ const { createOpenClawAgentEmojiUpdater } = require("../gateway/openclaw-agent-e
 const { createOpenClawAgentSettings } = require("../gateway/openclaw-agent-settings.cjs");
 const { isKnownBackendKind, setActiveBackendKind, getActiveBackendKind } = require("../gateway/backend-contract.cjs");
 const { createAgentTurnTracker } = require("../tools/glasses-ui-wake.cjs");
+const { mintPreloadedChildren, preloadedChildrenAreMinted } = require("../tools/glasses-ui-children.cjs");
 const { gatewaySessionKeyFor } = require("./openclaw-session-key.cjs");
 const { getRegisteredLiveuiGlassesLibraryController } = require("../tools/glasses-ui-tool.cjs");
 const { createLiveuiTaskRunController } = require("../tools/glasses-ui-task-run.cjs");
@@ -498,6 +499,10 @@ function createRelay(opts) {
   let cachedEntries = "";
   let entriesRevision = 0;
   let entriesLastSeq = -1;
+
+  let entriesCount = 0;
+
+  let entriesSessionId      = null;
 
   let cachedStatus = null;
 
@@ -2693,20 +2698,31 @@ function createRelay(opts) {
 
   const glassesUiResultHandlers = new Set();
 
+  let injectChildGeneration = 0;
+  function withInjectMintedChildren(surfaceId     , spec     ) {
+    if (!spec || !Array.isArray(spec.children) || preloadedChildrenAreMinted(spec.children)) return spec;
+    injectChildGeneration += 1;
+    return {
+      ...spec,
+      children: mintPreloadedChildren(surfaceId, spec.title, spec.children, `i${injectChildGeneration}`),
+    };
+  }
+
   function sendGlassesUiRender(params) {
     if (!server) return;
     const { sessionKey, liveUiSessionGeneration } = currentLiveUiSessionContext(
       params && params.sessionKey,
     );
+    const renderSurfaceId = params && typeof params.surfaceId === "string" ? params.surfaceId : "";
     const payload = {
       type: "glasses_ui_render",
       sessionKey,
       liveUiSessionGeneration,
-      surfaceId: params && typeof params.surfaceId === "string" ? params.surfaceId : "",
+      surfaceId: renderSurfaceId,
 
       seq: Number.isFinite(params && params.seq) ? Math.floor(params.seq) : null,
       depth: Number.isFinite(params && params.depth) ? Math.floor(params.depth) : 1,
-      spec: params && params.spec ? params.spec : null,
+      spec: params && params.spec ? withInjectMintedChildren(renderSurfaceId, params.spec) : null,
       marker: sanitizeGlassesMarker(params && params.marker),
     };
     server.broadcast(JSON.stringify(payload));
@@ -2832,8 +2848,9 @@ function createRelay(opts) {
         .map((i) => {
           if (typeof i === "string") return i;
           if (i && typeof i === "object" && typeof i.label === "string") {
-            const o = { label: i.label };
+            const o                                                      = { label: i.label };
             if (typeof i.body === "string") o.body = i.body;
+            if (typeof i.checked === "boolean") o.checked = i.checked;
             return o;
           }
           return null;
@@ -3517,7 +3534,7 @@ function createRelay(opts) {
             typeof conversationState.bindRunIdToClientSendId === "function"
           ) {
             if (conversationState.bindRunIdToClientSendId(id, runId)) {
-              broadcastEntriesForActiveLedgerClients();
+              broadcastEntriesForActiveLedgerClients("run_id_bound");
             }
           }
           relayOperationRegistry.markUpstreamAck(id, {
@@ -6197,7 +6214,7 @@ function createRelay(opts) {
         entry.clientCapabilities.includes("ledgerV1")
       ) {
 
-        setTimeout(() => broadcastEntriesForActiveLedgerClients(), 0);
+        setTimeout(() => broadcastEntriesForActiveLedgerClients("ledger_client_attached"), 0);
       }
     },
     onAppPresenceChanged(reason     ) {
@@ -6290,14 +6307,18 @@ function createRelay(opts) {
     );
   }
 
-  function broadcastEntriesForActiveLedgerClients() {
+  function broadcastEntriesForActiveLedgerClients(reason      = null) {
     if (!hasActiveLedgerClient()) return;
     const snapshot = activeLedgerSnapshot();
-    if (snapshot !== null) server.broadcast(cacheEntries(snapshot));
+    if (snapshot !== null) server.broadcast(cacheEntries(snapshot, reason));
   }
 
-  function cacheEntries(snapshot      = {}) {
+  function cacheEntries(snapshot      = {}, reason      = null, sourceRowCount      = null) {
     const sessionId = sessionService.peekSessionKey();
+    const previousSessionId = entriesSessionId;
+    const previousRevision = entriesRevision;
+    const previousLastSeq = entriesLastSeq;
+    const previousCount = entriesCount;
     cachedEntries = handler.formatEntries(snapshot, sessionId);
     entriesRevision = Number.isFinite(Number(snapshot.entriesRevision))
       ? Math.max(0, Math.floor(Number(snapshot.entriesRevision)))
@@ -6305,6 +6326,52 @@ function createRelay(opts) {
     entriesLastSeq = Number.isFinite(Number(snapshot.lastSeq))
       ? Math.floor(Number(snapshot.lastSeq))
       : -1;
+    entriesCount = Array.isArray(snapshot.entries) ? snapshot.entries.length : 0;
+    entriesSessionId = sessionId || null;
+
+    if (
+      previousCount > 0 &&
+      (entriesCount < previousCount || entriesLastSeq < previousLastSeq)
+    ) {
+      const sessionChanged = !!previousSessionId && previousSessionId !== entriesSessionId;
+      const rowsFromUpstream = Number.isFinite(Number(sourceRowCount))
+        ? Math.max(0, Math.floor(Number(sourceRowCount)))
+        : null;
+
+      const upstreamSentEnough = rowsFromUpstream !== null && rowsFromUpstream >= previousCount;
+      const verdict = sessionChanged
+        ? "session_changed_expected"
+        : reason === "gateway_history" || reason === "mirror_rehydrate"
+          ? (upstreamSentEnough ? "local_filter_dropped_rows" : "upstream_history_shrank")
+          : reason === "session_switch"
+            ? "session_switch_same_key"
+            : "local_state_shrank";
+      emitDebug(
+        "relay.session",
+        "ledger_snapshot_shrank",
+        sessionChanged ? "info" : "warn",
+        { sessionKey: sessionId },
+        () => ({
+          verdict,
+          implicates: sessionChanged
+            ? "neither"
+            : verdict === "upstream_history_shrank"
+              ? "gateway"
+              : "relay",
+          reason: reason || "unattributed",
+          upstreamRowCount: rowsFromUpstream,
+          sessionId,
+          previousSessionId,
+          entriesRevision,
+          previousEntriesRevision: previousRevision,
+          lastSeq: entriesLastSeq,
+          previousLastSeq,
+          entryCount: entriesCount,
+          previousEntryCount: previousCount,
+          complete: snapshot.complete !== false,
+        }),
+      );
+    }
     return cachedEntries;
   }
 
@@ -6328,7 +6395,11 @@ function createRelay(opts) {
       server.broadcast(next);
     }
     if (ledgerSnapshot !== null) {
-      const entriesFrame = cacheEntries(ledgerSnapshot);
+      const entriesFrame = cacheEntries(
+        ledgerSnapshot,
+        options.reason || null,
+        options.sourceRowCount ?? null,
+      );
 
       server.broadcast(entriesFrame);
     } else if (!preserveLedgerLane) {

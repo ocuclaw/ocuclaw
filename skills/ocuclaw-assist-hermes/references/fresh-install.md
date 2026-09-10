@@ -1,6 +1,6 @@
 # OcuClaw fresh install on Hermes — Steps 1–12 (plus Step 4b)
 
-**Guide version:** 2026-09-05 (1.3.19-hermes)
+**Guide version:** 2026-09-10 (1.3.20-hermes)
 
 Keep using the loaded setup skill for guardrails, the lane card, and the
 internal completion checklist.
@@ -101,13 +101,12 @@ or present it as an outstanding requirement in Desktop.
 OcuClaw needs Hermes `>=0.21.0,<0.22.0`; the certified baseline is Hermes
 `0.21.0`.
 
-**Private beta access.** `ocuclaw/ocuclaw` requires an invited GitHub account
-and Git HTTPS authentication on the installing machine (Desktop uses Git too).
-Verify access with `git ls-remote https://github.com/ocuclaw/ocuclaw.git HEAD`
-before installing. “Repository not found” or “could not read Username” means
-confirm your invitation with the beta contact and configure Git authentication
-locally; never paste an access token into setup chat. Repository visibility is
-not changed by this release. Even Hub beta access is a separate invitation.
+**Repository access.** `ocuclaw/ocuclaw` is a public repository and needs no
+invitation or GitHub sign-in to clone. Git must still be installed and working
+on the installing machine (Desktop uses Git too). Verify with
+`git ls-remote https://github.com/ocuclaw/ocuclaw.git HEAD` before installing;
+never paste an access token into setup chat. Even Hub beta access is a separate
+invitation, and the software itself is still beta.
 
 **Terminal first.** This is the supported path and the one every beta build is
 tested on:
@@ -408,6 +407,13 @@ Only after `terminal` reports that native elevation is unavailable, the account
 is not permitted to use it, the user cancels it, or the retry fails may you hand
 the original doctor-provided command to the user for a separate administrator
 terminal. Then run `doctor` again.
+
+`--tls-terminated-tcp` requires HTTPS Certificates enabled for this tailnet in
+the Tailscale admin console, under DNS, alongside MagicDNS. Without them
+Tailscale accepts the route and every connection through it then fails: the
+symptom is `probe_failed` plus `relay_verifier_protocol_error` on a route
+classified `ready`. `doctor` prechecks this and withholds the apply command
+when the certificate is unavailable, printing the admin-console fix instead.
 
 Continue only when the route is `ready` and the bounded reachability and relay
 checks succeed. Configuration shape alone is advisory. An `unknown` result is

@@ -2187,10 +2187,16 @@ class OpenClawClient extends EventEmitter {
     }
 
     const messages = result && Array.isArray(result.messages) ? result.messages : [];
-    this._logger.info(`[openclaw] Chat history loaded: ${messages.length} messages`);
+
+    const echoedSessionKey = (result && result.sessionKey) || sessionKey;
+    this._logger.info(
+      `[openclaw] Chat history loaded: ${messages.length} messages ` +
+        `(requested=${sessionKey} answered=${echoedSessionKey}` +
+        `${normalizeSessionKey(sessionKey) === normalizeSessionKey(echoedSessionKey) ? "" : " KEY_MISMATCH"})`
+    );
 
     this.emit("history", {
-      sessionKey: (result && result.sessionKey) || sessionKey,
+      sessionKey: echoedSessionKey,
       messages,
     });
 

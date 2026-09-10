@@ -1,6 +1,6 @@
 # Reset relay credential — all devices
 
-**Guide version:** 2026-09-05 (1.3.19-hermes)
+**Guide version:** 2026-09-10 (1.3.20-hermes)
 
 Use this branch only when the user explicitly asks to reset the Relay
 Credential or suspects a paired phone is lost or compromised. This is an

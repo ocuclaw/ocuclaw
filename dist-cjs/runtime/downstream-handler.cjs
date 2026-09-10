@@ -2822,11 +2822,12 @@ function createDownstreamHandler(opts) {
 
     if (action === "setting-set") {
       const settingKey = parseOptionalTrimmedString(msg.settingKey);
-      const value = parseOptionalTrimmedString(msg.value);
+
+      const value = typeof msg.value === "string" ? msg.value.trim() : null;
       if (!settingKey) {
         throw new Error("remote-control setting-set requires settingKey");
       }
-      if (!value) {
+      if (value === null) {
         throw new Error("remote-control setting-set requires value");
       }
       payload.settingKey = settingKey;
@@ -3108,6 +3109,16 @@ function createDownstreamHandler(opts) {
         );
       }
       return { ...payload, text: direction };
+    }
+
+    if (action === "webui-document-visibility") {
+      const state = parseOptionalTrimmedString(msg.value)?.toLowerCase();
+      if (state !== "hidden" && state !== "visible") {
+        throw new Error(
+          "remote-control webui-document-visibility requires value hidden|visible",
+        );
+      }
+      return { ...payload, value: state };
     }
 
     if (

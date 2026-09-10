@@ -32,7 +32,87 @@ SECTIONS = {
     "Profiles": ("profiles", "Review native profile configuration on the host."),
     "s6 Supervision": ("supervision", "Review native service supervision on the host."),
     "Gateway Service": ("service", "Review native gateway service status on the host."),
+    "Provider Retirement": ("provider", "Review retired provider models configured in this profile."),
+    "Plugin Compatibility": ("plugins", "Update plugins that import native paths scheduled for removal."),
 }
+
+# Hermes 2026.9 split doctor into ``doctor_*`` siblings and dropped the section
+# title from most checks (they run under ``title=None`` and inherit whichever
+# section came before), so titles alone no longer separate the categories: five
+# would vanish and profiles would report itself as memory. The check function
+# survives that split, so it, not the title, keys the category.
+CHECKS = {
+    "_check_security_advisories": "Security Advisories",
+    "_check_mcp_security": "MCP Server Security",
+    "_check_python_environment": "Python Environment",
+    "_check_certificates": "SSL / CA Certificates",
+    "_check_required_packages": "Required Packages",
+    "_check_env_file": "Configuration Files",
+    "_check_config_file": "Config Structure",
+    "_check_config_drift": "Config Structure",
+    "_check_xai_retirement": "Provider Retirement",
+    "_check_plugin_compat": "Plugin Compatibility",
+    "_check_auth_providers": "Auth Providers",
+    "_check_directory_structure": "Directory Structure",
+    "_check_state_db": "Directory Structure",
+    "_check_gateway_supervision": "s6 Supervision",
+    "_check_command_installation": "Command Installation",
+    "_check_git_and_rg": "External Tools",
+    "_check_terminal_backend": "External Tools",
+    "_check_node_and_browser": "External Tools",
+    "_check_npm_audit": "External Tools",
+    "_check_api_connectivity": "API Connectivity",
+    "_check_tool_availability": "Tool Availability",
+    "_check_skills_hub": "Skills Hub",
+    "_check_memory_provider": "Memory Provider",
+    "_check_profiles": "Profiles",
+}
+
+
+def capture_doctor(doctor, section, check):
+    """Route native doctor rows into ``section``/``check`` on either module layout.
+
+    Before 2026.9 the primitives were defined in ``hermes_cli.doctor`` and
+    patching that module was enough. 2026.9 moved them to
+    ``hermes_cli.doctor_report``; every ``doctor_*`` sibling from-imports them,
+    so each module holds its own binding and all of them must be rebound. The
+    names left behind in ``doctor`` there are dead plugin-compat stubs that no
+    internal check calls, so patching only ``doctor`` captures nothing at all
+    and the diagnostic reports zero checks instead of failing.
+    """
+    marks = {"check_ok": check("ok"), "check_warn": check("warning"),
+             "check_fail": check("error"), "check_info": check("info")}
+    # Read, never import: doctor pulls its siblings in at module scope, so on
+    # 2026.9 they are already loaded, and on the certified baseline the module
+    # does not exist at all. Importing it would widen the bundle's declared
+    # platform surface with a name half the supported range cannot resolve.
+    report = sys.modules.get("hermes_cli.doctor_report")
+    targets = [doctor] if report is None else [module for name, module in list(sys.modules.items())
+                                               if name.startswith("hermes_cli.doctor") and module is not None]
+    for module in targets:
+        for name, mark in marks.items():
+            if hasattr(module, name):
+                setattr(module, name, mark)
+        if hasattr(module, "_section"):
+            module._section = section
+    if report is not None:
+        # ``warn_on_error``'s ``report=check_warn`` default was bound at
+        # definition, so best-effort failures print through the original and go
+        # uncounted unless the default itself is replaced.
+        guard = getattr(getattr(report, "warn_on_error", None), "__wrapped__", None)
+        if guard is not None and guard.__defaults__:
+            guard.__defaults__ = guard.__defaults__[:-1] + (marks["check_warn"],)
+    checks = getattr(doctor, "DOCTOR_CHECKS", None)
+    if checks:
+        def titled(entry):
+            title = CHECKS.get(getattr(entry, "__name__", ""))
+            if title is None:
+                return entry
+            def run_check(*args, **kwargs):
+                section(title)
+                return entry(*args, **kwargs)
+            return run_check
+        doctor.DOCTOR_CHECKS = tuple((title, titled(entry)) for title, entry in checks)
 
 
 def run(kind, output):
@@ -64,19 +144,14 @@ def run(kind, output):
                         counts[key]["count"] += 1
                     emit()
                 return capture
-            doctor._section = section
-            doctor.check_ok = check("ok")
-            doctor.check_warn = check("warning")
-            doctor.check_fail = check("error")
-            doctor.check_info = check("info")
+            capture_doctor(doctor, section, check)
             doctor.run_doctor(SimpleNamespace(fix=False, ack=None))
             data.update(state="completed" if data["checks"] else "partial", coverage="native_reported_checks")
         else:
             import hermes_cli.security_audit as native
-            native_post, native_get = native._http_post_json, native._http_get_json
             details_complete = [True]
-            def post(url, payload):
-                result = native_post(url, payload)
+            def post(call, url, payload):
+                result = call(url, payload)
                 rows = result.get("results") if isinstance(result, dict) else None
                 if not isinstance(rows, list) or len(rows) != len(payload["queries"]):
                     raise RuntimeError("Incomplete native OSV result")
@@ -86,16 +161,27 @@ def run(kind, output):
                     if any(not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"] for item in row.get("vulns", [])):
                         raise RuntimeError("Malformed native OSV finding")
                 return result
-            def get(url):
+            def get(call, url):
                 try:
-                    record = native_get(url)
+                    record = call(url)
                     if not isinstance(record, dict) or not record.get("id"):
                         raise RuntimeError("Missing native advisory")
                     return record
                 except Exception:
                     details_complete[0] = False
                     raise
-            native._http_post_json, native._http_get_json = post, get
+            # 2026.9 merged the two OSV helpers into one that POSTs when handed a
+            # payload and GETs otherwise. The old pair is simply gone there, so
+            # reading it raises before the audit starts and the whole security
+            # result reports native_failed.
+            single = getattr(native, "_http_json", None)
+            if single is not None:
+                native._http_json = lambda url, payload=None: (
+                    get(single, url) if payload is None else post(single, url, payload))
+            else:
+                native_post, native_get = native._http_post_json, native._http_get_json
+                native._http_post_json = lambda url, payload: post(native_post, url, payload)
+                native._http_get_json = lambda url: get(native_get, url)
             data["phase"] = "component_discovery"
             emit()
             components = native._discover_components(hermes_home=Path(os.environ["HERMES_HOME"]))

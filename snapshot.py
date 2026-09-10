@@ -230,6 +230,13 @@ FACTS_KEYS_V1: Tuple[str, ...] = (
     "serveRelayPort",  # loopback port the route must forward to, or None
     "serveReason",  # stable classifier reason code, or None
     "serveReadCode",  # why the bounded CLI read observed what it did, or None
+    # The TLS preconditions behind the route (#2672). A tailnet with HTTPS
+    # Certificates turned off applies the Serve route, classifies it `ready`,
+    # and then fails every connection through it in a TLS alert, so both of
+    # these describe the route's certificate, not its shape, and both come
+    # from doctor's active lane rather than from passive collection.
+    "serveTlsCertAvailable",  # yes | no | unknown
+    "serveFrontDoorTlsError",  # bool: this run's front-door probe hit a TLS alert
     # -- durable Hermes First-Run Proof ----------------------------------
     # The completion journey that WRITES this record is #1322; v1 carries the
     # key set now so the schema does not move when the writer lands.
@@ -446,6 +453,19 @@ _FINDINGS: Dict[str, Tuple[str, str, str, Optional[str]]] = {
         "The configured tailnet route did not answer a bounded probe.",
         "check_tailscale_route",
     ),
+    "tailnet_tls_certs_unavailable": (
+        LEG_TAILNET_ROUTE,
+        "error",
+        "This tailnet cannot issue the TLS certificate the OcuClaw Serve "
+        "route needs.",
+        "enable_tailnet_https_certs",
+    ),
+    "tailnet_route_tls_error": (
+        LEG_TAILNET_ROUTE,
+        "error",
+        "The configured tailnet route refused the TLS handshake.",
+        "enable_tailnet_https_certs",
+    ),
     "phone_app_absent": (
         LEG_PHONE_APP,
         "error",
@@ -634,6 +654,8 @@ def blank_facts(**overrides: Any) -> Dict[str, Any]:
         "serveRelayPort": None,
         "serveReason": None,
         "serveReadCode": None,
+        "serveTlsCertAvailable": TRISTATE_UNKNOWN,
+        "serveFrontDoorTlsError": False,
         "firstRunProofRecord": None,
         "firstRunProofStatus": "missing",
     }
@@ -1184,6 +1206,8 @@ def _derive_tailnet_leg(
     configured = _tristate(facts["serveConfigured"])
     reachable = _tristate(facts["serveReachable"])
     application_ready = _tristate(facts["serveApplicationReady"])
+    tls_certs = _tristate(facts["serveTlsCertAvailable"])
+    tls_handshake_failed = facts["serveFrontDoorTlsError"] is True
 
     # Configuration shape is observed during collection, so its evidence is
     # fresh when it exists at all and absent otherwise — it carries no TTL.
@@ -1203,9 +1227,12 @@ def _derive_tailnet_leg(
         else _freshness(probed_at, now, ACTIVE_PROBE_TTL_S)
     )
     if probe_freshness != FRESHNESS_FRESH:
-        # Expired probe evidence stops supporting a claim about *now*.
+        # Expired probe evidence stops supporting a claim about *now*. The
+        # TLS observations come from the same lane and expire with it.
         reachable = TRISTATE_UNKNOWN
         application_ready = TRISTATE_UNKNOWN
+        tls_certs = TRISTATE_UNKNOWN
+        tls_handshake_failed = False
 
     evidence_ids = [
         out.evidence_entry(
@@ -1238,8 +1265,20 @@ def _derive_tailnet_leg(
     elif reachable == TRISTATE_NO or application_ready == TRISTATE_NO:
         state = HEALTH_UNHEALTHY
         out.finding("tailnet_route_unreachable", evidence_ids)
+    elif tls_handshake_failed:
+        # A TLS alert is not a refusal, so `reachable` stays unknown, but it
+        # is a definite observation that the front door does not work, and
+        # leaving the leg unknown over it is what left #2672 with a `ready`
+        # route, two non-verdicts, and nothing for the user to act on.
+        state = HEALTH_UNHEALTHY
+        out.finding("tailnet_route_tls_error", evidence_ids)
     else:
         state = HEALTH_UNKNOWN
+
+    if tls_certs == TRISTATE_NO:
+        # Independent of the state above: the route may not be configured at
+        # all yet, and this is the reason applying it would not help.
+        out.finding("tailnet_tls_certs_unavailable", evidence_ids)
 
     return {
         "state": state,

@@ -2926,6 +2926,12 @@ function thinkingStudyPose(variant,t,route){
 const expressions=['neutral','curious','focused','delighted','concerned','surprised','skeptical','sleepy','playful'];
 const CUES={ack:{duration:.7}};
 const ATTEND_POSE={...BASE,x:47,y:13,tilt:.035,lx:20,ly:27,rx:76,ry:27,lrot:.15,rrot:-.15,gazeX:.6,gazeY:.6,curious:1,browY:-1};
+// Attend from a held reply escorts the mic down instead of blinking it out:
+// the gripping mitten lowers `dip` px (ease-out over `lower` s) and holds
+// there until `hold`; from `sinkAt` the mic carrier relaxes at `spring`
+// (props.js sinks the mic 14 px behind the mitten as reveal falls) while the
+// eyes drop to it and come back. Chosen on the 2026-09-10 round-2 page.
+const STOW={lower:.35,hold:.6,dip:4,sinkAt:.15,spring:4,duration:1.4,gazeX:.7,gazeY:1.2};
 // Each activity has an entrance reaction and a slower, readable emotional arc.
 // These are face directions, independent of the action/prop catalogue.
 function expressionFor(def,age,variant=0){
@@ -3454,8 +3460,12 @@ function create(initial='idle',options={}){
   return q;
  }
  let cue=null;
- let attending=false,wakeBeat=null;
- function attend(){attending=true;resting=true;restAge=0;restFreeze=null;restPending=false;restVariant=null;wakeBeat=null;cue=null;}
+ let attending=false,wakeBeat=null,stow=null;
+ function attend(){
+  // Only a reply that still holds its mic gets the stow beat; every other
+  // attend entry glides straight onto the attend still as before.
+  stow=!attending&&byId[id].action==='reply'&&prop.kind==='mic'&&prop.reveal>.5?{at:time,rx:p.rx,ry:p.ry,rrot:p.rrot,ropen:p.ropen}:null;
+  attending=true;resting=true;restAge=0;restFreeze=null;restPending=false;restVariant=null;wakeBeat=null;cue=null;}
  function react(kind){cue=byId[id].action==='error'&&resting?null:CUES[kind]?{kind,at:time,id}:null;}
  let randomState=(options.seed===undefined?THINKING_SEED:options.seed)>>>0,bag=[],thinkingVariant=-1,thinkingAge=0;
  let thinkingChoice=null,thinkingDetail=null;const lastChoices={};
@@ -3476,26 +3486,27 @@ function create(initial='idle',options={}){
  const tapArmed={l:false,r:false};
  const firstAction=byId[id].action;if(firstAction in visits)visits[firstAction]=1;
  const variation=()=>{const a=byId[id].action;if(a==='idle')return restVariant!==null?restVariant:pinnedIdle===null?(entryVariant+Math.floor(age/10))%IDLE_VARIATIONS:pinnedIdle;return a==='thinking'?thinkingVariant:0;};
- function carrier(c,desired,dt){
+ function carrier(c,desired,dt,stiffness=18){
    if(c.kind!==desired&&c.reveal<.005&&Math.abs(c.velocity)<.08){c.kind=desired;}
    const goal=c.kind===desired&&desired?1:0;
-   [c.reveal,c.velocity]=spring(c.reveal,c.velocity,goal,18*response,dt);
+   [c.reveal,c.velocity]=spring(c.reveal,c.velocity,goal,stiffness*response,dt);
    c.reveal=clamp(c.reveal,0,1);
  }
- function setState(next){if(!byId[next])return false;if(id===next)return true;if(age<.6)interruptions++;entryPose={...p};const prev=byId[id].action,a=byId[next].action;transit={t0:time,dir:Math.sign(byId[next].pose.x-p.x)||Math.sign(byId[next].pose.gazeX)||1,via:transitions[prev+'>'+a]||transitions['*>'+a]||null};id=next;age=0;switches++;attending=false;wakeBeat=null;resting=false;restFreeze=null;restPending=false;restVariant=null;entryVariant=a in visits?visits[a]++%IDLE_VARIATIONS:0;if(a==='thinking')nextThinking();return true;}
- function isStill(){if(cue||wakeBeat||restPending)return false;const d=byId[id],calm=Object.values(v).every(x=>Math.abs(x)<.05)&&Math.abs(prop.velocity)<.01&&(icon.kind?icon.reveal>.999:icon.reveal<.001);
+ function setState(next){if(!byId[next])return false;if(id===next)return true;if(age<.6)interruptions++;entryPose={...p};const prev=byId[id].action,a=byId[next].action;transit={t0:time,dir:Math.sign(byId[next].pose.x-p.x)||Math.sign(byId[next].pose.gazeX)||1,via:transitions[prev+'>'+a]||transitions['*>'+a]||null};id=next;age=0;switches++;attending=false;wakeBeat=null;stow=null;resting=false;restFreeze=null;restPending=false;restVariant=null;entryVariant=a in visits?visits[a]++%IDLE_VARIATIONS:0;if(a==='thinking')nextThinking();return true;}
+ function isStill(){if(cue||wakeBeat||restPending||stow)return false;const d=byId[id],calm=Object.values(v).every(x=>Math.abs(x)<.05)&&Math.abs(prop.velocity)<.01&&(icon.kind?icon.reveal>.999:icon.reveal<.001);
    if(attending)return restAge>=.3&&calm&&prop.reveal<.005;
    if(resting)return restAge>=.3&&calm&&(d.prop?prop.kind===d.prop&&prop.reveal>.999:prop.reveal<.005);
    return !!d.static&&age>=2&&calm&&prop.kind===d.prop&&prop.reveal>.999;}
  // Finish the current stroke, then glide onto the approved authored rest frame.
  // Wake: resume, and for idle start the NEXT variation from its first beat.
  function rest(){if(resting||restPending)return;restAge=0;restStarted=time;restVariant=byId[id].action==='idle'?variation():null;if(byId[id].action==='idle')resting=true;else restPending=true;}
- function wake(input={x:0}){if((!resting&&!restPending)||(byId[id].action==='error'&&!attending))return;const wasAttending=attending;attending=false;resting=false;restPending=false;restFreeze=null;wakeBeat={at:time,x:clamp(Number(input?.x)||0,-1,1)};const v=restVariant;restVariant=null;if(byId[id].action==='idle'){if(!wasAttending&&v!==null)entryVariant=(v+1)%IDLE_VARIATIONS;age=0;}}
+ function wake(input={x:0}){if((!resting&&!restPending)||(byId[id].action==='error'&&!attending))return;const wasAttending=attending;attending=false;stow=null;resting=false;restPending=false;restFreeze=null;wakeBeat={at:time,x:clamp(Number(input?.x)||0,-1,1)};const v=restVariant;restVariant=null;if(byId[id].action==='idle'){if(!wasAttending&&v!==null)entryVariant=(v+1)%IDLE_VARIATIONS;age=0;}}
  function tick(dt){
    const def=byId[id];if(isStill())return;time+=dt;if(!wakeBeat)age+=dt;if(resting)restAge+=dt;
    if(def.magic&&magic.ready&&!attending&&!resting){magic.elapsed+=dt;if(magic.elapsed>=MAGIC_REVEAL_END)magic.phase='sustain';}
    if(cue&&(cue.id!==id||time-cue.at>=Math.min(1.5,CUES[cue.kind].duration)))cue=null;
    if(wakeBeat&&time-wakeBeat.at>=.6)wakeBeat=null;
+   if(stow&&time-stow.at>=STOW.duration)stow=null;
    if(def.action==='thinking'&&!resting&&!wakeBeat){thinkingAge+=dt;if(thinkingAge>=thinkingDuration(thinkingVariant)){const extra=thinkingAge-thinkingDuration(thinkingVariant);nextThinking();thinkingAge=extra;}}
    // Move, then hold. The oscillator is persistent through interruptions.
    const beat=time%4.8;phase+=dt*p.tempo*3*(beat<1.8?1:0);
@@ -3605,6 +3616,12 @@ function create(initial='idle',options={}){
    }
    if(cue){const elapsed=time-cue.at,duration=Math.min(1.5,CUES[cue.kind].duration),mix=Math.max(0,Math.min(1,elapsed/.12,(duration-elapsed)/.2));q.gazeX+=(1.2-q.gazeX)*mix;q.gazeY+=(.8-q.gazeY)*mix;q.browY+=mix;q.y+=.35*mix;}
    if(attending)Object.assign(q,ATTEND_POSE);
+   if(stow){
+    const e=time-stow.at,u=Math.min(1,e/STOW.lower),ease=1-(1-u)*(1-u);
+    if(e<STOW.hold||prop.reveal>.05){q.rx=stow.rx;q.ry=stow.ry+STOW.dip*ease;q.rrot=stow.rrot;q.ropen=stow.ropen;}
+    const look=Math.min(1,e/.2)*(1-clamp((e-.5)/.4,0,1));
+    q.gazeX+=(STOW.gazeX-q.gazeX)*look;q.gazeY+=(STOW.gazeY-q.gazeY)*look;q.tilt+=(.04-q.tilt)*look;
+   }
    if(wakeBeat){const t=time-wakeBeat.at,mix=Math.max(0,Math.min(1,t/.12,(.6-t)/.2));q.gazeX+=(wakeBeat.x*1.3-q.gazeX)*mix;q.gazeY+=(-.6-q.gazeY)*mix;q.browY-=mix;q.tilt+=wakeBeat.x*.06*mix;}
    if(def.magic&&!attending&&!resting)Object.assign(q,magicTarget);
    // Withdraw a prop before the face returns to the middle. On entrance, the
@@ -3616,7 +3633,7 @@ function create(initial='idle',options={}){
     if(p.thinkingStudy>.025)q.studyTime=p.studyTime;
    }
    const intendedHead=q.x;
-   const desiredProp=attending?null:def.prop;
+   const desiredProp=attending&&!(stow&&time-stow.at<STOW.sinkAt)?null:def.prop;
    const switchingStage=prop.kind&&(prop.kind!==desiredProp||prop.layout!==def.layout);
    if(switchingStage&&prop.reveal>.025)q.x=prop.layout?prop.layout.side<0?100-prop.layout.head:prop.layout.head:30;
    if(switchingStage&&prop.reveal>.025){q.listenCue=0;q.errorCue=0;}
@@ -3668,7 +3685,7 @@ function create(initial='idle',options={}){
    }
    const propReady=Math.abs(p.x-intendedHead)<1.5&&!switchingStage&&p.thinkingGear<.025&&p.thinkingStudy<.025;
    if(switchingStage&&prop.reveal<.005&&Math.abs(prop.velocity)<.08){prop.kind=null;prop.layout=def.layout||null;}
-   carrier(prop,desiredProp&&propReady?desiredProp:null,dt);
+   carrier(prop,desiredProp&&propReady?desiredProp:null,dt,attending&&prop.kind==='mic'?STOW.spring:18);
    if(prop.kind===def.prop)prop.layout=def.layout||null;
    carrier(icon,attending?null:def.icon,dt);
    if(def.magic&&!attending&&!resting){
@@ -3686,7 +3703,7 @@ function create(initial='idle',options={}){
    }
  }
  function step(seconds){carry+=clamp(Number.isFinite(seconds)?seconds:0,0,.25);while(carry>=1/120){tick(1/120);carry-=1/120;}return snapshot();}
- function snapshot(){const drawn={...p},d=byId[id],beat=time%4.8,microBreath=micro&&age>=2&&!resting&&!d.static&&d.action!=='idle'&&['Work','Mind','Web','Agents'].includes(d.group)&&beat>=2.4&&beat<3.8?1:0;if(microBreath){drawn.y=Math.round(Math.max(13,drawn.y))+1;drawn.ly=Math.round(drawn.ly)+1;drawn.ry=Math.round(drawn.ry)+1;}if(transit&&age<.75&&!resting){drawn.delighted=0;drawn.surprised=0;if(Math.abs(drawn.gazeX)<.5&&Math.abs(drawn.gazeY)<.5)drawn.gazeY=-.6;}return {id,action:attending?'attend':d.action,p:drawn,v:{...v},time,phase,age,thinkingAge,emotion,switches,interruptions,variant:variation(),thinking:thinkingDetail?{...thinkingDetail}:null,resting,attending,static:isStill(),microBreath,prop:{...prop},icon:{...icon},typing:{...typing}};}
+ function snapshot(){const drawn={...p},d=byId[id],beat=time%4.8,microBreath=micro&&age>=2&&!resting&&!d.static&&d.action!=='idle'&&['Work','Mind','Web','Agents'].includes(d.group)&&beat>=2.4&&beat<3.8?1:0;if(microBreath){drawn.y=Math.round(Math.max(13,drawn.y))+1;drawn.ly=Math.round(drawn.ly)+1;drawn.ry=Math.round(drawn.ry)+1;}if(transit&&age<.75&&!resting){drawn.delighted=0;drawn.surprised=0;if(Math.abs(drawn.gazeX)<.5&&Math.abs(drawn.gazeY)<.5)drawn.gazeY=-.6;}return {id,action:attending?'attend':d.action,p:drawn,v:{...v},time,phase,age,thinkingAge,emotion,switches,interruptions,variant:variation(),thinking:thinkingDetail?{...thinkingDetail}:null,resting,attending,stowing:!!stow,static:isStill(),microBreath,prop:{...prop},icon:{...icon},typing:{...typing}};}
  const rawSnapshot=snapshot;
  function buildSnapshot(){const result=rawSnapshot();if(byId[id].magic){const studyTime=Math.min(magic.elapsed,MAGIC_REVEAL_END);result.magic={...magic,performance:byId[id].magic,studyTime};if(magic.ready){result.time=studyTime;result.phase=studyTime*2;result.action='magic';result.p={...p};}}return result;}
  function acceptPose(held){
@@ -3735,7 +3752,9 @@ function draw(s,pen){
  const layout=s.prop.layout||{offset:0,side:1};
  // A handheld mic is picked up in place; it must never scroll into view like
  // the larger staged objects. Its shaft follows the rendered gripping hand.
- const g=pen.local(0,kind==='mic'?0:Math.round((1-s.prop.reveal)*34));
+ // On the way OUT (attend after a reply) it sinks 14 px behind the mitten as
+ // its carrier relaxes: the escort beat in engine.js (STOW) sets the pace.
+ const g=pen.local(0,kind==='mic'?(s.attending?Math.round((1-s.prop.reveal)*14):0):Math.round((1-s.prop.reveal)*34));
  const pt=(x,y)=>{x+=layout.offset+(s.p.propDX||0);return [layout.side<0?100-x:x,y+(s.p.propDY||0)];};
  const P=(points,c)=>g.poly(points.map(([x,y])=>pt(x,y)),c);
  const R=(x,y,w,h,c)=>P([[x,y],[x+w,y],[x+w,y+h],[x,y+h]],c);
@@ -3873,7 +3892,9 @@ function draw(s,pen){
   else{R(69,9,20,2);R(69,14,16,2);R(69,19,11,2);}break;}
  case 'mic':{
   const gripped=s.age>=.3;
-  const x=gripped?Math.round(handX):81,y=gripped?Math.min(27,Math.round(p.ry)):27;
+  // While the escort beat lowers the mitten the mic goes with it; the clamp at
+  // 27 only guards the pickup, where the hand is never below the grip line.
+  const x=gripped?Math.round(handX):81,y=gripped?(s.attending?Math.round(p.ry):Math.min(27,Math.round(p.ry))):27;
   // Keep the pickup ages, then settle on the approved lower-mouth silhouette.
   // A parallel-sided shaft follows the grip without the old taper.
   const u=Math.max(0,Math.min(1,(s.age-.4)/.6)),settle=u*u*(3-2*u);

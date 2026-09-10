@@ -727,6 +727,13 @@ def apply_command(*, relay_port: int, port: Optional[int] = None) -> str:
     ``--bg`` form is required — without it the route lives only as long as the
     foreground command, and the phone loses its front door when the terminal
     closes.
+
+    One precondition this string cannot carry: ``--tls-terminated-tcp`` needs
+    a TLS certificate for this node, which a tailnet with HTTPS Certificates
+    switched off cannot issue. Tailscale accepts the command anyway and the
+    route then classifies ``ready`` while every connection through it fails,
+    so doctor prechecks the certificate before it prints this line at all:
+    :func:`doctor.plan_cert_precheck` (#2672).
     """
     return (
         f"tailscale serve --bg --tls-terminated-tcp={serve_port(port)} "

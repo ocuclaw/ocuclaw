@@ -24,6 +24,11 @@ verifier then performs the approved transient WebSocket authentication
 handshake and closes without a protocol hello. Only that stronger result can
 set ``serveApplicationReady``. Inferring it from the front door remains the
 explicitly disproved #1275 path.
+
+A third check runs on the other side of that fork. :func:`plan_cert_precheck`
+fires only on a run with no route to probe and a Serve command about to be
+proposed, and asks whether this tailnet can issue the TLS certificate that
+command needs at all (#2672).
 """
 
 from __future__ import annotations
@@ -31,8 +36,10 @@ from __future__ import annotations
 import errno
 import os
 import queue
+import shutil
 import socket
 import ssl
+import subprocess
 import threading
 import time
 from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Tuple
@@ -54,9 +61,12 @@ PROBE_TOTAL_BUDGET_S = 5.0
 #: No single check may sit on the budget alone.
 PROBE_DEFAULT_TIMEOUT_S = 2.0
 
-#: The two checks the contract sanctions, named so their evidence is stable.
+#: The checks the contract sanctions, named so their evidence is stable.
 CHECK_TAILNET_REACHABILITY = "tailnet-reachability"
 CHECK_RELAY_APPLICATION = "credentialed-relay-verifier"
+#: The HTTPS-certificate precondition, checked only on a run that is about to
+#: propose the Serve command (#2672).
+CHECK_TAILNET_TLS_CERT = "tailnet-tls-cert"
 
 RELAY_TOKEN_ENV = "OCUCLAW_RELAY_TOKEN"
 
@@ -79,12 +89,24 @@ OUTCOME_RELAY_TIMEOUT = "relay_verifier_timeout"
 OUTCOME_RELAY_PROTOCOL_ERROR = "relay_verifier_protocol_error"
 OUTCOME_RELAY_UNKNOWN = "relay_verifier_unknown"
 OUTCOME_RELAY_NO_CREDENTIAL = "relay_verifier_skipped_no_credential"
+#: A TLS alert, told apart from the other ways a handshake can fail to
+#: complete. Something answered and refused the conversation at the TLS layer,
+#: which is a fact worth a finding. A tailnet without HTTPS certificates
+#: enabled produces exactly this on a route the classifier calls ready (#2672).
+OUTCOME_TLS_HANDSHAKE_FAILED = "probe_tls_handshake_failed"
+OUTCOME_CERT_AVAILABLE = "tls_cert_available"
+OUTCOME_CERT_UNAVAILABLE = "tls_cert_unavailable"
+OUTCOME_CERT_UNKNOWN = "tls_cert_unknown"
 
 PROBE_OUTCOME_CODES = (
     OUTCOME_REACHABLE,
     OUTCOME_UNREACHABLE,
     OUTCOME_TIMEOUT,
     OUTCOME_FAILED,
+    OUTCOME_TLS_HANDSHAKE_FAILED,
+    OUTCOME_CERT_AVAILABLE,
+    OUTCOME_CERT_UNAVAILABLE,
+    OUTCOME_CERT_UNKNOWN,
     OUTCOME_BUDGET_EXHAUSTED,
     OUTCOME_NO_CLASSIFIED_ROUTE,
     OUTCOME_LANE_FAILED,
@@ -255,9 +277,13 @@ def _front_door_handshake(host: str, port: int, timeout_s: float) -> str:
         return OUTCOME_UNREACHABLE
     except ssl.SSLError:
         # Something answered but the TLS conversation did not complete. That
-        # is not evidence the route is down, and it is not evidence it is up,
-        # so it resolves to "observed nothing".
-        return OUTCOME_FAILED
+        # is still not evidence the route is down, so it makes no negative
+        # claim about reachability, but it is not "observed nothing" either,
+        # and reporting it as such is what left #2672 with no finding to act
+        # on. It gets its own code so the deriver can say the front door
+        # refused at the TLS layer, which on a ready route is very nearly
+        # always this tailnet's missing HTTPS certificates.
+        return OUTCOME_TLS_HANDSHAKE_FAILED
     except socket.gaierror:
         # The node name did not resolve. Tailscale DNS being unavailable is a
         # local condition, not a verdict on the route.
@@ -271,6 +297,118 @@ def _front_door_handshake(host: str, port: int, timeout_s: float) -> str:
         if exc.errno in _NETWORK_REFUSAL_ERRNOS:
             return OUTCOME_UNREACHABLE
         return OUTCOME_FAILED
+
+
+#: The exact refusals Tailscale returns when a tailnet cannot issue TLS certs.
+#: Matched as substrings of the CLI's own message and nothing wider: any other
+#: non-zero exit is a condition this build has not verified, and claiming
+#: "your tailnet has HTTPS off" over it would send a user to an admin console
+#: that was never the problem.
+_CERT_UNAVAILABLE_SIGNATURES = (
+    "does not support getting tls certs",
+    "https must be enabled in the admin panel",
+    "https is not enabled",
+)
+
+
+def _run_cert_command(args: List[str], timeout_s: float) -> Optional[Tuple[int, str]]:
+    """Run one bounded certificate probe. ``None`` means "observed nothing"."""
+    if shutil.which(args[0]) is None:
+        return None
+    try:
+        completed = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+    return (
+        int(getattr(completed, "returncode", 1)),
+        f"{getattr(completed, 'stderr', '') or ''}\n"
+        f"{getattr(completed, 'stdout', '') or ''}",
+    )
+
+
+def tailnet_tls_cert_check(
+    dns_name: str,
+    timeout_s: float,
+    *,
+    runner: Optional[Callable[[List[str], float], Optional[Tuple[int, str]]]] = None,
+) -> str:
+    """Can this tailnet issue a TLS certificate for this node's own name?
+
+    `tailscale serve --tls-terminated-tcp` needs one, and a tailnet with
+    HTTPS Certificates turned off in the admin console silently cannot supply
+    it: the route applies, `serve status` classifies it ``ready``, and every
+    connection through it then dies in a TLS alert. That is #2672, and the
+    whole cost of finding it out is this one bounded call.
+
+    The certificate is written to the null device rather than to stdout. A
+    private key must never enter a captured buffer, and this check wants only
+    the exit status.
+
+    Three outcomes, and the third is the important one. Only Tailscale's own
+    "this tailnet cannot issue certs" refusal produces
+    :data:`OUTCOME_CERT_UNAVAILABLE`; a missing binary, a timeout, or any
+    other failure resolves to :data:`OUTCOME_CERT_UNKNOWN`, which withholds
+    nothing and claims nothing.
+    """
+    runner = _run_cert_command if runner is None else runner
+    null_device = os.devnull
+    try:
+        answer = runner(
+            [
+                "tailscale",
+                "cert",
+                "--cert-file",
+                null_device,
+                "--key-file",
+                null_device,
+                dns_name,
+            ],
+            timeout_s,
+        )
+    except Exception:  # noqa: BLE001 - a substituted runner may raise anything
+        return OUTCOME_CERT_UNKNOWN
+    if answer is None:
+        return OUTCOME_CERT_UNKNOWN
+    returncode, message = answer
+    if returncode == 0:
+        return OUTCOME_CERT_AVAILABLE
+    lowered = str(message or "").lower()
+    if any(signature in lowered for signature in _CERT_UNAVAILABLE_SIGNATURES):
+        return OUTCOME_CERT_UNAVAILABLE
+    return OUTCOME_CERT_UNKNOWN
+
+
+def plan_cert_precheck(facts: Mapping[str, Any]) -> Optional[ProbeCheck]:
+    """The certificate precondition, planned only where it changes the output.
+
+    Deliberately not part of :func:`plan_probes`. That function decides which
+    checks may be aimed at a *route*, and its answer for anything the
+    classifier did not recognise is "none", a contract this check would
+    muddy, because it aims at the tailnet's certificate authority rather than
+    at the route.
+
+    It runs exactly where a wrong answer costs the user an afternoon: on the
+    run that is about to print `tailscale serve --tls-terminated-tcp`, which
+    is a run whose route is ``absent`` or ``wrong`` and whose route probes
+    were therefore all skipped. Nothing is planned on a ``ready`` route, where
+    the front-door check already reports a TLS refusal directly.
+    """
+    if facts.get("serveClassification") not in {"absent", "wrong"}:
+        return None
+    dns_name = facts.get("serveNodeDnsName")
+    if not isinstance(dns_name, str) or not dns_name:
+        return None
+    return ProbeCheck(
+        name=CHECK_TAILNET_TLS_CERT,
+        timeout_s=PROBE_DEFAULT_TIMEOUT_S,
+        run=lambda allowance: tailnet_tls_cert_check(dns_name, allowance),
+    )
 
 
 def _read_relay_credential() -> str:
@@ -500,6 +638,8 @@ def _clear_probe_facts(facts: Mapping[str, Any]) -> Dict[str, Any]:
     updated["serveReachable"] = TRISTATE_UNKNOWN
     updated["serveApplicationReady"] = TRISTATE_UNKNOWN
     updated["serveProbedAt"] = None
+    updated["serveTlsCertAvailable"] = TRISTATE_UNKNOWN
+    updated["serveFrontDoorTlsError"] = False
     return updated
 
 
@@ -541,6 +681,9 @@ def apply_probe_outcomes(
     application = next(
         (o for o in outcomes if o.name == CHECK_RELAY_APPLICATION), None
     )
+    certificate = next(
+        (o for o in outcomes if o.name == CHECK_TAILNET_TLS_CERT), None
+    )
     observed = False
 
     if reachability is not None:
@@ -549,6 +692,21 @@ def apply_probe_outcomes(
             observed = True
         elif reachability.result_code in _NEGATIVE_OUTCOMES:
             updated["serveReachable"] = TRISTATE_NO
+            observed = True
+        elif reachability.result_code == OUTCOME_TLS_HANDSHAKE_FAILED:
+            # Reachability stays unknown: a TLS alert says the far side
+            # answered, not that the route is down. What it does establish is
+            # that the front door refuses TLS, which the deriver turns into a
+            # finding instead of silence.
+            updated["serveFrontDoorTlsError"] = True
+            observed = True
+
+    if certificate is not None:
+        if certificate.result_code == OUTCOME_CERT_AVAILABLE:
+            updated["serveTlsCertAvailable"] = TRISTATE_YES
+            observed = True
+        elif certificate.result_code == OUTCOME_CERT_UNAVAILABLE:
+            updated["serveTlsCertAvailable"] = TRISTATE_NO
             observed = True
 
     if application is not None:
@@ -994,14 +1152,31 @@ def observe(
     probed_at: Optional[str],
     budget_s: float = PROBE_TOTAL_BUDGET_S,
     planner: Callable[[Mapping[str, Any]], ProbePlan] = plan_probes,
+    cert_planner: Callable[
+        [Mapping[str, Any]], Optional[ProbeCheck]
+    ] = plan_cert_precheck,
     clock: Callable[[], float] = time.monotonic,
 ) -> Tuple[Dict[str, Any], List[ProbeOutcome]]:
     """Plan, run, and fold in one bounded active observation.
 
     The whole of doctor's active lane, as one function a test can drive with
     a fixture planner.
+
+    The certificate precheck shares the same five-second budget as the route
+    probes rather than getting an allowance of its own, and it goes last: the
+    two planners are mutually exclusive in practice, so in the run that plans
+    it the whole budget is still there.
     """
     plan = planner(facts)
+    precheck = cert_planner(facts)
     outcomes = list(plan.skipped)
-    outcomes.extend(run_probes(plan.checks, budget_s=budget_s, clock=clock))
+    if precheck is None:
+        outcomes.extend(run_probes(plan.checks, budget_s=budget_s, clock=clock))
+    else:
+        started = clock()
+        outcomes.extend(run_probes(plan.checks, budget_s=budget_s, clock=clock))
+        remaining = budget_s - (clock() - started)
+        outcomes.extend(
+            run_probes([precheck], budget_s=max(remaining, 0.0), clock=clock)
+        )
     return apply_probe_outcomes(facts, outcomes, probed_at=probed_at), outcomes

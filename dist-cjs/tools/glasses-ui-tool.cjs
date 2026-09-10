@@ -1,4 +1,5 @@
 const path = require("node:path");
+const { clipBreadcrumb, mintPreloadedChildren } = require("./glasses-ui-children.cjs");
 const { createLiveuiTemplateLibrary, createLiveuiGlassesLibraryController, dispatchLiveuiTemplateOperation, runLiveuiTemplateRenderLifecycle, LIVEUI_TEMPLATE_TOOL_DESCRIPTION, LIVEUI_TEMPLATE_LIBRARY_DIRNAME, LIVEUI_TEMPLATE_TOOL_NAME, liveuiTemplateToolParametersSchema } = require("./glasses-ui-template-library.cjs");
 const { createLiveuiTaskLibrary, dispatchLiveuiTaskOperation, LIVEUI_TASK_TOOL_DESCRIPTION, LIVEUI_TASK_TOOL_NAME, LIVEUI_TASK_UNKNOWN_APPROVAL_BEHAVIOUR, liveuiTaskToolParametersSchema, projectTaskForApproval } = require("./glasses-ui-task-library.cjs");
 const { createLiveuiLibraryOrganization, findLiveuiVisibleNameClash, isLiveuiLibraryItemVisible, rejectLiveuiVisibleNameClash } = require("./glasses-ui-library-organization.cjs");
@@ -986,26 +987,6 @@ function createGlassesUiToolHandler(deps) {
     return `decl-${declarationSalt}-${declarationSeq}`;
   }
 
-  const TITLE_BUDGET_PX = 540;
-
-  function clipBreadcrumb(s, reserveText = "") {
-    if (typeof s !== "string" || s.length === 0) return s;
-    const charBudget = Math.floor((TITLE_BUDGET_PX - reserveText.length * 20) / 20);
-    if (charBudget <= 0) return "";
-    if (s.length <= charBudget) return s;
-    const segments = s.split(" › ");
-
-    while (segments.length > 1 && segments.join(" › ").length > charBudget) {
-      segments.shift();
-    }
-    const joined = segments.join(" › ");
-    if (joined.length <= charBudget) return joined;
-
-    const clipped = joined.slice(0, charBudget);
-
-    return /[\uD800-\uDBFF]$/.test(clipped) ? clipped.slice(0, -1) : clipped;
-  }
-
   function emitMarker(sessionKey, surfaceId) {
     if (!surfaceId) return;
     const normalizedSessionKey = normalizeGlassesSessionKey(sessionKey);
@@ -1923,15 +1904,12 @@ function createGlassesUiToolHandler(deps) {
 
     const wireSpec = { ...validation.spec };
     if (Array.isArray(validation.spec.children)) {
-      const gen = declarationSeq;
-      wireSpec.children = validation.spec.children.map((child, i) => {
-        if (!child) return null;
-        const wired = { ...child, surfaceId: `${surfaceId}:c${i}-${gen}` };
-        if (typeof child.title === "string" && typeof validation.spec.title === "string") {
-          wired.title = clipBreadcrumb(`${validation.spec.title} › ${child.title}`);
-        }
-        return wired;
-      });
+      wireSpec.children = mintPreloadedChildren(
+        surfaceId,
+        validation.spec.title,
+        validation.spec.children,
+        declarationSeq,
+      );
     }
     paintFloor.enqueue({
       surfaceId,
