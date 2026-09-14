@@ -10,6 +10,7 @@ from pathlib import Path
 from .approvals_management import _native as approval_native
 from .management_profiles import management_profile_home
 from .native_compat import probe
+from .native_readers import approval_aliases, approval_reader
 
 OPERATIONS = {"permissions.read", "permissions.revoke", "permissions.receipt", "permissions.recover",
               "permissions.preview", "deny.add", "deny.edit", "deny.remove"}
@@ -52,6 +53,7 @@ def _snapshot(config, managed, approval, tx):
         current_allowlist()
     effective = config.load_config_readonly()
     leaves = tx.read_config_leaves(list(PATHS.values())) if tx else {}
+    aliases = approval_aliases(approval)
     lists = {}
     for kind, path in PATHS.items():
         value = raw.get("command_allowlist") if kind == "remembered" else (raw.get("approvals") or {}).get("deny")
@@ -65,7 +67,7 @@ def _snapshot(config, managed, approval, tx):
         # Never let an effective managed row index mutate a different raw list.
         entries = []
         for index, pattern in enumerate(resolved):
-            semantics = "case_insensitive_native_glob" if kind == "deny" else "native_class_alias" if pattern in approval._PATTERN_KEY_ALIASES else "case_sensitive_command_glob" if any(c in pattern for c in "*?[") else "exact_command"
+            semantics = "case_insensitive_native_glob" if kind == "deny" else "native_class_alias" if pattern in aliases else "case_sensitive_command_glob" if any(c in pattern for c in "*?[") else "exact_command"
             entries.append({"index": index, "pattern": pattern, "semantics": semantics,
                             "effect": "ignored_empty" if not pattern.strip() else "eligible"})
         revision = leaves[path]["revision"] if tx else hashlib.sha256(json.dumps([values, locked]).encode()).hexdigest()
@@ -74,7 +76,7 @@ def _snapshot(config, managed, approval, tx):
             "source": "managed" if managed.is_key_managed(path) else "user" if value is not None else "default"}
     result = {**lists, "cacheEffect": "fresh_profile_each_guard" if tx else "unverified_cached_policy",
             "sessionGrantEffect": "unchanged", "applyTiming": "subsequent_guard_checks",
-            "mode": approval._normalize_approval_mode((effective.get("approvals") or {}).get("mode", "manual")),
+            "mode": approval_reader(approval, "_normalize_approval_mode")((effective.get("approvals") or {}).get("mode", "manual")),
             "processYolo": bool(approval._YOLO_MODE_FROZEN)}
     if len(json.dumps(result, ensure_ascii=True).encode()) > 750_000:
         raise ValueError("Native rule lists exceed the bounded management response.")

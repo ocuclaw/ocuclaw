@@ -47,7 +47,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import concurrent.futures
+from contextvars import ContextVar
 import importlib.util
+import inspect
 import json
 import logging
 import os
@@ -687,7 +689,7 @@ SETUP_TOOL_DESCRIPTION = (
     "enable_stream_reasoning_deltas and enable_desktop_theme — and only with "
     "confirm: true after the operator has said yes."
 )
-SETUP_GUIDE_VERSION = "2026-09-10 (1.3.20-hermes)"
+SETUP_GUIDE_VERSION = "2026-09-14 (1.3.21-hermes)"
 SETUP_SKILL_LOAD_POINTER = (
     "If the OcuClaw Setup Assistant skill is not loaded in this conversation, "
     "load it via `/ocuclaw-setup` before mutating anything."
@@ -1127,6 +1129,35 @@ LIVEUI_TEMPLATE_TOOL_NAME = "manage_liveui_templates"
 LIVEUI_TASK_METHOD = "liveui.tasks"
 LIVEUI_TASK_TOOL_NAME = "manage_liveui_tasks"
 LIVEUI_TOOLSET = "ocuclaw"
+# Phone tools over the control link (#2797 / #2800). The Node child advertises
+# these as data in `hello.phoneTools`; this allow-list is what the adapter is
+# willing to register. Names are allow-listed NOW so #2801/#2802/#2803 only add
+# a descriptor on the Node side — nothing registers until the child sends one.
+# Hello order, which is the order the adapter registers in and the order the
+# manifest lists them in. The allow-list below is derived from it so the two
+# can never disagree.
+PHONE_TOOL_ORDER: Tuple[str, ...] = (
+    "get_current_location",
+    "get_evenrealities_device_info",
+    "set_session_title",
+)
+PHONE_TOOL_NAMES = frozenset(PHONE_TOOL_ORDER)
+# Every tool this bundle provides, in `plugin.yaml` provides_tools order. One
+# Python constant is the source of truth: the manifest pytest compares
+# provides_tools against it, and the inventory below is built from it, so a
+# tool cannot be added to one surface and forgotten on the other (#2804).
+PROVIDED_TOOL_NAMES: Tuple[str, ...] = (
+    LIVEUI_TOOL_NAME,
+    LIVEUI_STATE_TOOL_NAME,
+    LIVEUI_TEMPLATE_TOOL_NAME,
+    LIVEUI_TASK_TOOL_NAME,
+) + PHONE_TOOL_ORDER + (SETUP_TOOL_NAME,)
+# Applied when a descriptor omits `linkTimeoutMs`. Mirrors
+# PHONE_TOOL_DEFAULT_LINK_TIMEOUT_MS in the Node bridge module.
+PHONE_TOOL_DEFAULT_LINK_TIMEOUT_S = 15.0
+# The child owns the wait (ADR-0006), so a declared `linkTimeoutMs` gets a
+# margin on the adapter side rather than a competing deadline.
+PHONE_TOOL_LINK_MARGIN_S = 5.0
 HERMES_HOME_CHANNEL_NOTICE = (
     "📬 No home channel is set for Ocuclaw. A home channel is where Hermes "
     "delivers cron job results and cross-platform messages.\n\n"
@@ -1148,6 +1179,14 @@ _LIVEUI_TOOL_REGISTERED = False
 _LIVEUI_STATE_TOOL_REGISTERED = False
 _LIVEUI_TEMPLATE_TOOL_REGISTERED = False
 _LIVEUI_TASK_TOOL_REGISTERED = False
+# Per-name registration state for the data-driven phone tools (#2800). A
+# dict, not four flags, precisely so the next tickets add nothing here.
+_PHONE_TOOL_REGISTERED: Dict[str, bool] = {}
+# Set by `register()` when `ctx.register_tool` actually accepted the setup
+# tool. Without it the inventory could only guess, and the one tool whose job
+# is to report a broken install would report itself as present on a host where
+# it never registered (#2804).
+_SETUP_TOOL_REGISTERED = False
 _LIVEUI_LOCK = threading.RLock()
 
 
@@ -1188,7 +1227,7 @@ def _pid_alive_here(pid: Any) -> bool:
 
 
 def desktop_hold_details(
-    home: Optional[Path], lineage: List[str]
+    home: Optional[Path], lineage: List[str], *, strict: bool = False
 ) -> Optional[Dict[str, Any]]:
     """What Desktop/TUI currently holds on a lineage, from Hermes's own files.
 
@@ -1211,12 +1250,15 @@ def desktop_hold_details(
     lease names one of the lineage ids (``runtime/active_sessions.json`` via
     the public ``active_session_registry_snapshot`` reader, which prunes dead
     pids; ``_pid_alive_here`` re-checks with our own ``kill(pid, 0)``).
-    ``None`` — free, or unknowable (an unreadable registry never locks the
-    wearer out; the Node watches re-read on every file event and, while the
-    lane is held, on a bounded liveness tick that re-runs this probe). Never
-    a private read of ``session_turn_leases`` (RULED).
+    ``None`` — free. Legacy adoption callers also receive None when unknown;
+    the driver uses strict=True so missing/unreadable authority instead
+    raises and retains the controller's last safe admission as uncertain.
+    Its existing bounded liveness observer supplies recovery. Never a private
+    read of ``session_turn_leases`` (RULED).
     """
     if home is None or not lineage:
+        if strict:
+            raise ValueError("ownership lineage unavailable")
         return None
     ids = {str(value) for value in lineage if value}
     marker_hit: Optional[Dict[str, Any]] = None
@@ -1224,6 +1266,10 @@ def desktop_hold_details(
     try:
         with open(marker, encoding="utf-8") as handle:
             entries = json.load(handle)
+        if strict and (not isinstance(entries, dict) or any(
+            not isinstance(value, dict) for value in entries.values()
+        )):
+            raise ValueError("ownership_marker_invalid")
         if isinstance(entries, dict):
             for key, value in entries.items():
                 if key in ids and isinstance(value, dict):
@@ -1232,8 +1278,10 @@ def desktop_hold_details(
     except FileNotFoundError:
         pass
     except Exception:  # noqa: BLE001 - best-effort marker read
+        if strict:
+            raise
         logger.debug("[ocuclaw] turn marker unreadable at %s", marker, exc_info=True)
-    lease = _live_desktop_lease(home, ids)
+    lease = _live_desktop_lease(home, ids, strict=strict)
     if marker_hit is not None:
         if lease is None:
             logger.debug(
@@ -1246,18 +1294,27 @@ def desktop_hold_details(
                 "sessionId": marker_hit["sessionId"],
                 "surface": lease["surface"],
                 "pid": lease.get("pid"),
+                "generation": lease.get("generation"),
                 "since": marker_hit["since"],
             }
     return lease
 
 
-def _live_desktop_lease(home: Path, ids: Set[str]) -> Optional[Dict[str, Any]]:
+def _live_desktop_lease(home: Path, ids: Set[str], *, strict: bool = False) -> Optional[Dict[str, Any]]:
     """The first pid-alive Desktop/TUI lease naming one of ``ids`` as a
     ``hold`` detail, or ``None`` (free or unknowable)."""
     try:
         from hermes_cli.active_sessions import active_session_registry_snapshot
 
-        for entry in active_session_registry_snapshot(registry_home=home):
+        if strict and not Path(home).joinpath(*DESKTOP_LEASE_REGISTRY_RELPATH).is_file():
+            raise FileNotFoundError("ownership registry unavailable")
+        snapshot_options = {"registry_home": home}
+        if strict:
+            if "strict" not in inspect.signature(active_session_registry_snapshot).parameters:
+                raise RuntimeError("ownership_observer_unsupported")
+            snapshot_options["strict"] = True
+        holders = []
+        for entry in active_session_registry_snapshot(**snapshot_options):
             if not isinstance(entry, dict):
                 continue
             surface = str(entry.get("surface") or "").strip().lower()
@@ -1266,14 +1323,34 @@ def _live_desktop_lease(home: Path, ids: Set[str]) -> Optional[Dict[str, Any]]:
                 continue
             if not _pid_alive_here(entry.get("pid")):
                 continue
-            return {
+            # Native registry generations include process birth time. Verify it
+            # using psutil's public API; pid alone never carries consent forward.
+            generation = None
+            try:
+                import psutil
+                started = float(entry["process_start_time"])
+                actual = psutil.Process(int(entry["pid"])).create_time()
+                if abs(actual - started) >= 0.001:
+                    continue
+                if entry.get("lease_id"):
+                    generation = f'{entry["lease_id"]}:{started}'
+            except Exception:  # old engines/permissions: hold but no takeover
+                pass
+            holders.append({
                 "state": "hold",
                 "sessionId": session_id,
                 "surface": surface,
                 "pid": entry.get("pid"),
                 "since": entry.get("started_at"),
-            }
+                "generation": generation,
+            })
+        if holders:
+            if len(holders) > 1:
+                holders[0]["generation"] = None
+            return holders[0]
     except Exception:  # noqa: BLE001 - unknown liveness never locks the wearer out
+        if strict:
+            raise
         logger.debug("[ocuclaw] active-session registry unreadable", exc_info=True)
     return None
 
@@ -1611,6 +1688,87 @@ def _register_liveui_descriptor_from_hello(
     return True
 
 
+def provided_tool_inventory() -> Dict[str, Any]:
+    """Which of this bundle's eight tools actually registered (#2804).
+
+    One helper, two readers: the `ocuclaw_setup` status block and the
+    `hermes ocuclaw` doctor report. Before this, both surfaces reported a
+    healthy install while a tool the manifest promises had silently failed to
+    register — which is exactly how OCU-K3FQ-F76X reached a wearer: the
+    location tool shipped in the bundle and nothing on the Hermes side bound
+    it, and no diagnostic said so.
+
+    ``expected`` is the manifest list in manifest order. ``registered`` is what
+    this process observed registering, in the same order. ``missing`` is the
+    difference, so a hello that carries no ``phoneTools`` at all (an older
+    child against a newer adapter) shows up as three named absences rather
+    than a crash or a false green.
+
+    ``observed`` is the honesty guard, and it is load-bearing. Registration
+    state lives in module globals of the process that did the registering: the
+    gateway. `hermes ocuclaw status|doctor` runs in its OWN process, where
+    plugin discovery imports this module and `register()` binds the setup tool
+    but no platform ever connects, so seven of eight would read as absent on a
+    perfectly healthy host. A diagnostic that cries wolf is worse than no
+    diagnostic, so ``observed`` is False whenever no adapter instance has
+    connected in this process, and the readers report the inventory as
+    unobservable rather than as seven failures.
+    """
+    registrations: Dict[str, bool] = {
+        LIVEUI_TOOL_NAME: _LIVEUI_TOOL_REGISTERED,
+        LIVEUI_STATE_TOOL_NAME: _LIVEUI_STATE_TOOL_REGISTERED,
+        LIVEUI_TEMPLATE_TOOL_NAME: _LIVEUI_TEMPLATE_TOOL_REGISTERED,
+        LIVEUI_TASK_TOOL_NAME: _LIVEUI_TASK_TOOL_REGISTERED,
+        SETUP_TOOL_NAME: _SETUP_TOOL_REGISTERED,
+    }
+    for name in PHONE_TOOL_ORDER:
+        registrations[name] = bool(_PHONE_TOOL_REGISTERED.get(name))
+    # Two independent proofs that this process is the registering one, because
+    # either alone has a blind spot: a connected adapter covers the gateway
+    # whose tools ALL failed to register, and a runtime-advertised registration
+    # covers the moment before the adapter list is read. The setup tool is
+    # deliberately not a proof: it registers in the CLI process too.
+    expected = list(PROVIDED_TOOL_NAMES)
+    observed = bool(_ADAPTERS) or any(
+        registrations.get(name, False)
+        for name in expected
+        if name != SETUP_TOOL_NAME
+    )
+    registered = [name for name in expected if registrations.get(name, False)]
+    missing = [name for name in expected if not registrations.get(name, False)]
+    return {
+        "expected": expected,
+        "registered": registered,
+        "missing": missing,
+        "observed": observed,
+    }
+
+
+def missing_phone_tool_warnings(
+    inventory: Optional[Mapping[str, Any]] = None,
+) -> List[str]:
+    """One warning line per phone tool the manifest promises and nothing bound.
+
+    Phone tools only. The four LiveUI names already have their own unregistered
+    warning at hello time, and a setup tool that failed to register cannot be
+    the thing printing about it.
+
+    Silent when the inventory was not observed: a process that never registers
+    tools has not witnessed a failure, it has witnessed nothing.
+    """
+    if inventory is None:
+        inventory = provided_tool_inventory()
+    if not isinstance(inventory, Mapping) or not inventory.get("observed"):
+        return []
+    raw_missing = inventory.get("missing") if isinstance(inventory, Mapping) else None
+    missing = set(raw_missing) if isinstance(raw_missing, (list, tuple, set)) else set()
+    return [
+        f"[ocuclaw] phone tool {name!r} did not register"
+        for name in PHONE_TOOL_ORDER
+        if name in missing
+    ]
+
+
 def _warn_unregistered_liveui_descriptors(hello: Dict[str, Any]) -> None:
     liveui = hello.get("liveui") if isinstance(hello, dict) else None
     if not isinstance(liveui, dict):
@@ -1689,6 +1847,109 @@ def _register_liveui_tool_from_hello(hello: Dict[str, Any]) -> None:
                 log_label="liveui task",
             )
         _warn_unregistered_liveui_descriptors(hello)
+
+
+def _phone_tool_link_timeout_s(descriptor: Dict[str, Any]) -> float:
+    """Link timeout for one phone-tool descriptor.
+
+    The child owns the wait (ADR-0006): a declared ``linkTimeoutMs`` is the
+    child's budget, and the adapter waits that long plus a margin so the
+    child's own timeout is what the agent sees.
+    """
+
+    timeout_ms = descriptor.get("linkTimeoutMs")
+    if isinstance(timeout_ms, (int, float)) and not isinstance(timeout_ms, bool):
+        if timeout_ms > 0:
+            return float(timeout_ms) / 1000.0 + PHONE_TOOL_LINK_MARGIN_S
+    return PHONE_TOOL_DEFAULT_LINK_TIMEOUT_S
+
+
+def _make_phone_tool_handler(tool_name: str, method: str, timeout_s: float) -> Any:
+    """One generic forwarder per descriptor — no per-tool logic lives here."""
+
+    def _handler(args: Dict[str, Any], **_kwargs: Any) -> str:
+        adapter = _connected_adapter()
+        return adapter.handle_phone_tool_call(
+            args,
+            tool_name=tool_name,
+            method=method,
+            timeout_s=timeout_s,
+        )
+
+    _handler.__name__ = f"_phone_tool_handler_{tool_name}"
+    return _handler
+
+
+def _register_phone_tools_from_hello(hello: Dict[str, Any]) -> None:
+    """Register every allow-listed descriptor the child advertised.
+
+    Data-driven by design (#2800): the next tickets add a descriptor on the
+    Node side and a link method in the child, and nothing in this function
+    changes. A hello without ``phoneTools`` is the pre-#2800 shape and boots
+    exactly as before — no warnings, no extra log lines.
+    """
+
+    descriptors = hello.get("phoneTools") if isinstance(hello, dict) else None
+    if not isinstance(descriptors, list):
+        return
+    with _LIVEUI_LOCK:
+        for descriptor in descriptors:
+            if not isinstance(descriptor, dict):
+                logger.warning(
+                    "[ocuclaw] phone tool descriptor is not an object; skipped"
+                )
+                continue
+            name = str(descriptor.get("name") or "").strip()
+            if name not in PHONE_TOOL_NAMES:
+                logger.warning(
+                    "[ocuclaw] phone tool descriptor unknown: name=%r; skipped",
+                    name or "<missing>",
+                )
+                continue
+            if _PHONE_TOOL_REGISTERED.get(name):
+                continue
+            schema = descriptor.get("schema")
+            if not isinstance(schema, dict):
+                logger.warning(
+                    "[ocuclaw] phone tool %r has no schema; tool not registered",
+                    name,
+                )
+                continue
+            method = descriptor.get("method")
+            if not isinstance(method, str) or not method.strip():
+                logger.warning(
+                    "[ocuclaw] phone tool %r declares no link method; "
+                    "tool not registered",
+                    name,
+                )
+                continue
+            register_tool = _LIVEUI_REGISTER_TOOL
+            if not callable(register_tool):
+                logger.warning(
+                    "[ocuclaw] ctx.register_tool unavailable; phone tool %r degraded",
+                    name,
+                )
+                continue
+            description = str(
+                descriptor.get("description") or schema.get("description") or ""
+            )
+            register_tool(
+                name=name,
+                toolset=LIVEUI_TOOLSET,
+                schema=schema,
+                handler=_make_phone_tool_handler(
+                    name,
+                    method.strip(),
+                    _phone_tool_link_timeout_s(descriptor),
+                ),
+                check_fn=check_ocuclaw_requirements,
+                is_async=False,
+                description=description,
+            )
+            _PHONE_TOOL_REGISTERED[name] = True
+            logger.info(
+                "[ocuclaw] phone tool %r registered from runtime descriptor", name
+            )
 
 
 def _liveui_render_link_timeout_s(settings: Dict[str, Any]) -> float:
@@ -2411,6 +2672,18 @@ def _setup_status(facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         ),
         "registered": list(_hermes_feature_tokens()),
     }
+    # The tool inventory (#2804). Additive: no existing key moves or changes
+    # meaning, and the block is present on every status so "the key is absent"
+    # can only mean an OcuClaw older than this bundle.
+    inventory = provided_tool_inventory()
+    status["tools"] = {
+        "expected": inventory["expected"],
+        "registered": inventory["registered"],
+        "missing": inventory["missing"],
+        "count": len(inventory["registered"]),
+        "expectedCount": len(inventory["expected"]),
+        "observed": inventory["observed"],
+    }
     status["desktopTheme"] = _desktop_theme_status(raw_config, config_readable)
     status["desktopCredentials"] = desktop_credentials.status()
     status["sessionReadState"] = bool(session_read_state_supported())
@@ -2962,6 +3235,7 @@ def _admitted_is_connected(config: Any) -> bool:
 
 def register(ctx: Any) -> None:
     global _LAST_SETUP_BUNDLE_REPORT, _PLUGIN_CONTEXT, _LIVEUI_REGISTER_TOOL
+    global _SETUP_TOOL_REGISTERED
     _PLUGIN_CONTEXT = ctx
     version = _hermes_version()
     if parse_version(version) is None:
@@ -3067,6 +3341,7 @@ def register(ctx: Any) -> None:
                 is_async=False,
                 description=SETUP_TOOL_DESCRIPTION,
             )
+            _SETUP_TOOL_REGISTERED = True
         except Exception as exc:  # noqa: BLE001 - keep other recovery surfaces
             logger.warning("[ocuclaw] setup tool registration failed: %s", exc)
     else:
@@ -3323,6 +3598,10 @@ def _build_adapter(config: Any):
             self._janitor_task: Optional[asyncio.Task] = None
             self._first_run_welcome_task: Optional[asyncio.Task] = None
             self._message_seq = 0
+            self._delivery_record: ContextVar[Any] = ContextVar(
+                "ocuclaw_delivery_record", default=None
+            )
+            self._processing_deliveries: Dict[Tuple[str, str], Any] = {}
             # Per-process uniqueness for the minted platform message id
             # (#1691) — see `_next_message_id`.
             self._message_id_nonce = uuid.uuid4().hex[:8]
@@ -3553,7 +3832,7 @@ def _build_adapter(config: Any):
                 FOREIGN_COPY_METHOD, self.handle_foreign_copy
             )
             link.register_request_handler(
-                FOREIGN_ADOPT_METHOD, self.handle_foreign_adopt
+                FOREIGN_ADOPT_METHOD, self.handle_shared_handoff_unavailable
             )
             link.register_request_handler(
                 FOREIGN_DRIVER_METHOD, self.handle_foreign_driver
@@ -3633,6 +3912,7 @@ def _build_adapter(config: Any):
                 logger.error("[ocuclaw] runtime child failed to start: %s", exc)
                 return False
             _register_liveui_tool_from_hello(hello)
+            _register_phone_tools_from_hello(hello)
             self._link = link
             self._loop = asyncio.get_running_loop()
             try:
@@ -3747,11 +4027,18 @@ def _build_adapter(config: Any):
             if link is not None:
                 code = await link.terminate()
                 logger.info("[ocuclaw] runtime child stopped (code=%s)", code)
+            close_sessions = getattr(self._session_rpc, "close", None)
+            if callable(close_sessions):
+                await asyncio.to_thread(close_sessions)
             self._mark_disconnected()
 
         # -- outbound transport (StreamConsumer + gateway sends) -------------
 
         async def send(self, chat_id, content, reply_to=None, metadata=None):
+            if self._delivery_is_cancelled():
+                # Acknowledge suppression so Hermes does not retry/fallback
+                # with the same cancelled answer as an uncorrelated send.
+                return SendResult(success=True, message_id=self._next_message_id())
             text = _gateway_auth_recovery_message(strip_stream_cursor(content))
             message_id = self._next_message_id()
             adopt_waiter = self._adopt_waiters.get(str(chat_id))
@@ -4139,6 +4426,8 @@ def _build_adapter(config: Any):
         async def edit_message(
             self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
         ):
+            if self._delivery_is_cancelled():
+                return SendResult(success=True, message_id=str(message_id))
             # StreamConsumer edit transport: content is CUMULATIVE (never a
             # delta); finalize seals the message (turn end AND segment/
             # oversize breaks — one message commit per finalized message).
@@ -4493,6 +4782,7 @@ def _build_adapter(config: Any):
                 # that boundary can close only its own record.
                 setattr(event, "_ocuclaw_dispatch_run_id", record.run_id)
                 setattr(event, "_ocuclaw_dispatch_session_key", session_key)
+                setattr(event, "_ocuclaw_delivery_record", record)
                 await self.handle_message(event)
             except Exception:
                 # A failed dispatch must not strand its records as a phantom
@@ -4544,6 +4834,21 @@ def _build_adapter(config: Any):
                 result["sessionState"] = session_state
             return result
 
+        async def on_processing_start(self, event: Any) -> None:
+            # Hermes invokes this in the processing task before starting the
+            # handler/StreamConsumer. Its executor copies contextvars. Child
+            # tasks retain THIS record even after a successor starts; origin
+            # deliveries without a dispatch reset the context to None.
+            record = getattr(event, "_ocuclaw_delivery_record", None)
+            self._delivery_record.set(record)
+            if record is not None:
+                self._processing_deliveries[(record.session_key, record.run_id)] = record
+            await super().on_processing_start(event)
+
+        def _delivery_is_cancelled(self) -> bool:
+            record = self._delivery_record.get()
+            return record is not None and record.delivery_cancelled
+
         async def on_processing_complete(self, event: Any, outcome: Any) -> None:
             """Close the exact D9 record whose Hermes platform work finished."""
             run_id = str(
@@ -4554,6 +4859,7 @@ def _build_adapter(config: Any):
             ).strip()
             if not run_id or not session_key:
                 return
+            self._processing_deliveries.pop((session_key, run_id), None)
             outcome_value = str(getattr(outcome, "value", "") or "").lower()
             completed = outcome_value == "success"
             head, merged, promoted = self._ledger.complete_head_if_run(
@@ -5586,6 +5892,8 @@ def _build_adapter(config: Any):
         def _turn_activity_context(
             self, kwargs: Dict[str, Any], hook_label: str
         ) -> Optional[Tuple[str, Any]]:
+            if self._delivery_is_cancelled():
+                return None
             platform = str(kwargs.get("platform") or "").strip()
             if platform and platform != PLATFORM_NAME:
                 return None
@@ -6292,6 +6600,8 @@ def _build_adapter(config: Any):
             PREVIOUS message and passes `record.previous_message_id`, exactly
             as it already passes `previous_origin_ms` (#1691).
             """
+            if record.delivery_cancelled:
+                return
             upgraded = self._narration_full_text_for_prefix(record.run_id, text)
             if upgraded is not None:
                 # A note flushed mid-reveal: commit the sentence, not the
@@ -7137,7 +7447,9 @@ def _build_adapter(config: Any):
             if error:
                 return {"status": "rejected", "error": error}
             session_key = self._session_key_for_chat(chat_id, ns=ns)
-            was_busy = self._ledger.is_busy(session_key)
+            was_busy = self._ledger.is_busy(session_key) or any(
+                key == session_key for key, _ in self._processing_deliveries
+            )
             await self._close_session_records(session_key, code="cancelled")
             await self.interrupt_session_activity(session_key, chat_id)
             return {"status": "accepted", "aborted": bool(was_busy)}
@@ -7671,6 +7983,53 @@ def _build_adapter(config: Any):
                 render_request=lambda _payload: False,
             )
 
+        def handle_phone_tool_call(
+            self,
+            args: Dict[str, Any],
+            *,
+            tool_name: str,
+            method: str,
+            timeout_s: float = PHONE_TOOL_DEFAULT_LINK_TIMEOUT_S,
+        ) -> str:
+            """Generic forwarder for a data-registered phone tool (#2800).
+
+            Mirrors ``_handle_liveui_link_tool_call`` minus the render/abort
+            and welcome/first-run logic: one link request carrying the caller's
+            Hermes session key, the child's JSON back as the tool text. A child
+            ``{error, code}`` dict is returned verbatim, never raised.
+            """
+
+            payload = args if isinstance(args, dict) else {}
+            session_key = _current_hermes_session_key()
+            if not session_key:
+                return json.dumps(
+                    {"error": f"{tool_name} requires HERMES_SESSION_KEY"},
+                    ensure_ascii=False,
+                )
+            if parse_ocuclaw_session_key(session_key) is None:
+                return json.dumps(
+                    {"error": f"{tool_name} requires an OcuClaw session"},
+                    ensure_ascii=False,
+                )
+            try:
+                result = self._request_link_threadsafe(
+                    method,
+                    {"sessionKey": session_key, "params": payload},
+                    timeout_s=timeout_s,
+                )
+            except InterruptedError:
+                return json.dumps(
+                    {"error": f"{tool_name} interrupted"}, ensure_ascii=False
+                )
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"error": str(exc)}, ensure_ascii=False)
+            if isinstance(result, dict) and "result" in result:
+                return json.dumps(result["result"], ensure_ascii=False)
+            return json.dumps(
+                result if isinstance(result, dict) else {"result": result},
+                ensure_ascii=False,
+            )
+
         def handle_pre_llm_call(self, _kwargs: Dict[str, Any]) -> Optional[str]:
             # Native background-review forks deliberately share the parent's
             # session_id and platform for cache warmth. pre_llm_call supplies
@@ -7891,6 +8250,10 @@ def _build_adapter(config: Any):
                     continue
             return None
 
+        async def handle_shared_handoff_unavailable(self, params: Any) -> Dict[str, Any]:
+            """Fail closed for stale clients; copying is the supported interim."""
+            return self._adopt_rejection("shared_handoff_unavailable")
+
         async def handle_foreign_adopt(self, params: Any) -> Dict[str, Any]:
             """Adopt a Desktop/CLI/TUI transcript onto a fresh glasses lane.
 
@@ -7945,6 +8308,21 @@ def _build_adapter(config: Any):
                 if hold is not None:
                     return self._adopt_rejection("desktop_busy", holdState=hold, tip=tip)
 
+            # The native resume mutates before predecessor cleanup. Establish
+            # known writer support now, never discover its absence after re-keying.
+            try:
+                await asyncio.to_thread(
+                    self._session_rpc.ensure_adopt_writer_supported, identity
+                )
+            except Exception as exc:  # noqa: BLE001 - bounded pre-mutation refusal
+                reason = str(exc)
+                if reason not in {"session_writer_unsupported", "session_store_unavailable", "session_storage_busy"}:
+                    reason = "session_mutation_unknown"
+                return self._adopt_rejection(reason)
+            # Another request may have reserved this tip during preflight's await.
+            if tip in self._adopting_tips:
+                return self._adopt_rejection("own_lane_busy", tip=tip)
+
             chat_id = f"{ADOPT_CHAT_ID_PREFIX}{uuid.uuid4().hex}"
             adopt_key = self._session_key_for_chat(chat_id, ns=ns)
             loop = asyncio.get_running_loop()
@@ -7980,10 +8358,20 @@ def _build_adapter(config: Any):
                 self._adopting_tips.discard(tip)
             # The fresh stub Hermes ended (`session_switch`, 0 messages) is
             # presentation noise on the same key: hide it with the public flag.
-            hidden = await asyncio.to_thread(
-                self._session_rpc.hide_sessions,
-                [row["id"] for row in outcome.get("predecessors") or []],
-            )
+            predecessor_ids = [row["id"] for row in outcome.get("predecessors") or []]
+            cleanup = {}
+            try:
+                hidden = await asyncio.to_thread(
+                    self._session_rpc.hide_sessions, predecessor_ids
+                )
+                if set(hidden) != set(predecessor_ids):
+                    cleanup = {"cleanupStatus": "pending", "cleanupError": "session_mutation_unknown"}
+            except Exception as exc:  # noqa: BLE001 - adoption already committed
+                hidden = []
+                reason = str(exc)
+                if reason not in {"session_writer_unsupported", "session_store_unavailable", "session_storage_busy", "session_mutation_unknown"}:
+                    reason = "session_mutation_unknown"
+                cleanup = {"cleanupStatus": "pending", "cleanupError": reason}
             session = outcome.get("session") or {}
             return {
                 "status": "accepted",
@@ -7994,6 +8382,7 @@ def _build_adapter(config: Any):
                 "adoptedFrom": str(p.get("publicKey") or ""),
                 "predecessors": outcome.get("predecessors") or [],
                 "hiddenPredecessors": hidden,
+                **cleanup,
             }
 
         async def handle_foreign_driver(self, params: Any) -> Dict[str, Any]:
@@ -8020,6 +8409,8 @@ def _build_adapter(config: Any):
             home = self._profile_home_for_options(ns)
             lineage: List[str] = []
             session_id: Optional[str] = None
+            uncertain = False
+            correlation = uuid.uuid4().hex[:12]
             if chat_id:
                 session_key = self._session_key_for_chat(chat_id, ns=ns)
                 try:
@@ -8027,12 +8418,20 @@ def _build_adapter(config: Any):
                         self._session_rpc.lineage_for_key, session_key
                     )
                 except Exception:  # noqa: BLE001 - unknowable never locks
+                    uncertain = True
                     logger.debug(
-                        "[ocuclaw] driver lineage unavailable for %s", session_key, exc_info=True
+                        "[ocuclaw] driver reason=lineage_unavailable phase=resolve correlation=%s", correlation
                     )
                     lineage = []
                 session_id = lineage[0] if lineage else None
-            hold = await asyncio.to_thread(desktop_hold_details, home, lineage)
+            try:
+                hold = await asyncio.to_thread(desktop_hold_details, home, lineage, strict=True)
+            except Exception:
+                hold = None
+                uncertain = True
+                logger.debug(
+                    "[ocuclaw] driver reason=ownership_unavailable phase=observe correlation=%s", correlation
+                )
             inflight_platform = self.inflight_platform(lineage)
             return {
                 "status": "ok",
@@ -8040,6 +8439,7 @@ def _build_adapter(config: Any):
                 "sessionId": session_id,
                 "lineage": lineage,
                 "state": driver_state_for(hold),
+                "uncertain": uncertain,
                 "holdState": hold.get("state") if hold else None,
                 "hold": hold,
                 "inflight": {
@@ -8081,6 +8481,10 @@ def _build_adapter(config: Any):
         def handle_session_end(self, kwargs: Dict[str, Any]) -> None:
             # Tier 0 (T2 #2510) clears BEFORE the platform filter.
             self._inflight_clear(kwargs)
+            if self._delivery_is_cancelled():
+                # A late end on the same native carrier must not drain its
+                # successor or re-publish the cancelled reply via history.
+                return
             if str(kwargs.get("platform") or "") != PLATFORM_NAME:
                 return
             if self._background_hook_turn(kwargs):
@@ -8417,6 +8821,8 @@ def _build_adapter(config: Any):
                 task.cancel()
 
             head = closure["record"]
+            if head.delivery_cancelled:
+                return False
             merged = closure["riders"]
             if (
                 head.current_message_id is not None
@@ -8475,8 +8881,16 @@ def _build_adapter(config: Any):
                 )
 
         async def _close_session_records(self, session_key: str, *, code: str) -> None:
-            await self._drain_session_approvals(session_key)
+            # Seal delivery BEFORE awaiting approval cleanup or signalling the
+            # cooperative native interrupt. on_session_end can have removed
+            # the ledger head while the platform is still delivering its tail.
+            for (key, _), record in self._processing_deliveries.items():
+                if key == session_key:
+                    record.delivery_cancelled = True
             records = self._ledger.drain_session(session_key)
+            for record in records:
+                record.delivery_cancelled = True
+            await self._drain_session_approvals(session_key)
             for record in records:
                 self._emit_event(
                     "activity",

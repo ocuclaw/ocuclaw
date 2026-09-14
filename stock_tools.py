@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 from contextlib import contextmanager
+from .native_readers import skill_requirements
 
 @contextmanager
 def profile_tool_context():
@@ -46,8 +47,7 @@ def installed_skills(config):
             environment_ok = s.skill_matches_environment(meta)
             if not platform_ok: reasons.append("Unsupported operating system")
             if not environment_ok: reasons.append("Not offered in this runtime environment")
-            env, commands = s._collect_prerequisite_values(meta)
-            required = s._get_required_environment_variables(meta, env)
+            required, commands = skill_requirements(s, meta)
             if any(not get_secret(item["name"]) for item in required): reasons.append("Required environment configuration is missing")
             if any(shutil.which(command) is None for command in commands): reasons.append("Required command dependency is missing")
             row = {"name": name, "description": " ".join(str(meta.get("description", "")).split())[:240], "origin": origin,

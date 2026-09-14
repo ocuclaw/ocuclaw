@@ -7,7 +7,7 @@ metadata: {"hermes": {"emoji": "glasses"}}
 
 # OcuClaw Setup Assistant for Hermes
 
-**Guide version:** 2026-09-10 (1.3.20-hermes)
+**Guide version:** 2026-09-14 (1.3.21-hermes)
 
 **Provenance:** deliberately forked from the OcuClaw Setup Assistant guide
 1.0.41 at commit `fffbb2154`. That is the source guide version, not an
@@ -121,7 +121,18 @@ tailnet.
 Use the registered `ocuclaw_setup` tool for setup state and focused guidance.
 Never resolve a bundled reference by a relative path. Begin a resumed or new
 conversation with `{"operation":"status"}`; use `{"operation":"doctor"}` when
-the state is invalid or unavailable. Then request exactly one guidance branch:
+the state is invalid or unavailable.
+
+Both receipts carry a `status.tools` block: `expected` is the eight tools this
+bundle provides (`render_glasses_ui`, `get_glasses_ui_state`,
+`manage_liveui_templates`, `manage_liveui_tasks`, `get_current_location`,
+`get_evenrealities_device_info`, `set_session_title`, `ocuclaw_setup`),
+`registered` is what actually bound, and `missing` names the rest. A non-empty
+`missing` is a real defect even when every other block is healthy: the user
+will see the agent say it has no such tool. Report the missing names and route
+to `{"operation":"troubleshooting"}`.
+
+Then request exactly one guidance branch:
 
 - first install or incomplete setup -> `{"operation":"fresh_install"}`
 - compromised/lost phone or Relay Credential reset -> `{"operation":"credential_reset"}`

@@ -195,6 +195,10 @@ class DispatchRecord:
     session_state: Optional[str] = None
     prompt_owner: Optional[str] = None
     prompt_lane: Optional[str] = None
+    # Shared by the processing task and its copied async/thread contexts.
+    # It remains valid after this record leaves the ledger, unlike a lookup
+    # of the session head (which may already name the next turn).
+    delivery_cancelled: bool = False
     # Current (latest) outbound message for this turn — the StreamConsumer
     # opens one per segment; ``finalize=True`` commits it; a fresh send while
     # one is open commits the previous first (defensive).

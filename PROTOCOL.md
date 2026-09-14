@@ -117,9 +117,12 @@ failure (`EADDRINUSE` fail-fast once the relay boots in-child; spec
 Every frame carries `v` (protocol version) and `type`:
 
 - `link.hello` (child → parent, first frame on boot):
-  `{v, type, payload: {pid, runtimeName: "ocuclaw-runtime", liveui?}}`
+  `{v, type, payload: {pid, runtimeName: "ocuclaw-runtime", liveui?, phoneTools?}}`
   where `liveui.tools[]` advertises the `render_glasses_ui` descriptor
-  single-sourced from the TypeScript tool schema.
+  single-sourced from the TypeScript tool schema, and `phoneTools[]` is the
+  data-driven phone-tool descriptor list (see **Phone tools lane** below). Both
+  keys are optional in both directions: a hello without `phoneTools` boots
+  exactly as it did before #2800.
 - `link.hello.ack` (parent → child, completes the handshake):
   `{v, type, payload: {hermesVersion, platform: "ocuclaw", config: {wsPort,
   wsBind, …}}}` — the config object is the adapter's resolved settings; the
@@ -146,8 +149,8 @@ skip both the boot and the gate.
 
 Child → parent RPCs serving the bridge's sessions plane. Python side:
 `session_rpc.py` (SessionDB glue; reads on a read-only `mode=ro` SessionDB,
-title/delete writes on a writable instance, with one lazy cached handle per
-served profile namespace). Node side:
+mutations borrowing the native shared writer for the explicit resolved
+served-profile path). Node side:
 `hermes-gateway-bridge.ts` (all OcuClaw-shaping: public keys, seconds→ms,
 conversational shaping, describe/compaction synthesis). Timestamps on this
 lane are **unix seconds** (hermes-native); the Node bridge owns the ×1000.
@@ -165,6 +168,51 @@ lane are **unix seconds** (hermes-native); the Node bridge owns the ×1000.
 | `db.sessions.describe` | `{identity}` | `{model, tokens:{input,output,cacheRead,cacheWrite,reasoning}, lastMessageTokenCount?, messageCount, costUsd}` — `lastMessageTokenCount` is the public persisted `SessionStore.lookup_by_session_id(...).last_prompt_tokens` current-context count; omitted when that sanctioned read is unavailable (the child marks occupancy unknown and never substitutes cumulative billed totals). `costUsd = COALESCE(actual_cost_usd, estimated_cost_usd)` (upstream's own reaping filter uses the same coalesce, `hermes_state.py:8171`), `null` when neither column is present or populated |
 | `db.sessions.compactionInfo` | `{identity}` | `{hops}` — compression-chain hop count (in-place compactions invisible: documented undercount) |
 | `db.chat.watermark` | `{identity}` | `{sessionId, watermark, dbPath, hermesHome, inflight:{active, platform}}` — Desktop→glasses mirror (#2513). `watermark` is `MAX(messages.id)` over the lane's LIVE transcript (the compression tip), `null` when empty; read on its own `mode=ro` connection (no write lock) — NOT `latest_message_row_id`, which is role/text-filtered and sits still on a tool-call-only tail. `inflight` is the tier-0 verdict for that tip (the adapter wraps the bare session_rpc handler to add it). `db.chat.history` accepts `afterId` (rows with `id > afterId`, applied BEFORE `limit`) and answers `rowIdsUnavailable:true` with no rows when the host's projection carries no row ids. Both are read once per debounced WAL event, never on a timer |
+
+**Database ownership and compatibility (#2743).** `session_writer.py` uses
+`hermes_state_registry.acquire(path)` / `release(writer)`, verified on Hermes
+0.21.2 (`939e45c91d751fadd94dcd1b873ac3cb44846213`). Rename, read state,
+hide, predecessor hiding, copy and deletion all use that common accessor.
+An operation holds one reference; exceptions release it, shutdown never
+closes another holder, and the next borrow follows the registry's current
+generation after file replacement. The adapter serializes reader use and
+closes its own reader after active RPCs finish, on profile-path replacement
+and on disconnect. It never calls the registry's process-wide close sweep.
+
+The supported version floor is unchanged. The certified 0.21.0 engine
+(`29112bef099274229cadff79cdff7bf7b99c4b77`) has no safe public registry;
+mutations report `session_writer_unsupported` there, while reads remain
+available. There is no standalone-writer or ambient `SessionStore._db`
+fallback. Missing/unserved stores report `session_store_unavailable` /
+`session_profile_unserved`; read probes report `session_schema_unsupported`
+without bootstrapping, migration, repair or checkpoint. SQLite contention
+reports `session_storage_busy`; uncertain mutation completion reports
+`session_mutation_unknown`, with no automatic action replay.
+
+**Session-plane boundaries (#2744).** Key enumeration and watermark queries
+borrow public read-only SessionDB methods. Helper-only readers close on exit;
+an RPC pins one file generation across nested reads and refuses replacement
+with `session_store_changed`. The next independent RPC may reopen the new
+generation. Carrier/ID discovery and compression ancestry are bounded; reaching
+the bound reports `discovery_truncated`, never a partial selected lineage.
+
+Copy creates its row and all messages in one owner transaction. Its native
+branch marker keeps the copy independent when the source later compresses.
+Deletion validates the selected rows and compression edges inside the same
+transaction as native delegate cascading, branch orphaning, message deletion,
+system-prompt cleanup and orphan-key delivery-obligation cleanup. A changed
+selection reports `session_selection_changed`; a changed copy source reports
+`session_copy_source_changed`. Neither action automatically replays.
+
+The compatibility gaps stay inside `session_writer.py`: public import strips
+gateway keys and public bulk delete has no expected-lineage guard. Copy uses
+the owner's `_validate_import_payload`, `_import_session_row` and
+`_execute_write`; deletion uses the native `_delete_delegate_children`,
+`_delete_unreferenced_system_prompts` and `_remove_session_files` helpers.
+Missing primitives report `session_writer_unsupported` before mutation. No
+second writable connection, nested transaction or replacement native database
+implementation is introduced. These private seams are verified against the
+0.21.2 source above and remain explicit compatibility obligations.
 
 **Identity** (Node parses public keys; Python never sees `hermes:` keys):
 `{ns, chatId}` for minted keys, `{ns, remainder}` for foreign/external keys.
@@ -251,6 +299,29 @@ vanishing when it is hidden from the desktop.
 
 ## Foreign session lane (sanctioned policy — 2026-07-08)
 
+**Copy-only interim (2026-09-13).** The shipping path is **Copy as new glasses
+chat**. The new glasses chat starts with the source transcript. Future replies
+stay separate.
+Every copy has a fresh native ID and glasses key. `_branched_from` records
+provenance, but `parent_session_id` is null so native resume cannot follow the
+source into its copy. Creating the copy does not end or re-key the source.
+It uses the existing shared native writer compatibility adapter; engines
+without its required transaction primitives fail closed.
+
+New adoption is not advertised. The registered `foreign.sessions.adopt` door
+rejects with `shared_handoff_unavailable`, including requests with `takeOver`.
+`ocuclaw.session.driver.takeover` also refuses, preserving the current lock.
+The phone sheet and composer offer no Take over, and the Desktop status card
+has no editable Open chat action. Device, connection and ownership status
+remain available. Existing adopted chats retain their driver observation and
+mirror; disabling new handoff must not silently unlock them. The host's
+legacy `adoptSupported` grant now controls those protections only, not the
+shipping `foreignSessions.adopt` capability.
+
+The adoption and takeover mechanics documented below describe dormant legacy
+implementation, not available shipping actions. Re-enabling them requires
+native context-refresh and cooperative ownership-release evidence.
+
 All-platform session list/history survives. Foreign-session mutation is
 copy-only, plus the two view-state flags `read` and `hidden` — public
 `SessionDB` primitives upstream's REST applies to any session; they flip list
@@ -267,7 +338,7 @@ Child → parent RPCs:
 | Method | Params | Result |
 |---|---|---|
 | `foreign.sessions.copy` | `{identity, publicKey, target:{ns,chatId}, targetPublicKey}` | `{status:"accepted", sessionId, session}` or `{status:"rejected", error}` |
-| `foreign.sessions.adopt` | `{identity, publicKey, takeOver?}` | `{status:"accepted", sessionId, session, adoptKey, chatId, adoptedFrom, predecessors:[{id,endReason,messageCount}], hiddenPredecessors}` or `{status:"rejected", error, verdict, tip?, holdState?, detail?}` — `error` == `verdict` |
+| `foreign.sessions.adopt` | `{identity, publicKey, takeOver?}` | `{status:"accepted", sessionId, session, adoptKey, chatId, adoptedFrom, predecessors:[{id,endReason,messageCount}], hiddenPredecessors, cleanupStatus?, cleanupError?}` or `{status:"rejected", error, verdict, tip?, holdState?, detail?}` — `error` == `verdict` |
 | `foreign.sessions.driver` | `{identity, publicKey}` (a minted lane, normally `hermes:<ns>:adopt-<uuid>`) | `{status:"ok", publicKey, sessionId, lineage:[tip, …root, …predecessors], state:"glasses_drive"\|"desktop_hold"\|"desktop_working", holdState:"hold"\|"working"\|null, hold:{state,surface,pid?,sessionId,since}\|null, inflight:{active,platform}, hermesHome, watch:{markerDir,markerFile,leaseDir,leaseFile}}` — an unknown lane answers `glasses_drive` with `lineage:[]` (unknowable never locks) |
 
 **Single-driver lock (#2510).** One driver at a time on an adopted chat.
@@ -295,6 +366,21 @@ sends `ocuclaw.session.driver.takeover` `{sessionKey}` (accepted only in
 `desktop_hold`; `desktop_working` refuses). LOCK in both Desktop states;
 unlock on lease clear or Take-over. Typed phone sends on a locked lane are
 held and auto-sent exactly once on unlock; voice sends are never held.
+
+Take-over is ephemeral and scoped to the exact lane, profile home, lineage,
+and native holder generation (`hold.generation`, verified from lease identity
+and process birth time). Renewed Desktop work or foreign in-flight execution
+revokes it immediately; unchanged verified idle holders may retain it.
+Missing generation refuses Take-over. `foreign.sessions.driver` and the
+driver event add `uncertain`: failed/missing registry or marker reads preserve
+the controller's last admission, cannot grant Take-over, and keep its existing
+bounded liveness observer running until fresh evidence recovers. A new
+controller with no observation starts locked. Confirmed dead holders still
+release even with an old turn marker. Disarm and restart discard all grants.
+The driver requires the public registry snapshot's strict liveness mode;
+engines without it report uncertain without invoking the lenient reader.
+Malformed marker structures also report uncertain, including valid JSON
+whose root or entries have the wrong shape.
 
 **Desktop→glasses live mirror (#2513).** Turns typed in Hermes Desktop on an
 adopted chat reach the glasses about a second after they land, as finished
@@ -360,6 +446,23 @@ budget. The resolver (`_carriers_for_key`) reads carriers through
 `list_sessions_rich(session_key=K, include_children, include_hidden)` and
 prefers the LIVE row: `list_gateway_sessions` picks `MAX(started_at)` before
 `ended_at IS NULL` and would resolve the adopt key to the empty stub.
+
+Before dispatching `/resume`, adoption checks the same routed profile's native
+shared writer and public `set_session_hidden` primitive. Missing support rejects
+with `error == verdict == "session_writer_unsupported"` before native resume or
+any adoption mutation. No fallback writer is opened. Other preflight failures
+are bounded to `session_store_unavailable`, `session_storage_busy`, or
+`session_mutation_unknown`; the configured engine version floor is unchanged.
+
+Once the DB confirms adoption, predecessor hiding is presentation cleanup.
+A late cleanup failure retains `status:"accepted"` and the adopted identity,
+with `cleanupStatus:"pending"` and bounded `cleanupError` (`session_writer_unsupported`,
+`session_store_unavailable`, `session_storage_busy`, or `session_mutation_unknown`).
+`hiddenPredecessors` lists only confirmed successful hide calls; pending cleanup
+may already have hidden some rows. Neither the adapter nor callers automatically
+retry adoption or cleanup. Continue using the accepted identity; pending cleanup
+does not mean native resume failed. These optional cleanup fields are absent
+when all predecessor hiding completes successfully.
 
 Copy-to-glasses is public composition only. Node parses the source public key
 and Python resolves the live source tip through the public session DB facade.
@@ -1400,7 +1503,21 @@ and returns `{status:"accepted", aborted:boolean}`. The parent maps the target
 to the native `agent:<ns>:ocuclaw:dm:<chatId>` key, interrupts any running
 agent for that session, clears adapter activity state, and closes local
 dispatch ledger records with `code:"cancelled"`. Idle aborts still resolve
-accepted.
+accepted with `aborted:false`. Acceptance means the cooperative native
+interrupt was requested; it does not certify that model generation has ended.
+The adapter seals delivery for the cancelled processing records before the
+interrupt: copied task/executor contexts retain the original record, so late
+stream edits and fallback final sends cannot escape as uncorrelated output or
+attach to a successor turn. A separate origin/cron delivery without that
+processing context remains deliverable.
+
+The downstream `ocuclaw.session.abort.ack` preserves the originating
+`requestId` and public `sessionKey`, status, optional `aborted` and
+`abortedRunId`, and any error/errorCode. Clients correlate receipts to their
+pending request and current session. `accepted` is shown as a stop request,
+`aborted` as a completed stop, and `no-active-run`/`aborted:false` as no active
+turn. Disconnected stops are not queued for later replay; missing receipts
+time out without claiming the turn stopped.
 
 Child → parent RPC `sessions.steer` carries `{runId, sessionKey,
 target:{ns,chatId}, message, idempotencyKey?, attachments?}`. It enters the
@@ -1611,8 +1728,11 @@ to a post-beta structured activity surface, not this cut.
 Parent → child RPC `backend.hook` `{name, event?, ctx?}` → the child's host
 hook bus (`hermes-host-hooks.ts`) normalizes and fans out `(event, ctx)` to
 `on(name)` subscribers — the OpenClaw-plugin-host hook surface the ×4
-`agent_end` consumers (liveui finalize, title distiller, device-info,
-location) subscribe to (they wire up in W12+). `ctx.sessionKey` may be an
+`agent_end` consumers subscribe to. All four are wired: liveui finalize in the
+LiveUI bridge (`hermes-liveui-bridge.ts`), the session-title distiller where
+the relay owns it, and the device-info and location drains in the phone-tools
+bridge (`hermes-phone-tools-bridge.ts`, see **Phone tools lane** below).
+`ctx.sessionKey` may be an
 explicit echo or derived from `ctx.sessionIdentity` (same rule as
 `backend.event`). `agent_end` frames carry `ctx.sessionKey`,
 `ctx.agentId?` (hermes profile namespace), `ctx.runId?` (the id of the
@@ -1678,6 +1798,141 @@ Child → parent RPCs:
 |---|---|---|
 | `liveui.llmRecipe` | `{recipe, ctx}` | `{output}` or `{error}` — LLM refresh recipes execute through Hermes `ctx.llm`, so Node never receives raw provider credentials. |
 | `liveui.llmAuth` | `{model}` | Compatibility-only `{status:"unavailable", provider:"hermes", model, apiKey:"", resolvedFromBackend:false}`; the accepted path is `liveui.llmRecipe`. |
+
+## Phone tools lane (#2797 / #2800 — descriptors by data)
+
+Where the liveui lane binds four hard-coded names to hard-coded link methods,
+the phone-tool lane is registered from DATA. The child advertises a plain list
+at `link.hello.payload.phoneTools[]`; each entry is
+
+```
+{ name, toolset: "ocuclaw", description,
+  schema: { name, description, parameters },
+  method: "tools.<x>", linkTimeoutMs?: number }
+```
+
+Singular `method` (a string), unlike liveui's `methods` map, because the Python
+parent binds ONE generic forwarder per descriptor. It registers every
+descriptor whose `name` is on its allow-list (`PHONE_TOOL_NAMES` in
+`adapter.py`) and whose `schema` and `method` are usable; anything else is
+skipped with one warning each and never breaks a sibling. Calling a registered
+tool issues one request to the declared method with
+`{sessionKey, params}` — `sessionKey` from `get_session_env("HERMES_SESSION_KEY")`,
+`params` the model's arguments verbatim — and the child's JSON comes back as
+the tool text. A child `{error, code}` dict is returned verbatim, never raised.
+Without a parseable OcuClaw session key the tool fails closed and the link is
+never touched. `linkTimeoutMs` is the CHILD's budget (ADR-0006: the child owns
+the wait); the parent waits that plus a margin, and 15 s when it is absent.
+
+### The three descriptors
+
+The list carries three entries as of #2803, built by
+`PHONE_TOOL_DESCRIPTOR_BUILDERS` in `hermes-phone-tools-bridge.ts` and
+serialised by `buildHermesPhoneToolsHelloPayload()`. Hello order is
+registration order, and it is APPEND only: the adapter keys registered tools by
+method name, so reordering or renaming one is a wire break.
+
+| Tool name | Link method | `linkTimeoutMs` |
+|---|---|---|
+| `get_current_location` | `tools.getCurrentLocation` | 10 000 |
+| `get_evenrealities_device_info` | `tools.getDeviceInfo` | 10 000 |
+| `set_session_title` | `tools.setSessionTitle` | absent |
+
+The two tools that reach the phone declare 10 000 ms; the adapter then waits
+that plus its margin, 15 s in practice. The split is deliberate: the child's
+own deadline always fires first, so on silence the agent reads the handler's
+`location_timeout` or `device_info_timeout` rather than a bare link timeout
+that says nothing about which leg was slow. `set_session_title` declares no
+`linkTimeoutMs` because it makes no phone round trip. It is a short in-process
+RPC into the relay, so the adapter's 15 s default is the only deadline it needs.
+
+Name, description and JSON Schema for each descriptor are single-sourced from
+the same constants the OpenClaw registration hands `api.registerTool`. The
+agent therefore reads one tool on both hosts, and the Python parent never
+hand-copies a schema.
+
+### Session-key discipline
+
+The adapter forwards the NATIVE Hermes key it read from
+`get_session_env("HERMES_SESSION_KEY")`, which has the shape
+`agent:<ns>:ocuclaw:dm:<chatId>`. `resolvePhoneToolSessionKey` in the bridge
+normalises that to the MINTED public OcuClaw key `hermes:<ns>:<chatId>` and
+only then calls the handler. Everything else is refused with
+`requires_hermes_session_key` before the link is touched: an empty or
+whitespace key, a colon-free opaque key such as `main` (the LiveUI normaliser
+would happily mint one, which is exactly why this gate rejects it first), a
+foreign public key from a Desktop, Telegram or CLI-routed turn, and any key
+that normalises to something other than a minted OcuClaw key. The gate fails
+CLOSED by design. No location request is ever sent for a session the glasses
+do not own.
+
+### Errors are returned, never thrown
+
+A link method that throws reaches the Python side as a bare `{error: message}`
+and loses the machine-readable code, which is the part the agent must see
+verbatim. So every phone-tool handler RETURNS `{error, code}` instead. The
+codes are whatever the host-free handler in `src/tools/` produces, unchanged,
+which is what makes "same answer as OpenClaw" true rather than aspirational.
+
+| Tool | Codes (every tool also returns `requires_hermes_session_key` from the gate above) |
+|---|---|
+| `get_current_location` | `location_access_disabled`, `app_not_connected`, `location_timeout`, `location_unavailable`, `location_aborted` |
+| `get_evenrealities_device_info` | `glasses_not_connected`, `device_info_timeout`, `device_unavailable`, `device_info_aborted` |
+| `set_session_title` | `missing_field`, `invalid_type`, `title_empty`, `title_too_long`, `no_user_message_yet`, `no_active_session`, `session_not_renamable`, `session_title_unavailable` |
+
+The first two differ on their not-connected code (`app_not_connected` against
+`glasses_not_connected`) because their OpenClaw handlers do. The title guard
+matrix is OpenClaw parity too: the same four validation codes, the same
+`no_user_message_yet` refusal when nothing proves the wearer has spoken in the
+session yet, and the same structural `no_active_session` and
+`session_not_renamable` guards. A missing relay reader answers conservatively
+rather than guessing, so an absent `hasRecordedUserMessage` yields
+`no_user_message_yet` and not a title written into a silent session.
+
+### The `agent_end` drain
+
+Location and device info each hold pending in-flight requests, so both
+subscribe to the host hook bus. On `agent_end` the bridge drains them with
+`{ok: false, code: "location_aborted"}` and
+`{ok: false, code: "device_info_aborted"}`, matching the OpenClaw plugin's own
+abort codes. `set_session_title` keeps no pending state and therefore has no
+drain and no `agent_end` subscription of its own.
+
+### Parent → child RPCs
+
+| Method | Params | Result |
+|---|---|---|
+| `tools.getCurrentLocation` | `{sessionKey, params}` | The location handler's JSON, or `{error, code}` returned verbatim. Handler budget 10 s. |
+| `tools.getDeviceInfo` | `{sessionKey, params}` | The device-info handler's JSON, or `{error, code}` returned verbatim. Handler budget 10 s. |
+| `tools.setSessionTitle` | `{sessionKey, params}` | `{status:"accepted"}`, the same body OpenClaw's `execute` returns, or `{error, code}`. The relay mirrors the title into the Hermes SessionDB and rebroadcasts the session list; this glue writes neither again. |
+
+The SessionDB half of that mirror depends on the host's session writer. Hermes
+2026.9.7 and newer accept the write with user rank. Hermes 2026.8.31 (Hermes
+Agent 0.21.0, the certified pin) has no `hermes_state_registry`, so it keeps
+its own auto-title and only the phone's session picker shows the new name. That
+limit predates this lane and applies to hand renames on that host too.
+
+### Registration inventory
+
+The adapter records per-name registration state in `_PHONE_TOOL_REGISTERED`,
+and `provided_tool_inventory()` folds it together with the four LiveUI flags
+and the setup tool's flag into the eight-name inventory that `/ocuclaw-setup`
+reports under `status.tools` and `hermes ocuclaw status|doctor` prints as
+**Provided Tools**. A hello with no `phoneTools` key at all leaves the three
+names in `missing`, so version skew is visible as three named absences rather
+than as a silently short tool list (#2804).
+
+The inventory also carries `observed`. Registration state lives in the module
+globals of the process that registered, which is the gateway. `hermes ocuclaw
+status|doctor` runs in its own process, where plugin discovery imports the
+adapter and binds the setup tool but no platform ever connects, so an
+unguarded count there reads seven absences on a healthy host. `observed` is
+true only when an adapter has connected in this process or a
+runtime-advertised tool has actually registered in it. When it is false both
+readers print the eight names and withhold the verdict instead of reporting
+failures they did not witness, and `missing_phone_tool_warnings` returns
+nothing. `/ocuclaw-setup`, which runs inside a gateway turn, is the surface
+that carries the real count.
 
 Wake remains a normal `dispatch.send` turn. The Node wake controller first
 uses the relay-side busy mirror (`isAgentTurnBusy`). No Python private

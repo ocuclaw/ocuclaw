@@ -10,6 +10,7 @@ const { DEFAULT_HERMES_NAMESPACE, isAdoptableHermesSessionKey, isAdoptedHermesSe
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
 const { gatewaySessionKeyFor } = require("./openclaw-session-key.cjs");
 const { GREETING_SEND_HOLD_DEADLINE_MS, createGreetingSendGate } = require("./greeting-send-gate.cjs");
+const { fixtureKeySlug, normalizeSessionListFixture, resolveSessionListFixtureView } = require("./session-list-fixture.cjs");
 
 const SESSION_FIRST_USER_CACHE_FILE = "session-first-user-cache.json";
 const SESSION_TITLE_CACHE_FILE = "session-title-cache.json";
@@ -324,7 +325,23 @@ function createSessionService(opts = {}) {
 
   let inFlightSessionsFetch = null;
 
+  let simulatedSessionList = null;
+
+  const fixtureFakeSessionKeys = new Set();
+
   const sessionModelConfigCache = new Map();
+  const sessionModelConfigOperations = new Map();
+
+  function queueSessionModelConfig(sessionKey, operation) {
+    const previous = sessionModelConfigOperations.get(sessionKey) || Promise.resolve();
+    const pending = previous.catch(() => {}).then(operation);
+    sessionModelConfigOperations.set(sessionKey, pending);
+    const cleanup = () => {
+      if (sessionModelConfigOperations.get(sessionKey) === pending) sessionModelConfigOperations.delete(sessionKey);
+    };
+    pending.then(cleanup, cleanup);
+    return pending;
+  }
 
   const pendingInitialConfigSessionKeys = new Set();
 
@@ -532,6 +549,9 @@ function createSessionService(opts = {}) {
       modelProvider: normalized.modelProvider,
       model: normalized.model,
       thinkingLevel: normalizeThinkingLevel(row && row.thinkingLevel),
+      ...(row && typeof row.thinkingDefault === "string"
+        ? { thinkingDefault: normalizeThinkingLevel(row.thinkingDefault) } : {}),
+      ...sessionThinkingOptions(row),
       effectiveThinkingLevel: normalizeThinkingLevel(
         row && (row.effectiveThinkingLevel || row.thinkingLevel || row.thinkingDefault),
       ),
@@ -542,6 +562,16 @@ function createSessionService(opts = {}) {
 
       agentId: sessionAgentSelectorId(sessionKey),
     };
+  }
+
+  function sessionThinkingOptions(row) {
+    const levels = Array.isArray(row?.thinkingLevels)
+      ? row.thinkingLevels.map((level) => typeof level === "string" ? level : level?.id)
+      : Array.isArray(row?.thinkingOptions) ? row.thinkingOptions : null;
+    if (levels === null) return {};
+    return { thinkingLevels: [...new Set(levels.filter((level) =>
+      typeof level === "string" && /^(off|minimal|low|medium|high|xhigh|max|ultra)$/.test(level.trim()),
+    ).map((level) => level.trim()))] };
   }
 
   function listSessionsBySearch(search) {
@@ -640,6 +670,9 @@ function createSessionService(opts = {}) {
           modelProvider: base.modelProvider,
           model: base.model,
         };
+    const modelChanged = normalizedModel.modelProvider !== base.modelProvider ||
+      normalizedModel.model !== base.model;
+    const hasThinking = Object.prototype.hasOwnProperty.call(patch || {}, "thinkingLevel");
     const config = {
       sessionKey,
       modelProvider: normalizedModel.modelProvider,
@@ -647,7 +680,14 @@ function createSessionService(opts = {}) {
       thinkingLevel:
         patch && Object.prototype.hasOwnProperty.call(patch, "thinkingLevel")
           ? normalizeThinkingLevel(patch.thinkingLevel)
-          : base.thinkingLevel,
+          : modelChanged ? "" : base.thinkingLevel,
+      ...(!modelChanged && Object.prototype.hasOwnProperty.call(base, "thinkingDefault")
+        ? { thinkingDefault: base.thinkingDefault } : {}),
+      ...(!modelChanged && Array.isArray(base.thinkingLevels)
+        ? { thinkingLevels: base.thinkingLevels } : {}),
+      effectiveThinkingLevel: hasThinking
+        ? normalizeThinkingLevel(patch.thinkingLevel) || (modelChanged ? "" : base.thinkingDefault || "")
+        : modelChanged ? "" : base.effectiveThinkingLevel || "",
       reasoningLevel:
         patch && Object.prototype.hasOwnProperty.call(patch, "reasoningLevel")
           ? normalizeReasoningLevel(patch.reasoningLevel)
@@ -696,7 +736,11 @@ function createSessionService(opts = {}) {
     );
   }
 
-  async function getSessionModelConfig(sessionKey = ensureSessionKey()) {
+  function getSessionModelConfig(sessionKey = ensureSessionKey()) {
+    return queueSessionModelConfig(sessionKey, () => readSessionModelConfig(sessionKey));
+  }
+
+  async function readSessionModelConfig(sessionKey) {
     if (!isUpstreamConnected()) {
       return cachedSessionModelConfig(sessionKey);
     }
@@ -748,7 +792,11 @@ function createSessionService(opts = {}) {
     return getSessionModelConfig(ensureSessionKey());
   }
 
-  async function setSessionModelConfig(
+  function setSessionModelConfig(sessionKey = ensureSessionKey(), patch, options = {}) {
+    return queueSessionModelConfig(sessionKey, () => writeSessionModelConfig(sessionKey, patch, options));
+  }
+
+  async function writeSessionModelConfig(
     sessionKey = ensureSessionKey(),
     patch,
     options = {},
@@ -775,6 +823,9 @@ function createSessionService(opts = {}) {
       const row = resolved && resolved.row ? resolved.row : null;
       if (row && typeof row.key === "string" && row.key.trim()) {
         canonicalKey = row.key.trim();
+        if (gatewayBridge.kind === "openclaw") {
+          sessionModelConfigCache.set(sessionKey, buildSessionModelConfig(sessionKey, row));
+        }
       }
     }
     const request = gatewaySessionPatchRequest(sessionKey, { key: canonicalKey });
@@ -825,9 +876,20 @@ function createSessionService(opts = {}) {
     }
 
     try {
-      const result = await gatewayBridge.request("sessions.patch", request);
+      let result;
+      try {
+        result = await gatewayBridge.request("sessions.patch", request);
+      } catch (err) {
+        const rejection = /^thinkingLevel "minimal" is not supported for \S+ \(use ([a-z|]+)\)$/.exec(caughtMessage(err));
+        const supported = rejection ? rejection[1].split("|") : [];
+        if (gatewayBridge.kind !== "openclaw" || request.thinkingLevel !== "minimal" ||
+          !supported.includes("low") || supported.includes("minimal")) throw err;
+        request.thinkingLevel = "low";
+        result = await gatewayBridge.request("sessions.patch", request);
+      }
 
-      let primePatch = patch;
+      let primePatch = Object.prototype.hasOwnProperty.call(request, "thinkingLevel")
+        ? { ...patch, thinkingLevel: request.thinkingLevel } : patch;
       const applied =
         result &&
         typeof result === "object" &&
@@ -841,13 +903,41 @@ function createSessionService(opts = {}) {
             ? applied.provider.trim()
             : "";
         primePatch = {
-          ...patch,
+          ...primePatch,
           modelRef: appliedProvider
             ? `${appliedProvider}/${applied.model.trim()}`
             : applied.model.trim(),
         };
       }
-      const config = primeSessionModelConfig(sessionKey, primePatch);
+      let config = primeSessionModelConfig(sessionKey, primePatch);
+      if (gatewayBridge.kind === "openclaw") {
+
+        if (result?.entry && result?.resolved && typeof result.key === "string" &&
+          normalizeSessionKeyForCompare(result.key) === normalizeSessionKeyForCompare(canonicalKey)) {
+          const resolvedModel = normalizeSessionModelRef(result.resolved.modelProvider, result.resolved.model);
+          if (resolvedModel.model && resolvedModel.modelProvider) {
+            const modelChanged = resolvedModel.model !== config.model || resolvedModel.modelProvider !== config.modelProvider;
+            config = buildSessionModelConfig(sessionKey, {
+              ...(!modelChanged ? config : {}),
+              ...resolvedModel,
+              thinkingLevel: result.entry.thinkingLevel || "",
+              effectiveThinkingLevel: result.entry.thinkingLevel || (!modelChanged ? config.thinkingDefault || "" : ""),
+              reasoningLevel: result.entry.reasoningLevel ?? config.reasoningLevel,
+              verboseLevel: result.entry.verboseLevel ?? config.verboseLevel,
+              fastMode: result.entry.fastMode ?? config.fastMode,
+              elevatedLevel: result.entry.elevatedLevel ?? config.elevatedLevel,
+            });
+          }
+        }
+
+        try {
+          const resolved = await fetchCurrentSessionRow(sessionKey);
+          if (resolved?.row) config = buildSessionModelConfig(sessionKey, resolved.row);
+        } catch {
+
+        }
+        sessionModelConfigCache.set(sessionKey, config);
+      }
       notifySessionModelConfigIfCurrent(sessionKey, config);
       pendingInitialConfigSessionKeys.delete(sessionKey);
       return { status: "accepted", config };
@@ -872,7 +962,7 @@ function createSessionService(opts = {}) {
     return setSessionModelConfig(ensureSessionKey(), patch);
   }
 
-  async function getSessions() {
+  async function getRealSessions() {
     if (cachedSessions && Date.now() - cachedSessionsFetchedAt < sessionCacheTtlMs) {
       return cachedSessions;
     }
@@ -975,6 +1065,155 @@ function createSessionService(opts = {}) {
     });
   }
 
+  async function getSessions() {
+    const rows = await getRealSessions();
+    return applySessionListFixture(rows);
+  }
+
+  function resolveFixtureView(realRows) {
+    return resolveSessionListFixtureView({
+      rows: simulatedSessionList.rows,
+      anchorMs: simulatedSessionList.anchorMs,
+      realRows: Array.isArray(realRows) ? realRows : [],
+      currentKey: currentSessionKey,
+      currentBinding: simulatedSessionList.currentBinding,
+    });
+  }
+
+  function applySessionListFixture(realRows) {
+    if (!simulatedSessionList) return realRows;
+    const view = resolveFixtureView(realRows);
+    simulatedSessionList.currentBinding = view.currentBinding;
+    simulatedSessionList.keyToIndex = view.keyToIndex;
+    simulatedSessionList.lastReport = view.report;
+    return view.rows;
+  }
+
+  function fixtureFakeKeyPrefix() {
+    const parsed =
+      currentSessionKey && isHermesSessionKey(currentSessionKey)
+        ? parseHermesPublicKey(currentSessionKey)
+        : null;
+    if (parsed && parsed.namespace) return `hermes:${parsed.namespace}:`;
+    return DEFAULT_SESSION_KEY_PREFIX;
+  }
+
+  function isFixtureFakeSessionKey(sessionKey) {
+    return (
+      typeof sessionKey === "string" &&
+      fixtureFakeSessionKeys.has(sessionKey.trim().toLowerCase())
+    );
+  }
+
+  function isSessionListFixturePinned() {
+    return simulatedSessionList !== null;
+  }
+
+  async function setSimulatedSessionList(rawRows) {
+    if (rawRows === null || rawRows === undefined) {
+      const wasPinned = simulatedSessionList !== null;
+      simulatedSessionList = null;
+      return { pinned: false, wasPinned, count: 0, anchorMs: null, report: null };
+    }
+    const normalized = normalizeSessionListFixture(rawRows);
+    if (!normalized.ok) throw new Error(normalized.error);
+    const prefix = fixtureFakeKeyPrefix();
+    const rows = normalized.rows.map((row) => {
+      if (row.match) return row;
+      const fakeKey = row.key || `${prefix}fixture-${row.index + 1}-${fixtureKeySlug(row.title)}`;
+      if (
+        !hasSupportedSessionKeyPrefix(fakeKey) ||
+        isEvenAiSessionKey(fakeKey) ||
+        isForeignHermesSessionKey(fakeKey)
+      ) {
+        throw new Error(
+          `row ${row.index + 1}: fake key "${fakeKey}" is not a key this lane lists (use ${prefix}<id>)`,
+        );
+      }
+      return { ...row, fakeKey };
+    });
+    let realRows;
+    try {
+      realRows = await getRealSessions();
+    } catch {
+      realRows = cachedSessions || [];
+    }
+    const realKeys = new Set(
+      (Array.isArray(realRows) ? realRows : []).map((real) =>
+        String((real && real.key) || "").trim().toLowerCase(),
+      ),
+    );
+    for (const row of rows) {
+      if (row.fakeKey && realKeys.has(row.fakeKey.toLowerCase())) {
+        throw new Error(
+          `row ${row.index + 1}: fake key "${row.fakeKey}" is a real session; match it instead`,
+        );
+      }
+    }
+    for (const row of rows) {
+      if (row.fakeKey) fixtureFakeSessionKeys.add(row.fakeKey.toLowerCase());
+    }
+    const anchorMs = Date.now();
+    simulatedSessionList = {
+      rows,
+      anchorMs,
+      currentBinding: null,
+      keyToIndex: new Map(),
+      lastReport: null,
+    };
+    applySessionListFixture(realRows);
+    return {
+      pinned: true,
+      count: rows.length,
+      anchorMs,
+      report: simulatedSessionList.lastReport,
+    };
+  }
+
+  function getSimulatedSessionHistory(sessionKey) {
+    if (!simulatedSessionList || typeof sessionKey !== "string") return null;
+    const lk = sessionKey.trim().toLowerCase();
+    if (!lk) return null;
+    let index = simulatedSessionList.keyToIndex.get(lk);
+    if (index === undefined) {
+      index = resolveFixtureView(cachedSessions || []).keyToIndex.get(lk);
+    }
+    if (index === undefined) return null;
+    const row = simulatedSessionList.rows[index];
+    return row && Array.isArray(row.history) && row.history.length > 0
+      ? row.history.map((entry) => ({ ...entry }))
+      : null;
+  }
+
+  async function overlaySessionListFixtureOnExactRows(sessions, orderedKeys) {
+    if (!simulatedSessionList) return sessions;
+    let realRows;
+    try {
+      realRows = await getRealSessions();
+    } catch {
+      realRows = cachedSessions || [];
+    }
+    const view = applySessionListFixture(realRows);
+    const viewByKey = new Map(
+      view.map((row) => [String(row.key).trim().toLowerCase(), row]),
+    );
+    const out = [];
+    const seen = new Set();
+    for (const row of sessions) {
+      const lk = String((row && row.key) || "").trim().toLowerCase();
+      out.push(viewByKey.get(lk) || row);
+      seen.add(lk);
+    }
+    for (const key of orderedKeys) {
+      const lk = key.toLowerCase();
+      if (!seen.has(lk) && viewByKey.has(lk)) {
+        out.push(viewByKey.get(lk));
+        seen.add(lk);
+      }
+    }
+    return out;
+  }
+
   function rowActivityDescription(row) {
     const value = row && row.lastActivityDescription;
     return typeof value === "string" && value.trim() ? value.trim() : null;
@@ -1064,7 +1303,7 @@ function createSessionService(opts = {}) {
       });
     }
 
-    return sessions;
+    return overlaySessionListFixtureOnExactRows(sessions, orderedKeys);
   }
 
   async function copyForeignSession(sourceKey) {
@@ -1168,6 +1407,8 @@ function createSessionService(opts = {}) {
 
   function isSessionMutationKeyForKind(kind, key) {
     if (kind !== "ocuclaw" && kind !== "evenai") return false;
+
+    if (isFixtureFakeSessionKey(key)) return false;
     const shortKey = supportedMutationShortKey(key);
     if (!shortKey || isForeignHermesSessionKey(shortKey)) return false;
     return kind === "evenai"
@@ -1580,6 +1821,7 @@ function createSessionService(opts = {}) {
   function canWriteSessionReadState(sessionKey) {
     if (typeof sessionKey !== "string" || !sessionKey.trim()) return false;
     if (!isHermesSessionKey(sessionKey)) return false;
+    if (isFixtureFakeSessionKey(sessionKey)) return false;
     if (!sessionReadStateSupported()) return false;
     return isUpstreamConnected();
   }
@@ -1622,7 +1864,7 @@ function createSessionService(opts = {}) {
 
   async function setSessionHidden(sessionKey, hidden) {
     const key = typeof sessionKey === "string" ? sessionKey.trim() : "";
-    if (!key || !isHermesSessionKey(key)) {
+    if (!key || !isHermesSessionKey(key) || isFixtureFakeSessionKey(key)) {
       return { ok: false, code: "session_not_hideable" };
     }
     if (!sessionReadStateSupported()) {
@@ -1803,7 +2045,9 @@ function createSessionService(opts = {}) {
       typeof session.key === "string" &&
       hasSupportedSessionKeyPrefix(session.key) &&
       !isEvenAiSessionKey(session.key) &&
-      !isForeignHermesSessionKey(session.key)
+      !isForeignHermesSessionKey(session.key) &&
+
+      !isFixtureFakeSessionKey(session.key)
     ));
   }
 
@@ -2442,7 +2686,9 @@ function createSessionService(opts = {}) {
       sessionKey.length > 0 &&
       (
         isForeignHermesSessionKey(sessionKey) ||
-        !hasSupportedSessionKeyPrefix(sessionKey)
+        !hasSupportedSessionKeyPrefix(sessionKey) ||
+
+        isFixtureFakeSessionKey(sessionKey)
       )
     ) {
       emitDebug(
@@ -2490,7 +2736,22 @@ function createSessionService(opts = {}) {
 
     let outcome = null;
 
-    if (isUpstreamConnected()) {
+    const fixtureHistory = getSimulatedSessionHistory(sessionKey);
+    if (fixtureHistory) {
+      emitDebug(
+        "relay.session",
+        "session_history_fixture",
+        "info",
+        { sessionKey },
+        () => ({ sessionKey, rowCount: fixtureHistory.length }),
+      );
+      outcome = {
+        hydrate: true,
+        rows: fixtureHistory,
+        agentName: getAgentName(),
+        fixture: true,
+      };
+    } else if (isUpstreamConnected()) {
       try {
         const result = await gatewayBridge.request("chat.history", {
           sessionKey,
@@ -2567,7 +2828,7 @@ function createSessionService(opts = {}) {
         historyUnavailable: outcome.failed === true,
       });
 
-      if (outcome.failed !== true) {
+      if (outcome.failed !== true && outcome.fixture !== true) {
         recordHistoryFirstUserMessage(sessionKey, outcome.rows, {
           truncatedHead: outcome.truncatedHead === true,
         });
@@ -2793,6 +3054,10 @@ function createSessionService(opts = {}) {
     getSessionTitle,
     getSessionTitleRecord,
     getSessionsByExactKeys,
+    setSimulatedSessionList,
+    isSessionListFixturePinned,
+    isFixtureFakeSessionKey,
+    getSimulatedSessionHistory,
     hasRecordedFirstUserMessage,
     isNeuralSessionNamesEnabled,
     isEvenAiSessionKey,

@@ -1,6 +1,6 @@
 # Updating OcuClaw on Hermes
 
-**Guide version:** 2026-09-10 (1.3.20-hermes)
+**Guide version:** 2026-09-14 (1.3.21-hermes)
 
 Use this for an installed, healthy OcuClaw on Hermes moving to a strictly
 higher published bundle version. It is version-neutral: it never names a

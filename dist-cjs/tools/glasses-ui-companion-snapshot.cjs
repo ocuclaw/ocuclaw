@@ -21,6 +21,34 @@ const ENVELOPE_FIELDS = Object.freeze([
   "authority",
   "liveui",
 ]);
+const OWNERSHIP_FIELDS = Object.freeze([
+  "contract", "contractVersion", "sessionKey", "sessionId", "receiverFingerprint",
+  "observationGeneration", "observedAtMs", "state", "locked", "armed", "takeOver",
+  "uncertain", "takeOverAllowed", "holdGeneration", "holdState", "holdSurface",
+  "inflight", "inflightPlatform",
+]);
+
+function validOwnership(value, envelope) {
+  if (value === null) return true;
+  if (!exactKeys(value, OWNERSHIP_FIELDS) || envelope.backend !== "hermes" ||
+      value.contract !== "ocuclaw.session-driver-projection" || value.contractVersion !== 1 ||
+      value.sessionKey !== envelope.liveui?.sessionKey ||
+      typeof value.sessionKey !== "string" || value.sessionKey.split(":")[1] !== envelope.profile ||
+      !/^hermes:[A-Za-z0-9._-]{1,64}:[A-Za-z0-9._-]+$/.test(value.sessionKey) ||
+      typeof value.sessionId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(value.sessionId) ||
+      typeof value.receiverFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(value.receiverFingerprint) ||
+      typeof value.observationGeneration !== "string" || !/^[a-f0-9-]{36}:\d+:\d+$/.test(value.observationGeneration) ||
+      !Number.isSafeInteger(value.observedAtMs) || value.observedAtMs < 0 ||
+      value.observedAtMs > envelope.generatedAtMs ||
+      !["glasses_drive", "desktop_hold", "desktop_working"].includes(value.state)) return false;
+  for (const field of ["locked", "armed", "takeOver", "uncertain", "takeOverAllowed", "inflight"]) {
+    if (typeof value[field] !== "boolean") return false;
+  }
+  for (const field of ["holdGeneration", "holdState", "holdSurface", "inflightPlatform"]) {
+    if (value[field] !== null && (typeof value[field] !== "string" || value[field].length > 256)) return false;
+  }
+  return value.armed === true;
+}
 const BACKENDS = Object.freeze(["openclaw", "hermes"]);
 const PROFILE_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 const CONTENT_FIELDS = Object.freeze([
@@ -107,15 +135,18 @@ function buildCompanionSnapshot(input) {
     throw new Error("local companion content has the wrong shape");
   }
 
-  const snapshot = projectByEnumeration(ENVELOPE_FIELDS, {
-    schema: COMPANION_SNAPSHOT_SCHEMA_ID,
-    schemaVersion: COMPANION_SNAPSHOT_SCHEMA_VERSION,
+  const v2 = input.ownership !== undefined;
+  const snapshot = projectByEnumeration(v2 ? [...ENVELOPE_FIELDS, "ownership"] : ENVELOPE_FIELDS, {
+    schema: v2 ? "ocuclaw/companion-snapshot@2" : COMPANION_SNAPSHOT_SCHEMA_ID,
+    schemaVersion: v2 ? 2 : COMPANION_SNAPSHOT_SCHEMA_VERSION,
     generatedAtMs,
     backend,
     profile,
     authority: COMPANION_SNAPSHOT_AUTHORITY,
     liveui,
+    ownership: input.ownership,
   });
+  if (v2 && !validOwnership(snapshot.ownership, snapshot)) throw new Error("invalid ownership projection");
   const serialized = `${JSON.stringify(snapshot)}\n`;
   const bytes = new TextEncoder().encode(serialized).byteLength;
   if (bytes > COMPANION_SNAPSHOT_MAX_BYTES) {
@@ -128,10 +159,11 @@ function buildCompanionSnapshot(input) {
 
 function validateCompanionSnapshot(value) {
   try {
-    if (!exactKeys(value, ENVELOPE_FIELDS)) return fail("wrong_shape", "unexpected envelope fields");
+    const v2 = value?.schema === "ocuclaw/companion-snapshot@2" && value?.schemaVersion === 2;
+    if (!exactKeys(value, v2 ? [...ENVELOPE_FIELDS, "ownership"] : ENVELOPE_FIELDS)) return fail("wrong_shape", "unexpected envelope fields");
     if (
-      value.schema !== COMPANION_SNAPSHOT_SCHEMA_ID ||
-      value.schemaVersion !== COMPANION_SNAPSHOT_SCHEMA_VERSION
+      !v2 && (value.schema !== COMPANION_SNAPSHOT_SCHEMA_ID ||
+      value.schemaVersion !== COMPANION_SNAPSHOT_SCHEMA_VERSION)
     ) {
       return fail("wrong_schema", "unsupported companion snapshot schema");
     }
@@ -161,6 +193,7 @@ function validateCompanionSnapshot(value) {
     if (!validateContent(value.liveui.active && value.liveui.active.content)) {
       return fail("wrong_content_shape", "invalid local companion content");
     }
+    if (v2 && !validOwnership(value.ownership, value)) return fail("wrong_ownership", "invalid ownership projection");
     return { ok: true, snapshot: value };
   } catch (err) {
     return fail("invalid", err && err.message ? err.message : String(err));
@@ -178,6 +211,7 @@ function writeCompanionSnapshot(input) {
       generatedAtMs:
         typeof input.nowMs === "function" ? input.nowMs() : Date.now(),
       machine: input.machine,
+      ownership: input.ownership,
     });
     fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
     tmp = `${target}.tmp-${Date.now()}-${Math.random().toString(16).slice(2)}`;

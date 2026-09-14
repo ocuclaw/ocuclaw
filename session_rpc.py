@@ -8,12 +8,11 @@ vocabulary into the ``db.*`` link lane this module serves. Division of labor
   key — the bridge sends a parsed IDENTITY object (``{ns, chatId}`` minted /
   ``{ns, remainder}`` foreign-or-external) and this module resolves it to a
   live transcript id via native session_key reconstruction +
-  compression-tip walking (``resolve_resume_session_id``).
+  compression-tip walking (``get_compression_chain``).
 - **Reads ride a read-only SessionDB** — the documented WAL external-reader
   (``mode=ro`` takes no write lock; hermes_state.py:902-919 + the
-  session_search_tool precedent). The two writes this plane owns (title
-  patch, lineage delete) ride a lazily-created writable ``SessionDB`` — the
-  same per-instance-connection pattern every in-tree hermes consumer uses.
+  session_search_tool precedent). Mutations borrow Hermes's native shared
+  writer for the explicit profile path and release each operation's reference.
 - ``last_active``/timestamps stay **unix seconds** on the wire; the Node
   bridge owns the seconds→ms conversion (the contract map's ×1000 trap).
 
@@ -33,8 +32,13 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import closing, contextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from .conversation_resolver import carriers_for_key, compression_ancestors, compression_tip, resolve_conversation, ConversationUnavailable
+
+from .session_writer import SharedSessionWriter
 
 # ADR-0004 deny trio: the non-conversational sources excluded from the
 # glasses session list (messaging viewports stay visible by design).
@@ -236,6 +240,26 @@ def default_state_db_path() -> Path:
     return Path(get_hermes_home()) / "state.db"
 
 
+def _session_operation(method):
+    """Keep an RPC's reader alive until its entire operation finishes."""
+    @wraps(method)
+    def run(self, *args, **kwargs):
+        with self._access_lock:
+            outermost = self._operation_depth == 0
+            self._operation_depth += 1
+            try:
+                return method(self, *args, **kwargs)
+            except sqlite3.Error as exc:
+                raise RuntimeError(SharedSessionWriter._storage_reason(exc, "session_store_unavailable")) from None
+            except OSError:
+                raise RuntimeError("session_store_unavailable") from None
+            finally:
+                self._operation_depth -= 1
+                if outermost:
+                    self._operation_identity = None
+    return run
+
+
 class SessionRpc:
     """Link RPC handlers over one hermes ``state.db``."""
 
@@ -245,11 +269,15 @@ class SessionRpc:
         namespace: str = DEFAULT_SESSION_NAMESPACE,
         session_store_provider: Optional[Callable[[str], Any]] = None,
     ) -> None:
-        self._db_path = Path(db_path)
+        self._db_path = Path(db_path).resolve()
         self._ns = namespace or DEFAULT_SESSION_NAMESPACE
         self._session_store_provider = session_store_provider
         self._reader: Any = None
         self._writer: Any = None
+        self._access_lock = threading.RLock()
+        self._reader_identity = None
+        self._operation_depth = 0
+        self._operation_identity = None
         self._identity_warning_keys: set[Tuple[int, str, str]] = set()
         self._fts_probe_warning_emitted = False
 
@@ -317,6 +345,14 @@ class SessionRpc:
 
     # -- DB access ----------------------------------------------------------
 
+    def close(self):
+        """Drain only this reader; writer references belong to active calls."""
+        with self._access_lock:
+            reader, self._reader = self._reader, None
+            self._reader_identity = None
+            if reader is not None:
+                reader.close()
+
     def _get_reader(self):
         # Cross-thread reuse is SAFE by hermes's own design: SessionDB opens
         # its connection with check_same_thread=False and serializes every
@@ -325,45 +361,24 @@ class SessionRpc:
         # (serialized). The db.* RPC lane (asyncio.to_thread pool threads)
         # and the on_session_end hook (agent worker thread) both ride this
         # one cached reader deliberately.
+        try:
+            stat = self._db_path.stat()
+        except OSError:
+            raise RuntimeError("session_store_unavailable") from None
+        identity = (stat.st_dev, stat.st_ino)
+        if self._operation_identity is not None and self._operation_identity != identity:
+            raise RuntimeError("session_store_changed")
+        if self._reader is not None and self._reader_identity is not None and self._reader_identity != identity:
+            self.close()
         if self._reader is None:
-            if not self._db_path.exists():
-                raise RuntimeError(f"hermes state DB not found at {self._db_path}")
-            self._reader = self._open_reader_healed()
+            self._reader = self._open_reader_probed()
+            self._reader_identity = identity
+        if self._operation_depth:
+            self._operation_identity = identity
         return self._reader
 
-    def _open_reader_healed(self):
-        """Read-only SessionDB, healed once if the store is behind SCHEMA_SQL.
-
-        Read-only opens skip ``_reconcile_columns()`` by design (no DDL
-        against another profile's live DB), so a store created before a schema
-        addition raises "no such column" on read paths until something opens
-        it writable. This is not a hypothetical: hermes 0.20.5 moved
-        ``SCHEMA_VERSION`` 25 -> 26 (``hermes_state_common.py:219``, was
-        ``:155`` at v2026.8.3) with four new ``sessions`` columns
-        (``git_metadata_generation``, ``title_source``, ``hidden``,
-        ``last_read_at``), and ``list_sessions_rich`` appends
-        ``s.hidden = 0`` to the WHERE clause unconditionally when
-        ``include_hidden`` is False (``hermes_state.py:8768-8769``) — so
-        ``db.sessions.list`` fails OUTRIGHT on a pre-upgrade store, not merely
-        in an optional projection that per-row ``in`` gating could cover.
-
-        The one writable open is upstream's own documented remedy for exactly
-        this case, not an OcuClaw invention: see
-        ``hermes_state_schema.schema_read_probe_statements`` ("Callers that
-        heal on staleness (see ``_open_session_db_at_path`` in
-        ``hermes_cli/web_server.py``) run these probes right after a read-only
-        open") and that caller's probe -> one writable open -> reopen
-        read-only sequence. OcuClaw already opens this same store writable for
-        the title-patch / lineage-delete lane (``_get_writer``), so no new
-        access class is introduced, and the healthy path still never takes a
-        write lock: the probe runs first and a current store never reaches the
-        writable branch.
-
-        If the writable reconcile cannot close the gap (e.g. a column SQLite
-        refuses to ADD), the plain read-only reader is returned anyway and the
-        failure is logged once. Reads that do not touch the missing column
-        keep working, which is strictly better than raising on every poll.
-        """
+    def _open_reader_probed(self):
+        """Probe without healing: inspection never authorizes schema writes."""
         from hermes_state import SessionDB
 
         def _open_probed():
@@ -387,112 +402,63 @@ class SessionRpc:
         except sqlite3.DatabaseError as exc:
             if not _is_stale_schema_error(exc):
                 raise
-            logger.info(
-                "hermes state DB at %s is behind the running hermes schema "
-                "(%s); reconciling with one writable open",
-                self._db_path,
-                exc,
-            )
-
-        SessionDB(db_path=self._db_path).close()
-        try:
-            return _open_probed()
-        except sqlite3.DatabaseError as still_stale:
-            if not _is_stale_schema_error(still_stale):
-                raise
-            logger.warning(
-                "hermes state DB at %s is missing schema a writable "
-                "reconcile could not add (%s); serving reads unprobed — "
-                "queries touching the missing column will still fail",
-                self._db_path,
-                still_stale,
-            )
-            return SessionDB(db_path=self._db_path, read_only=True)
+            raise RuntimeError("session_schema_unsupported") from None
 
     def _get_writer(self):
         if self._writer is None:
-            from hermes_state import SessionDB
-
-            self._writer = SessionDB(db_path=self._db_path)
+            self._writer = SharedSessionWriter(self._db_path)
         return self._writer
 
-    def _session_keys_by_id(self, session_ids: List[str]) -> Dict[str, str]:
-        ids = [sid for sid in session_ids if isinstance(sid, str) and sid]
-        if not ids:
-            return {}
-        placeholders = ",".join("?" for _ in ids)
-        with sqlite3.connect(self._db_path, timeout=10) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                f"SELECT id, session_key FROM sessions WHERE id IN ({placeholders})",
-                ids,
-            ).fetchall()
-        return {
-            str(row["id"]): str(row["session_key"])
-            for row in rows
-            if row["session_key"]
-        }
+    def _store_identity(self):
+        try:
+            stat = self._db_path.stat()
+        except OSError:
+            raise RuntimeError("session_store_unavailable") from None
+        return stat.st_dev, stat.st_ino
+
+    @contextmanager
+    def _read_store(self):
+        """Borrow the operation's reader, or close a helper-only reader.
+
+        Never combine a target resolved on the retired file with a query on
+        its replacement. The next ordinary RPC can reopen that generation.
+        """
+        with self._access_lock:
+            identity = self._store_identity()
+            if self._reader is not None:
+                if self._reader_identity != identity:
+                    raise RuntimeError("session_store_changed")
+                yield self._reader
+            else:
+                with closing(self._open_reader_probed()) as reader:
+                    yield reader
+            if self._store_identity() != identity:
+                raise RuntimeError("session_store_changed")
 
     def _session_ids_by_key(self, session_key: str) -> List[str]:
         """Every row id carrying a native session_key, newest carrier first.
 
-        ``session_key`` is a NON-unique index: a ``/new`` reset ends the old
-        row with ``session_reset`` and mints a FRESH row on the same
-        deterministic key. Read straight through sqlite (the
-        ``_session_keys_by_id`` precedent) — SessionDB exposes no key → all-ids
-        primitive, and the recency lookups deliberately return only the newest.
+        The public bounded carrier query includes hidden and ended rows;
+        native recency-only lookup would lose adoption predecessors.
         """
         key = str(session_key or "")
         if not key:
             return []
-        with sqlite3.connect(self._db_path, timeout=10) as conn:
-            conn.row_factory = sqlite3.Row
-            # Live carriers first (same rule as `_carriers_for_key`): after an
-            # adopt the newest row on the key is the ended empty stub and the
-            # live transcript is the OLDER row (#2509).
-            rows = conn.execute(
-                """SELECT id FROM sessions
-                   WHERE session_key = ?
-                   ORDER BY (ended_at IS NULL) DESC, started_at DESC""",
-                (key,),
-            ).fetchall()
+        with self._read_store() as reader:
+            rows = carriers_for_key(reader, key, limit=SEARCH_SCAN_LIMIT)
         return [str(row["id"]) for row in rows]
-
-    def _purge_delivery_obligations_for_deleted_keys(
-        self, session_keys: List[str]
-    ) -> int:
-        keys = sorted({key for key in session_keys if isinstance(key, str) and key})
-        if not keys:
-            return 0
-        with sqlite3.connect(self._db_path, timeout=10) as conn:
-            table = conn.execute(
-                """SELECT 1 FROM sqlite_master
-                   WHERE type='table' AND name='delivery_obligations'"""
-            ).fetchone()
-            if table is None:
-                return 0
-            deleted = 0
-            for key in keys:
-                cursor = conn.execute(
-                    """DELETE FROM delivery_obligations
-                       WHERE session_key = ?
-                         AND NOT EXISTS (
-                           SELECT 1 FROM sessions WHERE session_key = ?
-                         )""",
-                    (key, key),
-                )
-                deleted += max(cursor.rowcount, 0)
-            return deleted
 
     # -- W06 dispatch-plane sync lookups (called from the on_session_end hook
     # thread — plain fast sqlite reads, never the event loop) ----------------
 
+    @_session_operation
     def row_by_id(self, session_id: str) -> Optional[Dict[str, Any]]:
         """id → {id, session_key, source} (on_session_end carries session_id,
         NOT session_key — the indexed native key column is the bridge back)."""
         row = self._get_reader().get_session(str(session_id))
         return dict(row) if row else None
 
+    @_session_operation
     def newest_carrier_id(self, session_key: str) -> Optional[str]:
         """Newest row id carrying a session_key (started_at DESC — hermes's
         own recovery order). A /new reset mints a FRESH row on the same
@@ -502,6 +468,7 @@ class SessionRpc:
         row = self._lookup_session_key(str(session_key))
         return str(row["id"]) if row else None
 
+    @_session_operation
     def conversation_by_id(
         self, session_id: str, limit: int = 0
     ) -> List[Dict[str, Any]]:
@@ -618,39 +585,9 @@ class SessionRpc:
         key = str(session_key or "")
         if not key:
             return []
-        reader = self._get_reader()
-        kwargs: Dict[str, Any] = {
-            "session_key": key,
-            "limit": SEARCH_SCAN_LIMIT,
-            "include_children": True,
-            "include_archived": True,
-            "order_by_last_active": True,
-            "project_compression_tips": False,
-        }
-        if session_read_state_supported():
-            # A hidden carrier is still the carrier (the wearer's open chat
-            # may be hidden from the desktop) — the 0.20.5+ kwarg only.
-            kwargs["include_hidden"] = True
-        try:
-            rows = reader.list_sessions_rich(**kwargs)
-        except TypeError:
-            # Pre-``session_key`` filter hosts: wide scan, exact-key match.
-            kwargs.pop("session_key", None)
-            rows = [
-                row
-                for row in reader.list_sessions_rich(**kwargs)
-                if row.get("session_key") == key
-            ]
-        carriers = [dict(row) for row in rows if row.get("session_key") == key]
-        carriers.sort(
-            key=lambda row: (
-                row.get("ended_at") is None,
-                float(row.get("started_at") or 0.0),
-            ),
-            reverse=True,
-        )
-        return carriers
+        return carriers_for_key(self._get_reader(), key, limit=SEARCH_SCAN_LIMIT)
 
+    @_session_operation
     def lineage_for_key(self, session_key: str) -> List[str]:
         """Every session id Desktop's marker/lease files could name for a
         native key: the live carrier's tip first, then its compression chain
@@ -668,8 +605,8 @@ class SessionRpc:
 
         carriers = self._carriers_for_key(session_key)
         if carriers:
-            live = carriers[0]
-            tip = str(self._get_reader().resolve_resume_session_id(str(live.get("id"))))
+            live = resolve_conversation(self._get_reader(), session_key, allow_ended=True)
+            tip = str(live["id"])
             push(tip)
             for value in self._walk_compression_chain(tip):
                 push(value)
@@ -678,15 +615,22 @@ class SessionRpc:
         return ordered
 
     def _lookup_session_key(self, session_key: str) -> Optional[Dict[str, Any]]:
-        # session_key is NOT unique (regular index): reset/re-created chats
-        # reuse the same deterministic key on a FRESH row that is not a
-        # compression child of the old one, and an adopt re-keys an OLDER
-        # transcript under a key whose newest row is an ended stub. The live
-        # carrier wins, newest-first within liveness (`_carriers_for_key`);
-        # the tip walk then resolves compression forks from whichever row we
-        # picked.
-        carriers = self._carriers_for_key(session_key)
-        return carriers[0] if carriers else None
+        # Validate the lineage before projecting its raw carrier. Dispatch
+        # needs the row carrying the key, which can be an ended compression
+        # parent when its live tip has no key. Recency never selects between
+        # unrelated live/historical lineages.
+        try:
+            reader = self._get_reader()
+            target = resolve_conversation(reader, session_key, allow_ended=True)
+            carriers = [row for row in self._carriers_for_key(session_key)
+                        if compression_tip(reader, row["id"]) == target["id"]]
+            if not carriers:
+                raise ConversationUnavailable("conversation_changed")
+            return next((row for row in carriers if row["id"] == target["id"]), carriers[0])
+        except ConversationUnavailable as error:
+            if error.reason == "conversation_missing":
+                return None
+            raise
 
     def _lookup_minted_chat_id(self, ns: str, chat_id: str) -> Optional[Dict[str, Any]]:
         # Exact DM-shaped native key ONLY — the Node grammar derives every
@@ -697,8 +641,8 @@ class SessionRpc:
             f"agent:{ns}:{OCUCLAW_PLATFORM_SEGMENT}:{OCUCLAW_CHAT_TYPE_SEGMENT}:{chat_id}"
         )
 
-    def _resolve_target(self, identity: Any, *, fail_closed: bool = False) -> str:
-        """identity → live transcript (compression-tip) session id."""
+    def _resolve_target(self, identity: Any, *, fail_closed: bool = False, allow_ended: bool = False) -> str:
+        """Validated target; historical actions explicitly opt into ended rows."""
         ident = identity if isinstance(identity, dict) else {}
         ns = str(ident.get("ns") or self._ns)
         chat_id = ident.get("chatId")
@@ -709,15 +653,19 @@ class SessionRpc:
                 f"agent:{ns}:{OCUCLAW_PLATFORM_SEGMENT}:"
                 f"{OCUCLAW_CHAT_TYPE_SEGMENT}:{chat_id}"
             )
-            row = self._lookup_minted_chat_id(ns, chat_id)
-            if row is None:
-                raise ValueError(f"no such session: hermes:{ns}:{chat_id}")
-            return db.resolve_resume_session_id(row["id"])
+            try:
+                return str(resolve_conversation(db, native_key, allow_ended=allow_ended)["id"])
+            except ConversationUnavailable as error:
+                if error.reason == "conversation_missing":
+                    raise ValueError("no such session") from None
+                raise
         if isinstance(remainder, str) and remainder:
             # Foreign gateway row: reconstruct the native session_key.
-            row = self._lookup_session_key(f"agent:{ns}:{remainder}")
-            if row is not None:
-                return db.resolve_resume_session_id(row["id"])
+            try:
+                return str(resolve_conversation(db, f"agent:{ns}:{remainder}", allow_ended=allow_ended)["id"])
+            except ConversationUnavailable as error:
+                if error.reason != "conversation_missing":
+                    raise
             # External-root form: <source>:<lineageRootId> (CLI/TUI/api rows
             # carry no platform-shaped session_key — ADR-0004). Derivation
             # ONLY mints these under the default-lane namespace, so any other
@@ -731,15 +679,22 @@ class SessionRpc:
                     source, root_id = parts
                     root = db.get_session(root_id)
                     if root is not None and root.get("source") == source:
-                        return db.resolve_resume_session_id(root_id)
+                        tip = compression_tip(db, root_id)
+                        target = db.get_session(tip) if tip else None
+                        if target is None:
+                            raise ValueError("no such session")
+                        if target.get("ended_at") is not None and not allow_ended:
+                            raise ConversationUnavailable("conversation_ended")
+                        return tip
             raise ValueError(f"no such session: hermes:{ns}:x:{remainder}")
         raise ValueError("invalid session identity")
 
+    @_session_operation
     def resolve_identity_row(self, identity: Any) -> Dict[str, Any]:
         """identity → live rich-ish row dict. W08 action handlers use this
         per request so compressed sessions and reset carriers never cache a
         stale transcript id."""
-        tip = self._resolve_target(identity)
+        tip = self._resolve_target(identity, allow_ended=True)
         row = self._get_reader().get_session(tip)
         if row is None:
             raise ValueError(f"no such session: {tip}")
@@ -748,12 +703,7 @@ class SessionRpc:
     def _walk_compression_chain(self, session_id: str) -> List[str]:
         """tip → root ids joined by compression edges (parent carries
         ``end_reason='compression'`` — the canonical up-walk predicate)."""
-        lineage = getattr(self._get_reader(), "get_compression_lineage", None)
-        if callable(lineage):
-            ids = lineage(session_id)
-            if ids:
-                return list(reversed([str(value) for value in ids]))
-        return [session_id]
+        return compression_ancestors(self._get_reader(), session_id)
 
     def _lineage_root_id(self, row: Dict[str, Any]) -> str:
         projected = row.get("_lineage_root_id")
@@ -851,6 +801,7 @@ class SessionRpc:
 
     # -- sync handler bodies -------------------------------------------------
 
+    @_session_operation
     def _sync_list(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
         try:
@@ -867,7 +818,7 @@ class SessionRpc:
             # make old-but-valid sessions vanish from key lookups (Codex
             # review W05 finding) — then fetch the rich row by exact id.
             try:
-                tip = self._resolve_target(key_identity)
+                tip = self._resolve_target(key_identity, allow_ended=True)
             except ValueError:
                 return {"sessions": []}
             # The exact-key path must hydrate a HIDDEN row too: the wearer's
@@ -920,6 +871,7 @@ class SessionRpc:
         # Dedupe can shrink a no-search page below limit; accepted for now.
         return {"sessions": wire}
 
+    @_session_operation
     def _sync_resolve_key(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
         key = str(p.get("key") or "").strip()
@@ -952,7 +904,7 @@ class SessionRpc:
 
     def _visible_search_row(self, session_id: str) -> Optional[Dict[str, Any]]:
         db = self._get_reader()
-        tip = db.resolve_resume_session_id(str(session_id))
+        tip = compression_tip(db, str(session_id))
         raw_row = db.get_session(tip)
         if raw_row is None:
             return None
@@ -964,7 +916,7 @@ class SessionRpc:
             newest = self._lookup_session_key(str(session_key))
             if newest is None:
                 return None
-            newest_tip = db.resolve_resume_session_id(str(newest["id"]))
+            newest_tip = compression_tip(db, str(newest["id"]))
             if newest_tip != tip:
                 # A reset can leave searchable messages on an older carrier
                 # whose public key now identifies a different live row. The
@@ -987,6 +939,7 @@ class SessionRpc:
             None,
         )
 
+    @_session_operation
     def _sync_search(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
         query = str(p.get("query") or "").strip()
@@ -1084,9 +1037,10 @@ class SessionRpc:
             "truncated": truncated,
         }
 
+    @_session_operation
     def _sync_set_title(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
-        tip = self._resolve_target(p.get("identity"), fail_closed=True)
+        tip = self._resolve_target(p.get("identity"), fail_closed=True, allow_ended=True)
         title = p.get("title")
         if title is not None and not isinstance(title, str):
             raise ValueError("title must be a string or null")
@@ -1096,6 +1050,7 @@ class SessionRpc:
         self._get_writer().set_session_title(tip, title if title else None)
         return {"ok": True}
 
+    @_session_operation
     def _sync_set_read(self, params: Any) -> Dict[str, Any]:
         """Stamp the read watermark (`last_read_at`) on one conversation.
 
@@ -1108,7 +1063,7 @@ class SessionRpc:
         if not session_read_state_supported():
             raise ValueError(SESSION_READ_STATE_UNSUPPORTED)
         p = params if isinstance(params, dict) else {}
-        tip = self._resolve_target(p.get("identity"), fail_closed=True)
+        tip = self._resolve_target(p.get("identity"), fail_closed=True, allow_ended=True)
         read = p.get("read")
         self._get_writer().set_session_read(
             tip, read=True if read is None else bool(read)
@@ -1143,6 +1098,7 @@ class SessionRpc:
             carriers.append(tip)
         return carriers
 
+    @_session_operation
     def _sync_set_hidden(self, params: Any) -> Dict[str, Any]:
         """Hide/unhide a conversation from the global sessions listing."""
         if not session_read_state_supported():
@@ -1150,12 +1106,14 @@ class SessionRpc:
         p = params if isinstance(params, dict) else {}
         identity = p.get("identity")
         hidden = bool(p.get("hidden"))
-        tip = self._resolve_target(identity, fail_closed=True)
-        writer = self._get_writer()
-        for target in self._hide_targets(identity, tip):
-            writer.set_session_hidden(target, hidden)
+        tip = self._resolve_target(identity, fail_closed=True, allow_ended=True)
+        targets = self._hide_targets(identity, tip)
+        with self._get_writer().borrow() as writer:
+            for target in targets:
+                writer.set_session_hidden(target, hidden)
         return {"ok": True}
 
+    @_session_operation
     def _sync_delete(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
         identity = p.get("identity")
@@ -1163,24 +1121,25 @@ class SessionRpc:
         chat_id = ident.get("chatId")
         if not isinstance(chat_id, str) or not chat_id:
             raise ValueError("refusing to delete non-minted (foreign) session")
-        tip = self._resolve_target(identity, fail_closed=True)
+        tip = self._resolve_target(identity, fail_closed=True, allow_ended=True)
         # Delete the WHOLE compression lineage tip→root: delete_session
         # orphans compression children (parent NULLed, hermes_state.py:
         # 4732-4736), so deleting only the tip would resurface ancestors as
         # roots in the next list (map sessions.delete verdict). Child-first
         # order avoids observing half-orphaned intermediates.
         chain = self._walk_compression_chain(tip)
-        keys_by_id = self._session_keys_by_id(chain)
-        writer = self._get_writer()
-        deleted = [sid for sid in chain if writer.delete_session(sid)]
-        self._purge_delivery_obligations_for_deleted_keys(
-            [keys_by_id[sid] for sid in deleted if sid in keys_by_id]
+        rows = [self._get_reader().get_session(sid) for sid in chain]
+        if any(row is None for row in rows):
+            raise RuntimeError("session_selection_changed")
+        deleted = self._get_writer().delete_conversation(
+            rows, expected_identity=self._reader_identity,
         )
         return {"deleted": deleted}
 
+    @_session_operation
     def _sync_history(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
-        tip = self._resolve_target(p.get("identity"), fail_closed=True)
+        tip = self._resolve_target(p.get("identity"), fail_closed=True, allow_ended=True)
         rows = self._conversation_rows_with_identity(tip)
         # Conversational shaping happens HERE, before serialization: only
         # user/assistant rows with content survive, and the tail slice
@@ -1228,6 +1187,7 @@ class SessionRpc:
 
     # -- Desktop→glasses mirror (#2513) --------------------------------------
 
+    @_session_operation
     def _sync_watermark(self, params: Any) -> Dict[str, Any]:
         """``{identity}`` → ``{sessionId, watermark, dbPath, hermesHome}``.
 
@@ -1249,20 +1209,17 @@ class SessionRpc:
         }
 
     def _max_message_row_id(self, session_id: str) -> Optional[int]:
-        uri = f"file:{self._db_path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=10)
-        try:
-            row = conn.execute(
-                "SELECT MAX(id) FROM messages WHERE session_id = ?",
-                (str(session_id),),
-            ).fetchone()
-        finally:
-            conn.close()
-        return int(row[0]) if row and row[0] is not None else None
+        # All roles and inactive generations matter, matching the former
+        # MAX(id) query. The active-only compression watermark is different.
+        with self._read_store() as reader:
+            rows = reader.get_messages(str(session_id), include_inactive=True,
+                                       limit=1, latest=True)
+        return int(rows[0]["id"]) if rows else None
 
+    @_session_operation
     def _sync_describe(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
-        tip = self._resolve_target(p.get("identity"), fail_closed=True)
+        tip = self._resolve_target(p.get("identity"), fail_closed=True, allow_ended=True)
         row = self._get_reader().get_session(tip)
         if row is None:
             raise ValueError(f"no such session: {tip}")
@@ -1335,15 +1292,17 @@ class SessionRpc:
                 continue
         return None
 
+    @_session_operation
     def _sync_compaction_info(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
-        tip = self._resolve_target(p.get("identity"), fail_closed=True)
+        tip = self._resolve_target(p.get("identity"), fail_closed=True, allow_ended=True)
         # Compaction count = compression-chain hops (map compaction.list row;
         # in-place archive_and_compact events are invisible to a hop count —
         # documented undercount, synthesized/medium).
         hops = len(self._walk_compression_chain(tip)) - 1
         return {"hops": hops}
 
+    @_session_operation
     def copy_to_ocuclaw(
         self,
         identity: Any,
@@ -1353,34 +1312,26 @@ class SessionRpc:
     ) -> Dict[str, Any]:
         """Copy a foreign/external transcript into a fresh OcuClaw-keyed
         session. This deliberately does NOT call hermes `/fork`, because that
-        marks the source ended as `branched`; instead it writes a public child
-        row and appends the transcript through Hermes' writer API."""
+        marks the source ended as `branched`; instead it creates an independent
+        row through the shared native writer. Provenance is metadata only:
+        native parent links would let Desktop resume traverse into the copy."""
         target_chat_id = str(chat_id or "").strip()
         if not target_chat_id:
             raise ValueError("copy target requires chatId")
-        source_tip = self._resolve_target(identity, fail_closed=True)
+        source_tip = self._resolve_target(identity, fail_closed=True, allow_ended=True)
+        source = self._get_reader().get_session(source_tip)
         messages = self.conversation_by_id(source_tip)
         if not messages:
             raise ValueError("copy source has no conversational messages")
         session_id = f"ocuclaw_copy_{uuid.uuid4().hex}"
         copy_chat_id = f"copy-{uuid.uuid4().hex}"
         copy_key = f"agent:{self._ns}:{OCUCLAW_PLATFORM_SEGMENT}:{OCUCLAW_CHAT_TYPE_SEGMENT}:{copy_chat_id}"
-        writer = self._get_writer()
-        writer.create_session(
-            session_id,
-            OCUCLAW_PLATFORM_SEGMENT,
-            session_key=copy_key,
-            chat_id=copy_chat_id,
-            chat_type=OCUCLAW_CHAT_TYPE_SEGMENT,
-            parent_session_id=source_tip,
+        from .models_rpc import profile_for_namespace
+        row = self._get_writer().copy_conversation(
+            session_id=session_id, session_key=copy_key, chat_id=copy_chat_id,
+            source=dict(source) if source else {}, messages=messages,
+            profile=profile_for_namespace(self._ns), expected_identity=self._reader_identity,
         )
-        for message in messages:
-            writer.append_message(
-                session_id=session_id,
-                role=str(message.get("role") or "unknown"),
-                content=message.get("content"),
-            )
-        row = writer.get_session(session_id)
         if row is None:
             raise RuntimeError(f"copied session missing after create: {session_id}")
         row_dict = dict(row)
@@ -1388,6 +1339,7 @@ class SessionRpc:
 
     # -- Continue here (adopt) — #2509 ---------------------------------------
 
+    @_session_operation
     def resolve_adopt_source(self, identity: Any) -> Dict[str, Any]:
         """identity → the live tip of an ADOPTABLE external row.
 
@@ -1430,6 +1382,7 @@ class SessionRpc:
             "lineage": lineage,
         }
 
+    @_session_operation
     def adopt_outcome(self, adopt_key: str, tip: str) -> Dict[str, Any]:
         """Read the adopt verdict from the DB, never from Hermes's reply text.
 
@@ -1463,18 +1416,28 @@ class SessionRpc:
             "session": self._row_to_wire(tip_row) if tip_row is not None else None,
         }
 
+    @_session_operation
+    def ensure_adopt_writer_supported(self) -> None:
+        """Reject known missing cleanup support before native /resume mutates."""
+        if not session_read_state_supported():
+            raise RuntimeError("session_writer_unsupported")
+        with self._get_writer().borrow() as writer:
+            if not callable(getattr(writer, "set_session_hidden", None)):
+                raise RuntimeError("session_writer_unsupported")
+
+    @_session_operation
     def hide_sessions(self, session_ids: List[str]) -> List[str]:
         """Hide rows with the public view-state flag (no-op pre-0.20.5)."""
         if not session_read_state_supported():
             return []
-        writer = self._get_writer()
         hidden = []
-        for session_id in session_ids:
-            try:
-                writer.set_session_hidden(str(session_id), True)
-                hidden.append(str(session_id))
-            except Exception:  # noqa: BLE001 - presentation only, never fatal
-                logger.debug("hide predecessor %s failed", session_id, exc_info=True)
+        with self._get_writer().borrow() as writer:
+            for session_id in session_ids:
+                try:
+                    writer.set_session_hidden(str(session_id), True)
+                    hidden.append(str(session_id))
+                except Exception:  # noqa: BLE001 - presentation only, never fatal
+                    logger.debug("hide predecessor failed")
         return hidden
 
 
@@ -1498,6 +1461,11 @@ class ProfileSessionRpc:
                 session_store_provider=self._session_store_provider,
             )
         }
+
+    def close(self):
+        with self._lock:
+            for rpc in self._rpcs.values():
+                rpc.close()
 
     def handlers(self) -> Dict[str, Callable[[Any], Any]]:
         return {
@@ -1549,13 +1517,13 @@ class ProfileSessionRpc:
             return self._rpcs[DEFAULT_SESSION_NAMESPACE]
         enabled, homes = self._routing()
         if not enabled or namespace not in homes:
-            raise RuntimeError(
-                f"Hermes profile namespace {namespace!r} is not served"
-            )
+            raise RuntimeError("session_profile_unserved")
         with self._lock:
             rpc = self._rpcs.get(namespace)
             db_path = homes[namespace] / "state.db"
             if rpc is None or rpc._db_path != db_path:
+                if rpc is not None:
+                    rpc.close()
                 rpc = SessionRpc(
                     db_path,
                     namespace=namespace,
@@ -1790,6 +1758,11 @@ class ProfileSessionRpc:
         return self._rpc_for_namespace(
             self._namespace_from_params({"identity": identity})
         ).resolve_adopt_source(identity)
+
+    def ensure_adopt_writer_supported(self, identity: Any) -> None:
+        self._rpc_for_namespace(
+            self._namespace_from_params({"identity": identity})
+        ).ensure_adopt_writer_supported()
 
     def adopt_outcome(self, adopt_key: str, tip: str) -> Dict[str, Any]:
         return self._rpc_for_namespace(DEFAULT_SESSION_NAMESPACE).adopt_outcome(

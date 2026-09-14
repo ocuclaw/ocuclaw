@@ -2,6 +2,8 @@ const { createHermesControlLink, LINK_EXIT_CODES, LINK_HANDSHAKE_TIMEOUT_MS } = 
 const { createHermesGatewayBridge, LINK_BACKEND_EVENT_METHOD, LINK_PROFILE_METHODS } = require("./hermes-gateway-bridge.cjs");
 const { createHermesHostHooks, LINK_HOST_HOOK_METHOD } = require("./hermes-host-hooks.cjs");
 const { buildHermesLiveUiHelloPayload, createHermesLiveUiBridge, mergeLiveConfig } = require("./hermes-liveui-bridge.cjs");
+
+const { buildHermesPhoneToolsHelloPayload, createHermesPhoneToolsBridge } = require("./hermes-phone-tools-bridge.cjs");
 const { createHermesPresencePush } = require("./hermes-presence-push.cjs");
 const { createHermesSttLane } = require("./hermes-stt-lane.cjs");
 const { createHermesPairingCompletionPush } = require("./hermes-pairing-completion-push.cjs");
@@ -66,6 +68,7 @@ const link = createHermesControlLink({
   methods: linkMethods,
   hello: {
     liveui: buildHermesLiveUiHelloPayload(),
+    phoneTools: buildHermesPhoneToolsHelloPayload(),
   },
 });
 
@@ -269,6 +272,13 @@ function bootRelay(ackPayload) {
       });
       relay.setLiveuiGlassesLibraryController(liveui.glassesLibrary);
       Object.assign(linkMethods, liveui.methods);
+
+      const phoneTools = createHermesPhoneToolsBridge({
+        relay,
+        hostHooks,
+        logger,
+      });
+      Object.assign(linkMethods, phoneTools.methods);
 
       hostHooks.on("agent_end", (_event, ctx) => {
         if (typeof relay.noteSessionMirrorTurnEnd !== "function") return;

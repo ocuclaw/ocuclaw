@@ -1,5 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
+const { createHash, randomUUID } = require("node:crypto");
+const { projectSessionDriverFields } = require("./session-driver-projection.cjs");
 
 const DRIVER_STATES = Object.freeze({
   glassesDrive: "glasses_drive",
@@ -31,8 +33,9 @@ function normalizeState(value) {
 }
 
 function buildSessionDriverSnapshot(key, result, options = {}) {
-  const state = normalizeState(result && result.state);
-  const takeOver = options.takeOver === true && state !== DRIVER_STATES.glassesDrive;
+  const conflicting = result?.inflight?.active === true && result.inflight.platform !== "ocuclaw";
+  const state = conflicting ? DRIVER_STATES.desktopWorking : normalizeState(result && result.state);
+  const takeOver = options.takeOver === true && state === DRIVER_STATES.desktopHold;
   const hold = result && result.hold && typeof result.hold === "object" ? result.hold : null;
   const inflight =
     result && result.inflight && typeof result.inflight === "object" ? result.inflight : null;
@@ -42,6 +45,9 @@ function buildSessionDriverSnapshot(key, result, options = {}) {
     state,
     locked: state !== DRIVER_STATES.glassesDrive && !takeOver,
     takeOver,
+    uncertain: options.uncertain === true,
+    takeOverAllowed: state === DRIVER_STATES.desktopHold && options.uncertain !== true && !!cleanString(hold?.generation),
+    holdGeneration: cleanString(hold?.generation),
     holdState: cleanString(result && result.holdState),
     holdSurface: cleanString(hold && hold.surface),
     holdPid: pid,
@@ -60,6 +66,9 @@ function sessionDriverSnapshotsEqual(a, b) {
     a.state === b.state &&
     a.locked === b.locked &&
     a.takeOver === b.takeOver &&
+    a.uncertain === b.uncertain &&
+    a.takeOverAllowed === b.takeOverAllowed &&
+    a.holdGeneration === b.holdGeneration &&
     a.holdState === b.holdState &&
     a.holdSurface === b.holdSurface &&
     a.holdPid === b.holdPid &&
@@ -87,16 +96,27 @@ function createSessionDriverWatch(opts = {}) {
   let armedKey = null;
   let generation = 0;
   let snapshot = null;
-  let takeOver = false;
+  let takeOver = null;
   let hermesHome = null;
   let watchSpec = null;
   let lastResult = null;
+  let acceptedRead = 0;
+  const observationEpoch = randomUUID();
+  let observedAtMs = null;
+  let receiverFingerprint = null;
+  function holderScope(result) {
+    const holder = cleanString(result?.hold?.generation);
+    if (!holder || !result?.hermesHome || !result?.sessionId) return null;
+    return JSON.stringify([armedKey, result.hermesHome, result.sessionId,
+      result.lineage, result.hold.surface, result.hold.pid, result.hold.sessionId, holder]);
+  }
 
   const watches = new Map();
   let debounceTimer = null;
   let refreshInFlight = null;
   let refreshQueued = false;
   let rearmTimers = 0;
+  const rearmTimerHandles = new Set();
 
   let livenessTimer = null;
   let livenessFailures = 0;
@@ -111,14 +131,18 @@ function createSessionDriverWatch(opts = {}) {
     }
   }
 
+  function failure(reason, phase) {
+    const correlationId = `driver-${generation}-${counters.refreshes}`;
+    logger.warn(`[session-driver] ${reason} phase=${phase} correlation=${correlationId}`);
+    debug(reason, { reason, phase, correlationId });
+  }
+
   function diagnostics() {
+
     return {
       armedKey,
-      hermesHome,
       watches: Array.from(watches.entries()).map(([name, entry]) => ({
         name,
-        dir: entry.dir,
-        file: entry.file,
         live: !!entry.watcher,
         fallback: entry.fallback === true,
       })),
@@ -145,7 +169,7 @@ function createSessionDriverWatch(opts = {}) {
   }
 
   function livenessWanted() {
-    return !!armedKey && !!snapshot && snapshot.state !== DRIVER_STATES.glassesDrive;
+    return !!armedKey && !!snapshot && (snapshot.uncertain || snapshot.state !== DRIVER_STATES.glassesDrive);
   }
 
   function stopLiveness(reason) {
@@ -199,14 +223,19 @@ function createSessionDriverWatch(opts = {}) {
     try {
       onState(next);
     } catch (err) {
-      logger.warn(`[session-driver] onState failed: ${err && err.message}`);
+      failure("state_delivery_failed", "publish");
     }
   }
 
   function closeWatches() {
+    for (const timer of rearmTimerHandles) clearTimeout(timer);
+    rearmTimerHandles.clear();
+    rearmTimers = 0;
     for (const entry of watches.values()) {
       try {
-        if (entry.watcher) entry.watcher.close();
+        const watcher = entry.watcher;
+        entry.watcher = null;
+        if (watcher) watcher.close();
       } catch {
 
       }
@@ -240,7 +269,7 @@ function createSessionDriverWatch(opts = {}) {
     }
     try {
       const watcher = fsImpl.watch(target, { persistent: false }, (eventType, filename) => {
-        if (myGeneration !== generation) return;
+        if (myGeneration !== generation || watches.get(name) !== entry) return;
         const changed = typeof filename === "string" ? filename : "";
         if (entry.fallback) {
           if (changed === path.basename(dir) && fsImpl.existsSync(dir)) {
@@ -262,13 +291,14 @@ function createSessionDriverWatch(opts = {}) {
         scheduleRefresh(`${name}:${eventType}`);
       });
       watcher.on("error", (err) => {
-        if (myGeneration !== generation) return;
-        logger.warn(`[session-driver] watch ${name} errored: ${err && err.message}`);
+        if (myGeneration !== generation || watches.get(name) !== entry) return;
+        failure("watch_failed", "observe");
         entry.watcher = null;
+        watcher.close();
         rearm(name, dir, file, myGeneration);
       });
       watcher.on("close", () => {
-        if (myGeneration !== generation) return;
+        if (myGeneration !== generation || watches.get(name) !== entry) return;
         if (entry.watcher === watcher) {
           entry.watcher = null;
           rearm(name, dir, file, myGeneration);
@@ -278,7 +308,7 @@ function createSessionDriverWatch(opts = {}) {
       entry.attempts = 0;
       watches.set(name, entry);
     } catch (err) {
-      logger.warn(`[session-driver] watch ${name} on ${target} failed: ${err && err.message}`);
+      failure("watch_open_failed", "observe");
       entry.watcher = null;
       watches.set(name, entry);
       rearm(name, dir, file, myGeneration);
@@ -297,11 +327,13 @@ function createSessionDriverWatch(opts = {}) {
     counters.rearms += 1;
     rearmTimers += 1;
     const timer = setTimeout(() => {
+      rearmTimerHandles.delete(timer);
       rearmTimers -= 1;
-      if (myGeneration !== generation) return;
+      if (myGeneration !== generation || watches.get(name) !== entry) return;
       openWatch(name, dir, file, myGeneration);
       scheduleRefresh(`${name}_rearmed`);
     }, REARM_BACKOFF_MS * entry.attempts);
+    rearmTimerHandles.add(timer);
     if (typeof timer.unref === "function") timer.unref();
   }
 
@@ -321,7 +353,7 @@ function createSessionDriverWatch(opts = {}) {
     };
     openWatch("marker", path.join(home, watchSpec.markerDir), watchSpec.markerFile, myGeneration);
     openWatch("lease", path.join(home, watchSpec.leaseDir), watchSpec.leaseFile, myGeneration);
-    debug("watches_armed", { hermesHome, watches: diagnostics().watches });
+    debug("watches_armed", { watchCount: watches.size });
   }
 
   async function refresh(reason = "manual") {
@@ -338,25 +370,44 @@ function createSessionDriverWatch(opts = {}) {
       try {
         result = await request(key);
       } catch (err) {
-        logger.warn(`[session-driver] driver read failed for ${key}: ${err && err.message}`);
-        debug("driver_read_failed", { reason, error: err && err.message });
+        failure("driver_read_failed", "observe");
         result = null;
       }
       if (myGeneration !== generation || armedKey !== key) return snapshot;
-      if (result) lastResult = result;
-      if (result && watches.size === 0) armWatches(result, myGeneration);
-      if (!result && snapshot) {
 
-        livenessFailures += 1;
+      if (result?.publicKey && result.publicKey !== key) {
+        failure("foreign_reply_discarded", "identity");
         syncLiveness(reason);
         return snapshot;
       }
-      livenessFailures = 0;
-      const next = buildSessionDriverSnapshot(key, result, { takeOver, nowMs: now() });
-      if (next.state === DRIVER_STATES.glassesDrive && takeOver) {
+      if (result?.hermesHome && hermesHome && result.hermesHome !== hermesHome) closeWatches();
+      if (result && watches.size === 0) armWatches(result, myGeneration);
+      const valid = result?.status === "ok" && result.uncertain !== true &&
+        (!result.publicKey || result.publicKey === key) &&
+        Object.values(DRIVER_STATES).includes(result.state);
+      if (!valid) {
 
-        takeOver = false;
+        livenessFailures += 1;
+        lastResult = null;
+        const conflicting = result?.inflight?.active === true && result.inflight.platform !== "ocuclaw";
+        if (conflicting) takeOver = null;
+        emit(conflicting ? buildSessionDriverSnapshot(key, result, { nowMs: now(), uncertain: true }) : snapshot ? { ...snapshot, uncertain: true, takeOverAllowed: false } : {
+          ...buildSessionDriverSnapshot(key, null, { nowMs: now(), uncertain: true }), locked: true,
+        }, reason);
+        syncLiveness(reason);
+        return snapshot;
       }
+      lastResult = result;
+      acceptedRead += 1;
+      observedAtMs = now();
+      try {
+        receiverFingerprint = createHash("sha256").update(fs.realpathSync(result.hermesHome)).digest("hex");
+      } catch { receiverFingerprint = null; }
+      livenessFailures = 0;
+      const scope = holderScope(result);
+      if (takeOver !== scope || result.state !== DRIVER_STATES.desktopHold ||
+          (result.inflight?.active && result.inflight.platform !== "ocuclaw")) takeOver = null;
+      const next = buildSessionDriverSnapshot(key, result, { takeOver: !!takeOver, nowMs: observedAtMs });
       emit(next, reason);
       syncLiveness(reason);
       return next;
@@ -379,7 +430,7 @@ function createSessionDriverWatch(opts = {}) {
     disarm();
     generation += 1;
     armedKey = next;
-    takeOver = false;
+    takeOver = null;
     debug("armed", {});
     return refresh("arm");
   }
@@ -389,7 +440,7 @@ function createSessionDriverWatch(opts = {}) {
     generation += 1;
     const previous = armedKey;
     armedKey = null;
-    takeOver = false;
+    takeOver = null;
     closeWatches();
     stopLiveness("disarm");
     if (debounceTimer) {
@@ -399,6 +450,8 @@ function createSessionDriverWatch(opts = {}) {
     watchSpec = null;
     hermesHome = null;
     lastResult = null;
+    observedAtMs = null;
+    receiverFingerprint = null;
     if (snapshot) {
 
       const released = {
@@ -427,14 +480,23 @@ function createSessionDriverWatch(opts = {}) {
     if (!armedKey || (target && target !== armedKey)) {
       return { ok: false, error: "session_not_armed", snapshot };
     }
+    const myGeneration = generation;
+    if (refreshInFlight) await refreshInFlight;
+    if (myGeneration !== generation) return { ok: false, error: "session_not_armed", snapshot };
+    const beforeRead = acceptedRead;
     const current = await refresh("takeover_precheck");
+    if (myGeneration !== generation) return { ok: false, error: "session_not_armed", snapshot };
+    if (acceptedRead === beforeRead) return { ok: false, error: "ownership_uncertain", snapshot: current };
+    if (!current || current.uncertain) return { ok: false, error: "ownership_uncertain", snapshot: current };
     if (!current || current.state === DRIVER_STATES.glassesDrive) {
       return { ok: true, snapshot: current, noop: true };
     }
     if (current.state === DRIVER_STATES.desktopWorking) {
       return { ok: false, error: "desktop_working", snapshot: current };
     }
-    takeOver = true;
+    const scope = holderScope(lastResult);
+    if (!scope) return { ok: false, error: "holder_unverified", snapshot: current };
+    takeOver = scope;
     debug("take_over", {});
     const next = buildSessionDriverSnapshot(armedKey, lastResult, { takeOver: true, nowMs: now() });
     emit(next);
@@ -446,6 +508,19 @@ function createSessionDriverWatch(opts = {}) {
     disarm,
     refresh,
     requestTakeOver,
+    projection(key) {
+      if (!key || key !== armedKey || snapshot?.sessionKey !== key || !receiverFingerprint || observedAtMs === null) return null;
+
+      if (watches.size !== 2 || [...watches.values()].some(entry => !entry.watcher)) return null;
+      return {
+        contract: "ocuclaw.session-driver-projection", contractVersion: 1,
+        ...projectSessionDriverFields(snapshot),
+        sessionId: snapshot.sessionId,
+        receiverFingerprint,
+        observationGeneration: `${observationEpoch}:${generation}:${acceptedRead}`,
+        observedAtMs,
+      };
+    },
     snapshot: () => snapshot,
     armedKey: () => armedKey,
     diagnostics,

@@ -196,7 +196,7 @@ function buildFamilies(source, options = {}) {
       },
       foreignSessions: {
 
-        adopt: isHermes && options.agentCatalogSnapshot?.foreignSessionAdopt === true,
+        adopt: false,
 
         driverLock: isHermes && options.agentCatalogSnapshot?.foreignSessionAdopt === true,
 

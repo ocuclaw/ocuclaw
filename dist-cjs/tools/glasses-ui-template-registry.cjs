@@ -52,7 +52,7 @@ const entries = [
     wireKind: { status: "existing", name: "text_surface" },
     wireTemplateField: "image_caption",
     intent:
-      "Show one small greyscale image with a single caption line under it — a welcome card, a rasterized glyph, a one-off picture.",
+      "Show one small greyscale image with a balanced caption and optional heading — a welcome card, a rasterized glyph, a one-off picture.",
     summary:
       "The only template that exists in shipped code (PR #1242). One centered image above the body, which is the caption and also the whole fallback on 2.0.0 clients that cannot paint the image. One-shot: it is an image transfer, not a live surface.",
     fieldSet: {
@@ -61,7 +61,7 @@ const entries = [
         { name: "kind", type: "string", requirement: "required", limit: 'const "text_surface"', note: "" },
         { name: "template", type: "string", requirement: "required", limit: 'const "image_caption"', note: "the wire template field" },
         { name: "body", type: "string", requirement: "required", limit: "1-64 chars", note: "the caption AND the 2.0.0 fallback text" },
-        { name: "title", type: "string", requirement: "forbidden", limit: "", note: "rejected with image_caption_title_unsupported — one caption line only" },
+        { name: "title", type: "string", requirement: "optional", limit: "<=64 chars", note: "plain heading; existing measured title fit applies" },
         { name: "refresh", type: "object", requirement: "forbidden", limit: "", note: "rejected with image_caption_refresh_unsupported — re-render explicitly" },
         { name: "imageAsset", type: "string", requirement: "optional", limit: 'enum ["hermes_welcome"]', note: "exactly one of imageAsset OR the three inline image fields" },
         { name: "imageBase64", type: "string", requirement: "optional", limit: "<=73728 chars, decodes to <=41472 bytes, must be PNG", note: "IHDR dimensions must equal imageWidth/imageHeight" },

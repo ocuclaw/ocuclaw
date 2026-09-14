@@ -10,6 +10,7 @@ import re
 
 from .management_profiles import management_profile_home
 from .native_compat import probe
+from .native_readers import approval_reader
 
 FIELDS = {
     "mode": ("approvals.mode", "_get_approval_mode"),
@@ -73,7 +74,8 @@ def _snapshot(config, managed_scope, approval, transactions):
         managed_path = directory / "config.yaml"
         config.require_readable_config_before_write(managed_path)
     managed_scope.invalidate_managed_cache()
-    names = [name for name, (_, getter) in FIELDS.items() if callable(getattr(approval, getter, None))]
+    readers = {name: approval_reader(approval, getter) for name, (_, getter) in FIELDS.items()}
+    names = list(readers)
     native_fields = transactions.read_config_leaves([FIELDS[name][0] for name in names]) if transactions else None
     effective = config.load_config_readonly()
     result = {}
@@ -87,9 +89,9 @@ def _snapshot(config, managed_scope, approval, transactions):
             # Profile policy is deliberately neutral with respect to room and
             # session context; report their separate override scope below.
             block = effective.get("approvals") or {}
-            resolved = approval._normalize_approval_mode(block.get("mode", "manual"))
+            resolved = approval_reader(approval, "_normalize_approval_mode")(block.get("mode", "manual"))
         else:
-            resolved = getattr(approval, getter)()
+            resolved = readers[name]()
         saved = _saved_value(name, value) if present else None
         managed = bool(config.is_managed() or managed_scope.is_key_managed(path))
         revision = native_fields[path]["revision"] if native_fields else hashlib.sha256(

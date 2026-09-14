@@ -28,8 +28,8 @@ the bundle publisher; do not hand-edit an installed checkout.
 The human-facing baseline is Hermes release `v2026.8.31`. Its package version
 `0.21.0` and certified commit
 `29112bef099274229cadff79cdff7bf7b99c4b77` are separate identities. The
-current bundle, shared plugin, and client train is 2.0.5; the bundled setup
-guide has its own `1.3.20-hermes` version. The bidirectional client/plugin
+current bundle, shared plugin, and client train is 2.0.6; the bundled setup
+guide has its own `1.3.21-hermes` version. The bidirectional client/plugin
 compatibility floors are `2.0.2`. This beta bundle ships from the GitHub
 repository only; it has no npm or ClawHub publication leg.
 
@@ -191,11 +191,88 @@ Per-device revocation is future work.
   skills, native approval mirroring, and copy-to-glasses support where the
   Hermes public API permits them. Approval countdowns inherit the host's
   effective `approvals.timeout`; timeout is an implicit deny.
-- `render_glasses_ui` LiveUI integration, shipping enabled.
+- Eight registered tools, listed in `plugin.yaml` `provides_tools`: the four
+  LiveUI tools (`render_glasses_ui`, `get_glasses_ui_state`,
+  `manage_liveui_templates`, `manage_liveui_tasks`, shipping enabled), the three
+  phone tools carried over the control link (`get_current_location`,
+  `get_evenrealities_device_info`, `set_session_title`), and `ocuclaw_setup`.
+  `/ocuclaw-setup` and `hermes ocuclaw status|doctor` both report which of the
+  eight actually registered and name any that did not.
 - Optional Soniox speech-to-text and Even AI routing.
 
 These are shipping capabilities, not simulator or real-hardware validation
 claims for any particular release candidate.
+
+### Read-only session ownership data
+
+The Hermes companion writer emits `ocuclaw/companion-snapshot@2`
+(`schemaVersion: 2`), retaining the v1 fields and adding exactly one
+`ownership` field. The 32 KiB cap, atomic overwrite, `authority: read_only`
+and nested LiveUI schema v7 are unchanged. Generic writers without ownership
+still emit v1; readers accept both. Missing or legacy ownership is unavailable.
+
+An ownership value is either `null` or the version 1
+`ocuclaw.session-driver-projection` contract. It enumerates the existing phone
+driver fields (`state`, `locked`, `armed`, `takeOver`, `uncertain`,
+`takeOverAllowed`, `holdGeneration`, `holdState`, `holdSurface`, `inflight`,
+`inflightPlatform`, `sessionKey`) with the native `sessionId`, canonical
+receiver-home SHA-256 `receiverFingerprint`, `observationGeneration`, and
+`observedAtMs`. PIDs, paths, credentials and transcripts are excluded. This is
+the existing adopted-session watcher's projection, not another ownership
+controller or permission to send.
+
+The observation generation combines a watcher epoch, arm generation and its
+accepted-read sequence. The epoch and observation timestamp do not change
+when the companion heartbeat samples an unchanged controller. Receipt age
+provides transport freshness: the existing 15-second heartbeat samples the
+live getter, and a receipt older than 30 seconds is stale. A healthy idle
+controller therefore remains current without extra native polling. A failed
+read preserves uncertainty and the previous observation timestamp; disarm,
+missing watch handles or a different connected-app session returns `null`.
+
+The authenticated `/glasses/state` response retains its version 1 contract and
+adds `ownership` (`ocuclaw.ownership`, version 1, `readOnly: true`). Its status
+is `present`, `uncertain`, `stale` or `unavailable`; `projection` contains the
+validated observation or `null`. Native observation age and receipt sampling
+time are separate. ETags change when ownership changes or its receipt expires.
+The receiver verifies exact public key, namespace/profile, canonical home
+fingerprint and resolved native session ID. Ownership accepts only the
+receiver's canonical `ocuclaw/companion-snapshot.json`; configured shared paths
+and redirected companion paths remain unavailable for ownership, while their
+existing LiveUI view remains compatible. No fallback profile or alternate
+store is searched.
+
+For existing shared conversations, the Desktop Pulse Card shows the bounded native title
+(`sessionTitle`, resolved with `storedSessionId` in the same read), native
+profile and machine label. The four approved labels follow the phone's lock
+projection: an idle holder with a current takeover is **Glasses driving**;
+renewed Desktop work takes precedence. Missing or expired ownership is
+**Checking session…**, never an unlocked default. The existing 30-second
+receipt deadline also expires the displayed label without a push event.
+Connection/profile changes clear identity immediately and fence late results.
+A transient read failure retains only the last shared identity, not LiveUI
+content. Independent copies omit this ownership block because they have no
+shared driver watch.
+
+### Independent glasses chat copies
+
+The shipping interim offers **Copy as new glasses chat** in the phone Sessions
+sheet. The new chat starts with the source transcript; future replies stay
+separate. Each copy receives a fresh native ID and glasses key. Provenance is
+stored as `_branched_from` metadata without a native parent link, so Desktop
+resume cannot follow the original into the copy. The source remains unchanged.
+
+Continue here, Take over and the Pulse Card's Open chat action are unavailable.
+The app ignores older adoption advertisements, and the installed runtime refuses
+stale adoption/takeover requests. The session pill is passive. Existing shared
+chats retain ownership observation and mirroring; older copies are not migrated.
+
+Shared editing remains unavailable until native context refresh and cooperative
+ownership release are supported. Stock Desktop may retain cached model context
+after external writes even when its displayed transcript has refreshed. The
+copy flow uses the existing guarded native writer compatibility adapter and
+refuses engines lacking its required transaction primitives; no engine patch is
+included. Retained navigation helpers are not exposed by the shipping card.
 
 ## Reasoning on the status line
 

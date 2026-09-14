@@ -6,7 +6,7 @@ const CLIENT_DIAGNOSTICS_FILES = [
   "client/prior-session/events.jsonl", "client/prior-session/connection-log.json", "client/prior-session/errors.json",
 ];
 
-const ENV_KEYS = new Set(["appVersion", "platform", "userAgent", "online", "language", "lastTerminalErrorClass", "diag.persistVerdict", "timerGuard", "timerScheduler"]);
+const ENV_KEYS = new Set(["appVersion", "platform", "userAgent", "online", "language", "lastTerminalErrorClass", "diag.persistVerdict", "timerGuard", "timerScheduler", "hiddenPump", "framePump"]);
 const object = (value         )                               => !!value && typeof value === "object" && !Array.isArray(value);
 const count = (value         ) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000 ? value : 0;
 const time = (value         ) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;

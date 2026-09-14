@@ -1,5 +1,6 @@
 const { normalizeEvenAiRoutingMode, normalizeEvenAiDefaultAgent } = require("../even-ai/even-ai-settings-store.cjs");
 const { activeBackendDisplayName } = require("../gateway/backend-contract.cjs");
+const { projectSessionDriverFields } = require("./session-driver-projection.cjs");
 const { managementRequest, validManagementRequest, managementResult, managementFailure } = require("./hermes-management.cjs");
 const { normalizeOcuClawDefaultModel, normalizeOcuClawDefaultThinking, normalizeOcuClawAgentProgressNotes, normalizeOcuClawSystemPrompt, normalizeOcuClawDefaultAgent, normalizeOcuClawEvenAiSection, normalizeOcuClawEvenAiPeer, normalizeOcuClawPathwayBinding, normalizeOcuClawPathways } = require("./ocuclaw-settings-store.cjs");
 const { formatMainOperationReceived, formatSendAck } = require("./relay-worker-protocol.cjs");
@@ -9,6 +10,7 @@ const { validateGlassesUiInjectSpec } = require("../tools/glasses-ui-tool.cjs");
 const { normalizeSonioxTemporaryKeyErrorCodeForDownstream: normalizeSonioxTemporaryKeyErrorCode } = require("../domain/soniox-temp-key-errors.cjs");
 const { DEFAULT_EVEN_AI_DEDICATED_SESSION_KEY } = require("../domain/even-ai-session-keys.cjs");
 const { isAdoptableHermesSessionKey, isForeignHermesSessionKey } = require("./hermes-session-keys.cjs");
+const { normalizeSessionListFixture } = require("./session-list-fixture.cjs");
 const { normalizeAndValidateCustomSystemPrompt } = require("../domain/custom-system-prompt-limit.cjs");
 
 const PROTOCOL_SECRET_KEYS = new Set([
@@ -91,6 +93,9 @@ function createDownstreamHandler(opts) {
   const onSimulateStream = opts.onSimulateStream || null;
   const onSimulateStreamCancel = opts.onSimulateStreamCancel || null;
   const onSimulateActivity = opts.onSimulateActivity || null;
+  const onSimulateThinking = opts.onSimulateThinking || null;
+  const onSimulateModelCatalog = opts.onSimulateModelCatalog || null;
+  const onSimulateSessionList = opts.onSimulateSessionList || null;
   const onSimulateTool = opts.onSimulateTool || null;
   const onSimulateApproval = opts.onSimulateApproval || null;
   const onSimulateDemand = opts.onSimulateDemand || null;
@@ -496,9 +501,12 @@ function createDownstreamHandler(opts) {
       messageType === "simulateStreamCancel" ||
       messageType === "simulateActivity" ||
       messageType === "simulateTool" ||
+      messageType === "simulateThinking" ||
       messageType === "simulateApproval" ||
       messageType === "simulateDemand" ||
-      messageType === "simulateVoice"
+      messageType === "simulateVoice" ||
+      messageType === "simulateModelCatalog" ||
+      messageType === "simulateSessionList"
     );
   }
 
@@ -512,6 +520,9 @@ function createDownstreamHandler(opts) {
       requestId: parseOptionalTrimmedString(data.requestId),
       status: data.status || "accepted",
     };
+    if (data.sessionKey !== undefined) msg.sessionKey = data.sessionKey;
+    if (typeof data.aborted === "boolean") msg.aborted = data.aborted;
+    if (data.abortedRunId !== undefined) msg.abortedRunId = data.abortedRunId;
     if (data.error !== undefined) msg.error = data.error;
     if (data.errorCode !== undefined) msg.errorCode = data.errorCode;
     return JSON.stringify(msg);
@@ -1336,6 +1347,8 @@ function createDownstreamHandler(opts) {
         payload && typeof payload.effectiveThinkingLevel === "string"
           ? payload.effectiveThinkingLevel
           : "",
+      ...(typeof payload?.thinkingDefault === "string" ? { thinkingDefault: payload.thinkingDefault } : {}),
+      ...(Array.isArray(payload?.thinkingLevels) ? { thinkingLevels: payload.thinkingLevels } : {}),
       sessionKey: (payload && payload.sessionKey) || "",
       modelProvider:
         payload && typeof payload.modelProvider === "string"
@@ -2063,6 +2076,19 @@ function createDownstreamHandler(opts) {
       normalized === "double-tap" ||
       normalized === "double_tap" ||
       normalized === "doubletap" ||
+
+      normalized === "double-click-left" ||
+      normalized === "double_click_left" ||
+      normalized === "doubleclickleft" ||
+      normalized === "double-tap-left" ||
+      normalized === "double_tap_left" ||
+      normalized === "doubletapleft" ||
+      normalized === "double-click-right" ||
+      normalized === "double_click_right" ||
+      normalized === "doubleclickright" ||
+      normalized === "double-tap-right" ||
+      normalized === "double_tap_right" ||
+      normalized === "doubletapright" ||
       normalized === "long-press" ||
       normalized === "long_press" ||
       normalized === "longpress" ||
@@ -2087,6 +2113,24 @@ function createDownstreamHandler(opts) {
         normalized === "doubletap"
       ) {
         return "double-click";
+      }
+      if (
+        normalized === "double_click_left" ||
+        normalized === "doubleclickleft" ||
+        normalized === "double-tap-left" ||
+        normalized === "double_tap_left" ||
+        normalized === "doubletapleft"
+      ) {
+        return "double-click-left";
+      }
+      if (
+        normalized === "double_click_right" ||
+        normalized === "doubleclickright" ||
+        normalized === "double-tap-right" ||
+        normalized === "double_tap_right" ||
+        normalized === "doubletapright"
+      ) {
+        return "double-click-right";
       }
       if (normalized === "long_press" || normalized === "longpress") {
         return "long-press";
@@ -2924,15 +2968,41 @@ function createDownstreamHandler(opts) {
       return { ...payload, value: operation, ...(text ? { text } : {}) };
     }
     if (action === "webui-temple-editor") {
+
       const operation = parseOptionalTrimmedString(msg.value);
-      if (!operation || !["open", "set", "cancel", "apply"].includes(operation)) {
-        throw new Error("remote-control webui-temple-editor requires open|set|cancel|apply");
+      if (!operation || !["open", "picker", "search", "choose", "back", "set", "cancel", "apply"].includes(operation)) {
+        throw new Error(
+          "remote-control webui-temple-editor requires open|picker|search|choose|back|set|cancel|apply",
+        );
       }
       const text = typeof msg.text === "string" ? msg.text : "";
-      if (operation === "set" && !/^(LEFT|RIGHT)=(DEFAULT|SESSIONS|LIVEUI|AGENTS)$/.test(text)) {
-        throw new Error("remote-control webui-temple-editor requires a known gesture and destination");
+
+      if (operation === "set" && !/^(LEFT|RIGHT)=[^|,\r\n]{0,200}$/.test(text)) {
+        throw new Error(
+          "remote-control webui-temple-editor set requires LEFT=<token> or RIGHT=<token> " +
+            "(empty for Default; no ',', '|' or newline; max 200 chars)",
+        );
       }
-      return { ...payload, value: operation, text: operation === "set" ? text : "" };
+      if (operation === "picker" && !/^(LEFT|RIGHT)$/.test(text)) {
+        throw new Error("remote-control webui-temple-editor picker requires text LEFT or RIGHT");
+      }
+
+      if (operation === "choose" &&
+          (typeof msg.text !== "string" || !/^[^|,\r\n]{0,200}$/.test(text))) {
+        throw new Error(
+          "remote-control webui-temple-editor choose requires a storage token in text " +
+            "(empty string for Default; no ',', '|' or newline; max 200 chars)",
+        );
+      }
+      if (operation === "search" &&
+          (typeof msg.text !== "string" || text.length > 200 || /[\r\n]/.test(text))) {
+        throw new Error(
+          "remote-control webui-temple-editor search requires text: a single line of at most 200 chars",
+        );
+      }
+      const carriesText = operation === "set" || operation === "picker" ||
+        operation === "choose" || operation === "search";
+      return { ...payload, value: operation, text: carriesText ? text : "" };
     }
     if (action === "webui-menu-editor") {
       const operation = parseOptionalTrimmedString(msg.value);
@@ -3629,6 +3699,7 @@ function createDownstreamHandler(opts) {
       return {
         unicast: formatSessionAbortAck({
           requestId,
+          sessionKey,
           status: "rejected",
           error: "Even Terminal sessions are no longer supported.",
           errorCode: "unsupported_session_key",
@@ -3640,6 +3711,7 @@ function createDownstreamHandler(opts) {
       return {
         unicast: formatSessionAbortAck({
           requestId,
+          sessionKey,
           status: "rejected",
           error: "session abort is not available",
         }),
@@ -3649,21 +3721,24 @@ function createDownstreamHandler(opts) {
       return {
         unicast: formatSessionAbortAck({
           requestId,
+          sessionKey,
           status: "rejected",
           error: `${activeBackendDisplayName()} disconnected`,
         }),
       };
     }
-    return Promise.resolve(onAbortSession({ requestId, sessionKey })).then(
+    return Promise.resolve().then(() => onAbortSession({ requestId, sessionKey })).then(
       (result) => ({
         unicast: formatSessionAbortAck({
-          requestId,
           ...(result || { status: "accepted" }),
+          requestId,
+          sessionKey,
         }),
       }),
       (err) => ({
         unicast: formatSessionAbortAck({
           requestId,
+          sessionKey,
           status: "rejected",
           error: err && err.message ? err.message : "session abort failed",
           errorCode: err && (err.errorCode || err.code) ? (err.errorCode || err.code) : undefined,
@@ -3818,6 +3893,18 @@ function createDownstreamHandler(opts) {
       };
     }
 
+    const messageKind = parseOptionalTrimmedString(msg.messageKind);
+    if (messageKind && messageKind !== "narration") {
+      return {
+        unicast: formatSendAckCompat(
+          id,
+          "rejected",
+          "simulateStream messageKind must be narration when set",
+          undefined,
+        ),
+      };
+    }
+
     const request = {
       id,
 
@@ -3832,6 +3919,11 @@ function createDownstreamHandler(opts) {
       thinkingTailMs,
       runId: parseOptionalTrimmedString(msg.runId) || null,
       nativeLifecycle: msg.nativeLifecycle === true,
+
+      continuesRun: msg.continuesRun === true,
+
+      messageKind: messageKind || null,
+      messageId: parseOptionalTrimmedString(msg.messageId) || null,
     };
 
     return Promise.resolve(onSimulateStream(request)).then(
@@ -3973,6 +4065,78 @@ function createDownstreamHandler(opts) {
     }));
   }
 
+  function handleSimulateModelCatalog(msg) {
+
+    const reject = (ackId, reason) => ({
+      unicast: formatSendAckCompat(ackId, "rejected", reason, undefined),
+    });
+    const id = parseOptionalTrimmedString(msg.id);
+    if (!id) return reject(msg.id || null, "Missing required field: id");
+    if (!onSimulateModelCatalog) {
+      return reject(id, "simulateModelCatalog not supported by relay");
+    }
+    let models = null;
+    if (msg.models !== undefined && msg.models !== null) {
+      if (!Array.isArray(msg.models)) {
+        return reject(id, "simulateModelCatalog models must be an array or null");
+      }
+      models = [];
+      for (const row of msg.models) {
+        const provider = parseOptionalTrimmedString(row && row.provider);
+        const modelId = parseOptionalTrimmedString(row && row.id);
+        if (!provider || !modelId) {
+          return reject(
+            id,
+            "simulateModelCatalog rows need a non-empty provider and id",
+          );
+        }
+        models.push({
+          provider,
+          id: modelId,
+          name: parseOptionalTrimmedString(row.name) || modelId,
+          ...(Number.isFinite(row.contextWindow)
+            ? { contextWindow: Math.floor(row.contextWindow) }
+            : {}),
+          ...(typeof row.reasoning === "boolean" ? { reasoning: row.reasoning } : {}),
+        });
+      }
+    }
+    return ackSimulateVerb(id, "simulateModelCatalog", onSimulateModelCatalog({
+      id,
+      models,
+    }));
+  }
+
+  function handleSimulateSessionList(msg) {
+    const reject = (ackId, reason) => ({
+      unicast: formatSendAckCompat(ackId, "rejected", reason, undefined),
+    });
+    const id = parseOptionalTrimmedString(msg.id);
+    if (!id) return reject(msg.id || null, "Missing required field: id");
+    if (!onSimulateSessionList) {
+      return reject(id, "simulateSessionList not supported by relay");
+    }
+    let rows = null;
+    if (msg.rows !== undefined && msg.rows !== null) {
+      const normalized = normalizeSessionListFixture(msg.rows);
+      if (!normalized.ok) {
+        return reject(id, `simulateSessionList ${normalized.error}`);
+      }
+      rows = msg.rows;
+    }
+    return Promise.resolve(onSimulateSessionList({ id, rows })).then(
+      (result) => {
+        const status = result && result.status ? result.status : "accepted";
+        const ack = JSON.parse(
+          formatSendAckCompat(id, status, result && result.error ? result.error : undefined),
+        );
+        if (result && result.sessionList) ack.sessionList = result.sessionList;
+        return { unicast: JSON.stringify(ack) };
+      },
+      (err) => reject(id, err && err.message ? err.message : "simulateSessionList failed"),
+    );
+  }
+
   function handleSimulateTool(clientId, msg) {
     const id = parseOptionalTrimmedString(msg.id);
     if (!id) {
@@ -4049,7 +4213,41 @@ function createDownstreamHandler(opts) {
           : null,
       isError: msg.isError === true,
       elapsedMs,
+      toolPhase: msg.toolPhase === true,
+      toolCallId: parseOptionalTrimmedString(msg.toolCallId) || null,
       nativeLifecycle: msg.nativeLifecycle === true,
+    }));
+  }
+
+  function handleSimulateThinking(clientId = "", msg = JSON.parse("{}")) {
+
+    const reject = (ackId = JSON.parse("null"), reason = "") => ({
+      unicast: formatSendAckCompat(ackId, "rejected", reason, undefined),
+    });
+    const id = parseOptionalTrimmedString(msg.id);
+    if (!id) return reject(msg.id || null, "Missing required field: id");
+    if (!onSimulateThinking) return reject(id, "simulateThinking not supported by relay");
+    const runId = parseOptionalTrimmedString(msg.runId);
+    if (!runId) {
+      return reject(id, "simulateThinking requires runId (thinking frames are run-scoped)");
+    }
+    const phase = parseOptionalTrimmedString(msg.phase);
+    if (phase !== "update" && phase !== "finalize") {
+      return reject(id, "simulateThinking phase must be update|finalize");
+    }
+    const delta = typeof msg.delta === "string" ? msg.delta : "";
+    if (phase === "update" && !delta.trim()) {
+      return reject(id, "simulateThinking update requires a non-empty delta");
+    }
+    return ackSimulateVerb(id, "simulateThinking", onSimulateThinking({
+      id,
+      runId,
+      phase,
+      sessionKey: parseOptionalTrimmedString(msg.sessionKey) || null,
+      delta: phase === "update" ? delta : null,
+      reason: phase === "finalize"
+        ? parseOptionalTrimmedString(msg.reason) || "response_started"
+        : null,
     }));
   }
 
@@ -4201,7 +4399,37 @@ function createDownstreamHandler(opts) {
           }))
           .filter((option) => option.label)
       : [];
-    if (!options.length) {
+
+    let presentationError = null;
+    if (
+      msg.presentation !== undefined &&
+      msg.presentation !== "reel" &&
+      msg.presentation !== "adaptive"
+    ) {
+      presentationError = "simulateDemand presentation must be reel or adaptive";
+    } else if (
+      msg.selectionMode !== undefined &&
+      msg.selectionMode !== "single" &&
+      msg.selectionMode !== "multi" &&
+      msg.selectionMode !== "open"
+    ) {
+      presentationError = "simulateDemand selectionMode must be single, multi, or open";
+    } else if (msg.allowOther !== undefined && typeof msg.allowOther !== "boolean") {
+      presentationError = "simulateDemand allowOther must be boolean";
+    }
+    if (presentationError) {
+      return {
+        unicast: formatSendAckCompat(
+          id,
+          "rejected",
+          presentationError,
+          "invalid_demand_presentation",
+        ),
+      };
+    }
+    const selectionMode = msg.selectionMode || "single";
+
+    if (!options.length && selectionMode !== "open") {
       return {
         unicast: formatSendAckCompat(
           id,
@@ -4227,6 +4455,9 @@ function createDownstreamHandler(opts) {
       questionCount: Number.isInteger(msg.questionCount) && msg.questionCount >= 0
         ? msg.questionCount
         : 0,
+      presentation: msg.presentation || "reel",
+      selectionMode,
+      allowOther: msg.allowOther === true,
       sessionKey: parseOptionalTrimmedString(msg.sessionKey) || null,
     }));
   }
@@ -6004,15 +6235,8 @@ function createDownstreamHandler(opts) {
     const s = snapshot && typeof snapshot === "object" ? snapshot : {};
     return JSON.stringify({
       type: APP_PROTOCOL.sessionDriver,
-      sessionKey: typeof s.sessionKey === "string" ? s.sessionKey : null,
-      state: typeof s.state === "string" ? s.state : "glasses_drive",
-      locked: s.locked === true,
-      takeOver: s.takeOver === true,
-      holdState: typeof s.holdState === "string" ? s.holdState : null,
-      holdSurface: typeof s.holdSurface === "string" ? s.holdSurface : null,
+      ...projectSessionDriverFields(s),
       holdPid: Number.isFinite(s.holdPid) ? s.holdPid : null,
-      inflight: s.inflight === true,
-      inflightPlatform: typeof s.inflightPlatform === "string" ? s.inflightPlatform : null,
       updatedAtMs: Number.isFinite(s.updatedAtMs) ? s.updatedAtMs : Date.now(),
     });
   }
@@ -6794,8 +7018,14 @@ function createDownstreamHandler(opts) {
           return handleSimulateStreamCancel(clientId, msg);
         case "simulateActivity":
           return handleSimulateActivity(clientId, msg);
+        case "simulateModelCatalog":
+          return handleSimulateModelCatalog(msg);
+        case "simulateSessionList":
+          return handleSimulateSessionList(msg);
         case "simulateTool":
           return handleSimulateTool(clientId, msg);
+        case "simulateThinking":
+          return handleSimulateThinking(clientId, msg);
         case "simulateApproval":
           return handleSimulateApproval(clientId, msg);
         case "simulateDemand":
@@ -7189,8 +7419,8 @@ function createDownstreamHandler(opts) {
             return { unicast: formatSendAckCompat(id, "rejected", "glasses_ui_render depth must be an integer >= 1") };
           }
           const marker = parseOptionalTrimmedString(msg.marker);
-          if (marker && marker !== "listening" && marker !== "parked" && marker !== "inflight" && marker !== "processing") {
-            return { unicast: formatSendAckCompat(id, "rejected", "glasses_ui_render marker must be listening|parked|inflight|processing") };
+          if (marker && marker !== "listening" && marker !== "parked" && marker !== "inflight" && marker !== "processing" && marker !== "refreshing") {
+            return { unicast: formatSendAckCompat(id, "rejected", "glasses_ui_render marker must be listening|parked|inflight|processing|refreshing") };
           }
           try {
             const liveUiSession = resolveInjectedLiveUiSession(msg.sessionKey);

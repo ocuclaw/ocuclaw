@@ -121,6 +121,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from .models_rpc import _clean_str
+from .native_readers import command_stt_providers, stt_private_url_reader
 
 STT_METHOD_CAPABILITIES_LIST = "stt.capabilities.list"
 STT_METHOD_TRANSCRIBE = "stt.transcribe"
@@ -391,13 +392,11 @@ def _probe_openai(tt: Any, stt_config: Dict[str, Any]) -> Tuple[bool, Optional[s
         return True, None
     base_url = _clean_str(section.get("base_url"))
     if base_url:
-        is_local = getattr(tt, "_is_local_or_private_url", None)
-        if callable(is_local):
-            try:
-                if is_local(base_url):
-                    return True, None
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            if stt_private_url_reader(tt)(base_url):
+                return True, None
+        except Exception:  # noqa: BLE001 — unavailable native reader is not positive evidence
+            pass
     try:
         from tools.tool_backend_helpers import resolve_openai_audio_api_key
 
@@ -1019,7 +1018,7 @@ def _command_provider_ids(tt: Any, stt_config: Dict[str, Any]) -> set:
     try:
         return {
             name
-            for name, config in tt._iter_command_stt_providers(stt_config)
+            for name, config in command_stt_providers(tt, stt_config)
             if isinstance(name, str) and isinstance(config, dict)
         }
     except Exception:  # noqa: BLE001 — unenumerable means "declares nobody"
@@ -1552,7 +1551,7 @@ class SttRpc:
         """
         rows: List[Tuple[str, Dict[str, Any]]] = []
         try:
-            for name, config in tt._iter_command_stt_providers(stt_config):
+            for name, config in command_stt_providers(tt, stt_config):
                 if isinstance(name, str) and isinstance(config, dict):
                     rows.append((name, config))
         except Exception:  # noqa: BLE001

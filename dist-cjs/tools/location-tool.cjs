@@ -275,7 +275,7 @@ function createLocationToolHandler(deps) {
   };
 }
 
-const TOOL_DESCRIPTION = [
+const LOCATION_TOOL_DESCRIPTION = [
   "Read the user's current phone GPS coordinates when Location access is enabled in WebUI settings.",
   "Returns latitude, longitude, and any available accuracy, altitude, speed, heading, timestamp fields.",
   "Errors: location_access_disabled, app_not_connected, location_timeout, location_unavailable.",
@@ -337,7 +337,7 @@ function registerLocationTool(api, service) {
       const factorySessionKey = resolveToolSessionKey(ctx, service);
       return {
         name: "get_current_location",
-        description: TOOL_DESCRIPTION,
+        description: LOCATION_TOOL_DESCRIPTION,
         parameters: locationParametersSchema,
         async execute(_toolCallId, params) {
           const data = await handler.getCurrentLocation(params, { sessionKey: factorySessionKey });
@@ -365,4 +365,4 @@ function registerLocationTool(api, service) {
   };
 }
 
-module.exports = { locationParametersSchema, validateLocationInput, createPendingLocationMap, DEFAULT_LOCATION_TIMEOUT_MS, createLocationToolHandler, registerLocationTool };
+module.exports = { locationParametersSchema, validateLocationInput, createPendingLocationMap, DEFAULT_LOCATION_TIMEOUT_MS, LOCATION_TOOL_DESCRIPTION, createLocationToolHandler, registerLocationTool };

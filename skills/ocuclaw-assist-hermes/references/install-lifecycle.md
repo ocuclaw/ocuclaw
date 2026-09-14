@@ -1,7 +1,7 @@
 # OcuClaw installation and lifecycle reference
 
 This reference is for OcuClaw train `2.0.4` and Setup Assistant guide
-`1.3.20-hermes`. Those identities are independent of the Hermes package version
+`1.3.21-hermes`. Those identities are independent of the Hermes package version
 (`0.21.0`) and certified source commit.
 
 The Relay Credential is host-managed: initial plugin bootstrap generates it

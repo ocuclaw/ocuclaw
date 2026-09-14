@@ -216,13 +216,6 @@ function validateImageCaptionTemplate(obj = Object.create(null), body = "") {
       message: `text_surface template must be "image_caption", got ${JSON.stringify(obj.template)}`,
     };
   }
-  if (obj.title !== undefined) {
-    return {
-      ok: false,
-      code: "image_caption_title_unsupported",
-      message: "image_caption uses one caption line and does not accept title",
-    };
-  }
   if (body.length === 0 || body.length > GLASSES_UI_LIMITS.imageCaptionMax) {
     return {
       ok: false,
@@ -260,6 +253,7 @@ function validateImageCaptionTemplate(obj = Object.create(null), body = "") {
       spec: {
         kind: "text_surface",
         template: "image_caption",
+        ...(typeof obj.title === "string" ? { title: obj.title } : {}),
         body,
         imageAsset: obj.imageAsset,
       },
@@ -310,6 +304,7 @@ function validateImageCaptionTemplate(obj = Object.create(null), body = "") {
     spec: {
       kind: "text_surface",
       template: "image_caption",
+      ...(typeof obj.title === "string" ? { title: obj.title } : {}),
       body,
       imageBase64: obj.imageBase64,
       imageWidth,

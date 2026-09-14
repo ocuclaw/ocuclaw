@@ -67,6 +67,11 @@ function createGlassesUiCronEngine(deps) {
 
   const active = new Map();
   let currentPresence = "unknown";
+  const onStateChanged = typeof deps.onStateChanged === "function" ? deps.onStateChanged : () => {};
+
+  function notifyHttpRefreshState(state) {
+    if (state.tier === "http") onStateChanged(state.sessionKey, state.surfaceId);
+  }
 
   function isPaused(state) {
     return !!(isRefreshPaused() || state.ownerPaused || state.presencePaused);
@@ -74,6 +79,7 @@ function createGlassesUiCronEngine(deps) {
 
   function syncPausedFlag(state) {
     state.paused = isPaused(state);
+    notifyHttpRefreshState(state);
   }
 
   function clearNextTick(state) {
@@ -281,6 +287,7 @@ function createGlassesUiCronEngine(deps) {
     state.nextTickTimer = null;
     state.maxDurationTimer = null;
     active.delete(state.surfaceId);
+    notifyHttpRefreshState(state);
 
     if (opts && opts.silent === true) return;
     try {
@@ -845,6 +852,7 @@ function createGlassesUiCronEngine(deps) {
         }
         changed += 1;
       }
+      for (const state of active.values()) notifyHttpRefreshState(state);
       return changed;
     },
     getPresence() {

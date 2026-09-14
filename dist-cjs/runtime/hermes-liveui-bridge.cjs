@@ -375,6 +375,8 @@ function createHermesLiveUiBridge(opts = {}) {
         backend: "hermes",
         profile: parsed ? parsed.namespace : DEFAULT_HERMES_NAMESPACE,
         machine,
+        ownership: typeof relay.getSessionDriverProjection === "function"
+          ? relay.getSessionDriverProjection(machine?.sessionKey) : null,
       });
     },
     templateLibraryDir:
@@ -410,6 +412,8 @@ function createHermesLiveUiBridge(opts = {}) {
           publishConnectedAppSnapshot();
         })
       : () => {};
+  const unsubscribeDriver = typeof relay.onSessionDriverChanged === "function"
+    ? relay.onSessionDriverChanged(publishConnectedAppSnapshot) : () => {};
   publishConnectedAppSnapshot();
 
   const companionRefreshTimer = setInterval(publishConnectedAppSnapshot, 15_000);
@@ -772,6 +776,7 @@ function createHermesLiveUiBridge(opts = {}) {
       clearInterval(companionRefreshTimer);
       unsubscribeAppState();
       unsubscribeAgentTurn();
+      unsubscribeDriver();
     },
     _debugState() {
       return {

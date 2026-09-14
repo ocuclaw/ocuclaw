@@ -22,6 +22,7 @@ const LIVEUI_TASK_TOOL_DESCRIPTION = [
   "Drafts are phone-only and cannot run until the phone owner approves.",
   "Never replace a pending Draft without asking the user; use replacePendingDraft only after they confirm.",
   "Always pass the digest you read as expectedDigest.",
+  "Omit fields unused by the operation; if the tool transport requires every field, use null, never dummy strings or values. For preferredTemplateId use {\"unchanged\":true} to omit it: null on create_draft/update_draft explicitly clears the hint. create_draft uses taskId/name/request and optional description/icon/executor/context/settings/preferredTemplateId; update_draft additionally uses expectedDigest/replacePendingDraft; read uses taskId; list uses no fields; find_tasks uses query; save_ui_as_helper uses taskId/expectedDigest and optional templateId/name.",
   "preferredTemplateId is an optional visual hint (a saved Template id). On an approved Task, changing it, the name, or the description creates a pending Draft for phone-owner approval before discovery or execution can use it.",
   "save_ui_as_helper turns the surface currently on the glasses into a hidden reusable helper Template (typed slots, no run content) and sets it as the Task's Preferred Template; use it only when the user asks to save this UI alongside a Task Draft.",
   "When the user asks in ordinary conversation for a job that sounds like a saved Task, call find_tasks first; exactly one match → reuse its request, settings and their current settingValues (and preferredTemplate when present) as helpers and do the work in THIS conversation with your own tools; several matches → ask the user which Task they mean IN YOUR CHAT REPLY and stop; do NOT call render_glasses_ui or paint any picker or surface until the user answers; none → proceed normally; never tell the user a Task \"ran\" — discovery is reuse, not a Task Run.",
@@ -58,7 +59,24 @@ const settingSchema = {
   additionalProperties: false,
 };
 
-const liveuiTaskToolParametersSchema = {
+function nullableTaskToolOptionals(schema) {
+  if (schema.type === "array") {
+    return { ...schema, items: nullableTaskToolOptionals(schema.items) };
+  }
+  if (schema.type !== "object") return schema;
+  const required = new Set(schema.required || []);
+  return {
+    ...schema,
+    properties: Object.fromEntries(Object.entries(schema.properties).map(([key, value]) => {
+      const field = nullableTaskToolOptionals(value);
+      return [key, required.has(key) || key === "preferredTemplateId"
+        ? field
+        : { anyOf: [field, { type: "null" }] }];
+    })),
+  };
+}
+
+const liveuiTaskToolParametersSchema = nullableTaskToolOptionals({
   type: "object",
   required: ["operation"],
   properties: {
@@ -77,13 +95,22 @@ const liveuiTaskToolParametersSchema = {
     context: { type: "string", enum: ["isolated", "current_session"] },
     settings: { type: "array", maxItems: 16, items: settingSchema },
     preferredTemplateId: {
-      anyOf: [{ type: "string" }, { type: "null" }],
+      anyOf: [
+        { type: "string" },
+        { type: "null" },
+        {
+          type: "object",
+          required: ["unchanged"],
+          properties: { unchanged: { type: "boolean", enum: [true] } },
+          additionalProperties: false,
+        },
+      ],
     },
     expectedDigest: { type: "string" },
     replacePendingDraft: { type: "boolean" },
   },
   additionalProperties: false,
-};
+});
 
 const CREATE_KEYS = new Set([
   "taskId",
@@ -1465,7 +1492,33 @@ function createLiveuiTaskLibrary(opts = {}) {
 }
 
 async function dispatchLiveuiTaskOperation(handler, args) {
+
+  try {
+    args = plainDataCopy(args);
+  } catch (err) {
+    return rejected("task_not_static_data", err && err.message ? err.message : String(err));
+  }
   const operation = args && typeof args.operation === "string" ? args.operation : "";
+  if (args && typeof args === "object" && !Array.isArray(args)) {
+    const hint = args.preferredTemplateId;
+    if (hint && typeof hint === "object" && !Array.isArray(hint) &&
+      Object.keys(hint).length === 1 && hint.unchanged === true) {
+      delete args.preferredTemplateId;
+    }
+    for (const key of Object.keys(liveuiTaskToolParametersSchema.properties)) {
+      if (key === "operation" || args[key] !== null) continue;
+      if (key === "preferredTemplateId" && ["create_draft", "update_draft"].includes(operation)) continue;
+      delete args[key];
+    }
+    if (Array.isArray(args.settings)) {
+      for (const setting of args.settings) {
+        if (!setting || typeof setting !== "object" || Array.isArray(setting)) continue;
+        for (const key of Object.keys(settingSchema.properties)) {
+          if (!settingSchema.required.includes(key) && setting[key] === null) delete setting[key];
+        }
+      }
+    }
+  }
   if (operation === "create_draft") {
     const { operation: _operation, ...input } = args;
     return handler.createTaskDraft(input);

@@ -86,10 +86,8 @@ function abstractSurfaceToTemplate(spec, options) {
 
   const slots = [];
   const slotValues = {};
-
   const isImageCaption = source.template === "image_caption";
-  const hasTitle = !isImageCaption &&
-    typeof source.title === "string" && source.title.length > 0;
+  const hasTitle = typeof source.title === "string" && source.title.length > 0;
   if (hasTitle) {
     slots.push(requiredTextSlot("title", GLASSES_UI_LIMITS.titleMax));
     fields.title = "{{slot.title}}";

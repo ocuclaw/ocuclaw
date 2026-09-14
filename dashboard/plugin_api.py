@@ -14,6 +14,7 @@ import hashlib
 import importlib
 import json
 import logging
+import re
 import secrets
 import sys
 import threading
@@ -43,7 +44,7 @@ GLASSES_STATE_STALE_AFTER_MS = 30_000
 DEVICE_STATE_STALE_AFTER_MS = 120_000
 DEVICE_STATE_CLOCK_SKEW_MS = 60_000
 PLATFORM_RECEIPT_EMPIRICAL_TTL_S = 300.0
-SETUP_GUIDE_VERSION = "2026-09-10 (1.3.20-hermes)"
+SETUP_GUIDE_VERSION = "2026-09-14 (1.3.21-hermes)"
 
 _LEG_ORDER = (
     ("hermesGateway", "Hermes gateway"),
@@ -121,6 +122,8 @@ def _load_bundle_modules() -> Tuple[Any, ...]:
                     "dispatch",
                     "desktop_credentials",
                     "desktop_fleet",
+                    "conversation_resolver",
+                    "models_rpc",
                 )
             )  # type: ignore[return-value]
         except ImportError:
@@ -150,6 +153,8 @@ def _load_bundle_modules() -> Tuple[Any, ...]:
             "dispatch",
             "desktop_credentials",
             "desktop_fleet",
+            "conversation_resolver",
+            "models_rpc",
         )
     )  # type: ignore[return-value]
 
@@ -167,6 +172,8 @@ def _load_bundle_modules() -> Tuple[Any, ...]:
     dispatch_module,
     desktop_credentials,
     desktop_fleet,
+    conversation_resolver,
+    models_rpc,
 ) = _load_bundle_modules()
 
 
@@ -248,8 +255,8 @@ def _native_session_key(public_key: Any) -> Optional[str]:
     return native
 
 
-def _stored_session_id(home: Optional[Path], public_key: Any) -> Optional[str]:
-    """Resolve one glasses chat to its newest stored Hermes session ID."""
+def _stored_session(home: Optional[Path], public_key: Any) -> Optional[Dict[str, Any]]:
+    """Compatibility projection; explicit failures live on resolve-open-target."""
 
     native = _native_session_key(public_key)
     if home is None or native is None:
@@ -260,16 +267,65 @@ def _stored_session_id(home: Optional[Path], public_key: Any) -> Optional[str]:
     try:
         from hermes_state import SessionDB
 
-        with SessionDB(db_path=db_path, read_only=True) as db:
-            row = db._conn.execute(
-                "SELECT id FROM sessions WHERE session_key = ? "
-                "ORDER BY COALESCE(last_activity_at, started_at) DESC LIMIT 1",
-                (native,),
-            ).fetchone()
-    except Exception:  # noqa: BLE001 - a missing/unreadable store is a data state
-        log.debug("stored glasses session unavailable", exc_info=True)
+        db = SessionDB(db_path=db_path, read_only=True)
+        try:
+            row = conversation_resolver.resolve_live_conversation(db, native)
+        finally:
+            db.close()
+    except Exception as error:  # noqa: BLE001 - bounded diagnostics, never raw exceptions
+        reason = (error.reason if isinstance(error, conversation_resolver.ConversationUnavailable)
+                  else "storage_unavailable")
+        log.debug("stored glasses session unavailable phase=resolve_open_target reason=%s correlation=%s",
+                  reason, secrets.token_hex(8))
         return None
+    return row
+
+
+def _stored_session_id(home: Optional[Path], public_key: Any) -> Optional[str]:
+    row = _stored_session(home, public_key)
     return str(row["id"]) if row is not None else None
+
+
+@router.post("/resolve-open-target")
+def resolve_open_target(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Authenticated plugin receiver; paths and default substitutions are forbidden."""
+    key = body.get("sessionKey")
+    base = {"contract": "ocuclaw.open-target", "contractVersion": 1,
+            "operationId": secrets.token_hex(8),
+            "sessionKey": key if isinstance(key, str) else None,
+            "observedAtMs": _now_ms(), "expiresAtMs": _now_ms() + GLASSES_STATE_STALE_AFTER_MS}
+    native = _native_session_key(key)
+    if native is None:
+        return {**base, "ok": False, "reason": "conversation_missing"}
+    namespace = key.split(":")[1]
+    profile = models_rpc.profile_for_namespace(namespace)
+    home = receipts.resolve_receipt_home()
+    # Only the already-served receiver's own profile is eligible. No sibling
+    # home discovery or cold/remote activation is performed by this endpoint.
+    if home is None:
+        return {**base, "ok": False, "reason": "profile_unavailable"}
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        if home.resolve() != Path(get_profile_dir(profile)).resolve():
+            return {**base, "ok": False, "reason": "profile_unavailable"}
+    except Exception:
+        return {**base, "ok": False, "reason": "profile_unavailable"}
+    base.update(namespace=namespace, nativeProfile=profile,
+                receiverFingerprint=hashlib.sha256(str(home.resolve()).encode()).hexdigest()[:24])
+    if not (home / "state.db").is_file():
+        return {**base, "ok": False, "reason": "conversation_missing"}
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=home / "state.db", read_only=True)
+        try:
+            row = conversation_resolver.resolve_live_conversation(db, native)
+        finally:
+            db.close()
+        return {**base, "ok": True, "storedSessionId": row["id"], "hasHistory": row["hasHistory"]}
+    except conversation_resolver.ConversationUnavailable as error:
+        return {**base, "ok": False, "reason": error.reason}
+    except Exception:
+        return {**base, "ok": False, "reason": "storage_unavailable"}
 
 
 def _empty_device_state(
@@ -1107,6 +1163,67 @@ def run_desktop_doctor() -> Dict[str, Any]:
         }
 
 
+_OWNERSHIP_FIELDS = frozenset({
+    "contract", "contractVersion", "sessionKey", "sessionId", "receiverFingerprint",
+    "observationGeneration", "observedAtMs", "state", "locked", "armed", "takeOver",
+    "uncertain", "takeOverAllowed", "holdGeneration", "holdState", "holdSurface",
+    "inflight", "inflightPlatform",
+})
+
+
+def _ownership_projection(body, home, path, stored_session_id, age_ms):
+    """A read-only projection of this receiver's existing controller observation."""
+    base = {"contract": "ocuclaw.ownership", "contractVersion": 1, "readOnly": True,
+            "status": "unavailable", "reason": "missing", "projection": None}
+    value = body.get("ownership")
+    if body.get("schema") != "ocuclaw/companion-snapshot@2" or value is None:
+        return base
+    def unavailable(reason):
+        return {**base, "reason": reason}
+    if not isinstance(value, Mapping) or set(value) != _OWNERSHIP_FIELDS:
+        return unavailable("invalid")
+    key = value.get("sessionKey")
+    if (value.get("contract") != "ocuclaw.session-driver-projection"
+            or type(value.get("contractVersion")) is not int or value["contractVersion"] != 1
+            or body.get("backend") != "hermes" or _native_session_key(key) is None
+            or key != body["liveui"].get("sessionKey")
+            or body.get("profile") != key.split(":")[1]):
+        return unavailable("scope_mismatch")
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        profile = models_rpc.profile_for_namespace(key.split(":")[1])
+        if (home is None or home.resolve() != Path(get_profile_dir(profile)).resolve()
+                or path.resolve() != home.resolve() / PLUGIN_NAME / COMPANION_SNAPSHOT_FILENAME
+                or value.get("receiverFingerprint") != receipts.fingerprint_home(home)):
+            return unavailable("receiver_mismatch")
+    except Exception:
+        return unavailable("receiver_unavailable")
+    if not stored_session_id or value.get("sessionId") != stored_session_id:
+        return unavailable("session_mismatch")
+    if (not isinstance(value.get("observationGeneration"), str)
+            or re.fullmatch(r"[a-f0-9-]{36}:\d+:\d+", value["observationGeneration"]) is None
+            or type(value.get("observedAtMs")) is not int
+            or not 0 <= value["observedAtMs"] <= body["generatedAtMs"] <= _now_ms()
+            or value.get("state") not in ("glasses_drive", "desktop_hold", "desktop_working")):
+        return unavailable("invalid")
+    for field in ("locked", "armed", "takeOver", "uncertain", "takeOverAllowed", "inflight"):
+        if type(value.get(field)) is not bool:
+            return unavailable("invalid")
+    for field in ("holdGeneration", "holdState", "holdSurface", "inflightPlatform"):
+        if value[field] is not None and (not isinstance(value[field], str) or len(value[field]) > 256):
+            return unavailable("invalid")
+    if not value["armed"]:
+        return unavailable("disarmed")
+    # The live getter is sampled at receipt publication. An unchanged, idle
+    # controller needs no new native read to remain current. Report native
+    # observation age separately; only receipt age expires the transport.
+    return {**base, "status": "stale" if age_ms > GLASSES_STATE_STALE_AFTER_MS else
+            "uncertain" if value["uncertain"] else "present", "reason": None,
+            "sampledAtMs": body["generatedAtMs"],
+            "observationAgeMs": max(0, _now_ms() - value["observedAtMs"]),
+            "projection": dict(value)}
+
+
 @router.get("/glasses/state")
 def get_glasses_state(
     response: Response,
@@ -1140,9 +1257,15 @@ def get_glasses_state(
     if not isinstance(body, Mapping):
         return _glasses_state_body("invalid", "wrong_schema", observed_at)
     if (
-        body.get("schema") != COMPANION_SNAPSHOT_SCHEMA
+        body.get("schema") not in (COMPANION_SNAPSHOT_SCHEMA, "ocuclaw/companion-snapshot@2")
         or body.get("authority") != "read_only"
         or not isinstance(body.get("liveui"), Mapping)
+    ):
+        return _glasses_state_body("invalid", "wrong_schema", observed_at)
+    if body.get("schema") == "ocuclaw/companion-snapshot@2" and (
+        type(body.get("schemaVersion")) is not int or body["schemaVersion"] != 2
+        or set(body) != {"schema", "schemaVersion", "generatedAtMs", "backend", "profile",
+                         "authority", "liveui", "ownership"}
     ):
         return _glasses_state_body("invalid", "wrong_schema", observed_at)
 
@@ -1157,7 +1280,12 @@ def get_glasses_state(
     age_ms = max(0, _now_ms() - generated_at_ms)
     liveui_snapshot = dict(body["liveui"])
     home = receipts.resolve_receipt_home()
-    stored_session_id = _stored_session_id(home, liveui_snapshot.get("sessionKey"))
+    stored_session = _stored_session(home, liveui_snapshot.get("sessionKey"))
+    stored_session_id = str(stored_session["id"]) if stored_session else None
+    title = stored_session.get("title") if stored_session else None
+    title = title.strip() if isinstance(title, str) else None
+    if title and (len(title) > 256 or any(ord(char) < 32 or ord(char) == 127 for char in title)):
+        title = None
     payload = {
         "contract": "ocuclaw.glasses-state",
         "contractVersion": 1,
@@ -1173,6 +1301,8 @@ def get_glasses_state(
         "homeFingerprint": receipts.fingerprint_home(home),
         "snapshot": liveui_snapshot,
         "storedSessionId": stored_session_id,
+        "sessionTitle": title or None,
+        "ownership": _ownership_projection(body, home, path, stored_session_id, age_ms),
     }
     rendered = json.dumps(payload, sort_keys=True)
     if any(forbidden in rendered for forbidden in ("tokenValue", "rawProfilePath")):
@@ -1182,6 +1312,9 @@ def get_glasses_state(
         {
             "generatedAtMs": generated_at_ms,
             "storedSessionId": stored_session_id,
+            "sessionTitle": title or None,
+            "ownership": {key: value for key, value in payload["ownership"].items()
+                          if key != "observationAgeMs"},
             "device": {
                 key: value
                 for key, value in payload["device"].items()

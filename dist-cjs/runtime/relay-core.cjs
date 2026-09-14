@@ -71,7 +71,7 @@ const { MIRROR_AUTHOR, MIRROR_ORIGIN, createSessionMirrorWatch } = require("./se
 const LIVEUI_TASK_DISCOVERY_CHANNEL_ONE =
   "The wearer may have saved LiveUI Tasks; before using shell, calendar or search tools for a job that sounds like a saved Task, call manage_liveui_tasks find_tasks.";
 
-const GLASSES_UI_MARKERS = new Set(["listening", "parked", "inflight", "processing"]);
+const GLASSES_UI_MARKERS = new Set(["listening", "parked", "inflight", "processing", "refreshing"]);
 function sanitizeGlassesMarker(v) { return GLASSES_UI_MARKERS.has(v) ? v : undefined; }
 
 function parseHermesFeatureTokens(raw         ) {
@@ -533,6 +533,8 @@ function createRelay(opts) {
   const pendingCommitPublishBySession = new Map();
 
   const simulateToolStarts = new Map();
+
+  const simulateThinkingBodies = new Map();
 
   const simulateOpenRuns = new Set();
 
@@ -1981,7 +1983,9 @@ function createRelay(opts) {
       previous.modelProvider !== config.modelProvider ||
       previous.model !== config.model ||
       previous.thinkingLevel !== config.thinkingLevel ||
-      previous.effectiveThinkingLevel !== config.effectiveThinkingLevel
+      previous.effectiveThinkingLevel !== config.effectiveThinkingLevel ||
+      previous.thinkingDefault !== config.thinkingDefault ||
+      JSON.stringify(previous.thinkingLevels) !== JSON.stringify(config.thinkingLevels)
     )) {
       server.broadcast(handler.formatSessionModelConfig(config));
     }
@@ -2289,6 +2293,14 @@ function createRelay(opts) {
       return snapshot;
     }
     server.broadcast(handler.formatProviderUsageSnapshot(snapshot || {}));
+    return snapshot;
+  }
+
+  function broadcastModelsCatalog(snapshot) {
+    if (!server || !handler || typeof handler.formatModelsCatalog !== "function") {
+      return snapshot;
+    }
+    server.broadcast(handler.formatModelsCatalog(snapshot || {}));
     return snapshot;
   }
 
@@ -3770,7 +3782,7 @@ function createRelay(opts) {
   let evenAiRouter = null;
   let evenAiRunWaiter = null;
   const pendingBufferedEvenAiResponses = new Map();
-  let relayApi = null;
+  let relayApi      = null;
 
   async function applyOcuClawSettingsPatch(patch = {}) {
     let localPatch = patch;
@@ -3935,12 +3947,16 @@ function createRelay(opts) {
     },
   });
 
+  const sessionDriverListeners = new Set();
   const sessionDriverWatch = createSessionDriverWatch({
     logger,
     request: (key     ) => gatewayBridge.request("sessions.driver", { key }),
     onState: (snapshot     ) => {
       if (server && handler && typeof handler.formatSessionDriverState === "function") {
         server.broadcast(handler.formatSessionDriverState(snapshot));
+      }
+      for (const listener of sessionDriverListeners) {
+        try { if (typeof listener === "function") listener(); } catch {  }
       }
     },
     onDebug: (event     , data     ) => {
@@ -4500,6 +4516,17 @@ function createRelay(opts) {
         "Simulator"
       ).trim();
       const text = typeof request.text === "string" ? request.text : "";
+
+      const narration = request.messageKind === "narration";
+      if (
+        narration &&
+        !(upstreamRuntime && typeof upstreamRuntime.ingestSimulatedGatewayEvent === "function")
+      ) {
+        return Promise.resolve({
+          status: "rejected",
+          error: "simulateStream narration not supported by relay",
+        });
+      }
       const chunkChars = Math.min(
         200,
         Math.max(1, request.chunkChars ?? 16),
@@ -4517,6 +4544,8 @@ function createRelay(opts) {
         Math.max(0, request.thinkingTailMs ?? 900),
       );
       const runId = request.runId || `sim-${Date.now()}-${++simulateStreamRunSeq}`;
+
+      const narrationMessageId = request.messageId || `${runId}:narration`;
       const nativeRunIsEmittable = nativeLifecycle
         ? ensureSimulatedRunOpen(runId, sessionKey, { nativeLifecycle })
         : false;
@@ -4551,6 +4580,7 @@ function createRelay(opts) {
           thinkingTailMs,
           chunkCount,
           supersededTimerCount,
+          messageKind: narration ? "narration" : null,
         }),
       );
 
@@ -4568,8 +4598,10 @@ function createRelay(opts) {
         const visibleChars = Math.min(text.length, (index + 1) * chunkChars);
         const delayMs = startDelayMs + (index * chunkIntervalMs);
         scheduleSimulateStreamTimer(streamRun, delayMs, () => {
+
           if (
             nativeRunIsEmittable &&
+            !narration &&
             !streamRun.nativeFirstChunkHandled
           ) {
             streamRun.nativeFirstChunkHandled = true;
@@ -4590,22 +4622,33 @@ function createRelay(opts) {
               }
             }
           }
+          if (narration && upstreamRuntime) {
 
-          const parsedSpans = parseTaggedSpans(text.slice(0, visibleChars), [
-            EMOJI_TAG_FAMILY_CONFIG,
-            PACE_TAG_FAMILY_CONFIG,
-          ]);
-          const { text: streamedText, spansByFamily } = applyMarkdownWithSpans(
-            parsedSpans,
-            streamPrefix,
-            conversationState,
-          );
-          server.broadcast(handler.formatStreaming(
-            streamedText,
-            spansByFamily.emoji || [],
-            spansByFamily.pace || [],
-            { runId, seq: index + 1 },
-          ));
+            upstreamRuntime.ingestSimulatedGatewayEvent("streaming", {
+              runId,
+              sessionKey,
+              text: text.slice(0, visibleChars),
+              messageId: narrationMessageId,
+              messageKind: "narration",
+            });
+          } else {
+
+            const parsedSpans = parseTaggedSpans(text.slice(0, visibleChars), [
+              EMOJI_TAG_FAMILY_CONFIG,
+              PACE_TAG_FAMILY_CONFIG,
+            ]);
+            const { text: streamedText, spansByFamily } = applyMarkdownWithSpans(
+              parsedSpans,
+              streamPrefix,
+              conversationState,
+            );
+            server.broadcast(handler.formatStreaming(
+              streamedText,
+              spansByFamily.emoji || [],
+              spansByFamily.pace || [],
+              { runId, seq: index + 1 },
+            ));
+          }
           emitDebug(
             "relay.protocol",
             "simulate_stream_chunk",
@@ -4624,15 +4667,29 @@ function createRelay(opts) {
       const completeDelayMs = startDelayMs + (chunkCount * chunkIntervalMs) + thinkingTailMs;
       scheduleSimulateStreamTimer(streamRun, completeDelayMs, () => {
         try {
+          if (narration && upstreamRuntime) {
 
-          conversationState.addMessage(
-            "assistant",
-            [{ type: "text", text: stripAllTaggedSpans(text) }],
-            sender,
-          );
-          broadcastPages();
+            upstreamRuntime.ingestSimulatedGatewayEvent("message", {
+              role: "assistant",
+              content: [{ type: "text", text }],
+              runId,
+              sessionKey,
+              id: narrationMessageId,
+              messageKind: "narration",
+              turnActive: true,
+            });
+          } else {
+
+            conversationState.addMessage(
+              "assistant",
+              [{ type: "text", text: stripAllTaggedSpans(text) }],
+              sender,
+            );
+            broadcastPages();
+          }
           if (nativeLifecycle) {
-            if (nativeRunIsEmittable) {
+
+            if (nativeRunIsEmittable && request.continuesRun !== true) {
               emitSimulatedRunComplete(runId, sessionKey, { nativeLifecycle });
             }
           } else {
@@ -4709,6 +4766,52 @@ function createRelay(opts) {
       return Promise.resolve({ status: "accepted", runId });
     },
 
+    onSimulateModelCatalog(request) {
+      const models = Array.isArray(request.models) ? request.models : null;
+      const snapshot = upstreamRuntime.setSimulatedModelCatalog(models);
+      emitDebug(
+        "relay.protocol",
+        "simulate_model_catalog",
+        "info",
+        { sessionKey: sessionService.ensureSessionKey() },
+        () => ({
+          messageId: request.id || null,
+          pinned: models !== null,
+          count: models ? models.length : 0,
+        }),
+      );
+      broadcastModelsCatalog(snapshot);
+      return Promise.resolve({ status: "accepted" });
+    },
+
+    onSimulateSessionList(request) {
+      const rows =
+        request.rows === undefined || request.rows === null ? null : request.rows;
+      return sessionService.setSimulatedSessionList(rows).then((result) => {
+        emitDebug(
+          "relay.protocol",
+          "simulate_session_list",
+          "info",
+          { sessionKey: sessionService.peekSessionKey() || undefined },
+          () => ({
+            messageId: request.id || null,
+            pinned: result.pinned,
+            count: result.count,
+            report: result.report,
+          }),
+        );
+        return broadcastSessions().then(() => ({
+          status: "accepted",
+          sessionList: {
+            pinned: result.pinned,
+            count: result.count,
+            anchorMs: result.anchorMs,
+            ...(result.report || {}),
+          },
+        }));
+      });
+    },
+
     onSimulateActivity(request) {
       const sessionKey = request.sessionKey || sessionService.ensureSessionKey();
       const runId = request.runId || `sim-${Date.now()}-${++simulateStreamRunSeq}`;
@@ -4780,6 +4883,8 @@ function createRelay(opts) {
       const nativeLifecycle = request.nativeLifecycle === true;
       const nowMs = Date.now();
       let elapsedMs = null;
+      const withToolPhase = request.toolPhase === true;
+      const toolCallId = request.toolCallId || `${runId}:tool:${tool}`;
       if (phase === "start") {
         simulateToolStarts.set(runId, nowMs);
         if (simulateToolStarts.size > 200) {
@@ -4795,6 +4900,13 @@ function createRelay(opts) {
           phase: "start",
         };
         if (args) activity.args = args;
+        if (withToolPhase) {
+          Object.assign(activity, {
+            toolPhase: "start",
+            activityId: toolCallId,
+            toolCallId,
+          });
+        }
         if (nativeLifecycle) {
           if (ensureSimulatedRunOpen(runId, sessionKey, { nativeLifecycle })) {
             emitSimulatedActivity(activity, { nativeLifecycle });
@@ -4810,6 +4922,29 @@ function createRelay(opts) {
             ? Math.max(0, nowMs - simulateToolStarts.get(runId))
             : null;
         simulateToolStarts.delete(runId);
+        if (withToolPhase) {
+
+          const endActivity = {
+            state: "thinking",
+            tool,
+            sessionKey,
+            runId,
+            origin: "tool",
+            phase: "update",
+          };
+          Object.assign(
+            endActivity,
+            { toolPhase: "end", activityId: toolCallId, toolCallId },
+            request.isError === true ? { isError: true } : {},
+          );
+          if (nativeLifecycle) {
+            if (ensureSimulatedRunOpen(runId, sessionKey, { nativeLifecycle })) {
+              emitSimulatedActivity(endActivity, { nativeLifecycle });
+            }
+          } else {
+            broadcastActivity(endActivity, "simulated");
+          }
+        }
       }
       emitDebug(
         "openclaw.run",
@@ -4832,6 +4967,60 @@ function createRelay(opts) {
       return Promise.resolve({ status: "accepted", runId });
     },
 
+    onSimulateThinking(request = JSON.parse("{}")) {
+      const sessionKey = request.sessionKey || sessionService.ensureSessionKey();
+      const runId = request.runId;
+      if (!upstreamRuntime || typeof upstreamRuntime.ingestSimulatedGatewayEvent !== "function") {
+        return Promise.resolve({
+          status: "rejected",
+          error: "simulateThinking not supported by relay",
+        });
+      }
+      const key = simulatedRunKey(runId, sessionKey);
+      const body = simulateThinkingBodies.get(key) || { text: "", seq: 0 };
+      simulateThinkingBodies.delete(key);
+      simulateThinkingBodies.set(key, body);
+      if (simulateThinkingBodies.size > 200) {
+        const oldest = simulateThinkingBodies.keys().next();
+        if (!oldest.done) simulateThinkingBodies.delete(oldest.value);
+      }
+      body.seq += 1;
+      if (request.phase === "update") {
+        body.text = body.text ? `${body.text}\n\n${request.delta}` : request.delta;
+        upstreamRuntime.ingestSimulatedGatewayEvent("thinking", {
+          phase: "update",
+          runId,
+          sessionKey,
+          text: body.text,
+          delta: request.delta,
+          seq: body.seq,
+          source: "simulate",
+        });
+      } else {
+        upstreamRuntime.ingestSimulatedGatewayEvent("thinking", {
+          phase: "finalize",
+          runId,
+          sessionKey,
+          reason: request.reason || "response_started",
+          seq: body.seq,
+        });
+      }
+      emitDebug(
+        "relay.protocol",
+        "simulate_thinking",
+        "info",
+        { sessionKey, runId },
+        () => ({
+          messageId: request.id || null,
+          phase: request.phase,
+          seq: body.seq,
+          textChars: body.text.length,
+          reason: request.phase === "finalize" ? request.reason || "response_started" : null,
+        }),
+      );
+      return Promise.resolve({ status: "accepted", runId });
+    },
+
     onSimulateDemand(request) {
       sendDemand({
         surfaceId: request.surfaceId,
@@ -4842,6 +5031,10 @@ function createRelay(opts) {
         deadlineSec: request.deadlineSec,
         questionIndex: request.questionIndex,
         questionCount: request.questionCount,
+
+        presentation: request.presentation,
+        selectionMode: request.selectionMode,
+        allowOther: request.allowOther,
         options: request.options,
       });
       return { status: "accepted" };
@@ -5099,7 +5292,11 @@ function createRelay(opts) {
     },
 
     onSessionDriverTakeOver(sessionKey) {
-      return sessionDriverWatch.requestTakeOver(sessionKey);
+      return Promise.resolve({
+        ok: false,
+        error: "shared_handoff_unavailable",
+        snapshot: sessionDriverWatch.snapshot(),
+      });
     },
 
     async onAdoptSession(sourceKey, options = {}) {
@@ -7393,6 +7590,14 @@ function createRelay(opts) {
 
     getSessionDriverDiagnostics() {
       return { ...sessionDriverWatch.diagnostics(), mirror: sessionMirrorWatch.diagnostics() };
+    },
+    getSessionDriverProjection(sessionKey     ) {
+      if (sessionKey !== relayApi.getConnectedAppActiveSessionKey()) return null;
+      return sessionDriverWatch.projection(sessionKey);
+    },
+    onSessionDriverChanged(listener     ) {
+      sessionDriverListeners.add(listener);
+      return () => sessionDriverListeners.delete(listener);
     },
 
     getSessionMirrorDiagnostics() {

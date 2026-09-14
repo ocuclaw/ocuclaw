@@ -169,7 +169,7 @@ function createDeviceInfoToolHandler(deps) {
   };
 }
 
-const TOOL_DESCRIPTION = [
+const DEVICE_INFO_TOOL_DESCRIPTION = [
   "Read the user's G2 glasses battery percentage. Returns { batteryLevel: <int 0-100> }.",
   "Errors: glasses_not_connected (no Even Realities device connected),",
   "device_info_timeout, device_unavailable (SDK could not read battery).",
@@ -200,7 +200,7 @@ function registerDeviceInfoTool(api, service) {
 
   api.registerTool({
     name: "get_evenrealities_device_info",
-    description: TOOL_DESCRIPTION,
+    description: DEVICE_INFO_TOOL_DESCRIPTION,
     parameters: deviceInfoParametersSchema,
     async execute(_toolCallId, params) {
       const data = await handler.getDeviceInfo(params, { sessionKey: "main" });
@@ -224,4 +224,4 @@ function registerDeviceInfoTool(api, service) {
   };
 }
 
-module.exports = { deviceInfoParametersSchema, validateDeviceInfoInput, createPendingDeviceInfoMap, DEFAULT_DEVICE_INFO_TIMEOUT_MS, createDeviceInfoToolHandler, registerDeviceInfoTool };
+module.exports = { deviceInfoParametersSchema, validateDeviceInfoInput, createPendingDeviceInfoMap, DEFAULT_DEVICE_INFO_TIMEOUT_MS, DEVICE_INFO_TOOL_DESCRIPTION, createDeviceInfoToolHandler, registerDeviceInfoTool };

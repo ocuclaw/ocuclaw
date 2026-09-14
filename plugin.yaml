@@ -1,7 +1,7 @@
 manifest_version: 1
 name: ocuclaw
 kind: platform
-version: 2.0.5
+version: 2.0.6
 description: >
   OcuClaw platform adapter for the hermes gateway. Spawns the shared OcuClaw
   Node runtime (glasses/phone relay, Even-AI endpoint, liveui engine) as a
@@ -15,6 +15,9 @@ provides_tools:
   - get_glasses_ui_state
   - manage_liveui_templates
   - manage_liveui_tasks
+  - get_current_location
+  - get_evenrealities_device_info
+  - set_session_title
   - ocuclaw_setup
 provides_hooks:
   - on_session_end

@@ -700,6 +700,54 @@ def _render_setup(
     return lines
 
 
+def _render_tools(inventory: Optional[Mapping[str, Any]]) -> List[str]:
+    """The provided-tool inventory section (#2804).
+
+    Pure, like every other renderer here: it prints the dict the adapter
+    collected and nothing else. Silent when the inventory is unavailable,
+    because a diagnostic that cannot read a fact must not invent one.
+
+    The per-tool warning lines use the same wording the adapter logs, so an
+    operator who greps a gateway log for a missing tool and an operator
+    reading this report are matching one string.
+    """
+    if not isinstance(inventory, Mapping):
+        return []
+    expected = list(inventory.get("expected") or [])
+    registered = set(inventory.get("registered") or [])
+    if not expected:
+        return []
+    lines = [
+        "",
+        "Provided Tools — what the manifest promises against what registered",
+    ]
+    if not inventory.get("observed"):
+        # This command runs in its own process. Only the gateway registers the
+        # runtime-advertised tools, so counting them here would report a
+        # healthy host as seven failures (#2804).
+        lines.extend(
+            [
+                f"  provided                  {len(expected)}",
+                "  registered                unknown from this process; the "
+                "gateway holds registration",
+                "                            state. Ask the agent to run "
+                "/ocuclaw-setup for the count.",
+            ]
+        )
+        lines.extend(f"  {_safe(name)}" for name in expected)
+        return lines
+    lines.append(
+        f"  registered                {len(registered & set(expected))} of "
+        f"{len(expected)}"
+    )
+    for name in expected:
+        state = "registered" if name in registered else "NOT registered"
+        lines.append(f"  {name:<32}{state}")
+    warnings = list(inventory.get("warnings") or [])
+    lines.extend(f"  {line}" for line in warnings)
+    return lines
+
+
 def _render_health(snapshot: Mapping[str, Any]) -> List[str]:
     health = snapshot.get("currentHealth") or {}
     legs = health.get("legs") or {}
@@ -1163,12 +1211,14 @@ def render_snapshot_text(
     replacement_safe: bool = True,
     claim_state: str = CLAIM_OWNED,
     prescribe: bool = True,
+    tools: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Render one snapshot as the human report. Pure; no clock, no host access."""
     lines: List[str] = []
     lines.extend(_render_header(snapshot))
     lines.extend(_render_provenance(snapshot))
     lines.extend(_render_setup(snapshot, facts, prescribe=prescribe))
+    lines.extend(_render_tools(tools))
     lines.extend(_render_health(snapshot))
     if facts is not None:
         lines.extend(
@@ -1292,6 +1342,23 @@ def _default_facts() -> Dict[str, Any]:
     from .adapter import _collect_health_facts
 
     return _collect_health_facts()
+
+
+def _default_tool_inventory() -> Dict[str, Any]:
+    """The provided-tool inventory, plus its warning lines (#2804).
+
+    Same lazy import as the facts collector and for the same reason. The
+    warnings travel WITH the inventory rather than being recomputed by the
+    renderer, so the report and a `--json` run cannot disagree about which
+    phone tools are missing.
+    """
+    from .adapter import missing_phone_tool_warnings, provided_tool_inventory
+
+    inventory = dict(provided_tool_inventory())
+    inventory["count"] = len(inventory.get("registered") or [])
+    inventory["expectedCount"] = len(inventory.get("expected") or [])
+    inventory["warnings"] = missing_phone_tool_warnings(inventory)
+    return inventory
 
 
 def prescription_eligible(
@@ -1545,6 +1612,7 @@ def run(
     teardown_fn: Optional[Callable[[Mapping[str, Any]], bool]] = None,
     replacement_fn: Optional[Callable[[Mapping[str, Any]], bool]] = None,
     removal_notice_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
+    tools_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
     stdout: Optional[TextIO] = None,
     stderr: Optional[TextIO] = None,
 ) -> int:
@@ -1558,6 +1626,7 @@ def run(
     # Resolved here rather than as bound defaults so a test can substitute the
     # collector on the module without reaching past an already-bound default.
     facts_fn = _default_facts if facts_fn is None else facts_fn
+    tools_fn = _default_tool_inventory if tools_fn is None else tools_fn
     observe_fn = doctor_lane.observe if observe_fn is None else observe_fn
     record_fn = doctor_lane.record_route_ownership if record_fn is None else record_fn
     teardown_fn = _default_teardown_permitted if teardown_fn is None else teardown_fn
@@ -1650,9 +1719,19 @@ def run(
     # that runs first turns an unclaimed host into an owned one.
     replacement_safe = claim_state in (CLAIM_OWNED, CLAIM_UNCLAIMED)
 
+    try:
+        tools = tools_fn()
+    except Exception:  # noqa: BLE001 - a diagnostic must not become an outage
+        tools = None
+
     if json_output:
         # Only the snapshot on stdout; human diagnostics go to stderr (#1273 §10).
+        # The snapshot's v1 key set is frozen, so the inventory is not smuggled
+        # into it; the missing-tool warnings still reach the operator, on the
+        # stream this contract reserves for exactly that.
         out.write(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
+        for line in (tools or {}).get("warnings") or []:
+            err.write(line + "\n")
     else:
         out.write(
             render_snapshot_text(
@@ -1663,6 +1742,7 @@ def run(
                 replacement_safe=replacement_safe,
                 claim_state=claim_state,
                 prescribe=(command == "doctor"),
+                tools=tools,
             )
         )
         if command == "doctor":

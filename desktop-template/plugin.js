@@ -234,6 +234,10 @@ const EMPTY_GLASSES_STATE = Object.freeze({
   gateway: Object.freeze({ running: false, loaded: false, state: null }),
   device: Object.freeze({ connected: null, batteryPercent: null, charging: null, inCase: null, observedAt: null, ageMs: null, stale: true }),
   companion: Object.freeze({ state: 'unavailable', ageMs: null, stale: true, backend: null, profile: null, snapshot: null }),
+  ownership: null,
+  receiver: null,
+  sessionTitle: null,
+  sharedSession: null,
 })
 const glassesStateStore = makeStore(EMPTY_GLASSES_STATE)
 let glassesStateApi = null
@@ -242,6 +246,7 @@ let glassesStateMounted = 0
 let glassesStateGeneration = 0
 let glassesStateWindowCleanup = null
 let glassesStateSocketCleanup = null
+let glassesStateReceiverCleanup = null
 
 const boundedBattery = value => (
   Number.isInteger(value) && value >= 0 && value <= 100 ? value : null
@@ -351,24 +356,53 @@ const invalidateGlassesStateQuery = () => {
 const glassesStateTick = async () => {
   if (!glassesStateMounted || !glassesStateApi || pluginAbsentStore.get()) return
   const generation = ++glassesStateGeneration
+  const receiver = {
+    connectionId: sdk.host.state?.connectionId?.get?.(),
+    profile: sdk.host.state?.['profile']?.get?.(),
+    label: null,
+  }
+  const current = () => glassesStateMounted && generation === glassesStateGeneration &&
+    receiver.connectionId === sdk.host.state?.connectionId?.get?.() &&
+    receiver['profile'] === sdk.host.state?.['profile']?.get?.()
+  const discard = () => {
+    // Older SDKs can lack atom subscriptions. A route first discovered by
+    // status() must still get another poll instead of stranding setup forever.
+    if (glassesStateMounted && generation === glassesStateGeneration) {
+      glassesStateStore.set(EMPTY_GLASSES_STATE)
+      scheduleGlassesPoll(0)
+    }
+  }
   let status = null
   try { status = await sdk.host.status() } catch {}
-  if (!glassesStateMounted || generation !== glassesStateGeneration) return
+  if (!current()) return discard()
   const facts = platformFacts(status)
   let paired = null
   let device = { connected: null, batteryPercent: null, charging: null, inCase: null, observedAt: null, ageMs: null, stale: true }
   let companion = { state: 'unavailable', ageMs: null, stale: true, backend: null, profile: null, snapshot: null }
   let controllerStatus = 'ready'
+  let ownership = null
+  let sessionTitle = null
+  const previous = glassesStateStore.get()
+  // Retain only identity across a transient read failure, never LiveUI content.
+  let sharedSession = previous.receiver?.connectionId === receiver.connectionId &&
+    previous.receiver?.['profile'] === receiver['profile'] ? previous.sharedSession : null
 
   if (facts.gateway.running && facts.gateway.loaded) {
     try {
       const setup = await glassesStateApi('/setup-card', { method: 'GET', timeoutMs: GLASSES_STATE_TIMEOUT_MS })
       if (setup && setup.contract === 'ocuclaw.desktop-setup-card') paired = setup.paired === true
+      const requestedAtMs = Date.now()
       const payload = await glassesStateApi('/glasses/state', { method: 'GET', timeoutMs: GLASSES_STATE_TIMEOUT_MS })
       device = normalizeGlassesDevice(payload)
       companion = normalizeGlassesState(payload)
+      ownership = pulseOwnershipText(receiver.connectionId) && pulseOwnershipText(receiver['profile'])
+        ? normalizePulseOwnership(payload, companion, requestedAtMs) : null
+      sessionTitle = pulseOwnershipText(payload.sessionTitle)
+      sharedSession = pulseOwnershipText(companion.snapshot?.sessionKey)
+        ? { sessionKey: companion.snapshot.sessionKey, storedSessionId: companion.snapshot.storedSessionId, title: sessionTitle } : null
     } catch (error) {
       if (isPluginAbsentError(error)) {
+        if (!current()) return discard()
         glassesStateStore.set({
           status: 'unavailable',
           observedAtMs: Date.now(),
@@ -386,7 +420,7 @@ const glassesStateTick = async () => {
     controllerStatus = 'unavailable'
   }
 
-  if (!glassesStateMounted || generation !== glassesStateGeneration) return
+  if (!current()) return discard()
   glassesStateStore.set({
     status: controllerStatus,
     observedAtMs: Date.now(),
@@ -394,13 +428,32 @@ const glassesStateTick = async () => {
     gateway: facts.gateway,
     device,
     companion,
+    ownership,
+    receiver,
+    sessionTitle,
+    sharedSession,
   })
+  // Display names are optional inventory, never routing authority. Do not
+  // delay ownership refresh or retain a label from another receiver.
+  if (typeof sdk.host.connections === 'function') {
+    void Promise.resolve().then(() => sdk.host.connections()).then(rows => {
+      if (!current() || !Array.isArray(rows)) return
+      const label = pulseOwnershipText(rows.find(row => row.id === receiver.connectionId)?.label)
+      glassesStateStore.set({ ...glassesStateStore.get(), receiver: { ...receiver, label } })
+    }).catch(() => {})
+  }
   scheduleGlassesPoll(glassesPollDelay())
 }
 
 const startGlassesStateController = (api, socket) => {
   glassesStateApi = api
   glassesStateMounted += 1
+  if (!glassesStateReceiverCleanup) {
+    glassesStateReceiverCleanup = [
+      watchHostAtom(sdk.host.state?.connectionId, clearProfileAbsence),
+      watchHostAtom(sdk.host.state?.['profile'], clearProfileAbsence),
+    ].filter(Boolean)
+  }
   if (!glassesStateWindowCleanup) {
     const refresh = () => scheduleGlassesPoll(0)
     window.addEventListener('focus', refresh)
@@ -430,6 +483,8 @@ const startGlassesStateController = (api, socket) => {
     glassesStateWindowCleanup = null
     glassesStateSocketCleanup?.()
     glassesStateSocketCleanup = null
+    for (const unsubscribe of glassesStateReceiverCleanup || []) unsubscribe()
+    glassesStateReceiverCleanup = null
   }
 }
 
@@ -962,6 +1017,58 @@ const pulseSessionPin = sessionKey => {
   const tail = parts[parts.length - 1] || sessionKey
   return tail.length > 14 ? `${tail.slice(0, 6)}…${tail.slice(-5)}` : tail
 }
+// PULSE_OWNERSHIP_BEGIN — only a validated, current receipt may name a driver.
+const pulseOwnershipText = value => typeof value === 'string' && value.trim() &&
+  value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value) ? value.trim() : null
+const normalizePulseOwnership = (payload, companion, receivedAtMs) => {
+  const value = payload?.ownership
+  const projection = value?.projection
+  if (value?.contract !== 'ocuclaw.ownership' || value.contractVersion !== 1 || value.readOnly !== true ||
+      value.status !== 'present' || companion.state !== 'present' || companion.stale ||
+      companion.backend !== 'hermes' || projection?.contract !== 'ocuclaw.session-driver-projection' ||
+      projection.contractVersion !== 1 || projection.armed !== true || projection.uncertain !== false ||
+      typeof projection.locked !== 'boolean' || typeof projection.takeOver !== 'boolean' ||
+      projection.sessionKey !== companion.snapshot?.sessionKey ||
+      !pulseOwnershipText(projection.sessionId) || projection.sessionId !== companion.snapshot?.storedSessionId ||
+      typeof projection.receiverFingerprint !== 'string' || projection.receiverFingerprint !== payload.homeFingerprint ||
+      !/^[a-f0-9]{64}$/.test(projection.receiverFingerprint) ||
+      !pulseOwnershipText(projection.observationGeneration) ||
+      !['glasses_drive', 'desktop_hold', 'desktop_working'].includes(projection.state) ||
+      !Number.isFinite(companion.ageMs) || companion.ageMs > 30000 ||
+      !Number.isFinite(value.sampledAtMs) || value.sampledAtMs !== payload.generatedAtMs) return null
+  // Match the phone's admission bit: an idle Desktop holder may remain present
+  // after a scoped takeover has lifted its lock. Renewed work always wins.
+  const state = projection.state === 'desktop_working' ? 'desktop_working'
+    : !projection.locked ? 'glasses_drive' : projection.state === 'desktop_hold' ? 'desktop_hold' : 'checking'
+  return { state, sessionKey: projection.sessionKey, sessionId: projection.sessionId,
+    receivedAtMs, expiresAtMs: receivedAtMs + 30000 - companion.ageMs }
+}
+const pulseOwnershipView = (controller, now) => {
+  const snapshot = pulseSnapshot(controller)
+  // A stale receipt can still identify which chat is being checked. It cannot
+  // identify a driver or enable Open chat. A receiver change clears both.
+  const shared = controller.sharedSession || snapshot
+  const key = pulseOwnershipText(shared?.sessionKey)
+  if (!key) return null
+  // Independent copies have no shared driver watch or ownership receipt.
+  // Keep their normal status card without an endless ownership check.
+  if (/^hermes:[^:]+:copy-/.test(key)) return null
+  const ownership = controller.ownership
+  const fresh = controller.status === 'ready' && controller.companion?.stale === false &&
+    ownership && ownership.sessionKey === key &&
+    ownership.sessionId === shared.storedSessionId && now >= ownership.receivedAtMs && now <= ownership.expiresAtMs
+  const state = fresh ? ownership.state : 'checking'
+  const receiver = controller.receiver || {}
+  const profile = pulseOwnershipText(receiver['profile']) || pulseOwnershipText(controller.companion?.profile)
+  const machine = receiver.connectionId && receiver.connectionId !== 'local'
+    ? pulseOwnershipText(receiver.label) || 'Remote machine' : null
+  const id = pulseOwnershipText(shared.storedSessionId) || key.split(':').pop()
+  return { state, title: pulseOwnershipText(shared.title) || pulseOwnershipText(controller.sessionTitle) || `Session ${id.slice(0, 6)}`,
+    identity: [profile, machine].filter(Boolean).join(' · '),
+    label: { glasses_drive: 'Glasses driving', desktop_hold: 'Desktop has this chat',
+      desktop_working: 'Desktop working', checking: 'Checking session…' }[state] }
+}
+// PULSE_OWNERSHIP_END
 const pulseContentShape = content => {
   if (!content || typeof content !== 'object' || Array.isArray(content)) return null
   const kind = typeof content.kind === 'string' ? content.kind : ''
@@ -1074,7 +1181,7 @@ const startPulseCardController = ctx => {
       try { ctx.os.notify({ ...copy, onActivate: () => openPulseCard() }) } catch {}
     }
   })
-  return unsubscribe
+  return () => { invalidatePulseNavigationCard(); unsubscribe() }
 }
 
 // The one preference the card keeps: whether the Agent rides the title bar.
@@ -1096,19 +1203,79 @@ const setPulseAgentEnabled = (ctx, enabled) => {
   try { ctx.storage.set(PULSE_AGENT_PREF_KEY, enabled === true) } catch {}
 }
 
-const openPulseSession = async (controller, onClose) => {
+// Stock Hermes navigation. Completion is the stock SDK's hydration result,
+// not a generation-bound fresh-transcript receipt or a cancellable native turn.
+let pulseNavigationCardGeneration = 0
+let pulseNavigationPending = null
+const pulseNavigationErrors = {
+  conversation_missing: 'This shared conversation is unavailable.',
+  identity_conflict: 'The shared conversation could not be identified safely.',
+  discovery_truncated: 'The shared conversation could not be identified safely.',
+  profile_unavailable: 'Open the owning local profile in Desktop, then retry.',
+  route_unavailable: 'Open chat currently supports the active local profile.',
+  unsupported_sdk: 'This Desktop does not support opening shared chats.',
+  loading_failed: 'Could not open this chat. Retry Open chat.',
+  loading_timeout: 'Loading timed out · retry Open chat',
+  storage_unavailable: 'The shared conversation is temporarily unavailable.',
+  storage_unsupported: 'This Hermes version cannot resolve the shared conversation.',
+  stale_receiver: 'The selected chat or profile changed. Retry Open chat.',
+  navigation_pending: 'The previous chat is still opening.',
+}
+const invalidatePulseNavigationCard = () => { pulseNavigationCardGeneration += 1 }
+const openPulseSession = (ctx, controller, onClose) => {
   const sessionKey = pulseSessionKey(controller)
-  if (!sessionKey) return
-  const snapshot = pulseSnapshot(controller)
-  try {
-    await sdk.host.openSession(snapshot.storedSessionId ?? sessionKey, {
-      profile: controller.companion && controller.companion.profile || undefined,
-      intent: 'tab',
-    })
-    onClose?.()
-  } catch {
-    try { sdk.host.notify({ kind: 'error', title: 'Session unavailable', message: 'Hermes could not open this G2 session.' }) } catch {}
-  }
+  const connectionId = sdk.host.state?.connectionId?.get?.()
+  const profile = sdk.host.state?.['profile']?.get?.()
+  const generation = pulseNavigationCardGeneration
+  const scope = JSON.stringify([sessionKey, connectionId, profile, generation])
+  if (pulseNavigationPending) return pulseNavigationPending.scope === scope
+    ? pulseNavigationPending.promise : Promise.resolve({ ok: false, reason: 'navigation_pending' })
+  let invalidated = false
+  const current = () => !invalidated && generation === pulseNavigationCardGeneration &&
+    connectionId === sdk.host.state?.connectionId?.get?.() && profile === sdk.host.state?.['profile']?.get?.() &&
+    sessionKey === pulseSessionKey(glassesStateStore.get())
+  const cleanup = [
+    watchHostAtom(sdk.host.state?.connectionId, () => { invalidated = true }),
+    watchHostAtom(sdk.host.state?.['profile'], () => { invalidated = true }),
+    glassesStateStore.subscribe(state => { if (pulseSessionKey(state) !== sessionKey) invalidated = true }),
+  ].filter(Boolean)
+  const operation = { scope, promise: null }
+  operation.promise = Promise.resolve().then(async () => {
+    try {
+      if (!sessionKey) throw { reason: 'conversation_missing' }
+      // A profile name is not cross-machine routing authority. This first
+      // stock lane operates only on the currently served local receiver.
+      if (connectionId !== 'local') throw { reason: 'route_unavailable' }
+      if (!profile || controller.receiver?.connectionId !== connectionId ||
+          controller.receiver?.['profile'] !== profile) throw { reason: 'profile_unavailable' }
+      if (typeof ctx?.rest !== 'function' || typeof sdk.host.openSession !== 'function') throw { reason: 'unsupported_sdk' }
+      if (!current()) throw { reason: 'stale_receiver' }
+      const target = await ctx.rest('/resolve-open-target', { method: 'POST', body: { sessionKey }, timeoutMs: 7000 })
+      if (!current()) throw { reason: 'stale_receiver' }
+      if (!target || target.contract !== 'ocuclaw.open-target' || target.contractVersion !== 1 || target.sessionKey !== sessionKey) throw { reason: 'identity_conflict' }
+      if (target.ok !== true) throw { reason: Object.hasOwn(pulseNavigationErrors, target.reason) ? target.reason : 'loading_failed' }
+      if (target.nativeProfile !== profile || typeof target.storedSessionId !== 'string' || !target.storedSessionId.trim() ||
+          typeof target.hasHistory !== 'boolean' || !Number.isFinite(target.expiresAtMs) || target.expiresAtMs <= Date.now()) throw { reason: 'identity_conflict' }
+      await sdk.host.openSession(target.storedSessionId, {
+        profile: target.nativeProfile, intent: 'tab', keepAllProfilesScope: true,
+        awaitHydration: true, forceResume: true, expectHistory: target.hasHistory,
+        hydrationTimeoutMs: 20000,
+      })
+      if (!current()) throw { reason: 'stale_receiver' }
+      onClose?.()
+      return { ok: true }
+    } catch (error) {
+      const reason = !current() ? 'stale_receiver'
+        : Object.hasOwn(pulseNavigationErrors, error?.reason) ? error.reason
+          : /^Timed out /.test(error?.message || '') ? 'loading_timeout' : 'loading_failed'
+      return { ok: false, reason }
+    } finally {
+      for (const dispose of cleanup) dispose()
+      if (pulseNavigationPending === operation) pulseNavigationPending = null
+    }
+  })
+  pulseNavigationPending = operation
+  return operation.promise
 }
 
 const runPulseDoctor = async api => {
@@ -1136,6 +1303,7 @@ const PulseThumbnail = ({ shape }) => {
 }
 
 const closePulseCard = () => {
+  invalidatePulseNavigationCard()
   pulseCardOpenStore.set(false)
 }
 
@@ -1161,6 +1329,7 @@ function PulseCard({ ctx, onClose }) {
     ? snapshot.profile.trim()
     : typeof controller.companion?.profile === 'string' ? controller.companion.profile : null
   const sessionKey = pulseSessionKey(controller)
+  const ownershipView = pulseOwnershipView(controller, Date.now())
   const sessionPin = pulseSessionPin(sessionKey)
   const pillText = [profile, sessionPin].filter(Boolean).join(' · ')
   const shape = pulseContentShape(snapshot?.active?.content)
@@ -1179,20 +1348,24 @@ function PulseCard({ ctx, onClose }) {
   const stateGlow = connected === true && view.state !== 'error'
     ? '0 0 6px rgba(77,213,138,.5)'
     : 'none'
-  const openChat = () => void openPulseSession(controller, onClose)
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 15000)
     return () => window.clearInterval(timer)
   }, [])
 
-  const sessionPill = pillText ? sessionKey ? jsx('button', {
-    type: 'button',
-    title: 'Open the active G2 session',
-    onClick: openChat,
+  useEffect(() => {
+    const expiry = controller.ownership?.expiresAtMs
+    if (!Number.isFinite(expiry)) return undefined
+    const timer = window.setTimeout(() => setNow(Date.now()), Math.max(0, expiry - Date.now() + 1))
+    return () => window.clearTimeout(timer)
+  }, [controller.ownership])
+
+  const sessionPill = pillText ? sessionKey ? jsx('span', {
+    title: 'Active G2 session',
     'data-pulse-session': sessionKey,
     'data-floating-no-drag': '',
-    style: { border: '1px solid var(--ui-border)', borderRadius: 999, padding: '1px 7px', background: 'transparent', color: 'var(--ui-text-secondary)', fontFamily: 'var(--font-mono, monospace)', fontSize: 8.5, cursor: 'pointer' },
+    style: { maxWidth: 185, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', border: '1px solid var(--ui-border)', borderRadius: 999, padding: '1px 7px', background: 'transparent', color: 'var(--ui-text-secondary)', fontFamily: 'var(--font-mono, monospace)', fontSize: 8.5 },
     children: pillText,
   }) : jsx('span', {
     style: { border: '1px solid var(--ui-border)', borderRadius: 999, padding: '1px 7px', color: 'var(--ui-text-secondary)', fontFamily: 'var(--font-mono, monospace)', fontSize: 8.5 },
@@ -1203,7 +1376,7 @@ function PulseCard({ ctx, onClose }) {
     style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 },
     children: [
       jsx('span', { style: { color: 'var(--ui-accent, #4dd58a)', fontFamily: 'var(--font-mono, monospace)', fontSize: 8.5, letterSpacing: '.14em', textTransform: 'uppercase' }, children: 'OcuClaw' }),
-      jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 6 }, children: [
+      jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }, children: [
         sessionPill,
         jsx('button', {
           type: 'button',
@@ -1246,7 +1419,7 @@ function PulseCard({ ctx, onClose }) {
   const footer = jsxs('div', {
     style: { marginTop: 'auto', display: 'flex', alignItems: 'center', gap: 8 },
     children: [
-      jsx('button', { type: 'button', disabled: !sessionKey, onClick: openChat, 'data-floating-no-drag': '', style: { minHeight: 27, flex: 1, border: '1px solid var(--ui-accent, #4dd58a)', borderRadius: 3, padding: '6px 10px', background: 'transparent', color: 'var(--ui-accent, #4dd58a)', fontFamily: 'var(--font-mono, monospace)', fontSize: 8.5, letterSpacing: '.09em', textAlign: 'center', textTransform: 'uppercase', cursor: sessionKey ? 'pointer' : 'default', opacity: sessionKey ? 1 : .5 }, children: 'Open chat' }),
+      jsx('span', { style: { minWidth: 0, flex: 1, color: 'var(--ui-text-secondary)', fontSize: 10 }, children: 'Glasses chats stay separate from Desktop.' }),
       jsx(PulseThumbnail, { shape }),
     ],
   })
@@ -1282,6 +1455,18 @@ function PulseCard({ ctx, onClose }) {
       hero,
       agentRow,
       jsx('div', { 'aria-hidden': 'true', style: { height: 1, background: 'var(--ui-border)' } }),
+      ownershipView ? jsxs('div', {
+        'data-pulse-ownership': ownershipView.state,
+        style: { minWidth: 0, padding: '1px 0 3px' },
+        children: [
+          jsx('div', { title: ownershipView.title, style: { fontSize: 11, fontWeight: 600, lineHeight: 1.35, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: ownershipView.title }),
+          jsx('div', { title: ownershipView.identity, style: { color: 'var(--ui-text-tertiary)', fontFamily: 'var(--font-mono, monospace)', fontSize: 8.5, lineHeight: 1.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: ownershipView.identity }),
+          jsxs('div', { role: 'status', style: { display: 'flex', alignItems: 'center', gap: 6, marginTop: 3, color: 'var(--ui-text-secondary)', fontSize: 10, lineHeight: 1.5 }, children: [
+            jsx('span', { 'aria-hidden': 'true', style: { width: 5, height: 5, flexShrink: 0, borderRadius: '50%', background: ownershipView.state === 'glasses_drive' ? 'var(--ui-accent, #4dd58a)' : ownershipView.state === 'desktop_working' ? '#ffb454' : ownershipView.state === 'checking' ? 'var(--ui-text-tertiary)' : 'currentColor' } }),
+            ownershipView.label,
+          ] }),
+        ],
+      }) : null,
       footer,
     ],
   })
@@ -1904,6 +2089,8 @@ const announceAbsenceOnce = () => {
 }
 
 const clearProfileAbsence = () => {
+  glassesStateGeneration += 1
+  glassesStateStore.set(EMPTY_GLASSES_STATE)
   window.clearTimeout(absenceRecheckTimer)
   if (pluginAbsentStore.get()) pluginAbsentStore.set(false)
   // The card's probe restarts from its own effect; the claim loop needs a kick.
@@ -3445,8 +3632,12 @@ function create(initial='idle',options={}){
  if(byId[id].action==='reply'){p.gazeY=.6;p.curious=1;p.rx=58;p.ry=24;}
  let prop={kind:byId[id].prop,reveal:byId[id].prop?1:0,velocity:0,layout:byId[id].layout||null},icon={kind:byId[id].icon,reveal:byId[id].icon?1:0,velocity:0};
  let response=1,motion=1,expression='auto',view='auto',entryPose={...p},emotion='neutral',micro=MICRO_DEFAULT;
- const visits={idle:0};let entryVariant=0,pinnedIdle=null,resting=false,restAge=0,restFreeze=null,restVariant=null,restPending=false,restStarted=0;
+ const visits={idle:0};let entryVariant=0,pinnedIdle=null,pinnedThinking=null,resting=false,restAge=0,restFreeze=null,restVariant=null,restPending=false,restStarted=0;
  let transit=null;
+ // The approved Soft and elastic presence handoffs. Work props, authored
+ // performances and held poses keep their existing choreography.
+ const presence=new Set(['idle','listening','thinking','reply']);
+ const flowing=def=>!!transit&&presence.has(transit.from)&&presence.has(def.action)&&!resting&&!attending;
  // Episode identity comes from the existing Kotlin activity owner. Pose and
  // velocity never reset at an episode boundary; only its one-shot phrase does.
  let magic={key:null,performance:byId[id].magic||'telekinesis',phase:'entrance',elapsed:0,ready:false};
@@ -3471,10 +3662,10 @@ function create(initial='idle',options={}){
  let thinkingChoice=null,thinkingDetail=null;const lastChoices={};
  const random=()=>{randomState=(Math.imul(randomState,1664525)+1013904223)>>>0;return randomState/0x100000000;};
  function nextThinking(){
-  if(!bag.length){bag=Array.from({length:THINKING_VARIATIONS},(_,i)=>i);for(let i=bag.length-1;i>0;i--){const j=Math.floor(random()*(i+1));[bag[i],bag[j]]=[bag[j],bag[i]];}
+  if(pinnedThinking===null&&!bag.length){bag=Array.from({length:THINKING_VARIATIONS},(_,i)=>i);for(let i=bag.length-1;i>0;i--){const j=Math.floor(random()*(i+1));[bag[i],bag[j]]=[bag[j],bag[i]];}
    if(bag[bag.length-1]===thinkingVariant)[bag[0],bag[bag.length-1]]=[bag[bag.length-1],bag[0]];
   }
-  thinkingVariant=bag.pop();thinkingAge=0;
+  thinkingVariant=pinnedThinking===null?bag.pop():pinnedThinking;thinkingAge=0;
   const count=thinkingVariant===5?6:thinkingVariant===6?4:thinkingVariant===7?THINKING_IDEAS.length:1;
   const previous=lastChoices[thinkingVariant];let choice=Math.floor(random()*(count-(previous===undefined||count===1?0:1)));
   if(count>1&&previous!==undefined&&choice>=previous)choice++;
@@ -3485,14 +3676,14 @@ function create(initial='idle',options={}){
  const typing={glyph:'_',count:0,hand:null,downAt:-1};let typingSeed=8146;
  const tapArmed={l:false,r:false};
  const firstAction=byId[id].action;if(firstAction in visits)visits[firstAction]=1;
- const variation=()=>{const a=byId[id].action;if(a==='idle')return restVariant!==null?restVariant:pinnedIdle===null?(entryVariant+Math.floor(age/10))%IDLE_VARIATIONS:pinnedIdle;return a==='thinking'?thinkingVariant:0;};
+ const variation=()=>{const a=byId[id].action;if(a==='idle')return pinnedIdle!==null?pinnedIdle:restVariant!==null?restVariant:(entryVariant+Math.floor(age/10))%IDLE_VARIATIONS;return a==='thinking'?thinkingVariant:0;};
  function carrier(c,desired,dt,stiffness=18){
    if(c.kind!==desired&&c.reveal<.005&&Math.abs(c.velocity)<.08){c.kind=desired;}
    const goal=c.kind===desired&&desired?1:0;
    [c.reveal,c.velocity]=spring(c.reveal,c.velocity,goal,stiffness*response,dt);
    c.reveal=clamp(c.reveal,0,1);
  }
- function setState(next){if(!byId[next])return false;if(id===next)return true;if(age<.6)interruptions++;entryPose={...p};const prev=byId[id].action,a=byId[next].action;transit={t0:time,dir:Math.sign(byId[next].pose.x-p.x)||Math.sign(byId[next].pose.gazeX)||1,via:transitions[prev+'>'+a]||transitions['*>'+a]||null};id=next;age=0;switches++;attending=false;wakeBeat=null;stow=null;resting=false;restFreeze=null;restPending=false;restVariant=null;entryVariant=a in visits?visits[a]++%IDLE_VARIATIONS:0;if(a==='thinking')nextThinking();return true;}
+ function setState(next){if(!byId[next])return false;if(id===next)return true;if(age<.6)interruptions++;entryPose={...p};const prev=byId[id].action,a=byId[next].action;transit={from:prev,t0:time,dir:Math.sign(byId[next].pose.x-p.x)||Math.sign(byId[next].pose.gazeX)||1,via:transitions[prev+'>'+a]||transitions['*>'+a]||null};id=next;age=0;switches++;attending=false;wakeBeat=null;stow=null;resting=false;restFreeze=null;restPending=false;restVariant=null;entryVariant=a in visits?visits[a]++%IDLE_VARIATIONS:0;if(a==='thinking')nextThinking();return true;}
  function isStill(){if(cue||wakeBeat||restPending||stow)return false;const d=byId[id],calm=Object.values(v).every(x=>Math.abs(x)<.05)&&Math.abs(prop.velocity)<.01&&(icon.kind?icon.reveal>.999:icon.reveal<.001);
    if(attending)return restAge>=.3&&calm&&prop.reveal<.005;
    if(resting)return restAge>=.3&&calm&&(d.prop?prop.kind===d.prop&&prop.reveal>.999:prop.reveal<.005);
@@ -3632,6 +3823,20 @@ function create(initial='idle',options={}){
     q.x=29;q.helper=0;q.listenCue=0;q.errorCue=0;
     if(p.thinkingStudy>.025)q.studyTime=p.studyTime;
    }
+   const softTransition=flowing(def);
+   if(softTransition){
+    const retain=Math.exp(-age/.75)*.75;
+    for(const k of ['curious','focused','delighted','skeptical','browLiftL','browLiftR'])q[k]=q[k]*(1-retain)+entryPose[k]*retain;
+    const beat=Math.sin(Math.PI*Math.min(1,age/.95));
+    if(def.action==='listening'){
+     q.gazeX=q.gazeX*(1-beat)+.25*beat;q.gazeY*=1-beat;
+     q.browLiftL-=beat;q.tilt+=.045*beat;
+    }
+    if(transit.from==='thinking'&&def.action==='reply'){
+     q.delighted=Math.max(q.delighted,.6*beat);q.browY-=.7*beat;
+    }
+    if(def.action==='idle')q.tilt+=.035*beat;
+   }
    const intendedHead=q.x;
    const desiredProp=attending&&!(stow&&time-stow.at<STOW.sinkAt)?null:def.prop;
    const switchingStage=prop.kind&&(prop.kind!==desiredProp||prop.layout!==def.layout);
@@ -3664,9 +3869,9 @@ function create(initial='idle',options={}){
     const facial=expressions.includes(k)||k.startsWith('gaze')||k.startsWith('eye');
     const brow=k.startsWith('brow'),head=['x','y','tilt','turn'].includes(k);
     const micHand=pickingUpMic&&['rx','ry','rrot','ropen','rpoint'].includes(k);
-    const delay=facial||micHand?0:brow?.07:head?(transit?.30:.14):transitHands.has(k[0])?0:.26;
+    const delay=facial||micHand?0:brow?.07:head?(transit?.30:.14):transitHands.has(k[0])?0:softTransition?.43:.26;
     let goal=age<delay?entryPose[k]:q[k];
-    const weighted=microMove&&['x','y','tilt'].includes(k);
+    const weighted=(microMove||(softTransition&&age<1.4))&&['x','y','tilt'].includes(k);
     if(weighted&&age<delay)goal-=Math.sign(q[k]-entryPose[k])*(k==='tilt'?.04:1.5);
     const w=(restFreeze?32:facial||micHand?30:brow?23:head?12:k==='tempo'?5:def.loop==='code'&&/^[lr][xyrotpoint]+$/.test(k)?30:16)*response;
     [p[k],v[k]]=(weighted?springZ:spring)(p[k],v[k],goal,w,dt);
@@ -3703,7 +3908,7 @@ function create(initial='idle',options={}){
    }
  }
  function step(seconds){carry+=clamp(Number.isFinite(seconds)?seconds:0,0,.25);while(carry>=1/120){tick(1/120);carry-=1/120;}return snapshot();}
- function snapshot(){const drawn={...p},d=byId[id],beat=time%4.8,microBreath=micro&&age>=2&&!resting&&!d.static&&d.action!=='idle'&&['Work','Mind','Web','Agents'].includes(d.group)&&beat>=2.4&&beat<3.8?1:0;if(microBreath){drawn.y=Math.round(Math.max(13,drawn.y))+1;drawn.ly=Math.round(drawn.ly)+1;drawn.ry=Math.round(drawn.ry)+1;}if(transit&&age<.75&&!resting){drawn.delighted=0;drawn.surprised=0;if(Math.abs(drawn.gazeX)<.5&&Math.abs(drawn.gazeY)<.5)drawn.gazeY=-.6;}return {id,action:attending?'attend':d.action,p:drawn,v:{...v},time,phase,age,thinkingAge,emotion,switches,interruptions,variant:variation(),thinking:thinkingDetail?{...thinkingDetail}:null,resting,attending,stowing:!!stow,static:isStill(),microBreath,prop:{...prop},icon:{...icon},typing:{...typing}};}
+ function snapshot(){const drawn={...p},d=byId[id],beat=time%4.8,microBreath=micro&&age>=2&&!resting&&!d.static&&d.action!=='idle'&&['Work','Mind','Web','Agents'].includes(d.group)&&beat>=2.4&&beat<3.8?1:0;if(microBreath){drawn.y=Math.round(Math.max(13,drawn.y))+1;drawn.ly=Math.round(drawn.ly)+1;drawn.ry=Math.round(drawn.ry)+1;}if(transit&&age<.75&&!resting&&!flowing(d)){drawn.delighted=0;drawn.surprised=0;if(Math.abs(drawn.gazeX)<.5&&Math.abs(drawn.gazeY)<.5)drawn.gazeY=-.6;}return {id,action:attending?'attend':d.action,p:drawn,v:{...v},time,phase,age,thinkingAge,emotion,switches,interruptions,variant:variation(),thinking:thinkingDetail?{...thinkingDetail}:null,resting,attending,stowing:!!stow,static:isStill(),microBreath,prop:{...prop},icon:{...icon},typing:{...typing}};}
  const rawSnapshot=snapshot;
  function buildSnapshot(){const result=rawSnapshot();if(byId[id].magic){const studyTime=Math.min(magic.elapsed,MAGIC_REVEAL_END);result.magic={...magic,performance:byId[id].magic,studyTime};if(magic.ready){result.time=studyTime;result.phase=studyTime*2;result.action='magic';result.p={...p};}}return result;}
  function acceptPose(held){
@@ -3720,6 +3925,11 @@ function create(initial='idle',options={}){
  },configure(opts){
   if(byId[id].static&&age>=2)age=1;
   if(opts.idleVariation===null)pinnedIdle=null;else if(Number.isInteger(opts.idleVariation))pinnedIdle=((opts.idleVariation%IDLE_VARIATIONS)+IDLE_VARIATIONS)%IDLE_VARIATIONS;
+   // Director pin: fixes WHICH thinking gesture plays (3 = the cogs). The route/idea
+   // draw below it is untouched, and a pinned variant never drains the shuffled bag.
+   if(opts.idleVariation!==undefined)restVariant=null;
+   if(opts.thinkingVariation===null)pinnedThinking=null;else if(Number.isInteger(opts.thinkingVariation))pinnedThinking=((opts.thinkingVariation%THINKING_VARIATIONS)+THINKING_VARIATIONS)%THINKING_VARIATIONS;
+   if(opts.thinkingVariation!==undefined&&byId[id].action==='thinking')nextThinking();
   if(opts.response!==undefined)response=clamp(opts.response,.35,2);
   if(opts.motion!==undefined)motion=clamp(opts.motion,0,1.5);
   if(typeof opts.micro==='boolean')micro=opts.micro;
@@ -4048,7 +4258,13 @@ function render(s,options={}){
   const flyAt=(x,y,w)=>{dot(x,y);dot(x-1,y-w);dot(x+1,y-w);};
   const sparks=(x,y)=>{for(const [dx,dy] of [[-3,-3],[3,-3],[-3,3],[3,3],[0,-4],[0,4],[-4,0],[4,0]])dot(x+dx,y+dy);};
   const Z=['111','.1.','111'],ZB=['1111','..1.','.1..','1111'];
-  if(v===0){const y=still?23:P.yoyoY(t);thin(80,19,80,y-2);ballAt(80,y);}
+  if(v===0){
+   // The hand travels in from listening/reply. Carry the whole yo-yo with
+   // its drawn grip instead of revealing it at the eventual resting point.
+   const x=Math.round(p.rx),handY=Math.min(27,Math.max(5,Math.round(p.ry)));
+   const y=handY+(still?23:P.yoyoY(t))-15;
+   thin(x,handY+4,x,y-2);ballAt(x,y);
+  }
   if(v===1){if(still)ringAt(86,9,3);else if(t>=1&&t<3.5)ringAt(48,25,1+2.5*(t-1)/2.5);else if(t>=3.5&&t<7.2){const b=P.bubble(t);ringAt(b.x,b.y,3.5);}else if(t>=7.2&&t<7.5){const b=P.bubble(7.2);sparks(b.x,b.y);}}
   if(v===2){if(still){sp(75,3,Z);sp(81,1,Z);}else if(t>=1.5&&t<6){for(let k=0;k<3;k++){const zt=t-1.5-1.3*k;if(zt>0&&zt<3.2){const y=8-zt*3.5;if(y>=1)sp(74+zt*2.5,y,zt<1.6?Z:ZB);}}}else if(t>=6&&t<6.3)sparks(78,5);}
   if(v===3&&!still){if(t<7){const f=P.fly(t);flyAt(f.x,f.y,Math.floor(t*20)%2);}else if(t>=8.5&&t<9.5){const f=P.flyEscape(t);flyAt(f.x,f.y,Math.floor(t*20)%2);}}
@@ -4100,7 +4316,8 @@ function render(s,options={}){
  // Close briskly, hold for a beat, then ease open. The persistent clock
  // keeps a state switch from restarting a blink halfway through.
  const closureAt=age=>age<0||age>=.23?0:age<.065?ease(age/.065):age<.09?1:1-ease((age-.09)/.14);
- const bt=T%11.6,blinkClosure=Math.max(...[2.65,6.4,10.1,10.42].map(start=>closureAt(bt-start)));
+ const wakeOpen=1-Math.max(0,Math.min(1,s.displayWakeProgress||0));
+ const bt=T%11.6,blinkClosure=wakeOpen*Math.max(...[2.65,6.4,10.1,10.42].map(start=>closureAt(bt-start)));
  const names=['curious','focused','delighted','concerned','surprised','skeptical','sleepy','playful'];
  let expression='neutral',weight=.5;for(const name of names)if((p[name]||0)>weight){expression=name;weight=p[name];}
  // Solid eyes from the reference: the familiar little L, shortened lids,
@@ -4147,7 +4364,7 @@ function render(s,options={}){
   const baseH=source.length,w=source[0].length;
   const focus=Math.max(0,Math.min(1,Math.max(p.focused||0,p.skeptical||0)));
   const sleepy=Math.max(0,Math.min(1,p.sleepy||0));
-  const wink=side&&expression==='playful'?closureAt(T%4.6-.95):0;
+  const wink=side&&expression==='playful'?wakeOpen*closureAt(T%4.6-.95):0;
   const closure=Math.max(blinkClosure,wink,1-Math.max(0,Math.min(1,p.eye)));
   // Brief up/down glances tuck the lower stem just enough to make room for
   // real eye movement. The full Balanced L returns when looking straight on.

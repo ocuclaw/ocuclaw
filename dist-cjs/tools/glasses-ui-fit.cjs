@@ -6,18 +6,23 @@ const GLASSES_UI_FIT_BUDGETS = {
   canvasH: 288,
   headerH: 49,
   markerX: 548,
+  markerW: 22,
   markerGutter: 8,
-  titleLaneX: 0,
+  titleLaneX: 16,
+  cueRightEdge: 560,
+  cueExactPad: 16,
   titleChipExtraW: 24,
   cuedChipMaxW: 504,
   cuedTitleCueGap: 8,
-  contentPadding: 6,
-  frameBorderWidth: 1,
+  cueOverlaySlack: 6,
+  contentPadding: 0,
+  frameBorderWidth: 0,
 
   narrowContentInnerW: 430,
   mediumContentInnerW: 550,
   wideContentInnerW: 550,
   captionPriorityInnerW: 540,
+  imageCaptionGap: 8,
   fullReaderMaxVisibleLines: 8,
   centeredListMaxItems: 3,
   focusListMaxItems: 6,
@@ -33,16 +38,14 @@ const GLASSES_UI_FIT_BUDGETS = {
   detailSpotlightVisibleRows: 2,
   splitRailVisibleRows: 5,
   stackedReaderVisibleRows: 2,
-  detailsGap: -1,
+  detailsGap: 12,
   detailSpotlightMinDetailLines: 3,
 };
 
 const B = GLASSES_UI_FIT_BUDGETS;
 
-const TITLE_LANE_W = B.markerX - B.markerGutter;
+const TITLE_LANE_W = B.markerX - B.markerGutter - B.titleLaneX;
 const POST_HEADER_H = B.canvasH - B.headerH;
-const CONTENT_EDGE_W = B.contentPadding + B.frameBorderWidth;
-const EDGE_PIXELS = 2 * CONTENT_EDGE_W;
 
 let cachedLineHeight = 0;
 function lineHeight() {
@@ -107,8 +110,7 @@ function linesError(code, field, text, width, maxLines, advice) {
 }
 
 function titleBudgetPx(rightLimit) {
-  const maxChipWidth = Math.max(0, 2 * (rightLimit - B.canvasW / 2));
-  return Math.max(0, maxChipWidth - B.titleChipExtraW);
+  return Math.max(0, rightLimit - B.titleLaneX - B.cueOverlaySlack);
 }
 
 function checkTitle(spec) {
@@ -122,7 +124,8 @@ function checkTitle(spec) {
     const cueWidth = Math.max(
       ...Array.from({ length: cuedCount }, (_unused, index) => getTextWidth(`${index + 1}/${cuedCount}`)),
     );
-    const budget = B.cuedChipMaxW - B.titleChipExtraW - B.cuedTitleCueGap - cueWidth;
+    const markerX = B.cueRightEdge - cueWidth - B.cueExactPad - B.markerGutter - B.markerW;
+    const budget = titleBudgetPx(markerX - B.markerGutter);
     return widthError("title_too_long", "title", title, budget, "shorten it");
   }
   return widthError("title_too_long", "title", title, titleBudgetPx(B.titleLaneX + TITLE_LANE_W), "shorten it");
@@ -137,6 +140,13 @@ function checkTextBody(spec) {
     B.fullReaderMaxVisibleLines,
     'trim it or use paged_text_surface',
   );
+}
+
+function checkImageCaption(spec) {
+
+  const imageHeight = spec.imageHeight ?? 144;
+  const maxLines = Math.max(1, Math.floor((POST_HEADER_H - imageHeight - B.imageCaptionGap) / lineHeight()));
+  return linesError("body_too_long", "body", spec.body, B.wideContentInnerW, maxLines, "shorten the caption");
 }
 
 function checkPages(spec) {
@@ -159,6 +169,34 @@ function worstRowLines(variants, width) {
   return Math.max(...variants.map((row) => wrappedLines(row, width)));
 }
 
+function pretextPadAtLeast(target) {
+  for (let width = target; ; width += 1) {
+    for (let graves = 0; graves <= Math.floor(width / 4); graves += 1) {
+      const remaining = width - graves * 4;
+      if (remaining % 5 === 0) return " ".repeat(remaining / 5) + "̀".repeat(graves);
+    }
+  }
+}
+
+let checklistMarks = null;
+function checklistRow(label, checked) {
+  if (!checklistMarks) {
+    const candidates = ["[", "[̀x"].map((prefix) => {
+      const widths = new Map();
+      for (let width = 4; width <= 52; width += 1) {
+        const value = prefix + pretextPadAtLeast(width - 4) + "̀";
+        widths.set(getTextWidth(value), value);
+      }
+      return widths;
+    });
+    const common = [...candidates[0].keys()].filter((width) => candidates[1].has(width));
+    if (common.length === 0) throw new Error("Native checkbox interiors must share a measurable width");
+    const target = Math.min(...common);
+    checklistMarks = candidates.map((widths) => widths.get(target) + "] " + pretextPadAtLeast(12));
+  }
+  return checklistMarks[checked ? 1 : 0] + label;
+}
+
 function rowSuffixesFor(spec) {
   const children = Array.isArray(spec && spec.children) ? spec.children : [];
   return (i) => (children[i] ? B.childCueSuffix : "");
@@ -166,41 +204,22 @@ function rowSuffixesFor(spec) {
 
 function checkMeasuredList(labels, rowVariants, field, suffixAt = () => "") {
   const variants = labels.map((label, i) => rowVariants(label, i));
-  const centeredFits =
-    labels.length <= B.centeredListMaxItems &&
-    variants.every((rows) => worstRowLines(rows, B.narrowContentInnerW) <= 1);
-  if (centeredFits) return null;
-  const focusFits =
-    labels.length <= B.focusListMaxItems &&
-    variants.every((rows) => worstRowLines(rows, B.mediumContentInnerW) <= B.focusListMaxLines);
-  if (focusFits) {
-
-    for (let i = 0; i < labels.length; i += 1) {
-      if (!suffixAt(i)) continue;
-      if (worstRowLines(variants[i], B.mediumContentInnerW) <= 1) continue;
-      return linesError(
-        "item_too_long",
-        field(i),
-        variants[i][0],
-        B.mediumContentInnerW,
-        1,
-        "shorten it (a row that opens a child stays on one line)",
-      );
-    }
-    return null;
-  }
+  const width = Math.min(B.wideContentInnerW - getTextWidth("> "),
+    Math.max(1, ...variants.flat().map(getTextWidth)) + B.cueOverlaySlack);
+  const maxLines = labels.length <= B.focusListMaxItems ? B.focusListMaxLines : 1;
   for (let i = 0; i < labels.length; i += 1) {
-    const measured = worstRowLines(variants[i], B.wideContentInnerW);
-    if (measured <= 1) continue;
+    const rowLines = suffixAt(i) ? 1 : maxLines;
+    const measured = worstRowLines(variants[i], width);
+    if (measured <= rowLines) continue;
 
     const widest = variants[i].reduce((a, b) => (getTextWidth(a) >= getTextWidth(b) ? a : b));
     return linesError(
       "item_too_long",
       field(i),
       widest,
-      B.wideContentInnerW,
-      1,
-      "shorten it",
+      width,
+      rowLines,
+      suffixAt(i) ? "shorten it (a row that opens a child stays on one line)" : "shorten it",
     );
   }
   return null;
@@ -208,49 +227,16 @@ function checkMeasuredList(labels, rowVariants, field, suffixAt = () => "") {
 
 function detailsLayout(items, suffixAt = () => "") {
   const bodyOf = (item) => (typeof item.body === "string" ? item.body : "");
-  const spotlightDetailLines = items.map((item) => wrappedLines(bodyOf(item), B.wideContentInnerW));
-  const splitLabelLines = items.map((item, i) => wrappedLines(item.label + suffixAt(i), B.splitLabelInnerW));
-  const splitDetailLines = items.map((item) => wrappedLines(bodyOf(item), B.splitDetailInnerW));
-  let mode = "STACKED_READER";
-  if (
-    items.length <= B.detailSpotlightMaxItems &&
-    spotlightDetailLines.every((lines) => lines <= B.detailsShortMaxLines)
-  ) {
-    mode = "DETAIL_SPOTLIGHT";
-  } else if (
-    items.length <= B.splitRailMaxItems &&
-    splitLabelLines.every((lines) => lines <= 1) &&
-    splitDetailLines.every((lines) => lines <= B.detailsShortMaxLines)
-  ) {
-    mode = "SPLIT_RAIL";
-  }
-  const labelInnerWidth =
-    mode === "DETAIL_SPOTLIGHT"
-      ? B.wideContentInnerW
-      : mode === "SPLIT_RAIL"
-        ? B.splitLabelInnerW
-        : B.wideContentInnerW;
-  const detailInnerWidth = mode === "SPLIT_RAIL" ? B.splitDetailInnerW : B.wideContentInnerW;
-  const visibleRows =
-    mode === "DETAIL_SPOTLIGHT"
-      ? B.detailSpotlightVisibleRows
-      : mode === "SPLIT_RAIL"
-        ? B.splitRailVisibleRows
-        : B.stackedReaderVisibleRows;
-  const lh = lineHeight();
-  const labelVisibleLines = mode === "DETAIL_SPOTLIGHT" ? 2 * visibleRows - 1 : visibleRows;
-  const labelOuterHeight = labelVisibleLines * lh + EDGE_PIXELS;
+  const labelInnerWidth = Math.min(B.wideContentInnerW - getTextWidth("> "),
+    Math.max(1, ...items.map((item, i) => getTextWidth(item.label + suffixAt(i)))) + B.cueOverlaySlack);
+  const labelLines = Math.min(2, Math.max(1, ...items.map((item, i) =>
+    suffixAt(i) ? 1 : wrappedLines(item.label, labelInnerWidth))));
 
-  const spotlightDetailHeight =
-    Math.max(...spotlightDetailLines, B.detailSpotlightMinDetailLines) * lh + EDGE_PIXELS;
-  const detailHeight =
-    mode === "DETAIL_SPOTLIGHT"
-      ? spotlightDetailHeight
-      : mode === "SPLIT_RAIL"
-        ? 5 * lh + EDGE_PIXELS
-        : B.fullReaderMaxVisibleLines * lh - labelOuterHeight - B.detailsGap;
-  const detailCapacity = Math.max(1, Math.floor((detailHeight - EDGE_PIXELS) / lh));
-  return { mode, labelInnerWidth, detailInnerWidth, detailCapacity, bodyOf };
+  const detailInnerWidth = B.wideContentInnerW;
+  const maximumDetailLines = Math.min(4, B.fullReaderMaxVisibleLines - Math.min(items.length, 2) * labelLines - 1);
+  const detailCapacity = Math.min(maximumDetailLines,
+    Math.max(1, ...items.map((item) => wrappedLines(bodyOf(item), detailInnerWidth))));
+  return { labelInnerWidth, labelLines, detailInnerWidth, detailCapacity, bodyOf };
 }
 
 function checkListWithDetails(items, suffixAt = () => "") {
@@ -262,7 +248,7 @@ function checkListWithDetails(items, suffixAt = () => "") {
       `items[${i}].label`,
       items[i].label + suffixAt(i),
       layout.labelInnerWidth,
-      1,
+      suffixAt(i) ? 1 : layout.labelLines,
       "shorten it",
     );
     if (labelErr) return labelErr;
@@ -302,8 +288,7 @@ function checkGlassesUiFit(spec) {
 function checkOwnFit(spec) {
   switch (spec.kind) {
     case "text_surface":
-
-      if (spec.template === "image_caption") return null;
+      if (spec.template === "image_caption") return checkImageCaption(spec);
       return checkTextBody(spec);
     case "paged_text_surface":
       return checkPages(spec);
@@ -314,7 +299,7 @@ function checkOwnFit(spec) {
     case "checklist_surface":
       return checkMeasuredList(
         spec.items.map((item) => item.label),
-        (label) => [B.checklistUncheckedMark + label, B.checklistCheckedMark + label],
+        (label) => [checklistRow(label, false), checklistRow(label, true)],
         (i) => `items[${i}].label`,
       );
     case "list_with_details_surface":
