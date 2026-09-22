@@ -1,5 +1,5 @@
 const { GLASSES_UI_LIMITS } = require("./glasses-ui-limits.cjs");
-const { copyLiveuiStaticJson } = require("./glasses-ui-template-slots.cjs");
+const { LIVEUI_TEMPLATE_SLOT_JSON_MAX_BYTES, copyLiveuiStaticJson } = require("./glasses-ui-template-slots.cjs");
 
 const SUPPORTED_KINDS = new Set([
   "text_surface",
@@ -52,6 +52,53 @@ function itemLabels(kind, items) {
   return items.map((item) => item.label);
 }
 
+const GRAPHIC_SLOT_STRUCTURAL_KEYS = new Set(["type", "label", "icon"]);
+
+const GRAPHIC_VALUE_NUMBER_BOUND = 1e9;
+
+function graphicValueSlotDeclaration(fieldValue) {
+  if (typeof fieldValue === "string") return { type: "text" };
+  if (typeof fieldValue === "number" && Number.isFinite(fieldValue)) {
+    return { type: "number", min: -GRAPHIC_VALUE_NUMBER_BOUND, max: GRAPHIC_VALUE_NUMBER_BOUND };
+  }
+
+  if (Array.isArray(fieldValue)) return { type: "json", maxBytes: LIVEUI_TEMPLATE_SLOT_JSON_MAX_BYTES };
+  return null;
+}
+
+function abstractGraphicSlots(rawSlots) {
+  if (!Array.isArray(rawSlots) || rawSlots.length === 0) {
+    rejectUnsupported("graphic has no reusable slots");
+  }
+  const slots = [];
+  const slotValues = {};
+  const templateSlots = rawSlots.map((rawSlot, index) => {
+    if (!rawSlot || typeof rawSlot !== "object" || Array.isArray(rawSlot)) {
+      rejectUnsupported(`graphic.slots[${index}] is not a reusable slot object`);
+    }
+    const out = {};
+    for (const key of Object.keys(rawSlot)) {
+      if (GRAPHIC_SLOT_STRUCTURAL_KEYS.has(key)) {
+        out[key] = rawSlot[key];
+        continue;
+      }
+      const declaration = graphicValueSlotDeclaration(rawSlot[key]);
+      if (!declaration) {
+        rejectUnsupported(`graphic.slots[${index}].${key} is not reusable template data`);
+      }
+      const slotKey = `graphic${index}_${key}`;
+      slots.push({ key: slotKey, required: true, ...declaration });
+      slotValues[slotKey] = rawSlot[key];
+      out[key] = `{{slot.${slotKey}}}`;
+    }
+    if (typeof out.type !== "string") {
+      rejectUnsupported(`graphic.slots[${index}] has no type`);
+    }
+    return out;
+  });
+  return { graphicField: { slots: templateSlots }, slots, slotValues };
+}
+
 function pagedBody(pages) {
   if (!Array.isArray(pages) || pages.length === 0 ||
       !pages.every((page) => typeof page === "string")) {
@@ -87,6 +134,7 @@ function abstractSurfaceToTemplate(spec, options) {
   const slots = [];
   const slotValues = {};
   const isImageCaption = source.template === "image_caption";
+  const isGraphic = source.template === "graphic";
   const hasTitle = typeof source.title === "string" && source.title.length > 0;
   if (hasTitle) {
     slots.push(requiredTextSlot("title", GLASSES_UI_LIMITS.titleMax));
@@ -103,10 +151,19 @@ function abstractSurfaceToTemplate(spec, options) {
     }
     slots.push(requiredTextSlot(
       "body",
-      isImageCaption ? GLASSES_UI_LIMITS.imageCaptionMax : GLASSES_UI_LIMITS.bodyMax,
+      isGraphic
+        ? GLASSES_UI_LIMITS.graphicCaptionMax
+        : isImageCaption ? GLASSES_UI_LIMITS.imageCaptionMax : GLASSES_UI_LIMITS.bodyMax,
     ));
     fields.body = "{{slot.body}}";
     slotValues.body = body;
+
+    if (isGraphic) {
+      const graphicAbstraction = abstractGraphicSlots(source.graphic && source.graphic.slots);
+      fields.graphic = graphicAbstraction.graphicField;
+      slots.push(...graphicAbstraction.slots);
+      Object.assign(slotValues, graphicAbstraction.slotValues);
+    }
   } else {
     const labels = itemLabels(kind, source.items);
     slots.push({
@@ -120,7 +177,10 @@ function abstractSurfaceToTemplate(spec, options) {
   }
 
   const assets = {};
-  if (typeof source.imageAsset === "string") {
+  if (isGraphic) {
+
+    assets.template = "graphic";
+  } else if (typeof source.imageAsset === "string") {
     assets.template = "image_caption";
     assets.imageAsset = source.imageAsset;
   } else if (typeof source.imageBase64 === "string" || typeof source.imageUrl === "string") {

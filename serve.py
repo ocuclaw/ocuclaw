@@ -60,9 +60,12 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import shutil
 import subprocess
 from typing import Any, Callable, Dict, Mapping, NamedTuple, Optional, Sequence, Tuple
+
+from . import receipts
 
 # -- the serve port accessor (#1272) ------------------------------------------
 
@@ -312,6 +315,32 @@ def _run_json(
     return document, READ_OK
 
 
+#: What every reader and every printed command starts with when no host
+#: receipt says otherwise: the CLI from PATH, talking to the default socket.
+DEFAULT_TAILSCALE_ARGV: Tuple[str, ...] = ("tailscale",)
+
+
+def tailscale_argv() -> Tuple[str, ...]:
+    """The argv prefix that reaches this host's tailscaled (#2980).
+
+    A userspace daemon set up by the Cloudways path is reached only through
+    an explicit binary and ``--socket``; the host receipt records that. With
+    no receipt this is exactly the bare ``tailscale`` it always was. Read on
+    every call rather than cached: the receipt appears mid-setup, and the
+    very next doctor run must see it.
+    """
+    try:
+        receipt = receipts.read_tailscale_cli()
+    except Exception:  # noqa: BLE001 - a broken receipt degrades, never crashes
+        receipt = None
+    return receipt.argv if receipt is not None else DEFAULT_TAILSCALE_ARGV
+
+
+def tailscale_command_prefix() -> str:
+    """The shell-quoted form of :func:`tailscale_argv` for printed commands."""
+    return shlex.join(tailscale_argv())
+
+
 def read_serve_status(
     *,
     timeout_s: float = READ_TIMEOUT_S,
@@ -323,9 +352,26 @@ def read_serve_status(
     deliberately no code path here that can reach ``serve``'s mutating forms.
     """
     return _run_json(
-        ("tailscale", "serve", "status", "--json"),
+        tailscale_argv() + ("serve", "status", "--json"),
         timeout_s=timeout_s,
         runner=runner,
+    )
+
+
+def read_status_document(
+    *,
+    timeout_s: float = READ_TIMEOUT_S,
+    runner: Optional[Callable[..., Any]] = None,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """`tailscale status --json`, bounded and read-only.
+
+    The whole document, for the readers that need more of it than this node's
+    own identity: the phone check that opens the Cloudways ladder's step 7
+    reads the peer list out of it (#3178). Reading is all this can do; the
+    argv is fixed here and no caller supplies a subcommand.
+    """
+    return _run_json(
+        tailscale_argv() + ("status", "--json"), timeout_s=timeout_s, runner=runner
     )
 
 
@@ -340,9 +386,7 @@ def read_node_dns_name(
     not this host's route) and the phone address is built from it. Without it
     the classifier reports ``unknown``, never ``ready`` (#1275).
     """
-    document, code = _run_json(
-        ("tailscale", "status", "--json"), timeout_s=timeout_s, runner=runner
-    )
+    document, code = read_status_document(timeout_s=timeout_s, runner=runner)
     if document is None:
         return None, code
     self_node = document.get("Self")
@@ -736,7 +780,7 @@ def apply_command(*, relay_port: int, port: Optional[int] = None) -> str:
     :func:`doctor.plan_cert_precheck` (#2672).
     """
     return (
-        f"tailscale serve --bg --tls-terminated-tcp={serve_port(port)} "
+        f"{tailscale_command_prefix()} serve --bg --tls-terminated-tcp={serve_port(port)} "
         f"tcp://{LOOPBACK}:{int(relay_port)}"
     )
 
@@ -752,7 +796,7 @@ def teardown_command(*, port: Optional[int] = None) -> str:
     disable-one-proxy instruction, and it is the only removal command this
     codebase prints.
     """
-    return f"tailscale serve --tls-terminated-tcp={serve_port(port)} off"
+    return f"{tailscale_command_prefix()} serve --tls-terminated-tcp={serve_port(port)} off"
 
 
 def phone_address(*, dns_name: Optional[str], port: Optional[int] = None) -> Optional[str]:
@@ -770,6 +814,9 @@ def phone_address(*, dns_name: Optional[str], port: Optional[int] = None) -> Opt
 
 
 __all__ = [
+    "DEFAULT_TAILSCALE_ARGV",
+    "tailscale_argv",
+    "tailscale_command_prefix",
     "CLASSIFICATIONS",
     "CLASSIFY_ABSENT",
     "CLASSIFY_READY",
@@ -793,6 +840,7 @@ __all__ = [
     "phone_address",
     "read_node_dns_name",
     "read_serve_status",
+    "read_status_document",
     "serve_port",
     "teardown_command",
 ]

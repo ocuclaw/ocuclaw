@@ -1,6 +1,6 @@
 # Troubleshooting OcuClaw on Hermes
 
-**Guide version:** 2026-09-14 (1.3.21-hermes)
+**Guide version:** 2026-09-21 (1.3.22-hermes)
 
 This guidance was loaded through the `ocuclaw_setup` tool. Keep using the
 loaded setup skill for command, secret, checkpoint, and restart rules, and use
@@ -10,12 +10,12 @@ matching observed evidence. Diagnose read-only before a mutation. Never widen
 
 ## HERMES-GATE-REFUSED
 
-`hermes --version` must report a version in `>=0.21.0,<0.22.0`. When the host
+`hermes --version` must report a version in `>=0.21.1,<0.22.0`. When the host
 still exposes the certified platform-registration API, the recovery row remains
 registered outside that hard range, but its checks and adapter refuse startup.
 Treat that row as best-effort on an unsupported, ABI-drifted host; the version
 mismatch or plugin-load error remains visible in the Hermes gateway log.
-Do not work around the gate or say "0.21.0 or later". Updating Hermes is outside
+Do not work around the gate or say "0.21.1 or later". Updating Hermes is outside
 the OcuClaw plugin update phase and needs the user's separate decision.
 
 ## RELAY-PORT-CLAIMED
@@ -78,6 +78,10 @@ reopen it; keep the same address and token. If Even Hub does not yet offer it,
 say the phone update is pending rather than weakening the host plugin.
 
 ## TS-NOT-INSTALLED
+
+First run `hermes ocuclaw cloudways detect`. If it reports `cloudways` (or
+`likely` and the user confirms), do not use any installer below: the host has
+no root and no system Tailscale. Call `{"operation":"cloudways"}` instead.
 
 Keep supported installation inside the current Hermes session. Detect the OS
 before selecting exactly one branch below. Every branch uses one `clarify`
@@ -231,12 +235,12 @@ hermes profile list
 
 Enter for an actual rejected secondary-profile turn (`Unauthorized user:`),
 not merely because multiple profiles exist. Confirm the running engine is
-supported and the installed bundle matches the candidate. OcuClaw 2.0.4 uses
+supported and the installed bundle matches the candidate. OcuClaw 2.0.9 uses
 `build_source` to retain the shared relay-authenticated adapter; Hermes 0.21
 resolves this provenance for authorization and approval delivery.
 
-Check the selected profile is in the served allowlist and was admitted before
-the last gateway restart. A just-created profile is pending until restart and
+Check the selected profile is in the OcuClaw enrollment set and was admitted
+before the last gateway restart. A just-created profile is pending until restart and
 reconnect confirm its route. Use the same creation receipt to retry partial
 setup; never create a second profile to hide the first failure.
 
@@ -266,7 +270,7 @@ already recorded. Show it to the user and confirm it contains no secrets or
 network addresses:
 
 ```text
-OcuClaw Hermes beta report — guide 2026-09-14 (1.3.21-hermes)
+OcuClaw Hermes beta report — guide 2026-09-21 (1.3.22-hermes)
 Hermes version:
 OcuClaw bundle version (from plugin.yaml/list output):
 Backend: hermes

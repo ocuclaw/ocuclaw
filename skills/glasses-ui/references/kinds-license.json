@@ -1,0 +1,83 @@
+{
+  "schema": "glasses-ui/kinds-license@1",
+  "gate": "F3",
+  "decisionDate": "2026-08-25",
+  "clientVersionAtDecision": "2.0.2",
+  "purpose": "Machine-readable Gate F3 kind decisions. CI binds the live descriptor enum and every template-registry entry to this file for every PR lane, including Hermes releases.",
+  "humanRecord": "docs/design/liveui-research/contract/GATE-F3-KINDS-LICENSE.md",
+  "kinds": [
+    {
+      "kind": "text_surface",
+      "status": "shipping",
+      "minClientVersion": "2.0.0",
+      "evidence": [
+        "extensions/ocuclaw/src/tools/glasses-ui-descriptors.ts"
+      ]
+    },
+    {
+      "kind": "list_surface",
+      "status": "shipping",
+      "minClientVersion": "2.0.0",
+      "evidence": [
+        "extensions/ocuclaw/src/tools/glasses-ui-descriptors.ts"
+      ]
+    },
+    {
+      "kind": "list_with_details_surface",
+      "status": "shipping",
+      "minClientVersion": "2.0.0",
+      "evidence": [
+        "extensions/ocuclaw/src/tools/glasses-ui-descriptors.ts"
+      ]
+    },
+    {
+      "kind": "paged_text_surface",
+      "status": "shipping",
+      "minClientVersion": "2.0.2",
+      "templates": [
+        "paged_briefing@1",
+        "guided_procedure@1",
+        "walking_brief@1"
+      ],
+      "evidence": [
+        "#540 ruling: all LiveUI moves at current payloads were perceptually seamless on G2; choose by semantics, not paint cost",
+        "docs/graphics-bench/2026-07-19-sdk-image-text-playbook.md: contentOffset/contentLength are ignored and textContainerUpgrade full-replaces",
+        "docs/superpowers/plans/2026-07-04-liveui-master-plan.md Part 2 B1: bounded pages and local paging contract",
+        "#550: TypeScript and Kotlin descriptors, local full-page upgrades, answer-first attachment, teaching, lint/corpus coverage, and both-host conformance"
+      ]
+    },
+    {
+      "kind": "checklist_surface",
+      "status": "shipping",
+      "minClientVersion": "2.0.2",
+      "templates": [
+        "checklist_routine@1"
+      ],
+      "evidence": [
+        "#1702: TypeScript and Kotlin checklist descriptors, local toggle renderer, full-state close outcome, and host conformance",
+        "#545: queueMode log landed with sim-clean multi-tap collection",
+        "docs/superpowers/plans/2026-07-04-liveui-master-plan.md Part 2 B2: local non-actuating toggles",
+        "extensions/ocuclaw/src/tools/glasses-ui-descriptors.ts: existing local cursor renderer pattern"
+      ]
+    },
+    {
+      "kind": "stepper_surface",
+      "status": "held",
+      "reason": "No registry entry, bounded field contract, or behavioral evidence exists yet. Local commit semantics need a charter before a floor can be assigned.",
+      "evidence": [
+        "docs/superpowers/plans/2026-07-04-liveui-master-plan.md Part 2 B4 is a proposal only"
+      ]
+    },
+    {
+      "kind": "variable_list_surface",
+      "status": "rescoped",
+      "successor": "#1701",
+      "replacement": "Recipe/template array mapping on shipping list_surface and list_with_details_surface; no new wire kind.",
+      "reason": "Its proposed distinction is data mapping and bounded replacement, not a new display or interaction primitive.",
+      "evidence": [
+        "docs/superpowers/plans/2026-07-04-liveui-master-plan.md Part 2 B6",
+        "extensions/ocuclaw/src/tools/glasses-ui-template-registry.ts existing list templates"
+      ]
+    }
+  ]
+}

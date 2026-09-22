@@ -1,0 +1,279 @@
+{
+  "schema": "glasses-ui/http-recipe-field-sets@1",
+  "purpose": "Per-recipe known-field sets for the WP6/#544 deterministic plan lint (template_field_unknown) and the S1-1 versioned template registry. Language-neutral: no JS, no imports, parse and use.",
+  "companionDoc": "./http-recipe-cookbook.md",
+  "verifiedAgainst": {
+    "date": "2026-08-25",
+    "codeAnchors": [
+      "extensions/ocuclaw/src/tools/glasses-ui-tool.ts:38-66 (GLASSES_UI_REFRESH_LIMITS)",
+      "extensions/ocuclaw/src/tools/glasses-ui-tool.ts:105-137 (http validateRefreshSpec branch)",
+      "extensions/ocuclaw/src/tools/glasses-ui-recipes.ts:310-485 (executeHttpRecipe)",
+      "extensions/ocuclaw/src/tools/glasses-ui-cron.ts:109-171 (wrapForTemplate / substituteIntoTargets)",
+      "extensions/ocuclaw/src/tools/glasses-ui-template.ts:28-134 (resolvePath / applyFilter)",
+      "extensions/ocuclaw/src/tools/glasses-ui-array-mapping.ts (bounded itemsFromPath resolution, substitution, and UTF-8 clamping)"
+    ]
+  },
+  "notes": {
+    "templatePathSyntax": "Dot-separated. Array indices are bare numeric segments ('workflow_runs.0.status'), NOT bracket syntax. Bracket syntax belongs to recipe.jsonPath only.",
+    "implicitPaths": "Every recipe additionally exposes 'output' (the whole post-jsonPath value) and 'previous.<any path in this set>' (prior tick). A lint MUST accept both without listing them per recipe.",
+    "matching": "There is no recipe-id field on the wire today. Identify a spec's cookbook recipe by the 'match' object: method (default GET when absent) + urlHost + urlPathPrefix + jsonPath. All present keys must match; absent keys are wildcards.",
+    "fieldSetClosed": "true  = a template path outside knownFields is an error-grade finding. false = report at most a soft warning; the field set is legitimately extensible (query-driven or integration-driven).",
+    "openPrefixes": "Any template path under one of these prefixes is always acceptable regardless of fieldSetClosed."
+  },
+  "lintCodes": {
+    "template_field_unknown": "WP6 heuristic this file feeds. The plan's original rule was 'http with jsonPath -> skip' because the post-extraction shape was unknowable. A spec matching a recipe below is no longer unknowable: apply the recipe's fieldSetClosed policy instead of skipping."
+  },
+  "recipes": [
+    {
+      "id": "open_meteo_current@1",
+      "title": "Open-Meteo current weather",
+      "recipeKind": "http",
+      "match": {
+        "method": "GET",
+        "urlHost": "api.open-meteo.com",
+        "urlPathPrefix": "/v1/forecast",
+        "jsonPath": "$.current"
+      },
+      "requiresAllowHost": "api.open-meteo.com",
+      "auth": {
+        "mode": "none",
+        "credentialInHeaders": false
+      },
+      "cadence": {
+        "recommendedIntervalMs": 900000,
+        "minLegalIntervalMs": 1000,
+        "recommendedMaxDurationMs": 7200000,
+        "rationale": "The API's own 'current.interval' is 900 s; the data does not change faster. Keyless, but the cadence is a courtesy floor, not a rate limit."
+      },
+      "consent": {
+        "actuatesOnExpiry": false,
+        "actuatesOnTick": false,
+        "requiresStaleAfterMs": false,
+        "policy": "read_only_display",
+        "assertion": "Display-only. No expiry-actuated consequence. Silence is never consent."
+      },
+      "fieldSetClosed": false,
+      "fieldSetOpenReason": "The returned field set is exactly the caller's 'current=' query list. Requesting a field yields that field; a template path naming an unrequested field is still an authoring bug, but a lint cannot know the query's contents without parsing the URL.",
+      "openPrefixes": [],
+      "knownFields": [
+        { "path": "time", "type": "string", "example": "2026-08-19T00:45", "note": "local ISO, no zone suffix" },
+        { "path": "interval", "type": "number", "example": 900, "note": "seconds; the vendor's own refresh rate" },
+        { "path": "temperature_2m", "type": "number", "example": 19.0, "note": "degC by default; units live in the sibling current_units object that $.current drops" },
+        { "path": "relative_humidity_2m", "type": "number", "example": 73, "note": "percent" },
+        { "path": "wind_speed_10m", "type": "number", "example": 10.8, "note": "km/h by default" },
+        { "path": "weather_code", "type": "number", "example": 3, "note": "WMO code; needs a lookup table, do not paint raw" }
+      ],
+      "nullableFields": [],
+      "verification": {
+        "method": "live_request",
+        "date": "2026-08-19",
+        "detail": "GET api.open-meteo.com/v1/forecast?...&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code returned exactly these keys under 'current'."
+      },
+      "lintExpectations": {
+        "interval_vs_window": "expected-and-correct-to-ignore: an ambient weather card is not meant to tick inside the listen window."
+      }
+    },
+    {
+      "id": "github_actions_latest_run@1",
+      "title": "GitHub Actions latest workflow run",
+      "recipeKind": "http",
+      "match": {
+        "method": "GET",
+        "urlHost": "api.github.com",
+        "urlPathPrefix": "/repos/",
+        "jsonPath": "$.workflow_runs[0]"
+      },
+      "requiresAllowHost": "api.github.com",
+      "auth": {
+        "mode": "none_by_default",
+        "credentialInHeaders": false,
+        "note": "Unauthenticated is the supported path (public repos, 60 req/hr/IP). There is NO secret-reference mechanism in the recipe path: headers pass through verbatim, no env expansion exists. An authenticated variant means a literal token in a tool call and is operator-gated, never agent-initiated.",
+        "lintHint": "A recipe matching this entry that carries an Authorization/x-api-key header is a finding, not a normal recipe."
+      },
+      "cadence": {
+        "recommendedIntervalMs": 120000,
+        "minLegalIntervalMs": 1000,
+        "recommendedMaxDurationMs": 3600000,
+        "rationale": "Unauthenticated api.github.com allows 60 req/hr/IP. 120000 ms = 30/hr, half the budget. 60000 ms is exactly the limit and nothing honors Retry-After for http recipes at HEAD."
+      },
+      "consent": {
+        "actuatesOnExpiry": false,
+        "actuatesOnTick": false,
+        "requiresStaleAfterMs": false,
+        "policy": "read_only_display",
+        "assertion": "Display-only. No expiry-actuated consequence. Silence is never consent."
+      },
+      "fieldSetClosed": true,
+      "openPrefixes": [],
+      "knownFields": [
+        { "path": "name", "type": "string", "example": "CI", "note": "workflow name; truncate for the HUD" },
+        { "path": "display_title", "type": "string", "example": "fix: relay reconnect", "note": "commit or PR title" },
+        { "path": "status", "type": "string", "example": "completed", "note": "queued | in_progress | completed" },
+        { "path": "conclusion", "type": "string|null", "example": "success", "note": "null until status is completed" },
+        { "path": "run_number", "type": "number", "example": 130 },
+        { "path": "head_branch", "type": "string", "example": "main" },
+        { "path": "head_sha", "type": "string", "example": "95d3a1db45abd547c2dafbee4f8a68ca53fb9c80", "note": "40 chars; truncate:7 for a short sha" },
+        { "path": "event", "type": "string", "example": "push" },
+        { "path": "run_started_at", "type": "string", "example": "2026-08-19T00:31:07Z" },
+        { "path": "updated_at", "type": "string", "example": "2026-08-19T00:35:52Z" },
+        { "path": "html_url", "type": "string", "example": "https://github.com/cli/cli/actions/runs/32202257734", "note": "too long for a HUD line" },
+        { "path": "id", "type": "number", "example": 32202257734 }
+      ],
+      "nullableFields": ["conclusion"],
+      "emptyResultBehavior": "A branch with no runs makes $.workflow_runs[0] undefined. The tick still counts as a SUCCESS and every path renders empty, so user-visible fields need a 'default:' filter rather than relying on a failure signal.",
+      "verification": {
+        "method": "live_request",
+        "date": "2026-08-19",
+        "detail": "GET api.github.com/repos/cli/cli/actions/runs?per_page=1 returned a workflow_runs[0] object carrying every path listed here."
+      },
+      "lintExpectations": {
+        "template_field_unknown": "enforce — this set is closed and stable.",
+        "nullable_without_default": "conclusion without a 'default:' filter renders empty for the whole duration of a running build."
+      }
+    },
+    {
+      "id": "github_actions_runs_list@1",
+      "title": "GitHub Actions workflow runs list",
+      "recipeKind": "http",
+      "match": {
+        "method": "GET",
+        "urlHost": "api.github.com",
+        "urlPathPrefix": "/repos/"
+      },
+      "requiresAllowHost": "api.github.com",
+      "auth": {
+        "mode": "none_by_default",
+        "credentialInHeaders": false,
+        "note": "Public repositories only. The existing no-literal-token rule is unchanged."
+      },
+      "cadence": {
+        "recommendedIntervalMs": 120000,
+        "minLegalIntervalMs": 1000,
+        "recommendedMaxDurationMs": 3600000,
+        "rationale": "Unauthenticated api.github.com allows 60 requests/hour/IP; 120000 ms uses half that budget."
+      },
+      "consent": {
+        "actuatesOnExpiry": false,
+        "actuatesOnTick": false,
+        "requiresStaleAfterMs": false,
+        "policy": "read_only_display",
+        "assertion": "Display-only list replacement. No expiry- or tick-actuated consequence. Silence is never consent."
+      },
+      "fieldSetClosed": true,
+      "openPrefixes": [],
+      "knownFields": [
+        { "path": "workflow_runs", "type": "array", "example": "[...]", "note": "Map with $.workflow_runs[]." }
+      ],
+      "arrayMappings": [
+        {
+          "path": "$.workflow_runs[]",
+          "fieldSetClosed": true,
+          "openPrefixes": [],
+          "knownFields": [
+            { "path": "name", "type": "string", "example": "CI" },
+            { "path": "display_title", "type": "string", "example": "fix: relay reconnect" },
+            { "path": "status", "type": "string", "example": "completed" },
+            { "path": "conclusion", "type": "string|null", "example": "success" },
+            { "path": "run_number", "type": "number", "example": 130 },
+            { "path": "head_branch", "type": "string", "example": "main" },
+            { "path": "head_sha", "type": "string", "example": "95d3a1db45abd547c2dafbee4f8a68ca53fb9c80" },
+            { "path": "event", "type": "string", "example": "push" },
+            { "path": "run_started_at", "type": "string", "example": "2026-08-19T00:31:07Z" },
+            { "path": "updated_at", "type": "string", "example": "2026-08-19T00:35:52Z" },
+            { "path": "html_url", "type": "string", "example": "https://github.com/cli/cli/actions/runs/32202257734" },
+            { "path": "id", "type": "number", "example": 32202257734 }
+          ],
+          "limits": {
+            "sourceOrder": "preserved",
+            "maxItems": 20,
+            "maxUtf8Bytes": 6144,
+            "overflow": "drop trailing rows deterministically and emit named clamp diagnostics",
+            "pagination": "not supported; load-more requires a separate explicit wearer turn"
+          }
+        }
+      ],
+      "nullableFields": [],
+      "verification": {
+        "method": "same_live_shape_as_github_actions_latest_run@1",
+        "date": "2026-08-19",
+        "detail": "The registered element fields are the closed workflow-run fields already verified by github_actions_latest_run@1."
+      },
+      "lintExpectations": {
+        "template_field_unknown": "enforce against the selected array mapping's closed element field set."
+      }
+    },
+    {
+      "id": "home_assistant_entity_state@1",
+      "title": "Home Assistant single entity state",
+      "recipeKind": "http",
+      "match": {
+        "method": "GET",
+        "urlPathPrefix": "/api/states/",
+        "jsonPath": "$"
+      },
+      "requiresAllowHost": "<the operator's PUBLIC Home Assistant hostname, e.g. .ui.nabu.casa>",
+      "ssrf": {
+        "guardApplies": true,
+        "guardMayNotBeWeakened": true,
+        "blockedByDesign": [
+          "http://127.0.0.1:8123",
+          "http://192.168.x.x:8123",
+          "http://10.x.x.x:8123",
+          "http://homeassistant.local:8123"
+        ],
+        "worksWithinGuard": [
+          "https://<instance>.ui.nabu.casa (Nabu Casa Cloud: public DNS, public IP)",
+          "an existing operator-run public reverse proxy"
+        ],
+        "confirmGated": [
+          "any private-range or loopback exception to the SSRF guard",
+          "adding a private or .local hostname to httpAllowHosts (which would not work anyway: the allowlist is an additional gate, not an override of the guard)",
+          "exposing a LAN-only Home Assistant to the internet (port forward, tunnel, new proxy, new subscription)",
+          "any local-relay or side-channel scheme whose purpose is to get private-network data past the guard"
+        ],
+        "confirmGateRule": "Every item under confirmGated is a network-exposure change and requires Matty's explicit CONFIRM before anyone builds it. No agent may take one as a step, and none may be actuated and reported afterwards."
+      },
+      "auth": {
+        "mode": "bearer_token_operator_gated",
+        "credentialInHeaders": true,
+        "note": "HA's REST API requires a long-lived access token. The same no-secret-reference gap as GitHub applies unchanged: the token would be a literal in a tool call. Operator decision only."
+      },
+      "cadence": {
+        "recommendedIntervalMs": 60000,
+        "minLegalIntervalMs": 1000,
+        "recommendedMaxDurationMs": 3600000,
+        "rationale": "An HA sensor card is an ambient glance and HA state is push-updated internally; polling faster only loads the operator's own box."
+      },
+      "consent": {
+        "actuatesOnExpiry": false,
+        "actuatesOnTick": false,
+        "requiresStaleAfterMs": false,
+        "policy": "read_only_display",
+        "assertion": "Read-only state fetch. POST /api/services/... is schema-legal but MUST NOT appear in a refresh recipe: a refresh fires on a timer, and a timer firing is not consent. Actuation belongs to an explicit tap outcome with staleAfterMs set, handled in the agent's turn.",
+        "lintHint": "An http recipe whose method is POST and whose urlPathPrefix is /api/services/ is an actuation-on-a-timer finding, error grade."
+      },
+      "fieldSetClosed": false,
+      "fieldSetOpenReason": "The top level is closed, but 'attributes' is integration-defined and varies per entity. An unrecognized attributes.* path must not be reported as an error.",
+      "openPrefixes": ["attributes."],
+      "knownFields": [
+        { "path": "entity_id", "type": "string", "example": "sensor.study_temperature" },
+        { "path": "state", "type": "string", "example": "21.4", "note": "ALWAYS a string, even for numeric sensors; 'unavailable' and 'unknown' are legal values" },
+        { "path": "last_changed", "type": "string", "example": "2026-08-19T00:31:07.000000+00:00" },
+        { "path": "last_updated", "type": "string", "example": "2026-08-19T00:31:07.000000+00:00" },
+        { "path": "attributes.friendly_name", "type": "string", "example": "Study Temperature", "note": "present on most entities, not guaranteed" },
+        { "path": "attributes.unit_of_measurement", "type": "string", "example": "degC", "note": "sensors only" },
+        { "path": "attributes.device_class", "type": "string", "example": "temperature", "note": "sensors only" },
+        { "path": "context.id", "type": "string", "example": "01J...", "note": "rarely useful on a HUD" }
+      ],
+      "nullableFields": [],
+      "verification": {
+        "method": "documented_shape_only",
+        "date": "2026-08-19",
+        "detail": "NOT verified against a live instance — no Home Assistant was reachable from the authoring session. Field names are HA's documented REST state shape. Re-check against the operator's instance with one manual request before trusting a template."
+      },
+      "lintExpectations": {
+        "template_field_unknown": "enforce for top-level paths; always accept anything under the 'attributes.' open prefix."
+      }
+    }
+  ]
+}

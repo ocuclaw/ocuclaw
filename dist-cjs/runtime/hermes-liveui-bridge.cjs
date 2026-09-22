@@ -350,6 +350,18 @@ function createHermesLiveUiBridge(opts = {}) {
     timeoutMs: renderTimeoutMs,
     paintFloorMs: Number.isFinite(opts.paintFloorMs) ? opts.paintFloorMs : undefined,
     isSessionConnected: () => boolFromRelay(relay, "hasConnectedAppClient", false),
+
+    getViewedSessionKeys: () => {
+      try {
+        const keys =
+          typeof relay.getAppViewedSessionKeys === "function"
+            ? relay.getAppViewedSessionKeys()
+            : null;
+        return Array.isArray(keys) ? keys.map((key) => normalizeHermesLiveUiSessionKey(key)) : null;
+      } catch {
+        return null;
+      }
+    },
     isUnderBackpressure: () => boolFromRelay(relay, "isGlassesSendBufferOverHighWater", false),
     dispatchWake:
       typeof relay.dispatchGlassesWake === "function"
@@ -428,6 +440,24 @@ function createHermesLiveUiBridge(opts = {}) {
       } else {
         handler.drainAll({ result: "glasses_disconnected" });
       }
+    });
+  }
+
+  if (typeof relay.onAppClientSessionLeft === "function") {
+    relay.onAppClientSessionLeft(({ sessionKey, nextSessionKey } = {}) => {
+      if (!sessionKey) return;
+      const normalizedSessionKey = normalizeHermesLiveUiSessionKey(sessionKey);
+      const drained = handler.drainSession(normalizedSessionKey, {
+        result: "preempted",
+        reason: "session_left",
+      });
+      resetDepth(normalizedSessionKey);
+      emitLifecycle("session_left_drain", "info", {
+        sessionKey: normalizedSessionKey,
+        nextSessionKey: nextSessionKey || null,
+        drained,
+        storeId: handler.storeId,
+      });
     });
   }
 
@@ -533,6 +563,8 @@ function createHermesLiveUiBridge(opts = {}) {
           depth: validateOnly ? 0 : nextDepth(sessionKey),
           spec,
           signal,
+
+          requireViewedSession: !(params && params.hostOriginated === true),
         });
         return toolResultEnvelope(outcome);
       } catch (err) {
@@ -686,6 +718,7 @@ function createHermesLiveUiBridge(opts = {}) {
           signal,
           depthBySession,
           nextDepth,
+          requireViewedSession: true,
           renderStoredTemplate: (renderInput) =>
             handler.renderStoredTemplate(renderInput),
         }),

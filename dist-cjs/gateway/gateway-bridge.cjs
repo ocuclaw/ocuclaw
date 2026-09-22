@@ -1,6 +1,7 @@
 const { gatewaySessionKeyFor } = require("../runtime/openclaw-session-key.cjs");
 const { splitReadabilitySystemPrompt } = require("../domain/readability-system-prompt.cjs");
-const { normalizeBridgePrompt } = require("./backend-contract.cjs");
+const { METHOD_NOT_FOUND_CODE, normalizeBridgePrompt } = require("./backend-contract.cjs");
+const { createOpenclawInputPredictionAdapter, isInputPredictionMethod } = require("./input-prediction-openclaw.cjs");
 
 function removeListenerCompat(emitter, eventName, listener) {
   if (typeof emitter.off === "function") {
@@ -191,6 +192,11 @@ function createPluginRpcGatewayBridge(opts) {
   if (typeof openclawClient.request !== "function") {
     throw new Error("Gateway bridge requires a backend client with request()");
   }
+  const inputPrediction = createOpenclawInputPredictionAdapter(
+    opts && opts.inputPrediction && typeof opts.inputPrediction === "object"
+      ? opts.inputPrediction
+      : {},
+  );
 
   function start() {
     if (typeof openclawClient.start === "function") {
@@ -205,6 +211,14 @@ function createPluginRpcGatewayBridge(opts) {
   }
 
   function request(method, params, requestOpts) {
+    if (isInputPredictionMethod(method)) {
+      const handled = inputPrediction.handle(method, params);
+      if (handled) return handled;
+
+      const err = new Error(`method not found: ${method}`);
+      err.code = METHOD_NOT_FOUND_CODE;
+      return Promise.reject(err);
+    }
     return callRequestMethod(openclawClient, method, params, requestOpts);
   }
 
@@ -287,4 +301,4 @@ function createPluginRpcGatewayBridge(opts) {
   };
 }
 
-module.exports = { createPluginRpcGatewayBridge, buildAgentRequestParams, buildChatSendRequestParams, gatewaySessionKeyFor };
+module.exports = { createPluginRpcGatewayBridge, buildAgentRequestParams, buildChatSendRequestParams, gatewaySessionKeyFor, scopeOpenClawSessionKey };

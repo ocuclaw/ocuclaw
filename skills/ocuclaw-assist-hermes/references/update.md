@@ -1,6 +1,6 @@
 # Updating OcuClaw on Hermes
 
-**Guide version:** 2026-09-14 (1.3.21-hermes)
+**Guide version:** 2026-09-21 (1.3.22-hermes)
 
 Use this for an installed, healthy OcuClaw on Hermes moving to a strictly
 higher published bundle version. It is version-neutral: it never names a
@@ -22,8 +22,10 @@ This is the one wording every OcuClaw-on-Hermes surface uses. Quote it; do not
 paraphrase it, and do not reorder its steps.
 
 <!-- ocuclaw:install-block:start -->
-OcuClaw needs Hermes `>=0.21.0,<0.22.0`; the certified baseline is Hermes
-`0.21.0`.
+OcuClaw needs Hermes `>=0.21.1,<0.22.0`; the certified baseline is Hermes
+`0.21.3`. Install it once, in the default Hermes profile: that profile owns the
+relay the glasses pair to, and a second copy in another profile is never the
+answer.
 
 **Repository access.** `ocuclaw/ocuclaw` is a public repository and needs no
 invitation or GitHub sign-in to clone. Git must still be installed and working
@@ -34,6 +36,58 @@ invitation, and the software itself is still beta.
 
 **Terminal first.** This is the supported path and the one every beta build is
 tested on:
+
+**Cloudways managed Hermes: install, restart once, then one command.**
+
+```bash
+hermes plugins install ocuclaw/ocuclaw --enable
+hermes gateway restart
+hermes ocuclaw cloudways setup
+```
+
+`hermes ocuclaw cloudways setup` takes the host from an installed plugin to a
+paired phone and an evidenced first reply, in numbered steps `[1/8]` to `[8/8]`
+in your own terminal. It reads live state before every step and skips what is
+already done. It asks twice, showing exactly what changes and defaulting to no.
+There is no retry flag: run the same command again and it continues where it
+stopped.
+
+**One restart, one run.** The restart above is the only one this install needs.
+If anything interrupts the run, including a restart that closes SSH, Hermes and
+tmux, reconnect with the Cloudways SSH command and run the same command again:
+it skips what is done and carries on from there.
+
+**The command looks for your phone before it pairs it.** Step 5 asks you to
+install Tailscale on the phone and approve the link there. Step 7 then checks
+whether a phone is on your private network. If one is, it says so and carries
+on. If none is, it explains what Tailscale is, gives you three short steps, and
+waits, checking again every few seconds; it carries on by itself the moment
+your phone turns up, and pressing Enter carries on anyway. The wait stops after
+ten minutes, having changed nothing, and running the same command again picks
+up right there. Leave Tailscale switched on afterwards: the phone needs it to
+reach this server.
+
+**The pairing code waits for you.** It lasts two minutes, so step 7 asks you to
+have the phone in your hand with the Even app open, and waits for you to press
+Enter before it makes the code. If a code does run out before anyone uses it,
+the command does not give up: press Enter for a new one, or type `stop` to
+finish there.
+
+**Check your agent's model before you start.** Step 8 sends a real message
+through your agent and waits for its reply on the glasses. Run `hermes -z hello`
+first. If your model answers, step 8 will too. If it returns an error, such as a
+rate limit, step 8 says so, records nothing, and asks you to fix the model and
+run the same command again.
+
+The guided assistant remains the fallback: open a fresh `hermes --tui`, enter
+`/ocuclaw-setup`, and it walks the same path with you. It loads the setup skill
+and tools in that fresh process, saves your agent choice and required settings,
+gives you the SSH reconnect command and the exact saved-session resume command,
+and requests one planned activation restart. Resume that setup session by its
+ID; do not blindly reopen the latest chat. Saved configuration is not gateway
+activation: the assistant must verify the new gateway and relay.
+
+For other hosts, the direct install/restart sequence is:
 
 ```bash
 hermes plugins install ocuclaw/ocuclaw --enable
@@ -49,7 +103,8 @@ Then, in bare `hermes` or in Hermes Desktop:
 
 `hermes plugins install` prints that restart instruction and stops there — it
 never restarts the gateway for you. Until the gateway restarts, OcuClaw is
-installed but not loaded, and nothing about the glasses works yet.
+installed but not loaded by that managed gateway, and nothing about the glasses
+works through it yet. A fresh TUI can prepare setup before that activation.
 
 **Run `hermes` in a real terminal.** The TUI boots only when stdin *and*
 stdout are a TTY, so a piped or captured run — `hermes | tee log`, a CI
@@ -101,6 +156,20 @@ Unlike install, `hermes plugins update` does **not** print the restart
 instruction, and it does not restart the gateway. The new code loads on the next
 gateway start and not a moment sooner, so restart it yourself — then run
 `/ocuclaw-setup` and let it re-verify health.
+
+**Cloudways Managed AI Agents.** The same install block applies. That host has
+no root and no system Tailscale, so OcuClaw carries its own path for it, and
+`hermes ocuclaw cloudways setup` runs the whole of it: a user-owned userspace
+Tailscale under `~/bin` and `~/.tailscale`, a Hermes cron watchdog that starts
+it again after every `hermes gateway restart` (a container restart there), the
+private tailnet route, the pairing ceremony and the first message. Cloudways has
+approved those pieces. Your only manual steps are opening the Tailscale
+authorization link it prints and the phone.
+
+The same work is still available one verb at a time (`hermes ocuclaw cloudways
+detect`, `install`, `enroll`, `status`, `retry`, `enable`, `disable`,
+`rollback`), and `/ocuclaw-setup` still guides the whole path when you would
+rather be walked through it.
 <!-- ocuclaw:install-block:end -->
 
 ## U1 · Read-only preflight
@@ -110,7 +179,7 @@ hermes --version
 hermes plugins list
 ```
 
-Hermes must remain within `>=0.21.0,<0.22.0`, and `ocuclaw` must be installed.
+Hermes must remain within `>=0.21.1,<0.22.0`, and `ocuclaw` must be installed.
 Call `{"operation":"status"}` first. If the state is not `configured` or
 `connected`, this is not an update — call `{"operation":"troubleshooting"}` or
 `{"operation":"fresh_install"}` instead.

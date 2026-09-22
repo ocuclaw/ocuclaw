@@ -28,6 +28,15 @@ const BRIDGE_REQUEST_METHODS = Object.freeze([
   "config.patch",
   "exec.approval.resolve",
   "hermes.management",
+  "optional.setup",
+  "optional.setup.disconnect",
+
+  "input.prediction.cancel",
+  "input.prediction.capabilities",
+
+  "input.prediction.open",
+  "input.prediction.request",
+  "input.prediction.test",
   "models.authStatus",
   "models.list",
   "plugin.approval.resolve",

@@ -22,6 +22,7 @@ function parseTerminalCapabilities(value         )                       {
   }
   const record = value                           ;
   const columns = record["columns"];
+  const rows = record["rows"];
   return {
     unicode: record["unicode"] === true,
     color: record["color"] === true,
@@ -30,6 +31,7 @@ function parseTerminalCapabilities(value         )                       {
       typeof columns === "number" && Number.isInteger(columns) && columns > 0 && columns <= 10000
         ? columns
         : 0,
+    rows: typeof rows === "number" && Number.isInteger(rows) && rows > 0 && rows <= 10000 ? rows : 0,
   };
 }
 
@@ -77,6 +79,7 @@ function createPairingControlService(
   const { exchangeHost, readRelayCredential } = options;
 
   let session                                                = null;
+  let creating = false;
 
   function withinRateLimit()          {
     const at = now();
@@ -171,8 +174,22 @@ function createPairingControlService(
     const op = typeof parsed.op === "string" ? parsed.op : null;
 
     if (op === "create") {
+
+      host.tick();
+      const existing = host.snapshot();
+      if (creating || !["idle", "completed", "failed"].includes(existing.state)) {
+        return refusal(409);
+      }
       const address = typeof parsed.address === "string" ? parsed.address : "";
-      const started = await host.beginBootstrapInitiation({ address });
+      let started                                                                      ;
+      creating = true;
+      try {
+        started = await host.beginBootstrapInitiation({ address });
+      } catch {
+        return refusal(503);
+      } finally {
+        creating = false;
+      }
       if (!started.ok) {
 
         return {

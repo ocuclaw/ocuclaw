@@ -26,6 +26,16 @@ const APP_PROTOCOL = Object.freeze({
   sessionContextSnapshot: "ocuclaw.session.context.snapshot",
   sessionCompact: "ocuclaw.session.compact",
   sessionCompactAck: "ocuclaw.session.compact.ack",
+
+  inputPredictionCapabilities: "ocuclaw.input.prediction.capabilities",
+  inputPredictionCapabilitiesResult: "ocuclaw.input.prediction.capabilities.result",
+  inputPredictionRequest: "ocuclaw.input.prediction.request",
+  inputPredictionResult: "ocuclaw.input.prediction.result",
+  inputPredictionOpen: "ocuclaw.input.prediction.open",
+  inputPredictionOpenResult: "ocuclaw.input.prediction.open.result",
+  inputPredictionCancel: "ocuclaw.input.prediction.cancel",
+  inputPredictionTest: "ocuclaw.input.prediction.test",
+  inputPredictionTestResult: "ocuclaw.input.prediction.test.result",
   visibility: "visibility",
 });
 
@@ -35,6 +45,7 @@ const WORKER_FEATURES = Object.freeze([
   "worker-resume-metadata",
   "message-send-worker-queue",
   "ledgerV1",
+  "input-prediction",
 ]);
 
 const DEFAULT_WORKER_QUEUE_CAPS = Object.freeze({

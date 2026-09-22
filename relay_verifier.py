@@ -9,11 +9,16 @@ This deliberately implements only the RFC 6455 opening handshake and the
 server close frame needed to observe the relay's authentication decision.  It
 never sends a protocol hello, so the relay keeps the connection's client kind
 ``unknown`` and it never enters the authenticated-app count.
+
+Public routes must use WSS. The all-device reset may verify the restarted relay
+over explicit ``127.0.0.1`` or ``::1`` WS with a port; every other plaintext
+address is refused before a credential can be transmitted.
 """
 
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import errno
 import hashlib
 import os
@@ -24,7 +29,10 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
-from urllib.parse import quote, urlencode, urlsplit
+from typing import Callable, Iterator
+from urllib.parse import SplitResult, quote, urlencode, urlsplit
+
+from . import tailnet_dial
 
 _WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _MAX_RESPONSE_HEADERS = 16 * 1024
@@ -76,7 +84,49 @@ def _remaining(deadline: float) -> float:
     return remaining
 
 
-def _recv_more(sock: ssl.SSLSocket, deadline: float, size: int = 4096) -> bytes:
+def _parse_verifier_address(
+    address: str,
+) -> tuple[SplitResult, int, bool] | None:
+    """Accept private WSS routes and explicit loopback-only WS endpoints."""
+
+    try:
+        parsed = urlsplit(address)
+        explicit_port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if (
+        not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in ("", "/")
+    ):
+        return None
+    if parsed.scheme == "wss":
+        return parsed, explicit_port or 443, True
+    if (
+        parsed.scheme == "ws"
+        and parsed.hostname in {"127.0.0.1", "::1"}
+        and explicit_port is not None
+    ):
+        return parsed, explicit_port, False
+    return None
+
+
+@contextmanager
+def _websocket_transport(
+    raw: socket.socket, *, use_tls: bool, server_hostname: str
+) -> Iterator[socket.socket]:
+    if not use_tls:
+        yield raw
+        return
+    context = ssl.create_default_context()
+    with context.wrap_socket(raw, server_hostname=server_hostname) as secured:
+        yield secured
+
+
+def _recv_more(sock: socket.socket, deadline: float, size: int = 4096) -> bytes:
     sock.settimeout(_remaining(deadline))
     chunk = sock.recv(size)
     if not chunk:
@@ -84,7 +134,7 @@ def _recv_more(sock: ssl.SSLSocket, deadline: float, size: int = 4096) -> bytes:
     return chunk
 
 
-def _read_response_headers(sock: ssl.SSLSocket, deadline: float) -> tuple[bytes, bytes]:
+def _read_response_headers(sock: socket.socket, deadline: float) -> tuple[bytes, bytes]:
     response = bytearray()
     marker = b"\r\n\r\n"
     while marker not in response:
@@ -114,7 +164,7 @@ def _parse_response_headers(head: bytes) -> tuple[int, dict[str, str]]:
 
 
 def _take_bytes(
-    sock: ssl.SSLSocket,
+    sock: socket.socket,
     buffer: bytearray,
     count: int,
     deadline: float,
@@ -127,7 +177,7 @@ def _take_bytes(
 
 
 def _read_frame(
-    sock: ssl.SSLSocket, buffer: bytearray, deadline: float
+    sock: socket.socket, buffer: bytearray, deadline: float
 ) -> tuple[int, bytes]:
     """Read one complete unmasked server frame."""
 
@@ -153,7 +203,7 @@ def _read_frame(
 
 
 def _read_close(
-    sock: ssl.SSLSocket, initial: bytes, deadline: float
+    sock: socket.socket, initial: bytes, deadline: float
 ) -> tuple[int | None, str]:
     """Ignore permissible frames until the server closes or time expires."""
 
@@ -234,35 +284,24 @@ def _verify_blocking(
     *,
     address: str,
     credential: str,
-    endpoints: list[tuple[int, int, int, str, tuple]],
+    connect: Callable[[], socket.socket],
     started: float,
     deadline: float,
 ) -> RelayVerifyOutcome:
     upgraded = False
     try:
-        parsed = urlsplit(address)
-        if (
-            parsed.scheme != "wss"
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-            or parsed.path not in ("", "/")
-        ):
+        endpoint = _parse_verifier_address(address)
+        if endpoint is None:
             return _outcome("protocol_error", started)
+        parsed, port, use_tls = endpoint
         if not isinstance(credential, str) or not credential:
             return _outcome("unknown", started)
-        try:
-            port = parsed.port or 443
-        except ValueError:
-            return _outcome("protocol_error", started)
 
-        context = ssl.create_default_context()
-        with _connect_resolved(endpoints, deadline) as raw:
+        with connect() as raw:
             raw.settimeout(_remaining(deadline))
-            with context.wrap_socket(
+            with _websocket_transport(
                 raw,
+                use_tls=use_tls,
                 server_hostname=parsed.hostname,
             ) as secured:
                 secured.settimeout(_remaining(deadline))
@@ -270,7 +309,7 @@ def _verify_blocking(
                 host_header = parsed.hostname
                 if ":" in host_header and not host_header.startswith("["):
                     host_header = f"[{host_header}]"
-                if port != 443:
+                if port != (443 if use_tls else 80):
                     host_header = f"{host_header}:{port}"
 
                 # Q12's exact exception: this authenticated request target is
@@ -353,9 +392,18 @@ def _verify_blocking(
 
 
 def verify_relay_credential(
-    *, address: str, credential: str, timeout_s: float = 2.0
+    *,
+    address: str,
+    credential: str,
+    timeout_s: float = 2.0,
+    socks5: tuple[str, int] | None = None,
 ) -> RelayVerifyOutcome:
-    """Verify one credential once, with a wall-clock cap over DNS and I/O."""
+    """Verify one credential once, with a wall-clock cap over DNS and I/O.
+
+    With ``socks5`` (a userspace tailscaled's loopback proxy, #2980) the
+    proxy resolves and reaches the tailnet name; the local resolver is never
+    asked, because on such a host it does not know MagicDNS names.
+    """
     started = time.monotonic()
     try:
         allowance = float(timeout_s)
@@ -364,35 +412,37 @@ def verify_relay_credential(
     if allowance <= 0:
         return _outcome("timeout", started)
 
-    parsed = urlsplit(address)
-    if (
-        parsed.scheme != "wss"
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-        or parsed.path not in ("", "/")
-    ):
+    endpoint = _parse_verifier_address(address)
+    if endpoint is None:
         return _outcome("protocol_error", started)
     if not isinstance(credential, str) or not credential:
         return _outcome("unknown", started)
-    try:
-        port = parsed.port or 443
-    except ValueError:
-        return _outcome("protocol_error", started)
+    parsed, port, use_tls = endpoint
     deadline = started + allowance
-    try:
-        endpoints = _resolve_endpoint(parsed.hostname, port, deadline)
-    except TimeoutError:
-        return _outcome("timeout", started)
-    except socket.gaierror:
-        return _outcome("unreachable", started)
+    hostname = parsed.hostname
+    if socks5 is not None:
+        if not use_tls:
+            return _outcome("protocol_error", started)
+        proxy = socks5
+
+        def connect() -> socket.socket:
+            return tailnet_dial.dial(hostname, port, deadline, socks5=proxy)
+
+    else:
+        try:
+            endpoints = _resolve_endpoint(hostname, port, deadline)
+        except TimeoutError:
+            return _outcome("timeout", started)
+        except socket.gaierror:
+            return _outcome("unreachable", started)
+
+        def connect() -> socket.socket:
+            return _connect_resolved(endpoints, deadline)
 
     return _verify_blocking(
         address=address,
         credential=credential,
-        endpoints=endpoints,
+        connect=connect,
         started=started,
         deadline=deadline,
     )

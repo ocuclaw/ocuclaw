@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import re
 import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, TextIO
@@ -88,7 +89,10 @@ COMMAND_DESCRIPTION = (
     "\n"
     "  status   passive: local facts and cached receipts only; always exits 0\n"
     "  doctor   bounded active checks; exits non-zero on problems or bad state\n"
+    "  setup-preflight  what /ocuclaw-setup must settle before it writes\n"
+    "  move-to-default  move the credential and pairing to the default profile\n"
     "  pair     pair a phone, approving it at this terminal; needs a real TTY\n"
+    "  first-use  check the phone's first message and hand off the welcome\n"
     "  reset-relay-credential  locally confirm an all-device credential reset\n"
     "  uninstall  remove OcuClaw while preserving shared Hermes sessions\n"
 )
@@ -748,6 +752,210 @@ def _render_tools(inventory: Optional[Mapping[str, Any]]) -> List[str]:
     return lines
 
 
+# -- the Profiles section (#2944) ---------------------------------------------
+#
+# Read-only, like every renderer here, and built from the profile inventory
+# rather than from the snapshot: the v1 snapshot key set is frozen (#1273 §12),
+# so this section travels beside the document the way the provided-tool
+# inventory does, and `--json` keeps emitting exactly the frozen contract.
+#
+# One pairing, one relay credential, and the default profile owns transport
+# (SPEC #2939). Everything below exists to let an operator see, in one screen,
+# which shape their host is actually in — and to name the four ways it can be
+# wrong before the next `hermes update` turns one of them into dark glasses.
+
+
+#: The closed set of service labels the inventory can report. Rendered from
+#: this table rather than through `_safe`, whose allowlist drops the spaces
+#: and parentheses that make "systemd (user)" readable — and which is the
+#: right rule for every value that came off the host, but not for one of our
+#: own literals.
+_SERVICE_LABELS = frozenset({"systemd (user)", "systemd (system)", "launchd"})
+
+
+def _service_word(value: Any) -> str:
+    return value if value in _SERVICE_LABELS else "installed"
+
+
+def _mode_word(value: Any) -> str:
+    if value is True:
+        return "multiplex"
+    if value is False:
+        return "standalone"
+    return "not set"
+
+
+def _render_profiles(inventory: Optional[Mapping[str, Any]]) -> List[str]:
+    """The profile / mode / topology inventory and its named faults."""
+    if not isinstance(inventory, Mapping):
+        return []
+    lines = ["", "Profiles — gateway mode, transport owner, topology (read-only)"]
+    if not inventory.get("observed"):
+        lines.append(
+            "  the default Hermes home could not be resolved from this "
+            "process, so nothing here is known"
+        )
+        return lines
+
+    mode = inventory.get("mode") or {}
+    effective = _safe(mode.get("effective"))
+    source = mode.get("effectiveSource")
+    suffix = (
+        "  (from the live gateway record)"
+        if source == "gateway-state"
+        else "  (no live gateway record to read)"
+    )
+    lines.append(f"  mode effective            {effective}{suffix}")
+    lines.append(
+        f"  mode configured           {_mode_word(mode.get('configuredFromFile'))}"
+        "  (gateway.multiplex_profiles)"
+    )
+    if mode.get("envOverride") is not None:
+        lines.append(
+            f"  mode env override         {_mode_word(mode.get('envOverride'))}"
+            "  (GATEWAY_MULTIPLEX_PROFILES)"
+        )
+    agent_mode = mode.get("agentMode")
+    lines.append(
+        "  mode OcuClaw saved        "
+        + (_safe(agent_mode) if agent_mode else "not set")
+        + "  (platforms.ocuclaw.extra.agent_mode)"
+    )
+
+    transport = inventory.get("transport") or {}
+    owner = transport.get("owner")
+    lines.append(
+        "  transport owner           "
+        + (_safe(owner) if owner else "not determined")
+    )
+    credential_profiles = [_safe(name) for name in (transport.get("credentialProfiles") or [])]
+    lines.append(
+        "  relay credential in       "
+        + (", ".join(credential_profiles) if credential_profiles else "no profile")
+        + "  (presence only; the value is never read)"
+    )
+    provenance = transport.get("provenanceObserved")
+    if provenance is None:
+        lines.append(
+            "  transport provenance      unknown from this process; the "
+            "gateway holds it"
+        )
+    else:
+        lines.append(
+            f"  transport provenance      {'present' if provenance else 'MISSING'}"
+        )
+
+    served = inventory.get("served") or {}
+    served_state = _safe(served.get("state"))
+    served_names = [_safe(name) for name in (served.get("profiles") or [])]
+    lines.append(
+        "  served set                "
+        + (", ".join(served_names) if served_names else f"none ({served_state})")
+        + (f"  [{served_state}]" if served_names else "")
+    )
+    enrolled = inventory.get("enrolled") or {}
+    enrolled_names = [_safe(name) for name in (enrolled.get("profiles") or [])]
+    if enrolled.get("state") == "bounded":
+        lines.append(
+            "  enrolled set              "
+            + (
+                ", ".join(enrolled_names)
+                if enrolled_names
+                # An empty list is a real answer — the key is there and it
+                # admits nobody — and it must not read like the "not bounded"
+                # case above, which means the opposite.
+                else "none — the key is set and admits no profile"
+            )
+            + f"  ({_safe(enrolled.get('source'))})"
+        )
+    elif enrolled.get("state") == "not_bounded":
+        lines.append(
+            "  enrolled set              not bounded — no OcuClaw enrollment "
+            "key and no served-profile allowlist"
+        )
+    else:
+        lines.append(f"  enrolled set              {_safe(enrolled.get('state'))}")
+
+    migration = inventory.get("migration") or {}
+    if migration.get("state") == "present":
+        lines.append(
+            "  migration receipt         migrated on "
+            f"{_safe(migration.get('migratedOn'))}"
+            f"  (multiplex was {_mode_word(migration.get('flagWas'))} before)"
+        )
+        folded = [_safe(name) for name in (migration.get("secondaries") or [])]
+        if folded:
+            lines.append(f"      folded in: {', '.join(folded)}")
+
+    lines.append("")
+    lines.append(
+        "  profile            ocuclaw   code     bundle      relay   gateway"
+    )
+    for row in inventory.get("profiles") or []:
+        if not isinstance(row, Mapping):
+            continue
+        name = _safe(row.get("name"))
+        enabled = _yes_no(row.get("pluginEnabled"))
+        code = _yes_no(row.get("codePresent"))
+        bundle = _safe(row.get("bundleVersion"), fallback="—")
+        credential = _yes_no(row.get("relayCredential"))
+        if row.get("gatewayLive"):
+            gateway = "live"
+        elif row.get("service"):
+            gateway = f"service: {_service_word(row.get('service'))}"
+        else:
+            gateway = "none"
+        lines.append(
+            f"  {name:<18} {enabled:<9} {code:<8} {bundle:<11} "
+            f"{credential:<7} {gateway}"
+        )
+
+    faults = [f for f in (inventory.get("faults") or []) if isinstance(f, Mapping)]
+    if not faults:
+        lines.append("")
+        lines.append("  profile faults            none")
+        return lines
+    lines.append("")
+    lines.append(f"  profile faults — {len(faults)}")
+    for fault in faults:
+        lines.append("")
+        lines.append(
+            f"  [{_safe(fault.get('severity'))}]  {_safe(fault.get('code'))}"
+        )
+        affected = [_safe(name) for name in (fault.get("profiles") or [])]
+        if affected:
+            lines.append(f"      profiles: {', '.join(affected)}")
+        summary = fault.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            lines.append(f"      {summary.strip()}")
+        fix = fault.get("fix")
+        if isinstance(fix, str) and fix.strip():
+            lines.append(f"      fix: {fix.strip()}")
+    return lines
+
+
+def profile_fault_warnings(inventory: Optional[Mapping[str, Any]]) -> List[str]:
+    """One stderr line per named fault, for the `--json` lane.
+
+    `--json` emits the frozen snapshot and nothing else, so the faults reach
+    the operator on the stream #1273 §10 reserves for exactly that — the same
+    treatment the provided-tool warnings get.
+    """
+    if not isinstance(inventory, Mapping):
+        return []
+    lines: List[str] = []
+    for fault in inventory.get("faults") or []:
+        if not isinstance(fault, Mapping):
+            continue
+        affected = [_safe(name) for name in (fault.get("profiles") or [])]
+        scope = f" [{', '.join(affected)}]" if affected else ""
+        lines.append(
+            f"[ocuclaw] profile fault {_safe(fault.get('code'))}{scope}: "
+            f"{str(fault.get('summary') or '').strip()}"
+        )
+    return lines
+
+
 def _render_health(snapshot: Mapping[str, Any]) -> List[str]:
     health = snapshot.get("currentHealth") or {}
     legs = health.get("legs") or {}
@@ -801,7 +1009,11 @@ def _render_proof(snapshot: Mapping[str, Any]) -> List[str]:
     if state == PROOF_PROVEN:
         setup_state = _safe((snapshot.get("setup") or {}).get("state"))
         health_state = _safe((snapshot.get("currentHealth") or {}).get("state"))
-        if setup_state == "configured" and health_state == HEALTH_UNHEALTHY:
+        if proof.get("replyEvidence") == "client_sdk_receipt":
+            detail = "the phone reported SDK acceptance of the reply; welcome dismissal completed setup"
+            if setup_state == "configured" and health_state == HEALTH_UNHEALTHY:
+                detail = "configured, currently unhealthy; " + detail
+        elif setup_state == "configured" and health_state == HEALTH_UNHEALTHY:
             detail = (
                 "configured, currently unhealthy, previously completed on G2; "
                 "later outages never erase this"
@@ -872,6 +1084,45 @@ def _render_findings(snapshot: Mapping[str, Any]) -> List[str]:
                     for key, value in sorted(parameters.items())
                 )
                 lines.append(f"      repair details: {rendered}")
+    return lines
+
+
+_TAILNET_DAEMON_HINT = {
+    "needs-authorization": "run `hermes ocuclaw cloudways retry` and open the printed link",
+    "stopped": "the cron watchdog restarts it within a minute; if not, run `hermes ocuclaw cloudways status --wait 90`",
+    "starting": "wait a few seconds, then run this again",
+    "absent": "run `hermes ocuclaw cloudways install`",
+    "unknown": "run `hermes ocuclaw cloudways status` for the raw answer",
+}
+
+
+def _render_tailnet_daemon(summary: Optional[Mapping[str, Any]]) -> List[str]:
+    """The `tailscale-daemon` check (Cloudways): only when the CLI receipt exists.
+
+    On a host with the system tailscaled there is no user-owned daemon, so the
+    whole section is absent rather than printing a misleading `unknown`.
+    """
+    if not isinstance(summary, Mapping):
+        return []
+    state = str(summary.get("state") or "unknown")
+    lines = ["", f"Tailscale daemon (userspace, cron-kept) — {state}"]
+    if summary.get("nodeName"):
+        online = summary.get("online")
+        online_text = "yes" if online is True else "no" if online is False else "?"
+        lines.append(
+            f"  node {summary.get('nodeName')} ({summary.get('dnsName') or '?'})  online={online_text}"
+        )
+    detail = str(summary.get("detail") or "")
+    if detail and state != "running":
+        lines.append(f"  {detail}")
+    hint = _TAILNET_DAEMON_HINT.get(state)
+    if hint and state != "running":
+        lines.append(f"  {hint}")
+    if summary.get("watchdogJobPresent") is False:
+        lines.append(
+            "  The cron watchdog job is missing: the daemon will not survive the next "
+            "`hermes gateway restart`. Run `hermes ocuclaw cloudways install`."
+        )
     return lines
 
 
@@ -1212,6 +1463,8 @@ def render_snapshot_text(
     claim_state: str = CLAIM_OWNED,
     prescribe: bool = True,
     tools: Optional[Mapping[str, Any]] = None,
+    profiles: Optional[Mapping[str, Any]] = None,
+    tailnet_daemon: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Render one snapshot as the human report. Pure; no clock, no host access."""
     lines: List[str] = []
@@ -1219,7 +1472,9 @@ def render_snapshot_text(
     lines.extend(_render_provenance(snapshot))
     lines.extend(_render_setup(snapshot, facts, prescribe=prescribe))
     lines.extend(_render_tools(tools))
+    lines.extend(_render_profiles(profiles))
     lines.extend(_render_health(snapshot))
+    lines.extend(_render_tailnet_daemon(tailnet_daemon))
     if facts is not None:
         lines.extend(
             _render_serve(
@@ -1333,6 +1588,20 @@ def doctor_exit_code(snapshot: Mapping[str, Any]) -> int:
 # -- command surface ----------------------------------------------------------
 
 
+def _default_tailnet_daemon() -> Optional[Mapping[str, Any]]:
+    """Cloudways `tailscale-daemon` check; None when the CLI receipt is absent."""
+    from . import cloudways
+
+    return cloudways.daemon_summary()
+
+
+def _safe_call(fn: Callable[[], Optional[Mapping[str, Any]]]) -> Optional[Mapping[str, Any]]:
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001 - an optional section must not break the report
+        return None
+
+
 def _default_facts() -> Dict[str, Any]:
     """Collect facts in this process, after plugin discovery (#1273 P8).
 
@@ -1359,6 +1628,21 @@ def _default_tool_inventory() -> Dict[str, Any]:
     inventory["expectedCount"] = len(inventory.get("expected") or [])
     inventory["warnings"] = missing_phone_tool_warnings(inventory)
     return inventory
+
+
+def _default_profiles_inventory() -> Dict[str, Any]:
+    """The profile / mode / topology inventory for this host (#2944).
+
+    Read-only and import-guarded end to end: it resolves the DEFAULT home from
+    the receipt seam, reads files, and mutates neither configuration nor the
+    environment. ``provenanceObserved`` stays None here on purpose — only the
+    gateway can see whether a routed turn carried transport provenance, and a
+    CLI process guessing at it would manufacture the one fault that must never
+    be answered with an allow line.
+    """
+    from . import profiles_report
+
+    return profiles_report.build_inventory()
 
 
 def prescription_eligible(
@@ -1613,6 +1897,8 @@ def run(
     replacement_fn: Optional[Callable[[Mapping[str, Any]], bool]] = None,
     removal_notice_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
     tools_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
+    profiles_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
+    tailnet_daemon_fn: Optional[Callable[[], Optional[Mapping[str, Any]]]] = None,
     stdout: Optional[TextIO] = None,
     stderr: Optional[TextIO] = None,
 ) -> int:
@@ -1627,6 +1913,10 @@ def run(
     # collector on the module without reaching past an already-bound default.
     facts_fn = _default_facts if facts_fn is None else facts_fn
     tools_fn = _default_tool_inventory if tools_fn is None else tools_fn
+    profiles_fn = _default_profiles_inventory if profiles_fn is None else profiles_fn
+    tailnet_daemon_fn = (
+        _default_tailnet_daemon if tailnet_daemon_fn is None else tailnet_daemon_fn
+    )
     observe_fn = doctor_lane.observe if observe_fn is None else observe_fn
     record_fn = doctor_lane.record_route_ownership if record_fn is None else record_fn
     teardown_fn = _default_teardown_permitted if teardown_fn is None else teardown_fn
@@ -1724,6 +2014,11 @@ def run(
     except Exception:  # noqa: BLE001 - a diagnostic must not become an outage
         tools = None
 
+    try:
+        profiles = profiles_fn()
+    except Exception:  # noqa: BLE001 - a diagnostic must not become an outage
+        profiles = None
+
     if json_output:
         # Only the snapshot on stdout; human diagnostics go to stderr (#1273 §10).
         # The snapshot's v1 key set is frozen, so the inventory is not smuggled
@@ -1731,6 +2026,8 @@ def run(
         # stream this contract reserves for exactly that.
         out.write(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
         for line in (tools or {}).get("warnings") or []:
+            err.write(line + "\n")
+        for line in profile_fault_warnings(profiles):
             err.write(line + "\n")
     else:
         out.write(
@@ -1743,6 +2040,8 @@ def run(
                 claim_state=claim_state,
                 prescribe=(command == "doctor"),
                 tools=tools,
+                profiles=profiles,
+                tailnet_daemon=_safe_call(tailnet_daemon_fn),
             )
         )
         if command == "doctor":
@@ -1785,10 +2084,34 @@ def run(
     )
 
 
+def _positive_seconds(raw: str) -> float:
+    """A wait bound argparse refuses at parse time rather than silently clamping.
+
+    Zero or negative is a bound no message can arrive inside, so accepting it
+    would spend the user's attention on a wait that was over before it started.
+    """
+    try:
+        seconds = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{raw!r} is not a number of seconds"
+        ) from None
+    if not seconds > 0:
+        raise argparse.ArgumentTypeError(
+            "the wait must be a positive number of seconds"
+        )
+    return seconds
+
+
 def register_cli(parser: argparse.ArgumentParser) -> None:
     """Wire `hermes ocuclaw ...`. Called by Hermes with the plugin's subparser."""
     parser.set_defaults(func=dispatch)
     subs = parser.add_subparsers(dest="ocuclaw_command", required=False)
+
+    from .optional_setup import register_cli as register_optional_setup
+    register_optional_setup(subs)
+    from .even_ai_cli import register_cli as register_even_ai
+    register_even_ai(subs)
 
     status_parser = subs.add_parser(
         "status",
@@ -1823,6 +2146,83 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
         help="Emit the snapshot v1 JSON document on stdout instead of the report",
     )
 
+    # The two profile-ownership commands (#2943). `setup-preflight` is
+    # read-only and answers what setup must settle BEFORE it writes anything;
+    # `move-to-default` is the one mutation, and it is plan-first — without
+    # `--apply` it changes nothing, so the assistant can show the user the
+    # exact list before asking.
+    preflight_parser = subs.add_parser(
+        "setup-preflight",
+        help="What /ocuclaw-setup must settle before it changes anything",
+        description=(
+            "Read-only. Answers three questions: may setup run on this "
+            "profile at all (the default profile owns the wearer's pairing); "
+            "what turning on multiple agents costs on this engine, detected "
+            "by probing for `hermes gateway migrate` rather than by reading a "
+            "version string; and whether transport has to be moved out of a "
+            "secondary profile first. Exits 0 when setup may proceed, 1 when "
+            "something must be settled first."
+        ),
+    )
+    preflight_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Emit the preflight report as JSON instead of the rendered text",
+    )
+
+    move_parser = subs.add_parser(
+        "move-to-default",
+        help="Move OcuClaw's credential and pairing to the default profile",
+        description=(
+            "The reporter's repair: OcuClaw installed in a secondary profile "
+            "holds the relay credential and the pairing, which the next "
+            "Hermes update folds away silently. This copies the bundle to the "
+            "default profile, moves the credential and the pairing state "
+            "there, and switches the secondary off. The credential is carried "
+            "across unchanged — never regenerated — so paired phones stay "
+            "paired. The secondary's copy of the plugin code is left on disk "
+            "and disabled; `hermes ocuclaw doctor` offers that cleanup "
+            "separately. Without --apply it prints the plan and changes "
+            "nothing. When both profiles hold a different credential the "
+            "plan refuses and reports when each was minted; "
+            "--keep-source-credential is how the wearer's answer is carried "
+            "out once they have chosen the secondary's pairing."
+        ),
+    )
+    move_parser.add_argument(
+        "--from",
+        required=True,
+        dest="move_source",
+        metavar="PROFILE",
+        help="The secondary profile transport currently lives in",
+    )
+    move_parser.add_argument(
+        "--apply",
+        action="store_true",
+        dest="apply_move",
+        help="Carry out the printed plan. Without this nothing is written.",
+    )
+    move_parser.add_argument(
+        "--keep-source-credential",
+        action="store_true",
+        dest="keep_source_credential",
+        help=(
+            "Only for the two-credential conflict, and only after the wearer "
+            "has chosen: keep the pairing that lives in the secondary "
+            "profile. The default profile's own relay credential is dropped "
+            "and the secondary's is carried across unchanged. Nothing is "
+            "regenerated, and the flag does nothing when there is no "
+            "conflict."
+        ),
+    )
+    move_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Emit the plan or receipt as JSON",
+    )
+
     # `pair` deliberately has NO --json and no non-interactive mode. #1270's Q4
     # puts the approval at an interactive terminal with an exact yes/no prompt
     # and states that no non-interactive or dashboard approval path exists, so
@@ -1848,6 +2248,39 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
             "wss://my-host.tail-scale.ts.net:8443. Required: this computer "
             "cannot discover its own private route yet, and guessing one would "
             "bind an address the phone cannot dial."
+        ),
+    )
+
+    # `first-use` inherits `pair`'s refusals for the same reason (#3099). When
+    # the phone reports no glasses SDK receipt for the reply, the only evidence
+    # left is the wearer's own typed answer about a physical display, so there
+    # is no --json and no non-interactive mode to supply it quietly. There is
+    # no --retry either: an attempt lives one hour and a rerun picks it up.
+    first_use_parser = subs.add_parser(
+        "first-use",
+        help="Check the first message from the phone, then hand off the welcome",
+        description=(
+            "Ask for one message from the paired phone and record it as this "
+            "profile's Hermes First-Run Proof attempt. When the phone reports "
+            "that the glasses SDK accepted that exact reply, nothing is asked "
+            "here; otherwise this asks whether the reply appeared on the Even "
+            "G2, which needs an interactive terminal. It then waits a bounded "
+            "time for the gateway to commit the welcome double-tap. Requires a "
+            "running gateway, and never displays or asks for any secret. "
+            "Without a terminal it still waits for the phone's message and its "
+            "glasses SDK receipt, and refuses only at the point where a typed "
+            "confirmation would be needed."
+        ),
+    )
+    first_use_parser.add_argument(
+        "--first-use-wait",
+        dest="first_use_wait",
+        type=_positive_seconds,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "How long to wait for the phone's message, in seconds. The default "
+            "is 165, the same bound the guided setup journey uses."
         ),
     )
 
@@ -1886,6 +2319,145 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
         dest="json_output",
         help="Emit the uninstall receipt as JSON",
     )
+    # Cloudways managed-Hermes path (#2979): user-owned userspace Tailscale
+    # kept alive by a Hermes cron watchdog. Registered lazily-implemented like
+    # `pair`; the verbs are deterministic and idempotent so the on-box agent
+    # can run them from its terminal tool.
+    cloudways_parser = subs.add_parser(
+        "cloudways",
+        help="Cloudways managed Hermes: userspace Tailscale + cron watchdog",
+        description=(
+            "Set up and operate the Cloudways-approved private route: a "
+            "non-root userspace tailscaled under ~/bin and ~/.tailscale, kept "
+            "alive across container restarts by a Hermes cron job with no LLM "
+            "involvement. Every verb is safe to re-run."
+        ),
+    )
+    cloudways_subs = cloudways_parser.add_subparsers(dest="cloudways_verb", required=True)
+    for verb, help_text in (
+        ("detect", "Which Cloudways environment signals fired"),
+        ("install", "Install pinned binaries, receipt, watchdog script and cron job"),
+        ("enroll", "Run `tailscale up` and print the authorization URL"),
+        ("status", "Daemon, route, watchdog job, receipt and legacy inventory"),
+        ("retry", "Print a fresh authorization URL"),
+        ("enable", "Resume the watchdog job and fire it now"),
+        ("disable", "Pause the watchdog job and stop the daemon"),
+        ("rollback", "Remove job, daemon, binaries, script and receipt (identity kept)"),
+    ):
+        verb_parser = cloudways_subs.add_parser(verb, help=help_text)
+        verb_parser.add_argument(
+            "--json", action="store_true", dest="json_output", help="Emit JSON instead of text"
+        )
+        if verb in ("enroll", "retry"):
+            verb_parser.add_argument(
+                "--hostname", default=None, help="Node name for a fresh identity (default ocuclaw-<host>)"
+            )
+            verb_parser.add_argument(
+                "--qr", action="store_true", help="Also print the authorization URL as a QR code"
+            )
+        if verb == "install":
+            verb_parser.add_argument(
+                "--force-download",
+                action="store_true",
+                help="Re-download the pinned archive even if the installed version matches",
+            )
+        if verb == "status":
+            verb_parser.add_argument(
+                "--wait",
+                type=float,
+                default=0.0,
+                metavar="SECONDS",
+                help="Return early once the daemon is running or needs authorization; cap the wait here",
+            )
+        if verb == "rollback":
+            verb_parser.add_argument(
+                "--yes", action="store_true", dest="assume_yes", help="Confirm removal without a prompt"
+            )
+            verb_parser.add_argument(
+                "--purge-identity",
+                action="store_true",
+                help="Also delete ~/.tailscale (the node must be re-authorized afterwards)",
+            )
+    # A wait of zero or less is a typo, not a request. Refuse it here with a
+    # plain line rather than quietly substituting the 600-second default.
+    def _wait_seconds(raw: str) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(f"{raw!r} is not a number of seconds")
+        if value <= 0:
+            raise argparse.ArgumentTypeError(
+                f"the wait must be more than 0 seconds, not {raw}"
+            )
+        return value
+
+    # `setup` is the ladder (#3101), deliberately outside the uniform verb loop
+    # above: it is the only verb with its own flag set. Steps 2, 3, 6, 7 and 8
+    # are not automated yet and each prints the manual command that covers it.
+    setup_parser = cloudways_subs.add_parser(
+        "setup",
+        help="Run the whole Cloudways path as one resumable command",
+        description=(
+            "Take this Cloudways Hermes host from an installed plugin to a paired "
+            "phone in numbered steps [1/8] to [8/8]. Every step reads live state "
+            "first and skips what is already done, so re-running after a timeout "
+            "or a dropped session continues where it stopped. Refuses on any host "
+            "that is not decisively a Cloudways Managed AI Agents container."
+        ),
+    )
+    setup_parser.add_argument(
+        "--json", action="store_true", dest="json_output", help="Emit the final summary as JSON"
+    )
+    setup_parser.add_argument(
+        "--yes",
+        action="store_true",
+        dest="assume_yes",
+        help="Answer the consent questions yes (automation); never approves a pairing",
+    )
+    setup_parser.add_argument(
+        "--wait",
+        type=_wait_seconds,
+        default=600.0,
+        metavar="SECONDS",
+        help="How long to wait for the tailnet node to be approved (default 600)",
+    )
+    setup_parser.add_argument(
+        "--first-use-wait",
+        type=_wait_seconds,
+        default=600.0,
+        dest="first_use_wait",
+        metavar="SECONDS",
+        help="How long to wait for the first message (default 600)",
+    )
+    setup_parser.add_argument(
+        "--no-pair", action="store_true", dest="no_pair", help="Stop before pairing the phone"
+    )
+    setup_parser.add_argument(
+        "--no-first-use",
+        action="store_true",
+        dest="no_first_use",
+        help="Stop before the first message",
+    )
+    setup_parser.add_argument(
+        "--light-terminal",
+        action="store_true",
+        dest="light_terminal",
+        help="Render the pairing QR for a light-background terminal instead of a dark one",
+    )
+    setup_parser.add_argument(
+        "--hostname",
+        default=None,
+        help="Tailnet node name for a fresh identity (default ocuclaw-<host>)",
+    )
+    setup_parser.add_argument(
+        "--details",
+        action="store_true",
+        help=(
+            "Spell out the exact settings keys and the full route explanation in "
+            "the consent questions. It changes what they say, never what is done "
+            "or what is asked"
+        ),
+    )
     pair_parser.add_argument(
         "--light-terminal",
         action="store_true",
@@ -1902,9 +2474,157 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _process_home() -> Optional[Path]:
+    """The home THIS process resolved — a secondary when `hermes -p` was used.
+
+    Deliberately not `default_home_for(...)`: the whole point of the setup
+    refusal is to notice that this invocation is NOT the default profile, and
+    normalising to the default first would erase exactly that fact.
+    """
+    try:
+        from .receipts import resolve_receipt_home
+
+        return resolve_receipt_home()
+    except Exception:  # noqa: BLE001 - an unresolved home is a refusal, not a crash
+        return None
+
+
+def run_setup_preflight(
+    *,
+    json_output: bool = False,
+    process_home_fn: Optional[Callable[[], Optional[Path]]] = None,
+    profiles_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
+    capability: Optional[Mapping[str, Any]] = None,
+    stdout: Optional[TextIO] = None,
+    stderr: Optional[TextIO] = None,
+) -> int:
+    """`hermes ocuclaw setup-preflight`. Read-only; every seam injectable."""
+    from . import setup_profiles
+
+    out = sys.stdout if stdout is None else stdout
+    err = sys.stderr if stderr is None else stderr
+    home_fn = _process_home if process_home_fn is None else process_home_fn
+    inventory_fn = _default_profiles_inventory if profiles_fn is None else profiles_fn
+
+    try:
+        report = setup_profiles.preflight(
+            process_home=home_fn(),
+            inventory=inventory_fn(),
+            capability=capability,
+        )
+    except Exception:  # noqa: BLE001 - a preflight must not become an outage
+        return _emit_error(
+            ERROR_COLLECTION_FAILED, json_output=json_output, stdout=out, stderr=err
+        )
+
+    if json_output:
+        out.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    else:
+        out.write("\n".join(setup_profiles.render_preflight(report)) + "\n")
+    return EXIT_OK if report.get("mayProceed") else EXIT_PROBLEM
+
+
+def run_move_to_default(
+    source: str,
+    *,
+    apply: bool = False,
+    json_output: bool = False,
+    keep_source_credential: bool = False,
+    process_home_fn: Optional[Callable[[], Optional[Path]]] = None,
+    profiles_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
+    stdout: Optional[TextIO] = None,
+    stderr: Optional[TextIO] = None,
+) -> int:
+    """`hermes ocuclaw move-to-default --from <profile> [--apply]`."""
+    from . import profiles_report, setup_profiles
+
+    out = sys.stdout if stdout is None else stdout
+    err = sys.stderr if stderr is None else stderr
+    home_fn = _process_home if process_home_fn is None else process_home_fn
+    inventory_fn = _default_profiles_inventory if profiles_fn is None else profiles_fn
+
+    default_home = profiles_report.default_home_for(home_fn())
+    if default_home is None:
+        return _emit_error(
+            ERROR_PROFILE_UNRESOLVED, json_output=json_output, stdout=out, stderr=err
+        )
+
+    try:
+        inventory = inventory_fn()
+        plan = setup_profiles.move_plan(
+            default_home=default_home,
+            source=source,
+            inventory=inventory,
+            keep_source_credential=keep_source_credential,
+        )
+    except Exception:  # noqa: BLE001 - never half-report a move
+        return _emit_error(
+            ERROR_COLLECTION_FAILED, json_output=json_output, stdout=out, stderr=err
+        )
+
+    receipt: Optional[Dict[str, Any]] = None
+    if apply and plan.get("mayApply"):
+        try:
+            receipt = setup_profiles.apply_move(
+                default_home=default_home, source=source, plan=plan
+            )
+        except Exception as exc:  # noqa: BLE001 - say what stopped, mid-move
+            # `apply_move` reports a partial move as a receipt rather than
+            # raising, so reaching here means something outside the step loop
+            # failed. Report the type only: a config parse error can carry
+            # file content in its message.
+            receipt = {
+                "status": setup_profiles.MOVE_PARTIAL,
+                "source": source,
+                "applied": [],
+                "error": type(exc).__name__,
+                "next": ["hermes ocuclaw doctor"],
+            }
+
+    if json_output:
+        # The receipt travels in the --json envelope too. A partial move that
+        # printed nothing on stdout would hide exactly the half-applied state
+        # the operator has to see before retrying.
+        document = {"plan": plan, "receipt": receipt}
+        out.write(json.dumps(document, indent=2, sort_keys=True) + "\n")
+    else:
+        out.write("\n".join(setup_profiles.render_move(plan, applied=receipt)) + "\n")
+
+    if receipt is not None:
+        if receipt.get("status") == setup_profiles.MOVE_PARTIAL:
+            err.write(
+                "[ocuclaw] the ownership move stopped part-way at "
+                f"{receipt.get('failedStep') or 'an early step'}; run "
+                "`hermes ocuclaw doctor` before retrying — the profile faults "
+                "name what is where now.\n"
+            )
+            return EXIT_PROBLEM
+        return EXIT_OK
+    return EXIT_OK if plan.get("mayApply") else EXIT_PROBLEM
+
+
 def dispatch(args: argparse.Namespace) -> int:
     """Hermes calls this with the parsed namespace; the return value is the rc."""
     command = getattr(args, "ocuclaw_command", None) or "status"
+    if command == "optional-setup":
+        from .optional_setup import dispatch as dispatch_optional_setup
+        return dispatch_optional_setup(args)
+    if command == "even-ai":
+        from .even_ai_cli import dispatch as dispatch_even_ai
+        return dispatch_even_ai(args)
+    if command == "setup-preflight":
+        return run_setup_preflight(
+            json_output=bool(getattr(args, "json_output", False))
+        )
+    if command == "move-to-default":
+        return run_move_to_default(
+            str(getattr(args, "move_source", "") or ""),
+            apply=bool(getattr(args, "apply_move", False)),
+            json_output=bool(getattr(args, "json_output", False)),
+            keep_source_credential=bool(
+                getattr(args, "keep_source_credential", False)
+            ),
+        )
     if command == "pair":
         # Imported lazily, like `_default_facts`, so wiring the subparser does
         # not drag the pairing surface into every `hermes` invocation.
@@ -1914,6 +2634,19 @@ def dispatch(args: argparse.Namespace) -> int:
             str(getattr(args, "address", "") or ""),
             light_terminal=bool(getattr(args, "light_terminal", False)),
             show_payload_text=bool(getattr(args, "show_payload_text", False)),
+        )
+    if command == "first-use":
+        # Lazy for the same reason as `pair`: the first-run machinery stays out
+        # of every other `hermes` invocation. Only the exit code leaves here;
+        # the lines are already on the terminal and the record belongs to the
+        # caller that injected its own sinks (#3105).
+        from .first_use_cli import run_first_use
+
+        wait = getattr(args, "first_use_wait", None)
+        return int(
+            run_first_use(
+                **({} if wait is None else {"wait_seconds": float(wait)})
+            )["exitCode"]
         )
     if command == "reset-relay-credential":
         from .pairing import run_reset_relay_credential
@@ -1926,6 +2659,10 @@ def dispatch(args: argparse.Namespace) -> int:
             assume_yes=bool(getattr(args, "assume_yes", False)),
             json_output=bool(getattr(args, "json_output", False)),
         )
+    if command == "cloudways":
+        from .cloudways_cli import run_cloudways
+
+        return run_cloudways(args)
     return run(command, json_output=bool(getattr(args, "json_output", False)))
 
 

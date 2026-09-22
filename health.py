@@ -11,12 +11,13 @@ no network connection and mutates nothing.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from . import serve
 from .control_link import HERMES_BUNDLE_DEFAULT_WS_BIND, HERMES_BUNDLE_DEFAULT_WS_PORT
@@ -37,10 +38,10 @@ PLATFORM_NAME = "ocuclaw"
 BUNDLE_DIR = Path(__file__).resolve().parent
 DEFAULT_RUNTIME_ENTRY = BUNDLE_DIR / "dist-cjs" / "runtime" / "hermes-runtime-entry.cjs"
 
-CERTIFIED_HERMES_VERSION = "0.21.0"
-CERTIFIED_HERMES_TAG = "v2026.8.31"
-CERTIFIED_HERMES_COMMIT = "29112bef099274229cadff79cdff7bf7b99c4b77"
-SUPPORTED_HERMES_MIN = (0, 21, 0)
+CERTIFIED_HERMES_VERSION = "0.21.3"
+CERTIFIED_HERMES_TAG = "v2026.9.14"
+CERTIFIED_HERMES_COMMIT = "345cd2b057a452236de401d3534b8502a7465e8d"
+SUPPORTED_HERMES_MIN = (0, 21, 1)
 SUPPORTED_HERMES_MAX_EXCLUSIVE = (0, 22, 0)
 
 # The ONE user id the adapter stamps on every wearer-originated event
@@ -57,6 +58,214 @@ _SECRET_ENV_TO_KEY = {
     OCUCLAW_SONIOX_API_KEY_ENV: "sonioxApiKey",
     OCUCLAW_EVEN_AI_TOKEN_ENV: "evenAiToken",
 }
+
+# Non-secret platform settings that may also come from the Hermes env file
+# (#3098). These are the keys `skills/ocuclaw-assist-hermes/references/
+# fresh-install.md` otherwise makes an operator type into `hermes config set`
+# by hand, so an unattended installer can seed them the same way it already
+# seeds the three secrets above. `wsBind` is deliberately NOT here: it is the
+# relay bind address, and an env name for it would be a remote way to widen
+# the listener past loopback.
+OCUCLAW_ALLOW_ADMIN_FROM_ENV = "OCUCLAW_ALLOW_ADMIN_FROM"
+OCUCLAW_EVEN_AI_ENABLED_ENV = "OCUCLAW_EVEN_AI_ENABLED"
+
+PLATFORM_ENV_TO_KEY = {
+    OCUCLAW_ALLOW_ADMIN_FROM_ENV: "allow_admin_from",
+    OCUCLAW_EVEN_AI_ENABLED_ENV: "evenAiEnabled",
+}
+
+_TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
+_FALSE_WORDS = frozenset({"0", "false", "no", "off"})
+
+
+def _parse_id_list(raw: str) -> List[str]:
+    """A user-id allow-list written as JSON (`["a","b"]`) or `a,b`.
+
+    Hermes' own reader (`gateway.slash_access._coerce_id_list`) already takes
+    either shape off `extra`, so both spellings survive the trip. Raises
+    ``ValueError`` on anything that is not a list of plain ids, including an
+    explicitly empty one: an allow-list with nobody in it silently disables
+    the gate it was set to turn on.
+    """
+    text = raw.strip()
+    if text.startswith("[") or text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except ValueError as exc:
+            raise ValueError("not valid JSON") from exc
+        if not isinstance(parsed, list):
+            raise ValueError("JSON value is not a list")
+        items: List[Any] = list(parsed)
+        # `str(item)` would happily turn JSON `null`/`true`/`1.5` into the ids
+        # "None"/"True"/"1.5", which is not what the operator wrote. Only a
+        # string or a whole number is an id; `bool` is an `int` subclass, so it
+        # is excluded by name.
+        if any(
+            isinstance(item, bool) or not isinstance(item, (str, int))
+            for item in items
+        ):
+            raise ValueError("list entries must be plain ids")
+    else:
+        items = list(text.split(","))
+    ids = [str(item).strip() for item in items]
+    ids = [item for item in ids if item]
+    if not ids:
+        raise ValueError("no user ids")
+    return ids
+
+
+def _parse_bool(raw: str) -> bool:
+    text = raw.strip().lower()
+    if text in _TRUE_WORDS:
+        return True
+    if text in _FALSE_WORDS:
+        return False
+    raise ValueError("expected true or false")
+
+
+_PLATFORM_ENV_PARSERS: Dict[str, Callable[[str], Any]] = {
+    OCUCLAW_ALLOW_ADMIN_FROM_ENV: _parse_id_list,
+    OCUCLAW_EVEN_AI_ENABLED_ENV: _parse_bool,
+}
+
+
+# Refusals are warned once per process per (env name, reason). `collect_health_facts`
+# runs the seed on every status and doctor read, and an operator polling a
+# broken `.env` line does not need the same complaint in the log a hundred times.
+_WARNED_PLATFORM_ENV: set = set()
+
+
+def reset_platform_env_warnings() -> None:
+    """Forget which refusals have been warned about (test seam)."""
+    _WARNED_PLATFORM_ENV.clear()
+
+
+def platform_env_seed(env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
+    """The non-secret `platforms.ocuclaw.extra` values this env file supplies.
+
+    An absent or blank env name contributes nothing, so a hand-edited
+    `config.yaml` keeps working exactly as before. A value that cannot be
+    parsed is refused with ONE plain warning line — once per process per
+    (name, reason) — and then treated as absent: gateway start must never fall
+    over because of a typo in `.env`, and the seeded Relay Credential must not
+    be lost along with it.
+    """
+    source = os.environ if env is None else env
+    seed: Dict[str, Any] = {}
+    for env_name, extra_key in PLATFORM_ENV_TO_KEY.items():
+        raw = str(source.get(env_name, "") or "").strip()
+        if not raw:
+            continue
+        try:
+            seed[extra_key] = _PLATFORM_ENV_PARSERS[env_name](raw)
+        except ValueError as exc:
+            # The reason is a fixed phrase, never the rejected value: an
+            # operator's `.env` line may sit next to secrets in one paste
+            # buffer, and a value in the key would also defeat the de-dupe.
+            if (env_name, str(exc)) in _WARNED_PLATFORM_ENV:
+                continue
+            _WARNED_PLATFORM_ENV.add((env_name, str(exc)))
+            logger.warning(
+                "[ocuclaw] %s is not a usable %s (%s) — ignoring it and using "
+                "platforms.ocuclaw.extra.%s from config.yaml",
+                env_name,
+                extra_key,
+                exc,
+                extra_key,
+            )
+    return seed
+
+
+def env_seed_reaches_extra(
+    platform_config: Any,
+    *,
+    relay_token_present: bool,
+    host_supported: bool,
+    node_available: bool,
+) -> bool:
+    """Whether Hermes would actually COMMIT the env seed onto this platform.
+
+    A seed that is never committed is not an effective value, and a status read
+    that reported one would be claiming something the gateway never took.
+    `gateway/config_env.py` `_enable_plugin_platform` (lines 375-417 at the
+    0.21.1 floor, commit ``2237be355906``; unchanged at 0.21.2/0.21.3) reaches
+    its ``platform_config.extra.update(seed)`` only past three refusals:
+
+    * line 385 — an `enabled:` key that says False (the loader's
+      ``_enabled_explicit`` marker, `gateway/config_loader.py:143`) returns at
+      once. An operator who switched the platform off is never overridden.
+    * line 389 — when the platform is not already enabled, ``is_connected``
+      must pass. OcuClaw's is `_admitted_is_connected`: a supported host plus a
+      Relay Credential, from the env file or the legacy yaml `extra.relayToken`.
+      **Before the credential exists there is no commit**, so a fresh install
+      that has written only `OCUCLAW_ALLOW_ADMIN_FROM` is not yet configured.
+    * line 405 — ``check_fn`` must pass, or the platform must register
+      ``ensure_deps_fn``. OcuClaw's `check_ocuclaw_requirements` is "supported
+      host and node found", and it registers no `ensure_deps_fn`.
+    """
+    block = platform_config if isinstance(platform_config, Mapping) else {}
+    enabled = block.get("enabled")
+    if enabled is False:  # explicitly switched off — never re-enabled
+        return False
+    if enabled is not True:  # not already enabled: the is_connected gate applies
+        extra = block.get("extra")
+        yaml_relay_token = (
+            str((extra or {}).get("relayToken") or "").strip()
+            if isinstance(extra, Mapping)
+            else ""
+        )
+        if not (host_supported and (relay_token_present or yaml_relay_token)):
+            return False
+    return bool(host_supported and node_available)  # check_fn, no ensure_deps_fn
+
+
+def effective_platform_extra(
+    extra: Any,
+    *,
+    seed_committed: bool,
+    env: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    """`extra` as the gateway will really see it: env layered over config.yaml.
+
+    Hermes commits the plugin's env seed with ``platform_config.extra.update``
+    (`gateway/config_env.py` `_enable_plugin_platform`), so env WINS for every
+    key it names — the same precedence the seeded secrets have always had.
+    The passive status reads parse raw `config.yaml`, which knows nothing about
+    `.env`; this is what keeps them honest about the effective value.
+
+    ``seed_committed`` is `env_seed_reaches_extra`'s answer for this host. When
+    it is False the env layer is left off entirely, because Hermes would not
+    have applied it either.
+    """
+    block = dict(extra) if isinstance(extra, Mapping) else {}
+    if seed_committed:
+        block.update(platform_env_seed(env))
+    return block
+
+
+def admin_ids_from_extra(extra: Any) -> List[str]:
+    """The platform's ``allow_admin_from`` list, coerced the way Hermes coerces it.
+
+    Mirrors ``gateway.slash_access._coerce_id_list``: a comma-separated string
+    or any sequence of ids, stripped, blanks dropped, order preserved. Public
+    so a caller that has to EXTEND the allow-list (the Cloudways ladder's
+    settings step, #3102) reads the same list the gate reads, instead of
+    inventing a second parser that could disagree and drop an admin.
+    """
+    block = extra if isinstance(extra, Mapping) else {}
+    raw = block.get("allow_admin_from")
+    if isinstance(raw, str):
+        parts: List[Any] = list(raw.split(","))
+    elif isinstance(raw, (list, tuple, set)):
+        parts = list(raw)
+    else:
+        parts = []
+    ids: List[str] = []
+    for part in parts:
+        text = str(part).strip()
+        if text and text not in ids:
+            ids.append(text)
+    return ids
 
 
 def continue_here_configured(extra: Any) -> bool:
@@ -79,14 +288,7 @@ def continue_here_configured(extra: Any) -> bool:
         return bool(policy.enabled and policy.is_admin(OCUCLAW_WEARER_USER_ID))
     except Exception:  # noqa: BLE001 - pure fallback below
         pass
-    raw = block.get("allow_admin_from")
-    if isinstance(raw, str):
-        ids = [part.strip() for part in raw.split(",")]
-    elif isinstance(raw, (list, tuple, set)):
-        ids = [str(part).strip() for part in raw]
-    else:
-        ids = []
-    return OCUCLAW_WEARER_USER_ID in {part for part in ids if part}
+    return OCUCLAW_WEARER_USER_ID in admin_ids_from_extra(block)
 
 
 def parse_version(raw: str) -> Optional[Tuple[int, int, int]]:
@@ -285,6 +487,24 @@ def collect_health_facts(
     extra = platform_config.get("extra")
     if not isinstance(extra, dict):
         extra = {}
+    # #3098: the yaml block alone is not what the gateway runs on. Layer the
+    # env-seeded platform settings over it so a host configured entirely from
+    # `.env` reports the values it will actually gate on — but only where
+    # Hermes would really commit that seed, so the read never claims a seed the
+    # gateway refused. These three reads are hoisted because the gate needs
+    # them; the facts below reuse the same values.
+    version = hermes_version_fn()
+    secret_inventory = secret_inventory_fn()
+    node = node_fn()
+    extra = effective_platform_extra(
+        extra,
+        seed_committed=env_seed_reaches_extra(
+            platform_config,
+            relay_token_present=bool(secret_inventory.get("relayToken")),
+            host_supported=bool(supported_fn(version)),
+            node_available=node is not None,
+        ),
+    )
 
     ws_bind = str(extra.get("wsBind") or HERMES_BUNDLE_DEFAULT_WS_BIND).strip()
     relay_port_valid = True
@@ -307,7 +527,6 @@ def collect_health_facts(
     plugins = raw_config.get("plugins")
     enabled_plugins = plugins.get("enabled", []) if isinstance(plugins, dict) else []
     uses_default_runtime = not bool(extra.get("runtimeCommand"))
-    version = hermes_version_fn()
     home = resolve_home_fn()
     source_receipt = source_fn(version, home)
     fingerprint = fingerprint_home(home)
@@ -339,10 +558,10 @@ def collect_health_facts(
         continueHereConfigured=continue_here_configured(extra),
         multiplexProfiles=multiplex_profiles,
         agentMode=agent_mode,
-        secretsPresent=secret_inventory_fn(),
+        secretsPresent=secret_inventory,
         hermesCliOnPath=shutil.which("hermes") is not None,
         nodeRequired=uses_default_runtime,
-        nodeAvailable=node_fn() is not None,
+        nodeAvailable=node is not None,
         runtimeAvailable=not uses_default_runtime or runtime_entry.is_file(),
         adapterLinkReady=any(bool(getattr(adapter, "link_ready", False)) for adapter in adapters),
         appPresenceRecord=presence_record,
@@ -357,8 +576,16 @@ def collect_health_facts(
 
 
 __all__ = [
+    "OCUCLAW_ALLOW_ADMIN_FROM_ENV",
+    "OCUCLAW_EVEN_AI_ENABLED_ENV",
     "OCUCLAW_WEARER_USER_ID",
+    "PLATFORM_ENV_TO_KEY",
+    "admin_ids_from_extra",
     "continue_here_configured",
+    "effective_platform_extra",
+    "env_seed_reaches_extra",
+    "platform_env_seed",
+    "reset_platform_env_warnings",
     "CERTIFIED_HERMES_COMMIT",
     "CERTIFIED_HERMES_TAG",
     "CERTIFIED_HERMES_VERSION",

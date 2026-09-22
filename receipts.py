@@ -7,9 +7,13 @@ Four profile-scoped records (#1273 §8 / #1268 / #1321), plus one host-scoped:
     <HERMES_HOME>/state/ocuclaw.first-run-proof.json   durable, never expires
     <HERMES_HOME>/state/ocuclaw.relay-credential.json  durable discriminator
     ~/.evenclaw/state/ocuclaw.managed-serve-route.json  host-wide, durable
+    <HERMES_HOME>/state/ocuclaw.cloudways-restart-pending.json  ladder marker
 
 Scope follows what each record describes. The first four describe one profile's
-state and are exact-profile. The fifth describes the machine's one Tailscale
+state and are exact-profile. The last is the Cloudways ladder's own note that
+it wrote a setting the gateway has not read yet (#3149): profile-scoped by
+path, carrying one wall-clock time and nothing else, so it needs neither a
+fingerprint nor a TTL. The fifth describes the machine's one Tailscale
 Serve route, which every gateway install on the host shares, so it is
 host-scoped by owner ruling (#1373) — a receipt about a host-wide route that
 lived in one profile's home could never be found by the install that needed
@@ -58,13 +62,14 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import subprocess
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterator, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 APP_PRESENCE_FILENAME = "ocuclaw.app-presence.json"
 FIRST_RUN_PROOF_FILENAME = "ocuclaw.first-run-proof.json"
@@ -1122,7 +1127,207 @@ def route_receipt_agrees(
     return True
 
 
+# -- Tailscale CLI receipt (host-scoped, #2980) --------------------------------
+#
+# A host whose tailscaled is a user-owned userspace daemon (Cloudways managed
+# Hermes: no root, no TUN, no system service) has no `tailscale` on PATH and
+# no kernel route to the tailnet. This receipt tells every reader in the
+# bundle two things: the exact argv that reaches that daemon
+# (`~/bin/tailscale --socket=~/.tailscale/run/tailscaled.sock`) and, when the
+# daemon exposes one, the loopback SOCKS5 proxy through which this host can
+# reach tailnet addresses — its own Serve route included. Host-scoped like the
+# Managed Serve Route receipt, because there is one tailscaled per host.
+# Absent receipt = today's behaviour: bare `tailscale` from PATH, direct dial.
+
+TAILSCALE_CLI_FILENAME = "ocuclaw.tailscale-cli.json"
+TAILSCALE_CLI_SCHEMA_VERSION = 1
+#: The only proxy hosts a receipt may name. The proxy carries no
+#: authentication, so it must never be anything but this host's loopback.
+_LOOPBACK_PROXY_HOSTS = ("127.0.0.1", "::1", "localhost")
+
+
+class TailscaleCli(NamedTuple):
+    argv: Tuple[str, ...]
+    socks5: Optional[Tuple[str, int]]
+    provisioner: str
+
+
+def tailscale_cli_path(state_dir: Optional[Path] = None) -> Optional[Path]:
+    directory = host_state_dir() if state_dir is None else state_dir
+    return None if directory is None else directory / TAILSCALE_CLI_FILENAME
+
+
+def parse_socks5(value: Any) -> Optional[Tuple[str, int]]:
+    """``"127.0.0.1:1055"`` → ``("127.0.0.1", 1055)``; anything else → ``None``.
+
+    Only loopback hosts parse. A receipt naming any other proxy is treated as
+    no proxy at all rather than as a reason to send probes off-host.
+    """
+    if not isinstance(value, str) or ":" not in value:
+        return None
+    host, _, port_text = value.rpartition(":")
+    host = host.strip("[]").strip().lower()
+    if host not in _LOOPBACK_PROXY_HOSTS:
+        return None
+    try:
+        port = int(port_text)
+    except ValueError:
+        return None
+    if not 0 < port < 65536:
+        return None
+    return host, port
+
+
+def build_tailscale_cli_body(
+    *, argv: Sequence[str], socks5: Optional[str], provisioner: str
+) -> Dict[str, Any]:
+    """Validate and shape the receipt. Raises ``ValueError`` on a bad argv."""
+    cleaned = [str(part) for part in argv if isinstance(part, str) and part.strip()]
+    if not cleaned or not os.path.isabs(cleaned[0]):
+        raise ValueError("tailscale CLI argv must start with an absolute binary path")
+    if socks5 is not None and parse_socks5(socks5) is None:
+        raise ValueError("socks5 must be a loopback host:port")
+    return {
+        "schemaVersion": TAILSCALE_CLI_SCHEMA_VERSION,
+        "argv": cleaned,
+        "socks5": socks5,
+        "provisioner": str(provisioner or "unknown"),
+        "writtenAt": now_iso(),
+    }
+
+
+def write_tailscale_cli(body: Mapping[str, Any], *, state_dir: Optional[Path] = None) -> Path:
+    path = tailscale_cli_path(state_dir)
+    if path is None:
+        raise ReceiptUnavailableError("no host state directory")
+    return write_json_receipt(path, body, durable=True)
+
+
+def remove_tailscale_cli(*, state_dir: Optional[Path] = None) -> bool:
+    """Delete the receipt; ``True`` if one was there."""
+    path = tailscale_cli_path(state_dir)
+    if path is None:
+        return False
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def read_tailscale_cli(*, state_dir: Optional[Path] = None) -> Optional[TailscaleCli]:
+    """The receipt, or ``None`` for missing/unreadable/foreign-schema/invalid.
+
+    Fail-soft on purpose: a broken receipt degrades every reader to the
+    PATH-and-direct-dial behaviour they had before the receipt existed, which
+    is a worse diagnosis, never a crashed one.
+    """
+    record, status = _read_json(tailscale_cli_path(state_dir))
+    if status != "ok" or record is None:
+        return None
+    if record.get("schemaVersion") != TAILSCALE_CLI_SCHEMA_VERSION:
+        return None
+    argv = record.get("argv")
+    if not isinstance(argv, list) or not argv:
+        return None
+    parts = tuple(part for part in argv if isinstance(part, str) and part.strip())
+    if len(parts) != len(argv) or not os.path.isabs(parts[0]):
+        return None
+    provisioner = record.get("provisioner")
+    return TailscaleCli(
+        argv=parts,
+        socks5=parse_socks5(record.get("socks5")),
+        provisioner=provisioner if isinstance(provisioner, str) else "unknown",
+    )
+
+
+# -- the Cloudways ladder's restart-pending marker ----------------------------
+
+RESTART_PENDING_FILENAME = "ocuclaw.cloudways-restart-pending.json"
+RESTART_PENDING_SCHEMA_VERSION = 1
+RESTART_PENDING_KIND = "cloudways-restart-pending"
+
+
+def restart_pending_path(home: Optional[Path] = None) -> Optional[Path]:
+    """Where the ladder records that IT wrote a setting the gateway has not read.
+
+    Profile-scoped, beside the ladder's journal, because the setting it stands
+    for is this profile's. It carries one wall-clock time and no value of any
+    setting, so it is readable by anything and reveals nothing.
+    """
+    directory = state_dir(home)
+    return None if directory is None else directory / RESTART_PENDING_FILENAME
+
+
+def write_restart_pending(written_at: float, *, home: Optional[Path] = None) -> Path:
+    path = restart_pending_path(home)
+    if path is None:
+        raise ReceiptUnavailableError("no profile state directory")
+    return write_json_receipt(
+        path,
+        {
+            "kind": RESTART_PENDING_KIND,
+            "schemaVersion": RESTART_PENDING_SCHEMA_VERSION,
+            "writtenAt": float(written_at),
+            "writtenAtIso": now_iso(),
+        },
+        durable=True,
+    )
+
+
+def read_restart_pending(*, home: Optional[Path] = None) -> Tuple[Optional[float], str]:
+    """``(written_at, status)`` — ``"missing"``, ``"unreadable"`` or ``"ok"``.
+
+    The three answers are deliberately distinct. "Missing" is positive
+    knowledge that the ladder has nothing waiting; "unreadable" is the honest
+    unknown, and a caller must never read it as either of the other two.
+    """
+    record, status = _read_json(restart_pending_path(home))
+    if status == "missing":
+        return None, "missing"
+    if status != "ok" or record is None:
+        return None, "unreadable"
+    if record.get("schemaVersion") != RESTART_PENDING_SCHEMA_VERSION:
+        return None, "unreadable"
+    written_at = record.get("writtenAt")
+    if isinstance(written_at, bool) or not isinstance(written_at, (int, float)):
+        return None, "unreadable"
+    if not math.isfinite(float(written_at)):
+        return None, "unreadable"
+    return float(written_at), "ok"
+
+
+def remove_restart_pending(*, home: Optional[Path] = None) -> bool:
+    """Delete the marker; ``True`` if one was there."""
+    path = restart_pending_path(home)
+    if path is None:
+        return False
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return True
+
+
 __all__ = [
+    "RESTART_PENDING_FILENAME",
+    "RESTART_PENDING_KIND",
+    "RESTART_PENDING_SCHEMA_VERSION",
+    "read_restart_pending",
+    "remove_restart_pending",
+    "restart_pending_path",
+    "write_restart_pending",
+    "TAILSCALE_CLI_FILENAME",
+    "TAILSCALE_CLI_SCHEMA_VERSION",
+    "TailscaleCli",
+    "build_tailscale_cli_body",
+    "parse_socks5",
+    "read_tailscale_cli",
+    "remove_tailscale_cli",
+    "tailscale_cli_path",
+    "write_tailscale_cli",
     "APP_PRESENCE_FILENAME",
     "MANAGED_SERVE_ROUTE_FILENAME",
     "MANAGED_SERVE_ROUTE_SCHEMA_VERSION",

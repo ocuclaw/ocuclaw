@@ -19,53 +19,43 @@ const PAIRING_BOOTSTRAP_FORBIDDEN_SUBSTRINGS                    = Object.freeze(
   "token=",
 ]);
 
-const RULE = "─".repeat(64);
-
-const ASCII_RULE = "-".repeat(64);
-
 const NARROW_TERMINAL_COLUMNS = 76;
 
 function renderCodeSection(
   qrPayload                  ,
   lightTerminal         ,
   terminal                      ,
+  prefix          ,
 )           {
+
+  const fits = (text        , columns        ) => {
+    if (terminal.columns > 0 && columns > terminal.columns) return false;
+    if (!terminal.rows || terminal.rows <= 0) return true;
+    const width = terminal.columns > 0 ? terminal.columns : 80;
+    const prefixRows = prefix.reduce((total, line) => total + Math.max(1, Math.ceil(line.length / width)), 0);
+    return prefixRows + text.split("\n").length + 2 <= terminal.rows;
+  };
   if (terminal.unicode) {
+    const code = renderQrPayloadToTerminal(qrPayload, { invert: !lightTerminal });
+
+    const codeColumns = code.split("\n")[0].length;
+    if (fits(code, codeColumns)) {
+      return [code];
+    }
+
     return [
-      "  Scan this code with the Even app:",
-      "",
-      renderQrPayloadToTerminal(qrPayload, { invert: !lightTerminal }),
+      "QR cannot fit in this terminal.",
     ];
   }
 
   const ansi = renderQrPayloadToTerminalAnsi(qrPayload);
-  if (terminal.color && terminal.columns > 0 && ansi.columns <= terminal.columns) {
-    return ["  Scan this code with the Even app:", "", ansi.text];
+  if (terminal.color && terminal.columns > 0 && fits(ansi.text, ansi.columns)) {
+    return [ansi.text];
   }
 
-  const detail           = !terminal.color
-    ? ["  Colour, which would work around that, is not available here either."]
-    : terminal.columns > 0
-      ? [
-          `  The colour version would fit, but needs ${ansi.columns} columns and this`,
-          `  terminal has ${terminal.columns}.`,
-        ]
-      : [
-          "  Colour would work around it, but this terminal's width could not be",
-          "  measured, and a code wide enough to wrap is a code that will not scan.",
-        ];
-
-  return [
-    "  No code is shown here.",
-    "",
-    "  This terminal is not set to UTF-8, so the block characters the code is",
-    "  drawn with would reach you as unreadable text rather than as something",
-    "  your camera could scan.",
-    ...detail,
-    "",
-    "  Pair with the address and code below, or set a UTF-8 locale",
-    "  (LANG=C.UTF-8) and run this again to get the code.",
-  ];
+  return [terminal.color
+    ? "QR cannot fit in this terminal."
+    : "QR rendering is unavailable."];
 }
 
 function renderPairingBootstrap(view                      )         {
@@ -77,43 +67,23 @@ function renderPairingBootstrap(view                      )         {
     terminal = ASSUMED_TERMINAL,
   } = view;
 
-  const rule = terminal.unicode ? RULE : ASCII_RULE;
-  const dash = terminal.unicode ? "—" : "-";
-  const codeSection = renderCodeSection(qrPayload, lightTerminal, terminal);
   const minutes = Math.max(0, Math.round(expiresInSeconds / 60));
   const window =
     expiresInSeconds < 60
       ? `${Math.max(0, Math.round(expiresInSeconds))} seconds`
       : `${minutes} minute${minutes === 1 ? "" : "s"}`;
 
-  const lines           = [
-    rule,
-    "  Pair your phone with OcuClaw",
-    rule,
-    "",
-    ...codeSection,
-    "",
-    `  Or pair manually ${dash} in the Even app, choose "Enter manually":`,
-    "",
-    `    Address:      ${qrPayload.address}`,
-    `    Pairing code: ${pairingCode}`,
-    "",
-    "  Both routes run the same encrypted exchange. The code is not a password;",
-    "  it only lets your phone join this one pairing request.",
-    "",
-    rule,
-    "  Next: your phone will show four words.",
-    rule,
-    "",
-    "  Check that all four words match the ones printed here, in the same order,",
-    "  then approve the pairing on this computer. If even one word is different,",
-    `  do not approve ${dash} stop and start pairing again.`,
-    "",
-    `  This pairing request expires in ${window}.`,
-    "",
+  const prefix = [
+    `Scan with Even. Expires in ${window}.`,
+    "Or choose Enter manually:",
+    `Address: ${qrPayload.address}`,
+    `Pairing code: ${pairingCode}`,
   ];
-
-  return lines.join("\n");
+  const section = renderCodeSection(qrPayload, lightTerminal, terminal, prefix);
+  if (section.length === 1 && section[0].startsWith("QR ")) {
+    return [`In Even, choose Enter manually. Expires in ${window}.`, section[0], ...prefix.slice(2), ""].join("\n");
+  }
+  return [...prefix, ...section, ""].join("\n");
 }
 
 function pairingBootstrapPayloadText(qrPayload                  )         {

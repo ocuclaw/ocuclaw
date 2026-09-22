@@ -491,6 +491,21 @@ function inferFailureHintFromText(rawText) {
     return "auth";
   }
 
+  if (
+    text.includes("oauthrefreshfailure") ||
+    text.includes("oauth refresh failed") ||
+    text.includes("token refresh failed") ||
+    text.includes("refresh token expired") ||
+    text.includes("session has ended") ||
+    text.includes("please log in again") ||
+    text.includes("401 unauthorized") ||
+    text.includes("http 401") ||
+    text.includes("status 401") ||
+    text.includes("unauthorized")
+  ) {
+    return "auth_refresh";
+  }
+
   if (text.includes("timed out") || text.includes("timeout")) {
     return "timeout";
   }
@@ -1596,6 +1611,10 @@ class OpenClawClient extends EventEmitter {
           role: "assistant",
           content: [{ type: "text", text: fullText }],
           sessionKey: completedSessionKey,
+
+          finalReplyCommitted: commitIsLiveActiveRun && !!completedRunId &&
+            normalizeRunId(runId) === completedRunId && !!completedSessionKey &&
+            normalizeSessionKey(committedActiveRunSessionKey) === completedSessionKey,
         });
         this.emit("activity", {
           state: "idle",
@@ -1614,6 +1633,9 @@ class OpenClawClient extends EventEmitter {
         const historyGuardOwner = this;
         this._fetchHistory(completedSessionKey || "main", {
           idleRunGeneration: historyGuardOwner._activeRunGeneration,
+
+          commitRunId: completedRunId,
+          commitText: fullText,
         }).catch((err) => {
           this._logger.error(
             `[openclaw] Post-commit history fetch failed: ${err.message}`
@@ -2198,6 +2220,10 @@ class OpenClawClient extends EventEmitter {
     this.emit("history", {
       sessionKey: echoedSessionKey,
       messages,
+
+      ...(normalizeRunId(options.commitRunId) && typeof options.commitText === "string"
+        ? { commitRunId: normalizeRunId(options.commitRunId), commitText: options.commitText }
+        : {}),
     });
 
     return result;
@@ -2307,4 +2333,4 @@ function createPluginOpenclawClient(opts = {}) {
   return new OpenClawClient(opts);
 }
 
-module.exports = { createPluginOpenclawClient };
+module.exports = { createPluginOpenclawClient, buildTerminalErrorActivity, resolveTerminalErrorCode, mapFailureHintToActivityCode, inferFailureHintFromText };

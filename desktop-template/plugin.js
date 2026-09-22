@@ -59,13 +59,73 @@ const SETUP_RUN_KEY = 'setup-run'
 // abandoned days ago.
 const SETUP_RUN_STALE_MS = 6 * 60 * 60 * 1000
 const PRESENTER_CAPABILITY = '__OCUCLAW_DESKTOP_PRESENTER_CAPABILITY__'
+// DESKTOP_ROUTE_BEGIN
+// A capability belongs only to the local installation that rendered it.
+// Unknown SDK routing is read-only too; never guess that it means local.
+const desktopLocalActions = () => sdk.host.state?.connectionId?.get?.() === 'local' &&
+  !PRESENTER_CAPABILITY.startsWith('__') && /^[A-Za-z0-9_-]{43,128}$/.test(PRESENTER_CAPABILITY)
+const desktopRouteApi = ctx => async (path, options = {}) => {
+  if (!desktopLocalActions() &&
+      ((options.method || 'GET').toUpperCase() !== 'GET' ||
+       !['/setup-card', '/glasses/state'].includes(path) ||
+       Object.entries(options).some(([key, value]) => value !== undefined &&
+         !['method', 'timeoutMs', 'signal'].includes(key)))) {
+    throw new Error('OcuClaw remote Desktop status is read-only')
+  }
+  const atoms = [sdk.host.state?.connectionId, sdk.host.state?.['profile']]
+  const receiver = atoms.map(atom => atom?.get?.())
+  const unsubscribes = []
+  let retired = false
+  const current = () => !retired && atoms.every((atom, index) => atom?.get?.() === receiver[index])
+  const changed = () => new Error('OcuClaw Desktop connection or profile changed; retry on the selected connection')
+  try {
+    for (const atom of atoms) {
+      let seen = atom?.get?.()
+      const unsubscribe = atom?.subscribe?.(value => {
+        // A same-id round trip still retires an in-flight response. Nanostores'
+        // initial replay is not a change, and owns no authority by itself.
+        if (value !== seen) retired = true
+        seen = value
+      })
+      if (typeof unsubscribe === 'function') unsubscribes.push(unsubscribe)
+    }
+    if (!current()) throw changed()
+    const result = await ctx.rest(path, options)
+    if (!current()) throw changed()
+    return result
+  } catch (error) {
+    if (!current()) throw changed()
+    throw error
+  } finally {
+    for (const unsubscribe of unsubscribes) unsubscribe()
+  }
+}
+// DESKTOP_ROUTE_END
+
+const useDesktopLocalActions = () => {
+  const [local, setLocal] = useState(desktopLocalActions)
+  useEffect(() => watchHostAtom(sdk.host.state?.connectionId,
+    () => setLocal(desktopLocalActions())) || undefined, [])
+  return local
+}
+
+const startLocalDesktopOwner = start => {
+  let stop = null
+  const update = () => {
+    stop?.(); stop = null
+    if (desktopLocalActions()) stop = start()
+  }
+  const unwatch = watchHostAtom(sdk.host.state?.connectionId, update)
+  update()
+  return () => { unwatch?.(); stop?.() }
+}
 const QR_QUIET_ZONE_MODULES = 4
 const QR_WATERMARK_FALLBACK = '#667085'
 const QR_WATERMARK_MAX_OPACITY = 0.18
 
 // OcuClaw look for Hermes Desktop. Always contributed, so it lists in
-// Settings > Appearance next to the built-ins; applied only when the operator
-// said yes in /ocuclaw-setup. The gateway renders that answer into the slot
+// Settings > Appearance next to the built-ins; applied only after an explicit
+// Desktop choice or an earlier /ocuclaw-setup consent. The gateway renders that answer into the slot
 // below (a UTC stamp, or empty) each time it reconciles this file, and
 // Hermes Desktop hot-reloads the file on change, so a yes lands without a
 // restart. requestTheme() exists from Hermes 0.20.6; older hosts still list
@@ -73,6 +133,7 @@ const QR_WATERMARK_MAX_OPACITY = 0.18
 const THEME_NAME = 'ocuclaw'
 const THEME_REQUEST = '__OCUCLAW_DESKTOP_THEME_REQUEST__'
 const THEME_REQUEST_APPLIED_KEY = 'theme-request-applied'
+const THEME_CHOICE_KEY = 'desktop-theme-choice-v1'
 const EMOJI_FALLBACK = ', "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji", emoji'
 const MONOGRAM_WOFF2_B64 = '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'
 const OCUCLAW_THEME_DARK_COLORS = Object.freeze({
@@ -173,6 +234,9 @@ const restoreStoredPick = () => {
 
 const applyThemeRequest = ctx => {
   if (!THEME_REQUEST || typeof sdk.requestTheme !== 'function') return false
+  // A local Desktop decision outranks an older backend's setup stamp.
+  // Reconciliation must not undo a later manual Appearance change either.
+  try { if (ctx.storage.get(THEME_CHOICE_KEY, null)) return false } catch { return false }
   let applied = ''
   try { applied = String(ctx.storage.get(THEME_REQUEST_APPLIED_KEY, '') ?? '') } catch {}
   // Each yes carries a fresh stamp; one stamp applies once, so a later manual
@@ -182,6 +246,76 @@ const applyThemeRequest = ctx => {
   try { ctx.storage.set(THEME_REQUEST_APPLIED_KEY, THEME_REQUEST) } catch {}
   return true
 }
+
+// DESKTOP_THEME_CHOICE_BEGIN
+// Plugin storage belongs to this Desktop installation, not the selected
+// gateway/profile. The choice never crosses SSH or changes backend settings.
+const rememberDesktopThemeChoice = (ctx, choice) => {
+  try {
+    ctx.storage.set(THEME_CHOICE_KEY, choice)
+    return ctx.storage.get(THEME_CHOICE_KEY, null) === choice
+  } catch { return false }
+}
+
+const shouldOfferDesktopTheme = ctx => {
+  if (typeof sdk.requestTheme !== 'function') return false
+  try {
+    if (ctx.storage.get(THEME_CHOICE_KEY, null)) return false
+    if (storedSkinIsOurs() || ctx.storage.get(THEME_REQUEST_APPLIED_KEY, '')) {
+      rememberDesktopThemeChoice(ctx, storedSkinIsOurs() ? 'ocuclaw' : 'current')
+      return false
+    }
+    return true
+  } catch { return false }
+}
+
+const chooseDesktopTheme = (ctx, choice) => {
+  if (!['ocuclaw', 'current'].includes(choice)) return { ok: false }
+  if (!rememberDesktopThemeChoice(ctx, choice)) {
+    return { ok: false, message: 'Your choice could not be saved. Please try again.' }
+  }
+  if (choice === 'ocuclaw') {
+    try {
+      if (typeof sdk.requestTheme !== 'function' || sdk.requestTheme(THEME_NAME) !== true) {
+        throw new Error('Theme unavailable')
+      }
+    } catch {
+      try { ctx.storage.remove(THEME_CHOICE_KEY) } catch {}
+      return { ok: false, message: 'The theme could not be applied. Try again or keep your current theme.' }
+    }
+  }
+  return { ok: true }
+}
+
+function DesktopThemeChoice({ ctx }) {
+  const [open, setOpen] = useState(() => shouldOfferDesktopTheme(ctx))
+  const [message, setMessage] = useState('')
+  const choose = choice => {
+    const result = chooseDesktopTheme(ctx, choice)
+    if (result.ok) setOpen(false)
+    else setMessage(result.message || 'Please try again.')
+  }
+  return jsx(Dialog, {
+    open,
+    onOpenChange: next => { if (!next) choose('current') },
+    children: open ? jsxs(DialogContent, {
+      style: { maxWidth: 420 },
+      children: [
+        jsx(DialogHeader, { children: jsx(DialogTitle, { children: 'Make Desktop feel like OcuClaw?' }) }),
+        jsx('p', { style: { color: 'var(--ui-text-secondary)', lineHeight: 1.5 },
+          children: 'Use the OcuClaw theme, or keep the look you have. Glasses status, battery and agent activity work with either.' }),
+        jsx('p', { style: { color: 'var(--ui-text-secondary)', fontSize: 12 },
+          children: 'You can change themes later in Settings → Appearance.' }),
+        message ? jsx('p', { role: 'alert', children: message }) : null,
+        jsxs(DialogFooter, { children: [
+          jsx(Button, { variant: 'outline', onClick: () => choose('current'), children: 'Keep current theme' }),
+          jsx(Button, { onClick: () => choose('ocuclaw'), children: 'Use OcuClaw theme' }),
+        ] }),
+      ],
+    }) : null,
+  })
+}
+// DESKTOP_THEME_CHOICE_END
 
 // The card and the presenter are two independent registry contributions, and
 // every signal below has to reach both: the card narrates what the presenter
@@ -242,10 +376,12 @@ const EMPTY_GLASSES_STATE = Object.freeze({
 const glassesStateStore = makeStore(EMPTY_GLASSES_STATE)
 let glassesStateApi = null
 let glassesStateTimer = null
+let glassesStateExpiryTimer = null
 let glassesStateMounted = 0
 let glassesStateGeneration = 0
 let glassesStateWindowCleanup = null
 let glassesStateSocketCleanup = null
+let glassesStateSocket = null
 let glassesStateReceiverCleanup = null
 
 const boundedBattery = value => (
@@ -361,6 +497,15 @@ const glassesStateTick = async () => {
     profile: sdk.host.state?.['profile']?.get?.(),
     label: null,
   }
+  if (!receiver.connectionId || !receiver['profile'] ||
+      (receiver.connectionId !== 'local' &&
+       (typeof sdk.host.state?.connectionId?.subscribe !== 'function' ||
+        typeof sdk.host.state?.['profile']?.subscribe !== 'function'))) {
+    glassesStateStore.set({ ...EMPTY_GLASSES_STATE, status: 'unavailable', receiver,
+      reason: 'This Desktop version does not expose safe connection and profile tracking.' })
+    scheduleGlassesPoll(glassesPollDelay())
+    return
+  }
   const current = () => glassesStateMounted && generation === glassesStateGeneration &&
     receiver.connectionId === sdk.host.state?.connectionId?.get?.() &&
     receiver['profile'] === sdk.host.state?.['profile']?.get?.()
@@ -373,13 +518,22 @@ const glassesStateTick = async () => {
     }
   }
   let status = null
-  try { status = await sdk.host.status() } catch {}
+  let statusTimeout = null
+  try {
+    status = await Promise.race([
+      sdk.host.status(),
+      new Promise((_, reject) => {
+        statusTimeout = window.setTimeout(() => reject(new Error('Hermes status timed out')), GLASSES_STATE_TIMEOUT_MS)
+      }),
+    ])
+  } catch {} finally { window.clearTimeout(statusTimeout) }
   if (!current()) return discard()
   const facts = platformFacts(status)
   let paired = null
   let device = { connected: null, batteryPercent: null, charging: null, inCase: null, observedAt: null, ageMs: null, stale: true }
   let companion = { state: 'unavailable', ageMs: null, stale: true, backend: null, profile: null, snapshot: null }
   let controllerStatus = 'ready'
+  let reason = null
   let ownership = null
   let sessionTitle = null
   const previous = glassesStateStore.get()
@@ -390,9 +544,16 @@ const glassesStateTick = async () => {
   if (facts.gateway.running && facts.gateway.loaded) {
     try {
       const setup = await glassesStateApi('/setup-card', { method: 'GET', timeoutMs: GLASSES_STATE_TIMEOUT_MS })
+      if (!current()) return discard()
+      if (receiver.connectionId !== 'local' && (!setup || setup.contract !== 'ocuclaw.desktop-setup-card' || setup.contractVersion !== 1)) {
+        throw { unsupportedContract: true }
+      }
       if (setup && setup.contract === 'ocuclaw.desktop-setup-card') paired = setup.paired === true
       const requestedAtMs = Date.now()
       const payload = await glassesStateApi('/glasses/state', { method: 'GET', timeoutMs: GLASSES_STATE_TIMEOUT_MS })
+      if (!payload || payload.contract !== 'ocuclaw.glasses-state' || payload.contractVersion !== 1) {
+        throw { unsupportedContract: true }
+      }
       device = normalizeGlassesDevice(payload)
       companion = normalizeGlassesState(payload)
       ownership = pulseOwnershipText(receiver.connectionId) && pulseOwnershipText(receiver['profile'])
@@ -410,19 +571,26 @@ const glassesStateTick = async () => {
           gateway: facts.gateway,
           device,
           companion,
+          receiver,
         })
         noteProfileAbsence()
         return
       }
       controllerStatus = 'unavailable'
+      reason = error?.unsupportedContract === true ? 'This backend does not support the OcuClaw desktop status contract.' : null
     }
   } else {
     controllerStatus = 'unavailable'
+    reason = !status ? 'Hermes status is unavailable. Check the saved connection.'
+      : status.gateway_state === 'stopped' ? 'The selected gateway is stopped.'
+      : !facts.gateway.running ? 'Hermes has not confirmed the selected gateway is running.'
+      : 'OcuClaw is absent or disabled in the selected gateway.'
   }
 
   if (!current()) return discard()
   glassesStateStore.set({
     status: controllerStatus,
+    reason,
     observedAtMs: Date.now(),
     paired,
     gateway: facts.gateway,
@@ -433,6 +601,16 @@ const glassesStateTick = async () => {
     sessionTitle,
     sharedSession,
   })
+  window.clearTimeout(glassesStateExpiryTimer)
+  const observed = glassesStateStore.get()
+  // A stalled host.status() must not leave a previously observed battery or
+  // connection looking live forever. Poll completion, not polling intent,
+  // renews this deadline. Keep the source identity while expiring its facts.
+  glassesStateExpiryTimer = window.setTimeout(() => {
+    if (glassesStateStore.get().device !== observed.device) return
+    glassesStateStore.set({ ...EMPTY_GLASSES_STATE, status: 'unavailable',
+      receiver, reason: 'The last remote observation expired. Reconnecting…' })
+  }, 30000)
   // Display names are optional inventory, never routing authority. Do not
   // delay ownership refresh or retain a label from another receiver.
   if (typeof sdk.host.connections === 'function') {
@@ -470,19 +648,22 @@ const startGlassesStateController = (api, socket) => {
   // profile, and intentionally no-ops for OAuth remotes. Polling above remains
   // mandatory and authoritative in every one of those cases.
   if (!glassesStateSocketCleanup && typeof socket === 'function') {
-    glassesStateSocketCleanup = socket('/glasses/events', () => invalidateGlassesStateQuery())
+    glassesStateSocket = socket
+    try { glassesStateSocketCleanup = socket('/glasses/events', () => invalidateGlassesStateQuery()) } catch {}
   }
   return () => {
     glassesStateMounted = Math.max(0, glassesStateMounted - 1)
     glassesStateGeneration += 1
     if (glassesStateMounted) return
     window.clearTimeout(glassesStateTimer)
+    window.clearTimeout(glassesStateExpiryTimer)
     glassesStateTimer = null
     glassesStateApi = null
     glassesStateWindowCleanup?.()
     glassesStateWindowCleanup = null
     glassesStateSocketCleanup?.()
     glassesStateSocketCleanup = null
+    glassesStateSocket = null
     for (const unsubscribe of glassesStateReceiverCleanup || []) unsubscribe()
     glassesStateReceiverCleanup = null
   }
@@ -1169,6 +1350,12 @@ const pulseNotificationCopy = event => {
 const startPulseCardController = ctx => {
   let previous = glassesStateStore.get()
   const unsubscribe = glassesStateStore.subscribe(controller => {
+    if (controller === EMPTY_GLASSES_STATE) {
+      previous = null
+      pulseActivityStore.set([])
+      pulseNotificationState = initialPulseNotificationState()
+      return
+    }
     const now = Date.now()
     observePulseActivity(previous, controller, now)
     previous = controller
@@ -1309,8 +1496,10 @@ const closePulseCard = () => {
 
 const openPulseCard = () => pulseCardOpenStore.set(true)
 
-function PulseCard({ ctx, onClose }) {
+function PulseCard({ ctx, onClose, readOnly = false }) {
   const controller = glassesStateStore.use()
+  const absent = pluginAbsentStore.use()
+  const receiver = controller.receiver || {}
   // The wearer already sees an approval prompt on the lens, so the card never
   // mentions approvals: drop the flag and show whatever else is true.
   const view = resolvePulseView(controller.device && controller.device.approvalPending === true
@@ -1331,13 +1520,15 @@ function PulseCard({ ctx, onClose }) {
   const sessionKey = pulseSessionKey(controller)
   const ownershipView = pulseOwnershipView(controller, Date.now())
   const sessionPin = pulseSessionPin(sessionKey)
-  const pillText = [profile, sessionPin].filter(Boolean).join(' · ')
+  const pillText = readOnly
+    ? [receiver.label || receiver.connectionId, receiver['profile']].filter(Boolean).join(' · ')
+    : [profile, sessionPin].filter(Boolean).join(' · ')
   const shape = pulseContentShape(snapshot?.active?.content)
   const lastActivity = activity[0] || null
   const latestEvent = view.state === 'painting'
     ? 'Rendering now'
     : view.state === 'disconnected'
-      ? `Last seen ${lastActivity ? pulseElapsed(lastActivity.at, now) : 'now'}`
+      ? lastActivity ? `Last seen ${pulseElapsed(lastActivity.at, now)}` : null
       : lastActivity ? `${lastActivity.label} ${pulseElapsed(lastActivity.at, now)}` : connected === true ? 'Connected now' : null
   const batteryColor = battery !== null && battery <= 10
     ? '#ff8798'
@@ -1400,7 +1591,7 @@ function PulseCard({ ctx, onClose }) {
         ] }),
         jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginTop: 6, color: 'var(--ui-text-secondary)' }, children: [
           jsx('span', { 'aria-hidden': 'true', style: { width: 6, height: 6, flex: '0 0 auto', borderRadius: '50%', background: stateColor, boxShadow: stateGlow } }),
-          jsx('span', { style: { fontFamily: "'Monogram', 'Pixelify Sans', 'Times New Roman', serif", fontSize: 16 }, children: PULSE_STATE_LABELS[view.state] || 'Idle' }),
+          jsx('span', { style: { fontFamily: "'Monogram', 'Pixelify Sans', 'Times New Roman', serif", fontSize: 16 }, children: readOnly && controller.status !== 'ready' ? 'Unavailable' : PULSE_STATE_LABELS[view.state] || 'Idle' }),
           typeof inCase === 'boolean' ? jsx('span', { style: { color: 'var(--ui-text-tertiary)' }, children: inCase ? '· in case' : '· out of case' }) : null,
         ] }),
         latestEvent ? jsx('span', { 'data-pulse-activity': '', style: { display: 'block', marginTop: 3, color: 'var(--ui-text-tertiary)', fontFamily: 'var(--font-mono, monospace)', fontSize: 8, letterSpacing: '.14em', textTransform: 'uppercase' }, children: latestEvent }) : null,
@@ -1419,8 +1610,8 @@ function PulseCard({ ctx, onClose }) {
   const footer = jsxs('div', {
     style: { marginTop: 'auto', display: 'flex', alignItems: 'center', gap: 8 },
     children: [
-      jsx('span', { style: { minWidth: 0, flex: 1, color: 'var(--ui-text-secondary)', fontSize: 10 }, children: 'Glasses chats stay separate from Desktop.' }),
-      jsx(PulseThumbnail, { shape }),
+      jsx('span', { style: { minWidth: 0, flex: 1, color: 'var(--ui-text-secondary)', fontSize: 10 }, children: readOnly ? 'Read-only desktop status. Existing pairing stays on Cloudways.' : 'Glasses chats stay separate from Desktop.' }),
+      readOnly ? null : jsx(PulseThumbnail, { shape }),
     ],
   })
 
@@ -1452,10 +1643,11 @@ function PulseCard({ ctx, onClose }) {
     style: { display: 'flex', minHeight: '100%', flexDirection: 'column', gap: 8, padding: '10px 12px 11px', color: 'var(--ui-text-primary)', fontSize: 10 },
     children: [
       header,
+      readOnly ? jsx('div', { role: 'status', style: { color: 'var(--ui-text-secondary)', overflowWrap: 'anywhere' }, children: remoteStatusMessage(controller, absent) }) : null,
       hero,
       agentRow,
       jsx('div', { 'aria-hidden': 'true', style: { height: 1, background: 'var(--ui-border)' } }),
-      ownershipView ? jsxs('div', {
+      !readOnly && ownershipView ? jsxs('div', {
         'data-pulse-ownership': ownershipView.state,
         style: { minWidth: 0, padding: '1px 0 3px' },
         children: [
@@ -1948,7 +2140,9 @@ function G2Pulse({ ctx, api, onActivate }) {
         style: { width: controller.paired === true ? 300 : 360, minHeight: controller.paired === true ? 212 : undefined, padding: controller.paired === true ? 0 : 12, overflow: 'hidden' },
         // PairingDialog can only display an existing ceremony. Until one
         // exists, expose the setup panel that can start it and track progress.
-        children: controller.paired === true
+        children: !desktopLocalActions()
+          ? jsx(PulseCard, { ctx, onClose: closePulseCard, readOnly: true })
+          : controller.paired === true
           ? jsx(PulseCard, { ctx, onClose: closePulseCard })
           : jsx(SetupCard, { ctx, api }),
       }),
@@ -2090,7 +2284,13 @@ const announceAbsenceOnce = () => {
 
 const clearProfileAbsence = () => {
   glassesStateGeneration += 1
+  window.clearTimeout(glassesStateExpiryTimer)
   glassesStateStore.set(EMPTY_GLASSES_STATE)
+  glassesStateSocketCleanup?.()
+  glassesStateSocketCleanup = null
+  if (glassesStateMounted && glassesStateSocket) {
+    try { glassesStateSocketCleanup = glassesStateSocket('/glasses/events', () => invalidateGlassesStateQuery()) } catch {}
+  }
   window.clearTimeout(absenceRecheckTimer)
   if (pluginAbsentStore.get()) pluginAbsentStore.set(false)
   // The card's probe restarts from its own effect; the claim loop needs a kick.
@@ -2734,12 +2934,22 @@ const resolveOrderFortySurface = (controller, pluginAbsent) => {
 function OrderFortyOwner({ ctx, api }) {
   const controller = glassesStateStore.use()
   const pluginAbsent = pluginAbsentStore.use()
+  const local = useDesktopLocalActions()
   const surface = resolveOrderFortySurface(controller, pluginAbsent)
   useEffect(() => {
-    if (surface !== 'pulse') closePulseCard()
-  }, [surface])
-  if (surface === 'setup') return jsx(SetupCard, { ctx, api })
+    if (local && surface !== 'pulse') closePulseCard()
+  }, [local, surface])
+  if (local && surface === 'setup') return jsx(SetupCard, { ctx, api })
   return jsx(G2Pulse, { ctx, api, onActivate: openPulseCard })
+}
+
+function remoteStatusMessage(controller, absent) {
+  const device = controller.device || {}
+  return absent ? 'OcuClaw is absent or disabled on this profile.'
+    : controller.reason || (controller.status !== 'ready' ? 'Remote status unavailable. Check the saved SSH connection and gateway.'
+      : controller.paired !== true ? 'Pair your phone using the existing Cloudways setup.'
+      : device.stale !== false ? 'Waiting for a current glasses observation.'
+      : device.connected === true ? 'Glasses connected' : device.connected === false ? 'Glasses disconnected' : 'Glasses connection unknown')
 }
 
 // Secret values live only in password inputs and the direct save request.
@@ -2989,7 +3199,8 @@ export default {
   id: 'ocuclaw',
   name: 'OcuClaw',
   register(ctx) {
-    const api = (path, options) => ctx.rest(path, options)
+    const api = desktopRouteApi(ctx)
+    const registerLocal = contribution => ctx.onDispose(startLocalDesktopOwner(() => ctx.register(contribution)))
     let monogramStyle = document.getElementById('ocuclaw-monogram')
     if (!monogramStyle) {
       monogramStyle = document.createElement('style')
@@ -3001,19 +3212,20 @@ export default {
     hydratePulseCardPrefs(ctx)
     ctx.onDispose(startPulseCardController(ctx))
     ctx.onDispose(startGlassesStateController(api, ctx.socket))
-    ctx.onDispose(startFleetInventory(api))
+    ctx.onDispose(startLocalDesktopOwner(() => startFleetInventory(api)))
     ctx.onDispose(closePulseCard)
     hydrateSetupRun(ctx)
-    ctx.register({
+    registerLocal({
       id: 'credentials-presenter', area: TITLEBAR_AREAS.right, order: 38,
       render: () => jsx(CredentialsDialog, { api }),
     })
-    for (const [integration, label] of [['soniox', 'Set up OcuClaw voice with Soniox'], ['evenAi', 'Set up OcuClaw Even AI']]) ctx.register({
+    for (const [integration, label] of [['soniox', 'Set up OcuClaw voice with Soniox'], ['evenAi', 'Set up OcuClaw Even AI']]) registerLocal({
       id: `private-credentials-${integration}`, area: PALETTE_AREA,
       data: {
         id: `private-credentials-${integration}`, label,
         keywords: [integration, 'token', 'api key', 'credentials', 'ocuclaw'],
         run: async () => {
+          if (!desktopLocalActions()) return
           try {
             const result = await api('/credentials', { method: 'POST', body: { action: 'open', selected: [integration], presenterCapability: PRESENTER_CAPABILITY } })
             if (result.state === 'pending') return
@@ -3035,7 +3247,7 @@ export default {
     // own and summon itself, so it moves to the same always-mounted titlebar
     // slot as the card. It renders no inline chrome — a portalled Dialog and
     // nothing else — so it costs the titlebar no width.
-    ctx.register({
+    registerLocal({
       id: 'pairing-presenter',
       area: TITLEBAR_AREAS.right,
       order: 39,
@@ -3047,7 +3259,7 @@ export default {
       order: 40,
       render: () => jsx(OrderFortyOwner, { ctx, api }),
     })
-    ctx.register({
+    registerLocal({
       id: 'glasses-doctor',
       area: PALETTE_AREA,
       data: {
@@ -3055,6 +3267,7 @@ export default {
         label: 'Run glasses doctor',
         keywords: ['glasses', 'g2', 'ocuclaw', 'doctor', 'health'],
         run: async () => {
+          if (!desktopLocalActions()) return
           const { ok, message } = await runPulseDoctor(api)
           try { sdk.host.notify({ kind: ok ? 'info' : 'warning', title: 'Glasses doctor', message }) } catch {}
         },
@@ -3063,6 +3276,10 @@ export default {
     ctx.register({ id: 'theme', area: THEMES_AREA, data: OCUCLAW_THEME })
     restoreStoredPick()
     applyThemeRequest(ctx)
+    ctx.register({
+      id: 'theme-choice', area: TITLEBAR_AREAS.right, order: 37,
+      render: () => jsx(DesktopThemeChoice, { ctx }),
+    })
   },
 }
 
@@ -3111,7 +3328,7 @@ function thinkingStudyPose(variant,t,route){
  return pose;
 }
 const expressions=['neutral','curious','focused','delighted','concerned','surprised','skeptical','sleepy','playful'];
-const CUES={ack:{duration:.7}};
+const CUES={ack:{duration:.7},relief:{duration:.9}};
 const ATTEND_POSE={...BASE,x:47,y:13,tilt:.035,lx:20,ly:27,rx:76,ry:27,lrot:.15,rrot:-.15,gazeX:.6,gazeY:.6,curious:1,browY:-1};
 // Attend from a held reply escorts the mic down instead of blinking it out:
 // the gripping mitten lowers `dip` px (ease-out over `lower` s) and holds
@@ -3657,7 +3874,7 @@ function create(initial='idle',options={}){
   // attend entry glides straight onto the attend still as before.
   stow=!attending&&byId[id].action==='reply'&&prop.kind==='mic'&&prop.reveal>.5?{at:time,rx:p.rx,ry:p.ry,rrot:p.rrot,ropen:p.ropen}:null;
   attending=true;resting=true;restAge=0;restFreeze=null;restPending=false;restVariant=null;wakeBeat=null;cue=null;}
- function react(kind){cue=byId[id].action==='error'&&resting?null:CUES[kind]?{kind,at:time,id}:null;}
+ function react(kind){cue=(byId[id].action==='error'&&resting)||(kind==='relief'&&byId[id].action!=='idle')?null:CUES[kind]?{kind,at:time,id}:null;}
  let randomState=(options.seed===undefined?THINKING_SEED:options.seed)>>>0,bag=[],thinkingVariant=-1,thinkingAge=0;
  let thinkingChoice=null,thinkingDetail=null;const lastChoices={};
  const random=()=>{randomState=(Math.imul(randomState,1664525)+1013904223)>>>0;return randomState/0x100000000;};
@@ -3683,7 +3900,7 @@ function create(initial='idle',options={}){
    [c.reveal,c.velocity]=spring(c.reveal,c.velocity,goal,stiffness*response,dt);
    c.reveal=clamp(c.reveal,0,1);
  }
- function setState(next){if(!byId[next])return false;if(id===next)return true;if(age<.6)interruptions++;entryPose={...p};const prev=byId[id].action,a=byId[next].action;transit={from:prev,t0:time,dir:Math.sign(byId[next].pose.x-p.x)||Math.sign(byId[next].pose.gazeX)||1,via:transitions[prev+'>'+a]||transitions['*>'+a]||null};id=next;age=0;switches++;attending=false;wakeBeat=null;stow=null;resting=false;restFreeze=null;restPending=false;restVariant=null;entryVariant=a in visits?visits[a]++%IDLE_VARIATIONS:0;if(a==='thinking')nextThinking();return true;}
+ function setState(next,resumingThought=false){if(!byId[next])return false;if(id===next)return true;if(age<.6)interruptions++;entryPose={...p};const prev=byId[id].action,a=byId[next].action;transit={from:prev,t0:time,dir:Math.sign(byId[next].pose.x-p.x)||Math.sign(byId[next].pose.gazeX)||1,via:transitions[prev+'>'+a]||transitions['*>'+a]||null};id=next;age=0;switches++;attending=false;wakeBeat=null;stow=null;resting=false;restFreeze=null;restPending=false;restVariant=null;entryVariant=a in visits?visits[a]++%IDLE_VARIATIONS:0;if(a==='thinking'&&!resumingThought)nextThinking();return true;}
  function isStill(){if(cue||wakeBeat||restPending||stow)return false;const d=byId[id],calm=Object.values(v).every(x=>Math.abs(x)<.05)&&Math.abs(prop.velocity)<.01&&(icon.kind?icon.reveal>.999:icon.reveal<.001);
    if(attending)return restAge>=.3&&calm&&prop.reveal<.005;
    if(resting)return restAge>=.3&&calm&&(d.prop?prop.kind===d.prop&&prop.reveal>.999:prop.reveal<.005);
@@ -3805,7 +4022,14 @@ function create(initial='idle',options={}){
     q.y+=(y?Math.sign(y)*.65:.35)*headCue;
     if(view==='auto'&&depthActive&&x)q.turn+=(Math.sign(dx)*2-q.turn)*headCue;
    }
-   if(cue){const elapsed=time-cue.at,duration=Math.min(1.5,CUES[cue.kind].duration),mix=Math.max(0,Math.min(1,elapsed/.12,(duration-elapsed)/.2));q.gazeX+=(1.2-q.gazeX)*mix;q.gazeY+=(.8-q.gazeY)*mix;q.browY+=mix;q.y+=.35*mix;}
+   if(cue){
+    const elapsed=time-cue.at,duration=Math.min(1.2,CUES[cue.kind].duration),mix=Math.max(0,Math.min(1,elapsed/.12,(duration-elapsed)/.2));
+    if(cue.kind==='relief'){
+     // A small exhale: soften the lids and settle the head, without a smile,
+     // prop or success pose. Admission and the shared deadline live in Kotlin.
+     q.eye+=(.55-q.eye)*mix;q.browY+=.4*mix;q.y+=.6*mix;
+    }else{q.gazeX+=(1.2-q.gazeX)*mix;q.gazeY+=(.8-q.gazeY)*mix;q.browY+=mix;q.y+=.35*mix;}
+   }
    if(attending)Object.assign(q,ATTEND_POSE);
    if(stow){
     const e=time-stow.at,u=Math.min(1,e/STOW.lower),ease=1-(1-u)*(1-u);
@@ -3909,7 +4133,9 @@ function create(initial='idle',options={}){
  }
  function step(seconds){carry+=clamp(Number.isFinite(seconds)?seconds:0,0,.25);while(carry>=1/120){tick(1/120);carry-=1/120;}return snapshot();}
  function snapshot(){const drawn={...p},d=byId[id],beat=time%4.8,microBreath=micro&&age>=2&&!resting&&!d.static&&d.action!=='idle'&&['Work','Mind','Web','Agents'].includes(d.group)&&beat>=2.4&&beat<3.8?1:0;if(microBreath){drawn.y=Math.round(Math.max(13,drawn.y))+1;drawn.ly=Math.round(drawn.ly)+1;drawn.ry=Math.round(drawn.ry)+1;}if(transit&&age<.75&&!resting&&!flowing(d)){drawn.delighted=0;drawn.surprised=0;if(Math.abs(drawn.gazeX)<.5&&Math.abs(drawn.gazeY)<.5)drawn.gazeY=-.6;}return {id,action:attending?'attend':d.action,p:drawn,v:{...v},time,phase,age,thinkingAge,emotion,switches,interruptions,variant:variation(),thinking:thinkingDetail?{...thinkingDetail}:null,resting,attending,stowing:!!stow,static:isStill(),microBreath,prop:{...prop},icon:{...icon},typing:{...typing}};}
- const rawSnapshot=snapshot;
+ // Snapshot carries choice metadata, never a live engine reference. The adapter only
+ // retains it after display acceptance, including before a study prop has risen.
+ const rawSnapshot=()=>({...snapshot(),thoughtChoice:thinkingChoice?{...thinkingChoice}:null});
  function buildSnapshot(){const result=rawSnapshot();if(byId[id].magic){const studyTime=Math.min(magic.elapsed,MAGIC_REVEAL_END);result.magic={...magic,performance:byId[id].magic,studyTime};if(magic.ready){result.time=studyTime;result.phase=studyTime*2;result.action='magic';result.p={...p};}}return result;}
  function acceptPose(held){
   setState(held.id);
@@ -3918,7 +4144,18 @@ function create(initial='idle',options={}){
   time=held.time;phase=held.phase;age=held.age;emotion=held.emotion;
   attending=held.attending;resting=held.resting;entryPose={...p};magic.ready=false;
  }
- return {setState,setBuildEpisode,acceptPose,step(seconds){step(seconds);return buildSnapshot();},snapshot:buildSnapshot,rest,wake,react,attend,resting:()=>resting,restartThinking(opts){
+ function resumeThought(choice){
+  if(!choice||!Number.isInteger(choice.variant)||choice.variant<0||choice.variant>=THINKING_VARIATIONS)return false;
+  if(pinnedThinking!==null&&pinnedThinking!==choice.variant)return false;
+  setState('thinking',true);
+  thinkingVariant=choice.variant;thinkingChoice={...choice};thinkingDetail=null;thinkingAge=0;
+  bag=bag.filter(variant=>variant!==thinkingVariant);lastChoices[thinkingVariant]=choice.route;
+  age=0;entryPose={...p};resting=false;restFreeze=null;restVariant=null;restPending=false;attending=false;wakeBeat=null;cue=null;
+  // Start at the safe opening from the current held body; no restored velocity/time.
+  for(const key of Object.keys(v))v[key]=0;
+  return true;
+ }
+ return {setState,setBuildEpisode,acceptPose,resumeThought,step(seconds){step(seconds);return buildSnapshot();},snapshot:buildSnapshot,rest,wake,react,attend,resting:()=>resting,restartThinking(opts){
   if(byId[id].action!=='thinking')return;
   randomState=opts.seed>>>0;bag=[];thinkingVariant=opts.previousVariant??thinkingVariant;
   nextThinking();age=0;entryPose={...p};resting=false;restFreeze=null;restVariant=null;restPending=false;attending=false;wakeBeat=null;cue=null;transit=null;

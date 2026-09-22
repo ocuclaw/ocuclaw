@@ -44,8 +44,9 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
+from . import tailnet_dial
 from .relay_verifier import RelayVerifyOutcome, verify_relay_credential
-from .serve import phone_address, serve_port
+from .serve import phone_address, serve_port, tailscale_argv
 from .snapshot import (
     OBSERVATION_ACTIVE,
     SERVE_CLASSIFICATIONS,
@@ -182,8 +183,19 @@ _NETWORK_REFUSAL_ERRNOS = frozenset(
 )
 
 
-def tailnet_front_door_check(host: str, port: int, timeout_s: float) -> str:
+def tailnet_front_door_check(
+    host: str,
+    port: int,
+    timeout_s: float,
+    *,
+    socks5: Optional[Tuple[str, int]] = None,
+) -> str:
     """One bounded TLS handshake through the configured Serve route.
+
+    ``socks5`` is the loopback proxy of a userspace tailscaled, from the host
+    receipt (#2980). Without it a userspace host has no route to its own
+    tailnet name and this check reports ``probe_failed`` on a route the phone
+    reaches fine; through it the handshake is the same evidence it always was.
 
     This is the sanctioned check, and its shape is chosen as much for what it
     does *not* do as for what it does.
@@ -234,7 +246,7 @@ def tailnet_front_door_check(host: str, port: int, timeout_s: float) -> str:
 
     def worker() -> None:
         try:
-            answer.put(_front_door_handshake(host, port, timeout_s))
+            answer.put(_front_door_handshake(host, port, timeout_s, socks5=socks5))
         except BaseException:  # noqa: BLE001 - the caller has already moved on
             answer.put(OUTCOME_FAILED)
 
@@ -248,7 +260,13 @@ def tailnet_front_door_check(host: str, port: int, timeout_s: float) -> str:
         return OUTCOME_TIMEOUT
 
 
-def _front_door_handshake(host: str, port: int, timeout_s: float) -> str:
+def _front_door_handshake(
+    host: str,
+    port: int,
+    timeout_s: float,
+    *,
+    socks5: Optional[Tuple[str, int]] = None,
+) -> str:
     """The blocking half of :func:`tailnet_front_door_check`."""
     deadline = time.monotonic() + timeout_s
     context = ssl.create_default_context()
@@ -256,7 +274,7 @@ def _front_door_handshake(host: str, port: int, timeout_s: float) -> str:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return OUTCOME_TIMEOUT
-        with socket.create_connection((host, port), timeout=remaining) as raw:
+        with tailnet_dial.dial(host, port, deadline, socks5=socks5) as raw:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return OUTCOME_TIMEOUT
@@ -361,7 +379,7 @@ def tailnet_tls_cert_check(
     try:
         answer = runner(
             [
-                "tailscale",
+                *tailscale_argv(),
                 "cert",
                 "--cert-file",
                 null_device,
@@ -431,8 +449,13 @@ def credentialed_relay_check(
     credential_reader: Optional[Callable[[], str]] = None,
     verifier: Optional[Callable[..., RelayVerifyOutcome]] = None,
     clock: Callable[[], float] = time.monotonic,
+    socks5: Optional[Tuple[str, int]] = None,
 ) -> str:
-    """Run Q12's verifier once and collapse it to a secret-free result code."""
+    """Run Q12's verifier once and collapse it to a secret-free result code.
+
+    ``socks5`` reaches the verifier unchanged; see
+    :func:`tailnet_front_door_check` for why a userspace host needs it.
+    """
     credential_reader = (
         _read_relay_credential if credential_reader is None else credential_reader
     )
@@ -486,14 +509,33 @@ def credentialed_relay_check(
     if remaining <= 0:
         return OUTCOME_RELAY_TIMEOUT
     try:
-        result = verifier(
-            address=address,
-            credential=credential,
-            timeout_s=remaining,
-        )
+        if socks5 is None:
+            result = verifier(
+                address=address,
+                credential=credential,
+                timeout_s=remaining,
+            )
+        else:
+            result = verifier(
+                address=address,
+                credential=credential,
+                timeout_s=remaining,
+                socks5=socks5,
+            )
     except Exception:  # noqa: BLE001 - no exception text crosses this boundary
         return OUTCOME_RELAY_UNKNOWN
     return _RELAY_VERIFY_OUTCOMES.get(result.outcome, OUTCOME_RELAY_UNKNOWN)
+
+
+def _tailscale_socks5() -> Optional[Tuple[str, int]]:
+    """The host receipt's loopback SOCKS5 proxy, or ``None``. Never raises."""
+    try:
+        from . import receipts as receipts_mod
+
+        receipt = receipts_mod.read_tailscale_cli()
+    except Exception:  # noqa: BLE001 - a broken receipt means direct dial
+        return None
+    return None if receipt is None else receipt.socks5
 
 
 def plan_probes(facts: Mapping[str, Any]) -> ProbePlan:
@@ -531,12 +573,19 @@ def plan_probes(facts: Mapping[str, Any]) -> ProbePlan:
                 ProbeOutcome(CHECK_RELAY_APPLICATION, OUTCOME_NO_CLASSIFIED_ROUTE, 0.0),
             ],
         )
+    # A userspace tailscaled (Cloudways) exposes a loopback SOCKS5 proxy and
+    # records it in the host receipt; both probes dial through it or they
+    # cannot reach the tailnet at all (#2980). Read here, once per plan.
+    socks5 = _tailscale_socks5()
+    # The kwarg is added only when a proxy exists, so the positional contract
+    # the existing checks (and their test doubles) were written to is intact.
+    proxy_kwargs: Dict[str, Any] = {} if socks5 is None else {"socks5": socks5}
     checks = [
         ProbeCheck(
             name=CHECK_TAILNET_REACHABILITY,
             timeout_s=PROBE_DEFAULT_TIMEOUT_S,
             run=lambda allowance: tailnet_front_door_check(
-                host, int(port), allowance
+                host, int(port), allowance, **proxy_kwargs
             ),
         )
     ]
@@ -550,7 +599,9 @@ def plan_probes(facts: Mapping[str, Any]) -> ProbePlan:
             ProbeCheck(
                 name=CHECK_RELAY_APPLICATION,
                 timeout_s=PROBE_DEFAULT_TIMEOUT_S,
-                run=lambda allowance: credentialed_relay_check(address, allowance),
+                run=lambda allowance: credentialed_relay_check(
+                    address, allowance, **proxy_kwargs
+                ),
             )
         )
     else:
@@ -1048,6 +1099,11 @@ def _ownership_conflict(
     if not mine or owner != mine:
         return RECORD_FOREIGN_OWNER
     return None
+
+
+#: The public name for the rule above. One implementation, asked by name, so a
+#: caller outside this module never keeps a second copy of it (#3104).
+ownership_conflict = _ownership_conflict
 
 
 def _carried_proposal(

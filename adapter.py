@@ -47,11 +47,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import concurrent.futures
+import contextlib
 from contextvars import ContextVar
 import importlib.util
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -70,8 +72,10 @@ from .control_link import (
     HERMES_BUNDLE_DEFAULT_WS_PORT,
     LINK_HANDSHAKE_TIMEOUT_S,
     LINK_TERMINATE_GRACE_S,
+    RPC_METHOD_NOT_FOUND_CODE,
     LinkError,
     LinkProcess,
+    LinkRpcError,
     default_child_env,
     resolve_runtime_argv,
 )
@@ -103,20 +107,37 @@ from .dispatch import (
 )
 from .first_run import (
     PhoneTurnCandidateGate,
+    REPLY_DELIVERY_OBSERVE_METHOD,
+    REPLY_DELIVERY_OBSERVE_TIMEOUT_SECONDS,
+    REPLY_DELIVERY_REPORT_METHOD,
+    REPLY_DELIVERY_UNCONFIRMED,
+    REPLY_DELIVERY_UNSUPPORTED,
+    REPLY_DELIVERY_WAIT_SECONDS,
+    REPLY_EVIDENCE_CLIENT_SDK_RECEIPT,
+    REPLY_EVIDENCE_VALUES,
+    REPLY_EVIDENCE_WEARER_CONFIRMED,
     WELCOME_SURFACE,
     arm_first_run_proof_from_candidate,
     inspect_attempt,
     is_welcome_surface,
     record_phone_turn_candidate,
+    record_reply_delivery,
     record_welcome_outcome,
+    validate_reply_delivery_report,
     wait_for_first_run_terminal,
     wait_for_phone_turn_candidate,
+    wait_for_reply_delivery,
+    welcome_surface,
 )
 from .models_rpc import (
     GwRpc,
     load_profile_routing_snapshot,
     namespace_for_profile,
     profile_for_namespace,
+)
+from .input_prediction import (
+    INPUT_PREDICTION_AUXILIARY_TASK,
+    InputPredictionRpc,
 )
 from .pairing_completion import record_pairing_completion
 from .presence import (
@@ -162,7 +183,13 @@ from .stt_rpc import (
 )
 from . import desktop_credentials, even_ai_route, serve
 from . import health as health_collect
-from .health import OCUCLAW_WEARER_USER_ID, continue_here_configured
+from .health import (
+    OCUCLAW_WEARER_USER_ID,
+    continue_here_configured,
+    effective_platform_extra,
+    env_seed_reaches_extra,
+    platform_env_seed,
+)
 from .desktop_pairing import (
     THEME_REQUEST_CONFIG_KEY as DESKTOP_THEME_CONFIG_KEY,
     desktop_convergence,
@@ -173,6 +200,11 @@ from .desktop_pairing import (
     reconcile_pairing_plugin,
 )
 from .setup_bootstrap import reconcile_setup_bundle
+from .setup_hint import (
+    awaiting_first_reply,
+    push_hint_edge,
+    read_hint_phase,
+)
 from .tui_pairing import reconcile_pairing_widget
 from .snapshot import (
     OBSERVATION_PASSIVE,
@@ -356,6 +388,37 @@ def _pre_transcription_hook_supported() -> bool:
     hook seam; absent at the 0.20.0 baseline.
     """
     return PRE_TRANSCRIPTION_HOOK_NAME in _valid_hook_names()
+
+
+# Silent input (#2829): set once at register() when the host accepted the
+# plugin-owned auxiliary task; the prediction lane passes `task=` only then.
+_INPUT_PREDICTION_TASK_REGISTERED = False
+
+
+def _input_prediction_policy() -> Dict[str, Any]:
+    """``plugins.entries.ocuclaw.llm`` override trust gate as written in
+    config.yaml — the SAME keys PluginLlm enforces (allow_model_override /
+    allowed_models), read so capabilities can list the authorized choices.
+    Enforcement stays host-side (PluginLlmTrustError → policy-denied)."""
+    config, readable = _setup_raw_config()
+    if not readable or not isinstance(config, dict):
+        return {}
+    node: Any = config
+    for key in ("plugins", "entries", "ocuclaw", "llm"):
+        if not isinstance(node, dict):
+            return {}
+        node = node.get(key)
+    return node if isinstance(node, dict) else {}
+
+
+def _input_prediction_route_config() -> Dict[str, Any]:
+    """The raw config the prediction route is derived from (#2836).
+
+    Called inside the requested profile's runtime scope, where
+    ``read_raw_config`` follows the home override to that profile's
+    config.yaml; the pure ``effective_prediction_route`` does the rest."""
+    config, readable = _setup_raw_config()
+    return config if readable and isinstance(config, dict) else {}
 
 
 def _stream_reasoning_deltas_configured() -> bool:
@@ -652,10 +715,10 @@ def _hermes_feature_tokens() -> Tuple[str, ...]:
 # admission and SessionDB contract is certified against this exact upstream
 # release. In-minor patches remain admissible, but the release watcher creates
 # an immediate recertification obligation for every first-seen 0.21.x patch.
-CERTIFIED_HERMES_VERSION = "0.21.0"
-CERTIFIED_HERMES_TAG = "v2026.8.31"
-CERTIFIED_HERMES_COMMIT = "29112bef099274229cadff79cdff7bf7b99c4b77"
-SUPPORTED_HERMES_MIN = (0, 21, 0)
+CERTIFIED_HERMES_VERSION = "0.21.3"
+CERTIFIED_HERMES_TAG = "v2026.9.14"
+CERTIFIED_HERMES_COMMIT = "345cd2b057a452236de401d3534b8502a7465e8d"
+SUPPORTED_HERMES_MIN = (0, 21, 1)
 SUPPORTED_HERMES_MAX_EXCLUSIVE = (0, 22, 0)
 
 # Hermes owns these bytes for every OcuClaw-platform session. Keep the section
@@ -669,6 +732,23 @@ OCUCLAW_READABILITY_SYSTEM_PROMPT = (
     "unbroken strings unless needed."
 )
 
+# The index line for the bundle's plugin skills (#3078). A Hermes plugin skill
+# is deliberately absent from the prompt's <available_skills> block
+# (agent/prompt_builder.py never consults the plugin-skill registry), so a
+# registered skill nobody names is a skill nobody loads. This section is the
+# only place a session learns the qualified name exists. Keep it byte-constant
+# for the same reason the readability section is: it is re-rendered at every
+# prompt-invalidation and compaction boundary.
+OCUCLAW_SKILLS_SECTION_ID = "ocuclaw.skills"
+OCUCLAW_SKILLS_SYSTEM_PROMPT = (
+    "Plugin skill ocuclaw:glasses-ui: deciding whether a turn belongs on the "
+    "wearer's Even G2 HUD instead of in chat, and authoring the "
+    "render_glasses_ui spec once it does. Load it with "
+    'skill_view("ocuclaw:glasses-ui") before any live/refreshing surface, '
+    "per-item detail list, or multi-screen flow, or whenever a turn might "
+    "belong on the glasses. Plain chat replies stay in chat."
+)
+
 BUNDLE_DIR = Path(__file__).resolve().parent
 DEFAULT_RUNTIME_ENTRY = BUNDLE_DIR / "dist-cjs" / "runtime" / "hermes-runtime-entry.cjs"
 SETUP_SKILL_NAME = "ocuclaw-assist-hermes"
@@ -676,6 +756,28 @@ SETUP_SKILL_PATH = BUNDLE_DIR / "skills" / SETUP_SKILL_NAME / "SKILL.md"
 SETUP_SKILL_DESCRIPTION = (
     "Guided OcuClaw setup, update, diagnostics, and troubleshooting for Hermes."
 )
+# The authoring/deciding skill for the LiveUI tools (#3078). It is the same
+# skill the OpenClaw manifest ships; the bundle carries a committed mirror at
+# skills/glasses-ui/ because Hermes loads no manifest and can only open a skill
+# the plugin physically ships and registers. Keep the copy in sync with
+# `node tools/sync-glasses-ui-skill.js`.
+#
+# Hermes resolves a plugin skill ONLY by its qualified name. It is absent from
+# ~/.hermes/skills/ and absent from the system prompt's <available_skills>
+# block, so registration alone is not reachability: the qualified name has to
+# appear in the prompt (OCUCLAW_SKILLS_SECTION_ID below) and in the tool
+# descriptions that tell the model to load it (_hermes_skill_qualified_description).
+GLASSES_UI_SKILL_NAME = "glasses-ui"
+GLASSES_UI_SKILL_PATH = BUNDLE_DIR / "skills" / GLASSES_UI_SKILL_NAME / "SKILL.md"
+GLASSES_UI_SKILL_QUALIFIED_NAME = f"ocuclaw:{GLASSES_UI_SKILL_NAME}"
+# Used only when the shipped SKILL.md frontmatter cannot be read. The live
+# description is read from the skill itself at registration time so the
+# `skills_list` entry a model sees can never drift from the skill.
+GLASSES_UI_SKILL_FALLBACK_DESCRIPTION = (
+    "Deciding whether a turn belongs on the wearer's Even G2 HUD instead of in "
+    "chat, and authoring the render_glasses_ui spec once it does."
+)
+
 SETUP_TOOL_NAME = "ocuclaw_setup"
 # Hermes 0.20.x interactive sessions resolve the `hermes-cli` composite when
 # they snapshot model tools. Registering this alongside the narrower `skills`
@@ -689,7 +791,7 @@ SETUP_TOOL_DESCRIPTION = (
     "enable_stream_reasoning_deltas and enable_desktop_theme — and only with "
     "confirm: true after the operator has said yes."
 )
-SETUP_GUIDE_VERSION = "2026-09-14 (1.3.21-hermes)"
+SETUP_GUIDE_VERSION = "2026-09-21 (1.3.22-hermes)"
 SETUP_SKILL_LOAD_POINTER = (
     "If the OcuClaw Setup Assistant skill is not loaded in this conversation, "
     "load it via `/ocuclaw-setup` before mutating anything."
@@ -697,6 +799,7 @@ SETUP_SKILL_LOAD_POINTER = (
 SETUP_REFERENCE_FILES = {
     "install_lifecycle": ("install-lifecycle.md", "Installation and lifecycle recovery"),
     "fresh_install": ("fresh-install.md", "Fresh install"),
+    "cloudways": ("cloudways.md", "Cloudways managed Hermes"),
     "agent_mode": ("agent-mode.md", "Choose single or multiple agents"),
     "credential_reset": ("relay-credential-reset.md", "Reset relay credential"),
     "update": ("update.md", "Update OcuClaw"),
@@ -717,10 +820,12 @@ SETUP_READ_ONLY_OPERATIONS = (
     SETUP_EVEN_AI_ROUTE_OPERATION,
     *SETUP_REFERENCE_FILES.keys(),
 )
+SETUP_REPLY_DELIVERY_OPERATION = "wait_reply_delivery"
 SETUP_INTERACTIVE_OPERATIONS = (
     "request_credentials",
     "pair_phone",
     "wait_phone_origin",
+    SETUP_REPLY_DELIVERY_OPERATION,
     "arm_first_run_proof",
     "welcome_round_trip",
 )
@@ -747,6 +852,9 @@ SETUP_TOOL_SCHEMA = {
                     "pair_phone opens the direct, model-bypassing "
                     "Hermes TUI or Desktop QR and four-word ceremony; "
                     "wait_phone_origin blocks for a completed phone turn; "
+                    f"{SETUP_REPLY_DELIVERY_OPERATION} makes one bounded check "
+                    "of whether the phone app reported that the glasses SDK "
+                    "accepted that turn's reply; "
                     "welcome_round_trip blocks for the managed welcome dismissal. "
                     "All other operations are read-only except "
                     f"{SETUP_STREAM_DELTAS_OPERATION} and "
@@ -778,8 +886,20 @@ SETUP_TOOL_SCHEMA = {
                 "pattern": "^[0-9a-f]{64}$",
                 "description": (
                     "Opaque candidate binding returned by wait_phone_origin. "
-                    "Pass it unchanged to welcome_round_trip; never show it "
-                    "to the user."
+                    f"Pass it unchanged to {SETUP_REPLY_DELIVERY_OPERATION} and "
+                    "welcome_round_trip; never show it to the user."
+                ),
+            },
+            "replyEvidence": {
+                "type": "string",
+                "enum": list(REPLY_EVIDENCE_VALUES),
+                "description": (
+                    "Which reply evidence you hold for arming. Send "
+                    "client_sdk_receipt only when wait_reply_delivery returned "
+                    "status sdk_accepted for this same candidate; send "
+                    "wearer_confirmed (the default) when the wearer answered "
+                    "the display question. A claimed receipt without a "
+                    "matching record is refused."
                 ),
             },
         },
@@ -992,6 +1112,14 @@ MULTIPLEX_DISABLED_ERROR = (
 PROFILE_NOT_SERVED_ERROR = (
     "Hermes profile {profile!r} is not served by this gateway."
 )
+#: A profile that WAS served and has just left the multiplexer's set (#2942).
+#: Distinct from "never served" on purpose: in-flight work on it is draining,
+#: so the refusal is about starting something new, and the wearer is told the
+#: agent went away rather than being answered by the default profile instead.
+PROFILE_NO_LONGER_SERVED_ERROR = (
+    "Hermes profile {profile!r} is no longer served by this gateway; "
+    "work already running there is finishing."
+)
 CROSS_PROFILE_COPY_ERROR = (
     "Cross-profile session copy is not supported; source and target must "
     "use the same profile."
@@ -1167,6 +1295,13 @@ LIVEUI_DEFAULT_RENDER_TIMEOUT_MS = 30 * 60 * 1000
 LIVEUI_RENDER_LINK_MARGIN_S = 60.0
 LIVEUI_PROMPT_LINK_TIMEOUT_S = 2.0
 FIRST_RUN_WELCOME_POLL_SECONDS = 1.0
+#: #3231. The Attempt is armed on the phone's SDK receipt for a SLICE of the
+#: reply, so "armed" does not mean the wearer has finished reading it. The
+#: welcome waits for the reply run's terminal boundary, then for the same
+#: finalize grace the stream tail already uses. The wait is bounded: a run that
+#: never reaches its boundary must not silence the welcome for the whole
+#: install, so after this many seconds of deferral the welcome goes anyway.
+FIRST_RUN_WELCOME_REPLY_WAIT_SECONDS = 30.0
 
 # Adapter instances the module-level hermes hook handlers route into (hooks
 # are registered ONCE at plugin load; adapters are constructed per platform
@@ -1182,12 +1317,27 @@ _LIVEUI_TASK_TOOL_REGISTERED = False
 # Per-name registration state for the data-driven phone tools (#2800). A
 # dict, not four flags, precisely so the next tickets add nothing here.
 _PHONE_TOOL_REGISTERED: Dict[str, bool] = {}
+# True once THIS process received a runtime hello: the only moment the seven
+# dynamic tools can register, so the only proof that a missing one is a
+# defect. A constructed adapter is not proof: Hermes 0.21's bare `hermes` TUI
+# runs its own gateway child, which constructs the platform (and its adapter)
+# but never starts the runtime while the managed gateway owns the relay port,
+# so seven tools read as "missing" on a perfectly healthy Cloudways host.
+_RUNTIME_HELLO_SEEN = False
+
+
+def _note_runtime_hello() -> None:
+    global _RUNTIME_HELLO_SEEN
+    _RUNTIME_HELLO_SEEN = True
 # Set by `register()` when `ctx.register_tool` actually accepted the setup
 # tool. Without it the inventory could only guess, and the one tool whose job
 # is to report a broken install would report itself as present on a host where
 # it never registered (#2804).
 _SETUP_TOOL_REGISTERED = False
 _LIVEUI_LOCK = threading.RLock()
+# The last runtime hello, kept so the seven hello-driven tools can be put back
+# after Hermes unloads them in a forced plugin rediscovery (OCU-1E6C-EEX1).
+_LAST_RUNTIME_HELLO: Optional[Dict[str, Any]] = None
 
 
 def _hermes_home() -> Optional[Path]:
@@ -1384,7 +1534,12 @@ def _namespace_for_profile(profile: Any) -> str:
 
 
 def _load_profile_routing() -> Tuple[bool, Dict[str, Path]]:
-    """Cheap fail-closed snapshot of the profiles this gateway serves."""
+    """The profiles this gateway serves RIGHT NOW (#2942).
+
+    One shared resolver behind it (``profile_routes``), TTL-cached, so calling
+    this per read costs a dict copy rather than a file read. ``(False, {})``
+    means "nothing proved", never "multiplex was switched off".
+    """
     return load_profile_routing_snapshot()
 
 
@@ -1620,6 +1775,135 @@ def _liveui_task_tool_handler(args: Dict[str, Any], **_kwargs: Any) -> str:
     return adapter.handle_liveui_task_tool_call(args)
 
 
+def _skill_frontmatter_description(path: Path) -> str:
+    """The `description:` line of a SKILL.md frontmatter block.
+
+    Read at registration time so the Hermes `skills_list` entry cannot drift
+    from the skill it points at. A skill whose listed description no longer
+    matches its body is worse than a short one: the model decides whether to
+    spend a load on it from this line alone.
+
+    Returns an empty string when the file is unreadable or carries no
+    frontmatter; every caller supplies its own fallback.
+    """
+
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    if not source.startswith("---"):
+        return ""
+    end = source.find("\n---", 3)
+    frontmatter = source if end < 0 else source[:end]
+    match = re.search(r"^description:[ \t]*(.+)$", frontmatter, re.MULTILINE)
+    if not match:
+        return ""
+    value = match.group(1).strip()
+    # A YAML block scalar (`description: >`, `>-`, `|`, `|+` …) keeps its text
+    # on the following lines, so this one-line reader would register the
+    # indicator itself as the description. Returning "" hands the caller its
+    # fallback instead of listing the skill as ">-".
+    if value.startswith(">") or value.startswith("|"):
+        return ""
+    return value
+
+
+# Hermes resolves a plugin skill ONLY as "<plugin>:<name>". A bare
+# skill_view("glasses-ui") runs the flat-tree scan over ~/.hermes/skills/ and
+# finds nothing, because a plugin skill is never copied there. The Node runtime
+# writes one tool description for both backends and the bare name is correct on
+# OpenClaw, so the qualification happens here, on the Hermes side, at the
+# moment the description is handed to register_tool.
+#
+# The lookbehind is what keeps this idempotent: an already-qualified
+# `"ocuclaw:glasses-ui" skill` is left alone rather than growing a second
+# prefix if the runtime ever starts emitting the qualified form itself. Every
+# pattern and replacement below is built from the two name constants, so
+# renaming the skill or its plugin moves the rewrite with it.
+_GLASSES_UI_SKILL_PREFIX = GLASSES_UI_SKILL_QUALIFIED_NAME[
+    : -len(GLASSES_UI_SKILL_NAME)
+]
+_GLASSES_UI_NAME_PATTERN = re.escape(GLASSES_UI_SKILL_NAME)
+_GLASSES_UI_PREFIX_PATTERN = re.escape(_GLASSES_UI_SKILL_PREFIX)
+_GLASSES_UI_QUOTED_SKILL_RE = re.compile(
+    rf'(?<!{_GLASSES_UI_PREFIX_PATTERN}){_GLASSES_UI_NAME_PATTERN}" skill'
+)
+_GLASSES_UI_QUOTED_SKILL_REPLACEMENT = f'{GLASSES_UI_SKILL_QUALIFIED_NAME}" skill'
+_GLASSES_UI_POSSESSIVE_SKILL_RE = re.compile(
+    rf"(?<!{_GLASSES_UI_PREFIX_PATTERN}){_GLASSES_UI_NAME_PATTERN} skill's"
+)
+_GLASSES_UI_POSSESSIVE_SKILL_REPLACEMENT = (
+    f"{GLASSES_UI_SKILL_QUALIFIED_NAME} skill's"
+)
+# The tail `render_glasses_ui` is expected to carry. If the runtime stops
+# emitting it, the prompt section still names the skill, so this is a warning
+# and never a registration failure.
+# Case-sensitive like the two rewrites above: a differently-cased pointer is one
+# they would not rewrite either, so matching it here would silence the warning
+# about exactly the description this code can no longer qualify.
+_GLASSES_UI_POINTER_RE = re.compile(
+    rf'load the\s+"{_GLASSES_UI_NAME_PATTERN}" skill'
+)
+_GLASSES_UI_POINTER_WARNED = False
+
+
+def _hermes_skill_qualified_description(description: str) -> str:
+    """Rewrite bare `glasses-ui` skill references to the qualified Hermes name."""
+
+    if not description:
+        return description
+    rewritten = _GLASSES_UI_QUOTED_SKILL_RE.sub(
+        _GLASSES_UI_QUOTED_SKILL_REPLACEMENT, description
+    )
+    return _GLASSES_UI_POSSESSIVE_SKILL_RE.sub(
+        _GLASSES_UI_POSSESSIVE_SKILL_REPLACEMENT, rewritten
+    )
+
+
+def _hermes_skill_qualified_schema(schema: Any) -> Any:
+    """A deep copy of `schema` with every `description` string qualified.
+
+    The tool description is not the only place the runtime names the skill: the
+    `render_glasses_ui` parameter schema tells the model that "Only the names in
+    the glasses-ui skill's references/graphic-icons.md draw". A model reading
+    that on Hermes is sent to a bare name its resolver never finds, which is the
+    same #3078 defect one level down — so the whole schema is rewritten, at any
+    depth, and the caller's dict (the runtime's own hello) is never mutated.
+    """
+
+    if isinstance(schema, dict):
+        rewritten: Dict[str, Any] = {}
+        for key, value in schema.items():
+            if key == "description" and isinstance(value, str):
+                rewritten[key] = _hermes_skill_qualified_description(value)
+            else:
+                rewritten[key] = _hermes_skill_qualified_schema(value)
+        return rewritten
+    if isinstance(schema, list):
+        return [_hermes_skill_qualified_schema(item) for item in schema]
+    return schema
+
+
+def _warn_once_on_missing_glasses_ui_pointer(description: str) -> None:
+    """Say so, once, if `render_glasses_ui` stopped pointing at the skill.
+
+    The pointer is the only thing in the tool surface that sends a model to the
+    authoring guidance. Losing it is how #3078 stayed invisible: the tool kept
+    working and the renders kept being the wrong kind.
+    """
+
+    global _GLASSES_UI_POINTER_WARNED
+    if _GLASSES_UI_POINTER_WARNED or _GLASSES_UI_POINTER_RE.search(description or ""):
+        return
+    _GLASSES_UI_POINTER_WARNED = True
+    logger.warning(
+        "[ocuclaw] %s description carries no `load the \"glasses-ui\" skill` "
+        "pointer; the qualified %s name may be unreachable from the tool surface",
+        LIVEUI_TOOL_NAME,
+        GLASSES_UI_SKILL_QUALIFIED_NAME,
+    )
+
+
 def _liveui_descriptor_from_hello(
     hello: Dict[str, Any], tool_name: str = LIVEUI_TOOL_NAME
 ) -> Optional[Dict[str, Any]]:
@@ -1663,6 +1947,25 @@ def _register_liveui_descriptor_from_hello(
         )
         return False
     description = str(descriptor.get("description") or schema.get("description") or "")
+    if tool_name == LIVEUI_TOOL_NAME:
+        # Both halves of what a model can read: Hermes's `tool_describe` serves
+        # the SCHEMA's own top-level description, not only the one passed to
+        # `register_tool`, so a pointer in either place is a pointer the model
+        # sees — and only its absence from both is worth a warning.
+        _warn_once_on_missing_glasses_ui_pointer(
+            "\n".join(
+                part
+                for part in (description, str(schema.get("description") or ""))
+                if part
+            )
+        )
+    description = _hermes_skill_qualified_description(description)
+    # All four LiveUI tools register through this one helper, so qualifying the
+    # schema here covers every liveui registration path there is. The schema's
+    # OWN top-level description is the text `tool_describe` serves, and the
+    # nested property descriptions name the skill too, so the rewrite walks the
+    # whole document rather than the one string `register_tool` is handed.
+    schema = _hermes_skill_qualified_schema(schema)
     descriptor_toolset = str(descriptor.get("toolset") or "")
     if descriptor_toolset and descriptor_toolset != LIVEUI_TOOLSET:
         logger.warning(
@@ -1723,13 +2026,25 @@ def provided_tool_inventory() -> Dict[str, Any]:
     }
     for name in PHONE_TOOL_ORDER:
         registrations[name] = bool(_PHONE_TOOL_REGISTERED.get(name))
+    # A flag says this module registered the tool once; the registry says
+    # whether Hermes still holds it. After a forced plugin rediscovery
+    # (OCU-1E6C-EEX1) the hello-driven flags are stale, and the inventory must
+    # not report a tool the model cannot reach. The setup tool is exempt:
+    # register() re-adds it on every load, so its flag never drifts.
+    for name, flagged in list(registrations.items()):
+        if name == SETUP_TOOL_NAME or not flagged:
+            continue
+        if _registry_has_tool(name) is False:
+            registrations[name] = False
     # Two independent proofs that this process is the registering one, because
-    # either alone has a blind spot: a connected adapter covers the gateway
-    # whose tools ALL failed to register, and a runtime-advertised registration
-    # covers the moment before the adapter list is read. The setup tool is
-    # deliberately not a proof: it registers in the CLI process too.
+    # either alone has a blind spot: a received runtime hello covers the
+    # gateway whose tools ALL failed to register, and a runtime-advertised
+    # registration covers the moment before the hello flag is read. The setup
+    # tool is deliberately not a proof: it registers in the CLI process too.
+    # Neither is a constructed adapter: the TUI's gateway child constructs one
+    # and never receives a hello (see `_RUNTIME_HELLO_SEEN`).
     expected = list(PROVIDED_TOOL_NAMES)
-    observed = bool(_ADAPTERS) or any(
+    observed = _RUNTIME_HELLO_SEEN or any(
         registrations.get(name, False)
         for name in expected
         if name != SETUP_TOOL_NAME
@@ -1952,6 +2267,140 @@ def _register_phone_tools_from_hello(hello: Dict[str, Any]) -> None:
             )
 
 
+def _hello_tool_names(hello: Any) -> List[str]:
+    """Tool names a runtime hello can register: the LiveUI four whose
+    descriptors are present, then every allow-listed ``phoneTools`` entry."""
+
+    names: List[str] = []
+    if not isinstance(hello, dict):
+        return names
+    for tool_name in (
+        LIVEUI_TOOL_NAME,
+        LIVEUI_STATE_TOOL_NAME,
+        LIVEUI_TEMPLATE_TOOL_NAME,
+        LIVEUI_TASK_TOOL_NAME,
+    ):
+        if _liveui_descriptor_from_hello(hello, tool_name):
+            names.append(tool_name)
+    descriptors = hello.get("phoneTools")
+    if isinstance(descriptors, list):
+        for descriptor in descriptors:
+            if not isinstance(descriptor, dict):
+                continue
+            name = str(descriptor.get("name") or "").strip()
+            if name in PHONE_TOOL_NAMES and name not in names:
+                names.append(name)
+    return names
+
+
+def _registry_has_tool(name: str) -> Optional[bool]:
+    """Whether Hermes' tool registry holds ``name`` in this plugin's scope.
+
+    None when there is nothing to check against: no bound ``ctx.register_tool``
+    (tests, hosts where register() never ran) or an unreadable registry. The
+    flags are trusted in that case, exactly as before.
+    """
+
+    ctx = getattr(_LIVEUI_REGISTER_TOOL, "__self__", None)
+    manager = getattr(ctx, "_manager", None)
+    if manager is None:
+        return None
+    try:
+        from tools.registry import registry
+
+        scope = getattr(manager, "scope_key", None)
+        return registry.get_entry(name, scope=scope) is not None
+    except Exception:  # noqa: BLE001 - a probe, never a failure path
+        return None
+
+
+def _forget_tool_registration(name: str) -> None:
+    global _LIVEUI_TOOL_REGISTERED, _LIVEUI_STATE_TOOL_REGISTERED
+    global _LIVEUI_TEMPLATE_TOOL_REGISTERED, _LIVEUI_TASK_TOOL_REGISTERED
+    if name == LIVEUI_TOOL_NAME:
+        _LIVEUI_TOOL_REGISTERED = False
+    elif name == LIVEUI_STATE_TOOL_NAME:
+        _LIVEUI_STATE_TOOL_REGISTERED = False
+    elif name == LIVEUI_TEMPLATE_TOOL_NAME:
+        _LIVEUI_TEMPLATE_TOOL_REGISTERED = False
+    elif name == LIVEUI_TASK_TOOL_NAME:
+        _LIVEUI_TASK_TOOL_REGISTERED = False
+    else:
+        _PHONE_TOOL_REGISTERED.pop(name, None)
+
+
+def _remember_runtime_hello(hello: Any) -> None:
+    """Keep the runtime hello so a Hermes plugin reload can be healed later.
+
+    OCU-1E6C-EEX1: Hermes 0.21.x re-runs plugin discovery with ``force=True``
+    on several provider-miss paths (a ``text_to_speech`` call naming a TTS
+    provider Hermes does not ship is one). That unloads every registration
+    this plugin made and re-imports this module as a FRESH module object. The
+    connected adapter, its hello and these one-shot flags stay behind in the
+    old module, so nothing ever re-registers the seven hello-driven tools:
+    ``tool_search`` stops listing them and glasses turns cannot render. The
+    hello is the only state that can rebuild them, so it is kept here, and the
+    flags are reset for any name the registry no longer holds so the hello
+    registrars run again (a reconnect hello heals the same way).
+    """
+
+    global _LAST_RUNTIME_HELLO
+    with _LIVEUI_LOCK:
+        if isinstance(hello, dict):
+            _LAST_RUNTIME_HELLO = hello
+        for name in _hello_tool_names(hello):
+            if _registry_has_tool(name) is False:
+                _forget_tool_registration(name)
+
+
+def ensure_hello_tools_registered(reason: str) -> int:
+    """Re-register the hello-driven tools a Hermes plugin reload dropped.
+
+    Cheap when nothing is wrong: one registry lookup per name under the lock.
+    Runs before each inbound glasses turn, so the first turn after a reload
+    already sees the tools (registering bumps the registry generation, which
+    invalidates Hermes' tool-definition cache), and from the janitor so other
+    surfaces heal within JANITOR_INTERVAL_SECONDS. Returns how many tools it
+    put back.
+    """
+
+    with _LIVEUI_LOCK:
+        hello = _LAST_RUNTIME_HELLO
+        if not isinstance(hello, dict):
+            return 0
+        missing = [
+            name
+            for name in _hello_tool_names(hello)
+            if _registry_has_tool(name) is False
+        ]
+        if not missing:
+            return 0
+        for name in missing:
+            _forget_tool_registration(name)
+        try:
+            _register_liveui_tool_from_hello(hello)
+            _register_phone_tools_from_hello(hello)
+        except Exception:  # noqa: BLE001 - never fail the turn over a heal
+            logger.exception(
+                "[ocuclaw] re-registering tools after a Hermes plugin reload "
+                "failed (%s)",
+                reason,
+            )
+        still_missing = [
+            name for name in missing if _registry_has_tool(name) is False
+        ]
+        healed = [name for name in missing if name not in still_missing]
+        logger.warning(
+            "[ocuclaw] re-registered %d tool(s) after a Hermes plugin reload "
+            "(%s): %s%s",
+            len(healed),
+            reason,
+            ", ".join(healed) or "none",
+            "; still missing: " + ", ".join(still_missing) if still_missing else "",
+        )
+        return len(healed)
+
+
 def _liveui_render_link_timeout_s(settings: Dict[str, Any]) -> float:
     timeout_ms = settings.get("renderGlassesUiTimeoutMs")
     if not isinstance(timeout_ms, (int, float)) or timeout_ms <= 0:
@@ -2107,6 +2556,50 @@ def resolve_even_ai_routing_mode(extra: Dict[str, Any]) -> str:
     return value
 
 
+TYPESAFE_API_KEY_ENV = "TYPESAFE_API_KEY"
+
+
+def _typesafe_api_key() -> str:
+    try:
+        from hermes_cli.config import get_env_value
+
+        value = str(get_env_value(TYPESAFE_API_KEY_ENV) or "").strip()
+        if value:
+            return value
+    except Exception:  # noqa: BLE001 - fall back to the process environment
+        pass
+    return str(os.environ.get(TYPESAFE_API_KEY_ENV) or "").strip()
+
+
+def _resolve_silent_input_jev(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Project ``platforms.ocuclaw.extra.silentInputJev`` for the Node child (#3124).
+
+    The flag sends the wearer's draft, and the message they are answering, to a third
+    party, so only a literal true (or the string "true") arms it, matching the OpenClaw
+    lane.
+
+    The key follows this module's secret posture: it comes ONLY from ``TYPESAFE_API_KEY``
+    in the Hermes-managed env store (process environment as the fallback). A
+    ``silentInputJev.apiKey`` in ``config.yaml`` is ignored, like every other yaml secret.
+    It is resolved here because the child's env is an allowlist that never carries it, and
+    only when the flag is armed, so a disabled feature never puts the secret on the pipe.
+
+    ``budgetMs`` is forwarded only when finite (a NaN would make the handshake frame
+    unparseable); the relay owns the clamp and default.
+    """
+    flag = raw.get("enabled")
+    enabled = flag is True or flag == "true"
+    budget = raw.get("budgetMs")
+    finite = isinstance(budget, (int, float)) and not isinstance(budget, bool) and math.isfinite(
+        float(budget)
+    )
+    return {
+        "enabled": enabled,
+        "apiKey": _typesafe_api_key() if enabled else "",
+        "budgetMs": budget if finite else None,
+    }
+
+
 def resolve_adapter_settings(config: Any) -> Dict[str, Any]:
     """Resolve the adapter's settings from PlatformConfig.extra (pinned key
     paths: ``platforms.ocuclaw.extra.*``)."""
@@ -2156,6 +2649,7 @@ def resolve_adapter_settings(config: Any) -> Dict[str, Any]:
         "sonioxApiKey": str(extra.get("sonioxApiKey") or "").strip(),
         "stateDir": str(extra.get("stateDir") or default_state_dir),
         "glassesUiLive": _dict("glassesUiLive"),
+        "silentInputJev": _resolve_silent_input_jev(_dict("silentInputJev")),
         "renderGlassesUiTimeoutMs": render_timeout_ms if render_timeout_ms > 0 else None,
         # Ratified beta posture (#976/B8): Hermes explicitly enables the
         # support capture + phone handoff gates. These are chosen defaults,
@@ -2172,6 +2666,9 @@ def resolve_adapter_settings(config: Any) -> Dict[str, Any]:
         "evenAiRequestTimeoutMs": _int("evenAiRequestTimeoutMs", 60_000),
         "evenAiMaxBodyBytes": _int("evenAiMaxBodyBytes", 65_536),
         "evenAiDedupWindowMs": _int("evenAiDedupWindowMs", 500),
+        # Silent input (#2829): operator/bench knob for the host prediction
+        # deadline; None keeps the relay-core provisional 1500 ms.
+        "inputPredictionTimeoutMs": (_int("inputPredictionTimeoutMs", 0) or None),
         "evenAiRoutingMode": resolve_even_ai_routing_mode(extra),
         "evenAiDedicatedSessionKey": str(
             extra.get("evenAiDedicatedSessionKey") or ""
@@ -2195,6 +2692,7 @@ def _child_runtime_config(settings: Dict[str, Any]) -> Dict[str, Any]:
         "sonioxApiKey": settings["sonioxApiKey"],
         "stateDir": settings["stateDir"],
         "glassesUiLive": settings["glassesUiLive"],
+        "silentInputJev": settings["silentInputJev"],
         "renderGlassesUiTimeoutMs": settings["renderGlassesUiTimeoutMs"],
         "externalDebugToolsEnabled": settings["externalDebugToolsEnabled"],
         "debugAutoArm": settings["debugAutoArm"],
@@ -2208,6 +2706,7 @@ def _child_runtime_config(settings: Dict[str, Any]) -> Dict[str, Any]:
         "evenAiRequestTimeoutMs": settings["evenAiRequestTimeoutMs"],
         "evenAiMaxBodyBytes": settings["evenAiMaxBodyBytes"],
         "evenAiDedupWindowMs": settings["evenAiDedupWindowMs"],
+        "inputPredictionTimeoutMs": settings["inputPredictionTimeoutMs"],
         "evenAiRoutingMode": settings["evenAiRoutingMode"],
         "evenAiDedicatedSessionKey": settings["evenAiDedicatedSessionKey"],
     }
@@ -2270,12 +2769,23 @@ def _is_connected(config: Any) -> bool:
     return bool(relay_token)
 
 
-def _env_enablement() -> Optional[Dict[str, str]]:
-    seed = {
+def _env_enablement() -> Optional[Dict[str, Any]]:
+    """The `platforms.ocuclaw.extra` values Hermes seeds from the env file.
+
+    Hermes commits this with ``platform_config.extra.update(seed)``
+    (`gateway/config_env.py` `_enable_plugin_platform`), so every key named
+    here WINS over `config.yaml`. Beside the three secrets, it carries the
+    non-secret platform settings the fresh-install guide otherwise makes an
+    operator type by hand (#3098) — a malformed one of those is dropped with a
+    warning rather than raised, so a typo can never cost this seed its Relay
+    Credential.
+    """
+    seed: Dict[str, Any] = {
         adapter_key: value
         for env_name, adapter_key in _SECRET_ENV_TO_ADAPTER_KEY.items()
         if (value := os.environ.get(env_name, "").strip())
     }
+    seed.update(platform_env_seed())
     return seed or None
 
 
@@ -2290,6 +2800,8 @@ def _hermes_version() -> str:
 
 def setup_ocuclaw_platform() -> None:
     """Confirm host-managed relay state, then configure optional secrets."""
+    optional_changed = False
+    optional_failed = False
     version = _hermes_version()
     if not hermes_version_supported(version):
         print(f"OcuClaw setup: {_unsupported_hermes_message(version)}.")
@@ -2322,8 +2834,9 @@ def setup_ocuclaw_platform() -> None:
         )
     try:
         from hermes_cli.cli_output import prompt
-        from hermes_cli.config import save_env_value
+        from hermes_cli.config import get_env_value, save_env_value
     except Exception:  # noqa: BLE001 - setup must retain its recovery handoff
+        optional_failed = True
         print(
             "Optional masked credential setup could not be completed; diagnostics "
             "and Relay Credential recovery remain available."
@@ -2353,20 +2866,27 @@ def setup_ocuclaw_platform() -> None:
                 else:
                     print(f"No {label} is configured; this integration is optional.")
                 value = str(prompt(question, password=True) or "").strip()
-                if value:
+                if value and value != str(get_env_value(env_name) or "").strip():
                     save_env_value(env_name, value)
+                    optional_changed = True
                     print(f"OcuClaw {label} saved through Hermes's .env contract.")
                 elif already_present:
                     print(f"Existing OcuClaw {label} configuration kept.")
                 else:
                     print(f"Optional {label} setup skipped.")
             except Exception:  # noqa: BLE001 - isolate each optional setup lane
+                optional_failed = True
                 print(
                     f"OcuClaw {label} setup could not be completed; continuing "
                     "with the remaining masked prompts."
                 )
-    print("Restart explicitly with: hermes gateway restart")
-    print("After Hermes restarts, then run /ocuclaw-setup.")
+    if optional_changed or optional_failed:
+        print("Resolve both optional choices before activation; keep their masked prompts separate.")
+        print("Restart explicitly with: hermes gateway restart")
+        print("After Hermes restarts, then run /ocuclaw-setup.")
+    else:
+        print("No optional credential changes; no restart is needed for these prompts.")
+        print("Continue /ocuclaw-setup for any other saved changes awaiting activation.")
 
 
 def _setup_secret_present(env_name: str) -> bool:
@@ -2616,9 +3136,8 @@ def _setup_status(facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     what the host looks like. ``facts`` lets a caller that already collected
     reuse them rather than observe the host twice in one turn.
     """
-    status = derive_legacy_setup_status(
-        facts if facts is not None else _collect_health_facts()
-    )
+    resolved_facts = facts if facts is not None else _collect_health_facts()
+    status = derive_legacy_setup_status(resolved_facts)
     raw_config, config_readable = _setup_raw_config()
     # Guide readiness is independent of connection health. Read only this
     # non-secret, profile-scoped leaf; a running gateway cannot prove it.
@@ -2631,10 +3150,35 @@ def _setup_status(facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     )
     gateway = raw_config.get("gateway")
     multiplex = gateway.get("multiplex_profiles") if isinstance(gateway, dict) else None
-    mode_config: Any = raw_config
-    for key in ("platforms", "ocuclaw", "extra"):
-        mode_config = mode_config.get(key) if isinstance(mode_config, dict) else None
+    platform_block: Any = raw_config
+    for key in ("platforms", "ocuclaw"):
+        platform_block = (
+            platform_block.get(key) if isinstance(platform_block, dict) else None
+        )
+    mode_config = (
+        platform_block.get("extra") if isinstance(platform_block, dict) else None
+    )
     agent_mode = mode_config.get("agent_mode") if isinstance(mode_config, dict) else None
+    # #3098: `.env`-seeded platform settings win over this yaml block at
+    # gateway start, so the setup ladder must judge the effective value or it
+    # will keep asking for a key the env file already supplies — but only where
+    # Hermes would really commit that seed (no Relay Credential yet, an
+    # explicitly disabled platform, or a failing deps check mean it never
+    # lands), so the ladder never reports a setting the gateway refused.
+    secrets_present = resolved_facts.get("secretsPresent")
+    mode_config = effective_platform_extra(
+        mode_config,
+        seed_committed=env_seed_reaches_extra(
+            platform_block,
+            relay_token_present=bool(
+                (secrets_present or {}).get("relayToken")
+                if isinstance(secrets_present, dict)
+                else False
+            ),
+            host_supported=bool(resolved_facts.get("hermesVersionSupported")),
+            node_available=bool(resolved_facts.get("nodeAvailable")),
+        ),
+    )
     agent_mode_chosen = config_readable and isinstance(multiplex, bool) and (
         (agent_mode == "multiple" and multiplex is True)
         or (agent_mode == "single" and multiplex is False)
@@ -2676,17 +3220,43 @@ def _setup_status(facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     # meaning, and the block is present on every status so "the key is absent"
     # can only mean an OcuClaw older than this bundle.
     inventory = provided_tool_inventory()
+    observed_tools = bool(inventory["observed"])
+    # An unobservable inventory carries NO names in `missing`. The reader is a
+    # model that acts on `missing` alone (live on Cloudways it refused to pair
+    # over seven "missing" tools that the managed gateway had bound fine), so
+    # a process that cannot see registration state must not publish absences.
     status["tools"] = {
         "expected": inventory["expected"],
-        "registered": inventory["registered"],
-        "missing": inventory["missing"],
-        "count": len(inventory["registered"]),
+        "registered": inventory["registered"] if observed_tools else [],
+        "missing": inventory["missing"] if observed_tools else [],
+        "count": len(inventory["registered"]) if observed_tools else None,
         "expectedCount": len(inventory["expected"]),
-        "observed": inventory["observed"],
+        "observed": observed_tools,
+        "verdict": "observed" if observed_tools else "unobservable",
+        "reason": None
+        if observed_tools
+        else (
+            "registration state lives in the gateway process that received "
+            "the runtime hello; this process did not, so no tool is known to "
+            "be missing"
+        ),
     }
     status["desktopTheme"] = _desktop_theme_status(raw_config, config_readable)
     status["desktopCredentials"] = desktop_credentials.status()
     status["sessionReadState"] = bool(session_read_state_supported())
+    # The Profiles inventory (#2944). Additive, exactly like the tool
+    # inventory above: no existing key moves, so "the key is absent" can only
+    # mean an OcuClaw older than this bundle. Read-only — it opens nothing,
+    # writes nothing, and never carries a credential value, only presence.
+    # A collection failure degrades this one block rather than the status a
+    # wearer is reading precisely because something is broken.
+    try:
+        from . import profiles_report
+
+        status["profiles"] = profiles_report.build_inventory()
+    except Exception:  # noqa: BLE001 - a diagnostic must not become an outage
+        logger.exception("[ocuclaw] profile inventory unavailable")
+        status["profiles"] = {"observed": False, "faults": []}
     return status
 
 
@@ -2847,8 +3417,11 @@ def _run_setup_pairing_action() -> Dict[str, Any]:
 
 
 def _setup_journey(
-    snapshot: Any, attempt: Any, mandatory_configuration: Any = None
-) -> Dict[str, str]:
+    snapshot: Any,
+    attempt: Any,
+    mandatory_configuration: Any = None,
+    tailnet_daemon: Any = None,
+) -> Dict[str, Any]:
     snap = snapshot if isinstance(snapshot, dict) else {}
     setup = snap.get("setup") if isinstance(snap.get("setup"), dict) else {}
     health = (
@@ -2888,11 +3461,49 @@ def _setup_journey(
         checkpoint = "secure-phone-pairing"
     else:
         checkpoint = "phone-origin-proof"
-    return {
+    journey = {
         "owner": "host",
         "nextCheckpoint": checkpoint,
-        "phoneRole": "test-message-and-wearer-confirmation-only",
+        # The phone sends the test message and returns the welcome double-tap.
+        # A display answer is asked for only when the app's own SDK receipt for
+        # that exact reply is missing or ineligible.
+        "phoneRole": "test-message-welcome-dismissal-and-fallback-confirmation",
     }
+    if checkpoint == "tailnet-route" and isinstance(tailnet_daemon, dict):
+        # The Cloudways sub-check: a user-owned userspace tailscaled fronts the
+        # route, so "route not ready" first means "is the daemon even up and
+        # authorized". Present only when the tailscale-cli receipt exists.
+        state = str(tailnet_daemon.get("state") or "unknown")
+        journey["tailnetDaemon"] = {
+            "state": state,
+            "detail": str(tailnet_daemon.get("detail") or ""),
+        }
+        if state != "running":
+            journey["subCheck"] = "tailnet-daemon"
+    return journey
+
+
+def _tailnet_daemon_summary() -> Optional[Dict[str, Any]]:
+    """The Cloudways `tailscale-daemon` check; None off that path or on any fault."""
+    try:
+        from . import cloudways
+
+        return cloudways.daemon_summary()
+    except Exception:  # noqa: BLE001 - a sub-check must not break the setup tool
+        logger.exception("[ocuclaw] tailscale daemon summary unavailable")
+        return None
+
+
+def _welcome_host_is_cloudways() -> bool:
+    """Picks the three-way welcome lockup (#3187). Fail-soft: an unclassifiable
+    host is an ordinary host, and only the decisive verdict counts."""
+    try:
+        from . import cloudways
+
+        return cloudways.detect().verdict == cloudways.DETECT_CLOUDWAYS
+    except Exception:  # noqa: BLE001 - a picture choice must not break first run
+        logger.exception("[ocuclaw] welcome host detection unavailable")
+        return False
 
 
 def _desktop_theme_operation_receipt(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -2949,6 +3560,32 @@ def _desktop_theme_operation_receipt(args: Dict[str, Any]) -> Dict[str, Any]:
             "message": str(result.get("message") or ""),
         }
     return receipt
+
+
+def _setup_phone_candidate_id(args: Any) -> Optional[str]:
+    """The opaque candidate binding, or None when it is absent or malformed."""
+
+    candidate_id = str((args or {}).get("phoneCandidateId") or "").strip()
+    if len(candidate_id) != 64 or any(
+        char not in "0123456789abcdef" for char in candidate_id
+    ):
+        return None
+    return candidate_id
+
+
+def _phone_candidate_binding_error(operation: str) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "operation": operation,
+        "error": {
+            "code": "phone_candidate_binding_required",
+            "message": (
+                "Wait for a new phone-origin turn first, retain its opaque "
+                "candidate binding, then retry this operation with that exact "
+                "binding."
+            ),
+        },
+    }
 
 
 def _setup_tool_handler_impl(args: Dict[str, Any], **_kwargs: Any) -> str:
@@ -3013,7 +3650,27 @@ def _setup_tool_handler_impl(args: Dict[str, Any], **_kwargs: Any) -> str:
         pairing_action = _run_setup_pairing_action()
     phone_origin_action = None
     if operation == "wait_phone_origin":
-        phone_origin_action = wait_for_phone_turn_candidate()
+        # #3010: this wait IS the moment the wearer is being asked for a phone
+        # message — and the ask cannot reach the host terminal while this tool
+        # is running. The phone carries it instead, for exactly this wait. This
+        # process is the host, not the gateway, so the ask is published as a
+        # profile-scoped receipt the gateway's first-run watcher picks up.
+        with awaiting_first_reply():
+            phone_origin_action = wait_for_phone_turn_candidate()
+    reply_delivery_action = None
+    if operation == SETUP_REPLY_DELIVERY_OPERATION:
+        candidate_id = _setup_phone_candidate_id(args)
+        if candidate_id is None:
+            return json.dumps(
+                _phone_candidate_binding_error(operation), sort_keys=True
+            )
+        # Bounded, non-mutating, and never a restart: a timeout here reports
+        # `unconfirmed` and the same candidate still arms through the wearer
+        # path afterwards.
+        reply_delivery_action = wait_for_reply_delivery(
+            candidate_id=candidate_id,
+            timeout_seconds=REPLY_DELIVERY_WAIT_SECONDS,
+        )
     first_run_action = None
     if operation in {"arm_first_run_proof", "welcome_round_trip"}:
         existing_attempt = (
@@ -3033,21 +3690,24 @@ def _setup_tool_handler_impl(args: Dict[str, Any], **_kwargs: Any) -> str:
         ):
             first_run_action = {**existing_attempt, "armed": True}
         else:
-            candidate_id = str((args or {}).get("phoneCandidateId") or "").strip()
-            if (
-                len(candidate_id) != 64
-                or any(char not in "0123456789abcdef" for char in candidate_id)
-            ):
+            candidate_id = _setup_phone_candidate_id(args)
+            if candidate_id is None:
+                return json.dumps(
+                    _phone_candidate_binding_error(operation), sort_keys=True
+                )
+            reply_evidence = str(
+                (args or {}).get("replyEvidence") or REPLY_EVIDENCE_WEARER_CONFIRMED
+            ).strip()
+            if reply_evidence not in REPLY_EVIDENCE_VALUES:
                 return json.dumps(
                     {
                         "ok": False,
                         "operation": operation,
                         "error": {
-                            "code": "phone_candidate_binding_required",
+                            "code": "reply_evidence_invalid",
                             "message": (
-                                "Wait for a new phone-origin turn first, retain its "
-                                "opaque candidate binding, then retry the welcome "
-                                "round trip with that exact binding."
+                                "replyEvidence must be wearer_confirmed or "
+                                "client_sdk_receipt."
                             ),
                         },
                     },
@@ -3058,6 +3718,25 @@ def _setup_tool_handler_impl(args: Dict[str, Any], **_kwargs: Any) -> str:
                 hermes_package_version=_hermes_version() or None,
                 ocuclaw_version=_ocuclaw_version(),
                 expected_candidate_id=candidate_id,
+                reply_evidence=reply_evidence,
+            )
+        if first_run_action.get("state") == "reply_evidence_unavailable":
+            return json.dumps(
+                {
+                    "ok": False,
+                    "operation": operation,
+                    "error": {
+                        "code": "reply_evidence_unavailable",
+                        "message": (
+                            "This turn has no accepted glasses SDK receipt, so "
+                            "the automatic path cannot arm it. Ask the wearer "
+                            "whether the reply appeared on their Even G2 and "
+                            "retry with replyEvidence: wearer_confirmed."
+                        ),
+                        "reason": first_run_action.get("reason"),
+                    },
+                },
+                sort_keys=True,
             )
         if str(first_run_action.get("state") or "").startswith("phone_turn_"):
             return json.dumps(
@@ -3067,9 +3746,11 @@ def _setup_tool_handler_impl(args: Dict[str, Any], **_kwargs: Any) -> str:
                     "error": {
                         "code": "phone_turn_required",
                         "message": (
-                            "Send a message from the OcuClaw phone app, confirm "
-                            "its reply appeared on the Even G2, then continue "
-                            "setup here on the host."
+                            "Send a message from the OcuClaw phone app, run "
+                            "wait_reply_delivery for that turn, and if it does "
+                            "not report sdk_accepted ask the wearer whether the "
+                            "reply appeared on the Even G2. Then continue setup "
+                            "here on the host."
                         ),
                         "reason": first_run_action.get("state"),
                     },
@@ -3121,6 +3802,7 @@ def _setup_tool_handler_impl(args: Dict[str, Any], **_kwargs: Any) -> str:
         "fresh_install",
         "pair_phone",
         "wait_phone_origin",
+        SETUP_REPLY_DELIVERY_OPERATION,
         "arm_first_run_proof",
         "welcome_round_trip",
     }:
@@ -3138,6 +3820,7 @@ def _setup_tool_handler_impl(args: Dict[str, Any], **_kwargs: Any) -> str:
             snapshot_v1,
             receipt["firstRunProofAttempt"],
             receipt["status"]["mandatoryConfiguration"],
+            _tailnet_daemon_summary(),
         )
     if first_run_action is not None:
         receipt["firstRunProofAction"] = first_run_action
@@ -3145,6 +3828,10 @@ def _setup_tool_handler_impl(args: Dict[str, Any], **_kwargs: Any) -> str:
         receipt["pairingAction"] = pairing_action
     if phone_origin_action is not None:
         receipt["phoneOriginAction"] = phone_origin_action
+    if reply_delivery_action is not None:
+        # Machine evidence only: SDK acceptance of a slice of the committed
+        # reply. It is never wearer confirmation and never a display claim.
+        receipt["replyDelivery"] = reply_delivery_action
     if operation == "doctor":
         receipt["bundle"] = dict(_LAST_SETUP_BUNDLE_REPORT)
     if operation in SETUP_REFERENCE_FILES:
@@ -3181,46 +3868,8 @@ def _setup_tool_handler_impl(args: Dict[str, Any], **_kwargs: Any) -> str:
 
 def _setup_even_ai_route_receipt() -> Dict[str, Any]:
     """Expose the read-only live :8443 classifier to the setup assistant."""
-    raw_config, readable = _setup_raw_config()
-    if not readable:
-        return {
-            "ok": False,
-            "operation": SETUP_EVEN_AI_ROUTE_OPERATION,
-            "error": {
-                "code": "config_unreadable",
-                "message": "Hermes configuration could not be read; no route will be changed.",
-            },
-        }
-    node: Any = raw_config
-    for key in ("platforms", "ocuclaw", "extra"):
-        if not isinstance(node, Mapping):
-            node = {}
-            break
-        node = node.get(key, {})
-    raw_port = (
-        node.get("wsPort", HERMES_BUNDLE_DEFAULT_WS_PORT)
-        if isinstance(node, Mapping)
-        else None
-    )
-    if (
-        not isinstance(raw_port, int)
-        or isinstance(raw_port, bool)
-        or not 1 <= raw_port <= 65535
-    ):
-        return {
-            "ok": False,
-            "operation": SETUP_EVEN_AI_ROUTE_OPERATION,
-            "error": {
-                "code": "relay_port_unknown",
-                "message": "Hermes relay port is unreadable; no route will be changed.",
-            },
-        }
-    decision = even_ai_route.plan_live(relay_port=raw_port)
-    return {
-        "ok": decision.state != "refused",
-        "operation": SETUP_EVEN_AI_ROUTE_OPERATION,
-        "route": decision._asdict(),
-    }
+    from .even_ai_cli import observe
+    return {**observe(), "operation": SETUP_EVEN_AI_ROUTE_OPERATION}
 
 
 def _admitted_adapter_factory(config: Any):
@@ -3235,8 +3884,24 @@ def _admitted_is_connected(config: Any) -> bool:
 
 def register(ctx: Any) -> None:
     global _LAST_SETUP_BUNDLE_REPORT, _PLUGIN_CONTEXT, _LIVEUI_REGISTER_TOOL
-    global _SETUP_TOOL_REGISTERED
+    global _SETUP_TOOL_REGISTERED, _INPUT_PREDICTION_TASK_REGISTERED
     _PLUGIN_CONTEXT = ctx
+    # Silent input (#2829): a plugin-owned auxiliary task so operators can
+    # pin a cheap prediction model under `auxiliary.silent_input_prediction`
+    # without touching the chat model. Optional: an older host without
+    # register_auxiliary_task keeps the lane on the plugin's default routing.
+    _INPUT_PREDICTION_TASK_REGISTERED = False
+    register_auxiliary_task = getattr(ctx, "register_auxiliary_task", None)
+    if callable(register_auxiliary_task):
+        try:
+            register_auxiliary_task(
+                INPUT_PREDICTION_AUXILIARY_TASK,
+                display_name="Silent input predictions",
+                description="Next-word candidates for the OcuClaw glasses keyboard (direct, no agent turn)",
+            )
+            _INPUT_PREDICTION_TASK_REGISTERED = True
+        except Exception as exc:  # noqa: BLE001 - never block plugin registration
+            logger.warning("[ocuclaw] silent_input_prediction auxiliary task not registered: %s", exc)
     version = _hermes_version()
     if parse_version(version) is None:
         raise RuntimeError(
@@ -3308,6 +3973,14 @@ def register(ctx: Any) -> None:
             position="after_memory",
             max_chars=4000,
         )
+        # A plugin skill never appears in <available_skills>, so without this
+        # line a session has no way to learn `ocuclaw:glasses-ui` exists (#3078).
+        register_system_prompt_section(
+            OCUCLAW_SKILLS_SECTION_ID,
+            OCUCLAW_SKILLS_SYSTEM_PROMPT,
+            position="after_memory",
+            max_chars=2000,
+        )
     register_skill = getattr(ctx, "register_skill", None)
     setup_skill_registered = False
     if callable(register_skill):
@@ -3323,10 +3996,25 @@ def register(ctx: Any) -> None:
                 "[ocuclaw] setup skill registration failed: %s",
                 exc,
             )
+        # Its own try/except, deliberately: the setup skill is the recovery
+        # surface and the glasses-ui skill is the authoring surface. Neither
+        # failing may take the other down with it.
+        try:
+            register_skill(
+                GLASSES_UI_SKILL_NAME,
+                GLASSES_UI_SKILL_PATH,
+                _skill_frontmatter_description(GLASSES_UI_SKILL_PATH)
+                or GLASSES_UI_SKILL_FALLBACK_DESCRIPTION,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep other recovery surfaces
+            logger.warning(
+                "[ocuclaw] glasses-ui skill registration failed: %s",
+                exc,
+            )
     else:
         logger.warning(
             "[ocuclaw] ctx.register_skill unavailable — /ocuclaw-setup "
-            "bootstrap is unavailable"
+            "bootstrap and the glasses-ui authoring skill are unavailable"
         )
     register_tool = getattr(ctx, "register_tool", None)
     if callable(register_tool):
@@ -3517,6 +4205,27 @@ async def _handle_pairing_completed(params: Any) -> Dict[str, Any]:
     return {"ok": True}
 
 
+async def _handle_reply_delivery_report(params: Any) -> Dict[str, Any]:
+    """Join one validated client SDK receipt to the current phone candidate.
+
+    Closed shape in, closed answer out. A duplicate of the same observation
+    answers ``{ok: true}`` so the child's bounded retry terminates; an
+    unknown or replaced candidate is refused and nothing is persisted.
+    """
+
+    normalized, error = validate_reply_delivery_report(params)
+    if normalized is None:
+        return {"ok": False, "error": error or "invalid_params"}
+    try:
+        result = await asyncio.to_thread(record_reply_delivery, **normalized)
+    except Exception:  # noqa: BLE001 — a receipt fault must not kill the link
+        logger.exception("[ocuclaw] reply-delivery receipt unavailable")
+        return {"ok": False, "error": "receipt_unavailable"}
+    if result.get("ok") is True:
+        return {"ok": True}
+    return {"ok": False, "error": str(result.get("error") or "receipt_unavailable")}
+
+
 def _build_adapter(config: Any):
     # Deferred import: keeps this module importable (for framing tests and
     # version-gate units) outside a hermes environment.
@@ -3557,14 +4266,48 @@ def _build_adapter(config: Any):
             )
             self._session_status = SessionStatusObserver()
             self._phone_turn_candidate_gate = PhoneTurnCandidateGate()
+            # Strong refs for the fire-and-forget reply-delivery observations,
+            # so the loop cannot collect one mid-flight.
+            self._reply_delivery_tasks: set = set()
+            # Tier 0 in-flight signal (T2 #2510): session_id → {at, platform}
+            # for EVERY platform this gateway runs (fed by pre_llm_call / tool
+            # hooks BEFORE their ocuclaw platform filter, cleared by
+            # on_session_end, TTL-expired as the fail-safe). Zero idle cost: no
+            # timer — expiry is checked lazily on read. Declared HERE, ahead of
+            # routing, because the #2942 drain release asks it whether anything
+            # is still running and routing is refreshed during construction.
+            self._inflight: Dict[str, Dict[str, Any]] = {}
+            self._inflight_lock = threading.Lock()
             self._multiplex_enabled = False
             self._served_profile_homes: Dict[str, Path] = {}
+            # #2942: namespaces that have LEFT the served set while this
+            # process may still have output for them — see
+            # `_note_route_departures`. Never a route for new work.
+            self._draining_profile_homes: Dict[str, Path] = {}
+            self._draining_profile_until: Dict[str, float] = {}
+            # Routing is now read from every lane — the loop and the worker
+            # threads RPC handlers run in — so the read-modify-write that moves
+            # a namespace into or out of the drain set needs one owner.
+            self._routing_lock = threading.Lock()
+            # #2940: OcuClaw's own enrollment set, installed BEFORE the first
+            # route read so no resolution in this process's life is ever wider
+            # than the wearer's selection. This one call migrates the retired
+            # `gateway.multiplex_profile_allowlist` (when it is still there)
+            # and installs the admission predicate on the shared resolver, so
+            # every reader downstream of `load_profile_routing_snapshot` — the
+            # agent menu, the RPC facade, dispatch, session resolution, the
+            # management lane — is bounded by the same set.
+            self._install_profile_enrollment()
             self._refresh_profile_routing()
             # Sessions-plane SessionDB glue: the default reader is preserved
             # byte-for-byte outside multiplex; secondary readers are lazy.
             self._session_rpc = ProfileSessionRpc(
                 default_db_path=default_state_db_path(),
                 routing_provider=self._profile_routing_snapshot,
+                # #2940: the ambient finalizer alone may read a draining
+                # profile's own DB, so a turn in an agent the wearer just
+                # removed still records how it ended.
+                routable_provider=self._profile_routing_routable,
                 # Hermes injects the public SessionStore after construction
                 # and before connect. Resolve lazily so current prompt-token
                 # reads use that live, persisted authority.
@@ -3578,13 +4321,6 @@ def _build_adapter(config: Any):
             # now (a second tap on the same row is `own_lane_busy`).
             self._adopt_waiters: Dict[str, asyncio.Future] = {}
             self._adopting_tips: set = set()
-            # Tier 0 in-flight signal (T2 #2510): session_id → {at, platform}
-            # for EVERY platform this gateway runs (fed by pre_llm_call /
-            # tool hooks BEFORE their ocuclaw platform filter, cleared by
-            # on_session_end, TTL-expired as the fail-safe). Zero idle cost:
-            # no timer — expiry is checked lazily on read.
-            self._inflight: Dict[str, Dict[str, Any]] = {}
-            self._inflight_lock = threading.Lock()
             # W07 models/status/config read plane (gw.* lanes).
             self._gw_rpc = GwRpc(
                 namespace=self._namespace,
@@ -3594,14 +4330,38 @@ def _build_adapter(config: Any):
             self._gw_rpc._management_adapter = self
             # STT lane (#1938): what the connected Hermes can transcribe with.
             self._stt_rpc = SttRpc()
+            # Silent input (#2829): direct predictions from ctx.llm.
+            # Late-bound lambdas: the module globals are read per call, so a
+            # register()-time flag flip (and a test monkeypatch) is honoured.
+            # #2836: per-profile — profileId (a Hermes profile name from the
+            # authenticated session) → a namespace this gateway serves; the
+            # policy/route readers run inside that profile's runtime scope.
+            self._input_prediction_rpc = InputPredictionRpc(
+                lambda: getattr(_PLUGIN_CONTEXT, "llm", None),
+                hermes_version=lambda: _hermes_version(),
+                task_registered=lambda: _INPUT_PREDICTION_TASK_REGISTERED,
+                get_policy=lambda: _input_prediction_policy(),
+                get_route_config=lambda: _input_prediction_route_config(),
+                resolve_profile=self._input_prediction_resolve_profile,
+                profile_scope=self._input_prediction_profile_scope,
+            )
             self._loop: Optional[asyncio.AbstractEventLoop] = None
             self._janitor_task: Optional[asyncio.Task] = None
             self._first_run_welcome_task: Optional[asyncio.Task] = None
+            # #3010: the last setup-hint phase this adapter told its runtime
+            # child about. Edge memory only — the phase itself is re-derived
+            # from the host's receipt on every watcher pass.
+            self._setup_hint_phase: Optional[str] = None
             self._message_seq = 0
             self._delivery_record: ContextVar[Any] = ContextVar(
                 "ocuclaw_delivery_record", default=None
             )
             self._processing_deliveries: Dict[Tuple[str, str], Any] = {}
+            # #3231. Monotonic stamp of the last phone-origin reply run to
+            # reach its terminal boundary, and when the welcome first started
+            # waiting on one. Both are welcome-timing only.
+            self._ocuclaw_reply_settled_at: Optional[float] = None
+            self._welcome_defer_since: Optional[float] = None
             # Per-process uniqueness for the minted platform message id
             # (#1691) — see `_next_message_id`.
             self._message_id_nonce = uuid.uuid4().hex[:8]
@@ -3736,9 +4496,12 @@ def _build_adapter(config: Any):
                     # generic `pull_failed`: "the link is gone" and "the relay's
                     # presence method failed" need different repairs.
                     raise PresenceLinkUnavailableError("control link not ready")
-                return await link.request(
+                result = await link.request(
                     PRESENCE_SNAPSHOT_METHOD, None, timeout_s=PULL_TIMEOUT_S
                 )
+                from .optional_setup import observe_runtime
+                observe_runtime(self._settings, home=home)
+                return result
 
             def _write(body: Dict[str, Any]) -> None:
                 if home is None:
@@ -3826,6 +4589,10 @@ def _build_adapter(config: Any):
             from .restart_rpc import RestartRpc
             self._restart_rpc = RestartRpc(self, self._gw_rpc)
             link.register_request_handler("gw.hermes.management", self._restart_rpc.handle)
+            from .optional_setup_rpc import OptionalSetupRpc
+            self._optional_setup_rpc = OptionalSetupRpc(self._restart_rpc)
+            link.register_request_handler("gw.optional.setup", self._optional_setup_rpc.handle)
+            link.register_request_handler("gw.optional.setup.disconnect", self._optional_setup_rpc.disconnect)
             for method, handler in self._stt_rpc.handlers().items():
                 link.register_request_handler(method, handler)
             link.register_request_handler(
@@ -3876,10 +4643,17 @@ def _build_adapter(config: Any):
             link.register_request_handler(
                 LIVEUI_LLM_RECIPE_METHOD, self.handle_liveui_llm_recipe
             )
+            # Silent input (#2829): direct, agent-free word predictions from
+            # the plugin's ctx.llm. Child-initiated lane; identical method
+            # names on both sides of the link.
+            for method, handler in self._input_prediction_rpc.handlers().items():
+                link.register_request_handler(method, handler)
             runtime_ready: asyncio.Event = asyncio.Event()
             self._runtime_ready_event = runtime_ready
 
             async def _on_runtime_ready(_params: Any) -> Dict[str, Any]:
+                from .optional_setup import observe_runtime
+                observe_runtime(settings)
                 runtime_ready.set()
                 return {"ok": True}
 
@@ -3898,6 +4672,11 @@ def _build_adapter(config: Any):
             link.register_request_handler(
                 PAIRING_COMPLETED_METHOD, _handle_pairing_completed
             )
+            # Reply-delivery reports arrive shortly after a phone turn, and
+            # the report may beat the host's wait either way round.
+            link.register_request_handler(
+                REPLY_DELIVERY_REPORT_METHOD, _handle_reply_delivery_report
+            )
             # The presence lane must be live BEFORE the child can speak: a
             # phone that is already connected when the relay boots produces a
             # push during the handshake window, and a `-32601` there would
@@ -3911,6 +4690,8 @@ def _build_adapter(config: Any):
             except LinkError as exc:
                 logger.error("[ocuclaw] runtime child failed to start: %s", exc)
                 return False
+            _note_runtime_hello()
+            _remember_runtime_hello(hello)
             _register_liveui_tool_from_hello(hello)
             _register_phone_tools_from_hello(hello)
             self._link = link
@@ -3987,6 +4768,10 @@ def _build_adapter(config: Any):
             if self._first_run_welcome_task is not None:
                 self._first_run_welcome_task.cancel()
                 self._first_run_welcome_task = None
+            # A new child starts with no hint, so the edge memory must not
+            # outlive this link or the first pass after a reconnect would skip
+            # the push that puts a live row back on the phone (#3010).
+            self._setup_hint_phase = None
             # Clean shutdown is one of the receipt's three write triggers: say
             # so now rather than leaving the last healthy reading to age out
             # over the next two minutes and read as current in between.
@@ -4783,6 +5568,10 @@ def _build_adapter(config: Any):
                 setattr(event, "_ocuclaw_dispatch_run_id", record.run_id)
                 setattr(event, "_ocuclaw_dispatch_session_key", session_key)
                 setattr(event, "_ocuclaw_delivery_record", record)
+                # OCU-1E6C-EEX1: a Hermes plugin reload between turns drops
+                # the hello-registered tools; put them back before this turn's
+                # tool list is assembled.
+                ensure_hello_tools_registered("inbound dispatch")
                 await self.handle_message(event)
             except Exception:
                 # A failed dispatch must not strand its records as a phantom
@@ -4860,6 +5649,7 @@ def _build_adapter(config: Any):
             if not run_id or not session_key:
                 return
             self._processing_deliveries.pop((session_key, run_id), None)
+            self._note_ocuclaw_reply_settled(session_key)
             outcome_value = str(getattr(outcome, "value", "") or "").lower()
             completed = outcome_value == "success"
             head, merged, promoted = self._ledger.complete_head_if_run(
@@ -4875,10 +5665,7 @@ def _build_adapter(config: Any):
                 # on_session_end or slash completion already closed this run;
                 # never let a late platform callback consume its successor.
                 if processing_publishes_candidate:
-                    record_phone_turn_candidate(
-                        session_key=session_key,
-                        turn_id=run_id,
-                    )
+                    self._publish_phone_turn_candidate(session_key, run_id)
                 return
             if (
                 head.current_message_id is not None
@@ -4889,10 +5676,7 @@ def _build_adapter(config: Any):
                 self._emit_message_commit(head, head.current_text)
                 self._note_phone_turn_message_commit(head)
             if processing_publishes_candidate:
-                record_phone_turn_candidate(
-                    session_key=session_key,
-                    turn_id=run_id,
-                )
+                self._publish_phone_turn_candidate(session_key, run_id)
             interrupted = outcome_value == "cancelled"
             code = None if completed or interrupted else "processing_failed"
             for record in [head, *merged]:
@@ -4942,6 +5726,64 @@ def _build_adapter(config: Any):
                     return key
             return None
 
+        def _note_ocuclaw_reply_settled(self, session_key: str) -> None:
+            """Stamp a phone-origin reply run reaching its terminal boundary."""
+
+            if parse_ocuclaw_session_key(session_key) is None:
+                return
+            self._ocuclaw_reply_settled_at = time.monotonic()
+
+        def _first_run_welcome_reply_pending(self) -> Optional[str]:
+            """Name the in-flight reply the welcome must not paint over (#3231).
+
+            The Attempt is armed on the phone's SDK receipt for a SLICE of the
+            reply, so ``armed`` alone says nothing about the end of the run.
+            Returns the reason to skip this welcome cycle, or None to deliver.
+            """
+
+            try:
+                processing = list(self._processing_deliveries)
+            except RuntimeError:  # pragma: no cover - mutated mid-iteration
+                # A run is starting or ending in another thread right now,
+                # which is itself the answer: something is still in flight.
+                return "run_in_flight"
+            for session_key, _run_id in processing:
+                if parse_ocuclaw_session_key(session_key) is not None:
+                    return "run_in_flight"
+            with self._stream_tail_lock:
+                tail_keys = list(self._stream_tail_closures)
+            for session_key, _message_id in tail_keys:
+                if parse_ocuclaw_session_key(session_key) is not None:
+                    return "stream_tail_pending"
+            settled_at = self._ocuclaw_reply_settled_at
+            if (
+                settled_at is not None
+                and time.monotonic() - settled_at < STREAM_FINALIZE_GRACE_SECONDS
+            ):
+                return "finalize_grace"
+            return None
+
+        def _defer_welcome(self, reason: Optional[str]) -> Optional[Dict[str, Any]]:
+            """Bookkeeping for one skipped welcome cycle, bounded (#3231).
+
+            Returns this cycle's answer while the welcome should wait, or None
+            once it should go regardless. Nothing is consumed by a skipped
+            cycle: the Attempt stays armed and the 1 s watcher retries.
+            """
+
+            if reason is None:
+                self._welcome_defer_since = None
+                return None
+            now = time.monotonic()
+            if self._welcome_defer_since is None:
+                self._welcome_defer_since = now
+            if now - self._welcome_defer_since < FIRST_RUN_WELCOME_REPLY_WAIT_SECONDS:
+                return {"state": "reply_pending", "reason": reason}
+            # Bounded: a run whose terminal boundary never arrives must not
+            # silence the welcome for the whole install.
+            self._welcome_defer_since = None
+            return None
+
         async def _deliver_armed_first_run_welcome(self) -> Dict[str, Any]:
             attempt = inspect_attempt(
                 hermes_release=CERTIFIED_HERMES_TAG,
@@ -4950,12 +5792,26 @@ def _build_adapter(config: Any):
                 session_key=None,
             )
             if attempt.get("state") != "armed":
+                self._welcome_defer_since = None
                 return {"state": str(attempt.get("state") or "missing")}
+            deferred = self._defer_welcome(self._first_run_welcome_reply_pending())
+            if deferred is not None:
+                return deferred
             session_key = await asyncio.to_thread(
                 self._resolve_armed_first_run_session
             )
             if session_key is None:
                 return {"state": "session_unavailable"}
+            # A queued or active run for this exact conversation. A mid-run
+            # credential rotation (Hermes `credential_pool … rotating`, the
+            # OpenClaw lane's `failoverPending`) ends one run and re-dispatches
+            # the turn, which from here looks like a reply that finished. It
+            # did not, so the welcome waits for the successor too.
+            deferred = self._defer_welcome(
+                "session_busy" if self._ledger.is_busy(session_key) else None
+            )
+            if deferred is not None:
+                return deferred
             link = self._link
             if link is None or not link.ready:
                 return {"state": "link_unavailable"}
@@ -4966,7 +5822,13 @@ def _build_adapter(config: Any):
                     {
                         "callId": call_id,
                         "sessionKey": session_key,
-                        "args": dict(WELCOME_SURFACE),
+                        # #3209: the gateway made this render, not an agent
+                        # tool call, so the "wearer is in another chat"
+                        # refusal must not apply to it.
+                        "hostOriginated": True,
+                        "args": welcome_surface(
+                            cloudways=_welcome_host_is_cloudways()
+                        ),
                     },
                     timeout_s=(
                         float(WELCOME_SURFACE["timeoutMs"]) / 1000.0
@@ -4997,6 +5859,16 @@ def _build_adapter(config: Any):
                     raise
                 except Exception:  # noqa: BLE001 - keep the gateway watcher alive
                     logger.exception("[ocuclaw] first-run welcome watcher failed")
+                # The phone's setup hint (#3010) rides the same first-run
+                # watcher: same journey, same lifecycle, no second timer. It is
+                # deliberately AFTER the welcome step and separately guarded, so
+                # neither half of first use can silence the other.
+                try:
+                    await self._refresh_setup_hint()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - keep the gateway watcher alive
+                    logger.exception("[ocuclaw] setup hint watcher failed")
                 await asyncio.sleep(FIRST_RUN_WELCOME_POLL_SECONDS)
 
         # -- W09 approvals + live-session control (ADR-0008) -----------------
@@ -7496,11 +8368,47 @@ def _build_adapter(config: Any):
             }
 
         def _profile_home_for_options(self, ns: str) -> Optional[Path]:
-            if self._multiplex_enabled:
-                routed = self._served_profile_homes.get(ns)
+            """This namespace's OWN Hermes home, or None (#2942).
+
+            Draining namespaces still resolve, so an in-flight turn keeps
+            reading and writing its own profile's files. A namespace the
+            multiplexer does not serve resolves to None and NEVER to the
+            default profile's home: answering one agent's request out of
+            another agent's files is a silent redirect, and every caller here
+            already treats None as "unknown".
+            """
+            multiplex, homes = self._profile_routing_routable()
+            if multiplex:
+                routed = homes.get(ns)
                 if routed is not None:
                     return Path(routed)
+                if ns != self._namespace:
+                    return None
             return _hermes_home()
+
+        def _input_prediction_resolve_profile(
+            self, profile_id: str
+        ) -> Tuple[str, Optional[Path], Optional[str]]:
+            """Silent input (#2836): the child's ``profileId`` wire form is a
+            Hermes profile name ("default" = canonical); empty = this
+            gateway's own namespace. Returns ``(ns, home, route_error)``."""
+            name = str(profile_id or "").strip() or profile_for_namespace(self._namespace)
+            ns = namespace_for_profile(name)
+            error = self._namespace_route_error(ns)
+            if error:
+                return ns, None, error
+            return ns, self._profile_home_for_options(ns), None
+
+        def _input_prediction_profile_scope(self, ns: str, home: Optional[Path]):
+            """Scope config + credentials to a secondary multiplexed profile;
+            the gateway's own namespace needs no scope."""
+            if not self._multiplex_enabled or ns == self._namespace or home is None:
+                return contextlib.nullcontext()
+            try:
+                from gateway.run import _profile_runtime_scope
+            except ImportError:
+                return contextlib.nullcontext()
+            return _profile_runtime_scope(home)
 
         def _read_profile_options_sync(self, home: Path) -> Dict[str, Any]:
             from gateway.run import _load_gateway_config, _profile_runtime_scope
@@ -7787,6 +8695,31 @@ def _build_adapter(config: Any):
                     dict(options),
                 )
 
+        async def _refresh_setup_hint(self) -> None:
+            """Carry the host's guided-setup hint to this platform's phones.
+
+            The setup tool runs in the host conversation, which has no adapter
+            and no link; it leaves a profile-scoped receipt instead. This is the
+            gateway half of that hop (#3010), and it is DERIVED, never
+            remembered: the phase is re-read from the receipt every pass, so a
+            host that died mid-wait stops showing a row as soon as its receipt
+            expires, and a restarted gateway or runtime child starts from what
+            is true now. Only the edge is pushed, so an idle profile costs one
+            small read per pass and no link traffic at all.
+            """
+
+            link = self._link
+            if link is None:
+                return
+            phase = await asyncio.to_thread(read_hint_phase)
+            try:
+                self._setup_hint_phase = await push_hint_edge(
+                    link, phase, self._setup_hint_phase
+                )
+            except Exception:  # noqa: BLE001 — a cosmetic row, never a gate
+                # The remembered phase is left alone, so the next pass retries.
+                logger.debug("[ocuclaw] setup hint push failed", exc_info=True)
+
         # -- W12 liveui tool/prompt glue --------------------------------------
 
         def _request_link_threadsafe(
@@ -7907,6 +8840,9 @@ def _build_adapter(config: Any):
                     {
                         "callId": call_id,
                         "sessionKey": session_key,
+                        # #3209: the managed first-run welcome is never refused
+                        # as "wearer is in another chat"; agent renders are.
+                        **({"hostOriginated": True} if welcome_call else {}),
                         "args": payload,
                     },
                     timeout_s=timeout_s,
@@ -8641,24 +9577,172 @@ def _build_adapter(config: Any):
 
         # -- helpers -----------------------------------------------------------
 
+        def _install_profile_enrollment(self) -> None:
+            """Enforce OcuClaw's enrollment set on every route read (#2940).
+
+            Migrates the retired ``gateway.multiplex_profile_allowlist`` when
+            it is still on the host, then installs the admission predicate on
+            the shared resolver.
+
+            **A failure here must narrow, never widen.** If the enrollment
+            module cannot be installed at all, the resolver would keep its
+            default predicate — "every served profile is routable" — which is
+            precisely the pre-#2940 behaviour this ticket exists to remove. So
+            the fallback is a predicate that admits nothing but the default
+            profile: the wearer keeps the agent that carries their pairing and
+            is told to reselect, rather than silently getting every profile on
+            the host.
+            """
+            try:
+                from . import profile_enrollment
+
+                enrollment = profile_enrollment.install_admission()
+                logger.debug(
+                    "[ocuclaw] agent enrollment installed: state=%s agents=%d",
+                    enrollment.state,
+                    len(enrollment.profiles),
+                )
+            except Exception as error:  # noqa: BLE001 - fails CLOSED
+                try:
+                    from .profile_routes import (
+                        DEFAULT_PROFILE as _DEFAULT,
+                        set_admission,
+                    )
+
+                    set_admission(
+                        lambda profile, **_kwargs: str(profile) == _DEFAULT
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                logger.warning(
+                    "[ocuclaw] agent enrollment unavailable (%s); only the"
+                    " default agent is reachable",
+                    type(error).__name__,
+                )
+
         def _refresh_profile_routing(self) -> None:
+            """Take the live served set, and note anything that left it.
+
+            Hermes 0.21.3 reconciles the served profiles while the gateway
+            runs, so this is a READ, not a boot snapshot. Two rules keep it
+            from ever taking the wearer's agents away by accident:
+
+            * ``gateway.multiplex_profiles`` is boot configuration — it cannot
+              turn off under a running gateway (that needs a restart, which
+              builds a new adapter). A later read that cannot see multiplex is
+              therefore a failed read, and changes nothing.
+            * a multiplex table without this adapter's own namespace is
+              likewise unproven, never "every secondary went away".
+            """
             enabled, homes = _load_profile_routing()
-            self._multiplex_enabled = enabled
-            self._served_profile_homes = dict(homes)
+            proved = bool(enabled) and self._namespace in homes
+            with self._routing_lock:
+                if proved:
+                    previous = dict(self._served_profile_homes)
+                    self._multiplex_enabled = True
+                    self._served_profile_homes = dict(homes)
+                    self._note_route_departures(previous, homes)
+                else:
+                    # An unproven read changes no route, but the drain clock
+                    # must still run: a namespace may not sit in the drain set
+                    # forever just because the route source went quiet.
+                    self._release_drained_namespaces(self._served_profile_homes)
+
+        def _note_route_departures(
+            self, previous: Dict[str, Path], current: Dict[str, Path]
+        ) -> None:
+            """Drain policy for a profile deleted mid-turn (#2942).
+
+            A namespace that leaves the served set keeps ITS OWN home for a
+            bounded window so work already in flight finishes against the
+            right profile's files. It admits nothing new — that refusal is
+            :data:`PROFILE_NO_LONGER_SERVED_ERROR` — and it is never rewritten
+            to the default profile's home, because silently answering as
+            another agent is worse than answering with an error.
+
+            The window is ``INFLIGHT_TTL_S``, the same bound the adapter
+            already uses to declare a turn dead; and a namespace is released
+            early as soon as this gateway has no turn in flight at all.
+            """
+            now = time.monotonic()
+            added_homes: Dict[str, Path] = {}
+            added_until: Dict[str, float] = {}
+            for ns, home in previous.items():
+                if ns == self._namespace or ns in current:
+                    continue
+                if ns not in self._draining_profile_homes:
+                    logger.info(
+                        "[ocuclaw] profile namespace %s left the served set; "
+                        "draining in-flight work for up to %.0fs",
+                        ns,
+                        INFLIGHT_TTL_S,
+                    )
+                    added_homes[ns] = home
+                    added_until[ns] = now + INFLIGHT_TTL_S
+            if added_homes:
+                # Rebind, never mutate: this view is read without the lock.
+                self._draining_profile_homes = {
+                    **self._draining_profile_homes, **added_homes
+                }
+                self._draining_profile_until = {
+                    **self._draining_profile_until, **added_until
+                }
+            self._release_drained_namespaces(current)
+
+        def _release_drained_namespaces(self, current: Dict[str, Path]) -> None:
+            """Drop draining namespaces that are served again, expired, or idle.
+
+            Callers hold ``_routing_lock``. The published view is REBOUND, never
+            mutated in place, because it is read from the loop and from every
+            worker thread an RPC handler runs on.
+            """
+            if not self._draining_profile_homes:
+                return
+            now = time.monotonic()
+            any_inflight = bool(self.inflight_snapshot())
+            keep_homes: Dict[str, Path] = {}
+            keep_until: Dict[str, float] = {}
+            for ns, home in self._draining_profile_homes.items():
+                if (
+                    ns in current
+                    or not any_inflight
+                    or now >= self._draining_profile_until.get(ns, 0.0)
+                ):
+                    continue
+                keep_homes[ns] = home
+                keep_until[ns] = self._draining_profile_until[ns]
+            self._draining_profile_homes = keep_homes
+            self._draining_profile_until = keep_until
 
         def _profile_routing_snapshot(self) -> Tuple[bool, Dict[str, Path]]:
+            """The ADMITTED routes: where a new turn may be dispatched."""
+            self._refresh_profile_routing()
             return self._multiplex_enabled, dict(self._served_profile_homes)
+
+        def _profile_routing_routable(self) -> Tuple[bool, Dict[str, Path]]:
+            """Admitted plus draining: where existing work still resolves."""
+            multiplex, homes = self._profile_routing_snapshot()
+            if not self._draining_profile_homes:
+                return multiplex, homes
+            merged = dict(self._draining_profile_homes)
+            merged.update(homes)
+            return multiplex, merged
 
         def _namespace_route_error(self, ns: str) -> Optional[str]:
             namespace = str(ns or self._namespace)
             if namespace == self._namespace:
                 return None
-            if not self._multiplex_enabled:
+            multiplex, homes = self._profile_routing_snapshot()
+            if not multiplex:
                 return MULTIPLEX_DISABLED_ERROR
             profile = profile_for_namespace(namespace)
-            if namespace not in self._served_profile_homes:
-                return PROFILE_NOT_SERVED_ERROR.format(profile=profile)
-            return None
+            if namespace in homes:
+                return None
+            if namespace in self._draining_profile_homes:
+                # Discovery is not admission, and neither is draining: work
+                # already running finishes, nothing new starts.
+                return PROFILE_NO_LONGER_SERVED_ERROR.format(profile=profile)
+            return PROFILE_NOT_SERVED_ERROR.format(profile=profile)
 
         def _namespace_for_outbound(
             self,
@@ -8695,9 +9779,11 @@ def _build_adapter(config: Any):
                 pass
             if chat_id is not None:
                 candidates = []
-                namespaces = dict.fromkeys(
-                    (self._namespace, *self._served_profile_homes.keys())
-                )
+                # Draining namespaces are included: an outbound frame for a
+                # turn that was in flight when its profile left the served set
+                # must still be attributed to that profile, not to default.
+                _, routable = self._profile_routing_routable()
+                namespaces = dict.fromkeys((self._namespace, *routable))
                 for ns in namespaces:
                     session_key = self._session_key_for_chat(chat_id, ns=ns)
                     record = self._ledger.head(session_key)
@@ -8812,6 +9898,7 @@ def _build_adapter(config: Any):
                 task = self._stream_tail_tasks.pop(closure_key, None)
             if closure is None:
                 return False
+            self._note_ocuclaw_reply_settled(session_key)
             current_task = None
             try:
                 current_task = asyncio.current_task()
@@ -8875,10 +9962,114 @@ def _build_adapter(config: Any):
             if self._phone_turn_candidate_gate.note_committed(
                 record.session_key, record.run_id
             ):
-                record_phone_turn_candidate(
-                    session_key=record.session_key,
-                    turn_id=record.run_id,
+                self._publish_phone_turn_candidate(
+                    record.session_key, record.run_id
                 )
+
+        def _publish_phone_turn_candidate(
+            self, session_key: str, run_id: str
+        ) -> None:
+            """Record the candidate, then ask the child to observe delivery.
+
+            Fire-and-forget: the observation is evidence for setup, never a
+            step in the turn. Nothing here blocks, retries the turn, or fails
+            it, and a child without the method degrades to `unsupported`.
+            """
+
+            recorded = record_phone_turn_candidate(
+                session_key=session_key,
+                turn_id=run_id,
+            )
+            candidate_id = (
+                recorded.get("candidateId")
+                if isinstance(recorded, Mapping)
+                else None
+            )
+            if not candidate_id:
+                return
+            loop = self._loop
+            if loop is None or loop.is_closed():
+                return
+
+            def _start() -> None:
+                task = loop.create_task(
+                    self._observe_reply_delivery(
+                        str(candidate_id), session_key, run_id
+                    )
+                )
+                self._reply_delivery_tasks.add(task)
+                task.add_done_callback(self._reply_delivery_tasks.discard)
+
+            try:
+                loop.call_soon_threadsafe(_start)
+            except RuntimeError:  # pragma: no cover - loop torn down mid-turn
+                return
+
+        async def _observe_reply_delivery(
+            self, candidate_id: str, session_key: str, run_id: str
+        ) -> None:
+            # The evidence only serves first-run setup. Once the proof is
+            # committed, an ordinary turn must not cost a probe and a write.
+            try:
+                attempt = await asyncio.to_thread(
+                    inspect_attempt,
+                    hermes_release=CERTIFIED_HERMES_TAG,
+                    hermes_package_version=_hermes_version() or None,
+                    ocuclaw_version=_ocuclaw_version(),
+                    session_key=None,
+                )
+            except Exception:  # noqa: BLE001 — evidence only, never the turn
+                attempt = {}
+            if attempt.get("committed") is True:
+                return
+            link = self._link
+            if link is None or not link.ready:
+                await self._note_reply_delivery_fallback(
+                    candidate_id, REPLY_DELIVERY_UNCONFIRMED, "runtime_unavailable"
+                )
+                return
+            try:
+                answer = await link.request(
+                    REPLY_DELIVERY_OBSERVE_METHOD,
+                    {
+                        "candidateId": candidate_id,
+                        "sessionKey": session_key,
+                        "runId": run_id,
+                    },
+                    timeout_s=REPLY_DELIVERY_OBSERVE_TIMEOUT_SECONDS,
+                )
+                if isinstance(answer, Mapping) and answer.get("ok") is False:
+                    # The child answered that it cannot observe; say so now
+                    # instead of letting setup wait out its bound.
+                    await self._note_reply_delivery_fallback(
+                        candidate_id, REPLY_DELIVERY_UNCONFIRMED, "runtime_unavailable"
+                    )
+            except LinkRpcError as exc:
+                if exc.code != RPC_METHOD_NOT_FOUND_CODE:
+                    # Raw session and run identifiers never reach the log.
+                    logger.debug("[ocuclaw] reply-delivery observe refused")
+                    return
+                # An older child has no reply-delivery contract at all, so the
+                # honest answer is available immediately: setup falls back to
+                # the wearer question instead of waiting out the bound.
+                await self._note_reply_delivery_fallback(
+                    candidate_id, REPLY_DELIVERY_UNSUPPORTED, "runtime_lacks_contract"
+                )
+            except Exception:  # noqa: BLE001 — never fail or delay the turn
+                logger.debug("[ocuclaw] reply-delivery observe unavailable")
+
+        async def _note_reply_delivery_fallback(
+            self, candidate_id: str, status: str, reason: str
+        ) -> None:
+            try:
+                await asyncio.to_thread(
+                    record_reply_delivery,
+                    candidate_id=candidate_id,
+                    status=status,
+                    reason=reason,
+                )
+            except Exception:  # noqa: BLE001 — evidence only, never the turn
+                logger.debug("[ocuclaw] reply-delivery fallback receipt failed")
 
         async def _close_session_records(self, session_key: str, *, code: str) -> None:
             # Seal delivery BEFORE awaiting approval cleanup or signalling the
@@ -8926,7 +10117,7 @@ def _build_adapter(config: Any):
                 else self._namespace
             )
             home = (
-                self._served_profile_homes.get(ns)
+                self._profile_routing_routable()[1].get(ns)
                 if ns != self._namespace
                 else _hermes_home()
             )
@@ -9099,6 +10290,11 @@ def _build_adapter(config: Any):
                 await asyncio.sleep(JANITOR_INTERVAL_SECONDS)
                 try:
                     self._sweep_stale_dispatch_records()
+                    # OCU-1E6C-EEX1 backstop for surfaces that never pass
+                    # through inbound dispatch (phone chat, cron, other
+                    # platforms calling the glasses tools).
+                    if self._link is not None:
+                        ensure_hello_tools_registered("janitor")
                 except Exception:  # noqa: BLE001
                     logger.exception("[ocuclaw] dispatch janitor sweep failed")
 

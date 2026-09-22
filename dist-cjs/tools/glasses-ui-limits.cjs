@@ -15,6 +15,25 @@ const GLASSES_UI_LIMITS = {
   imageHeightMax: 144,
   imagePayloadMax: 288 * 144,
   imagePayloadBase64Max: 73_728,
+
+  graphicCaptionMax: 64,
+  graphicSlotsMax: 2,
+  graphicMetricValueMax: 8,
+  graphicMetricUnitMax: 6,
+  graphicMetricLabelMax: 18,
+
+  graphicSeriesMin: 2,
+  graphicSparklineValuesMax: 60,
+  graphicBarsValuesMax: 14,
+  graphicHeatstripValuesMax: 24,
+
+  graphicGaugeMinDefault: 0,
+  graphicGaugeMaxDefault: 100,
+
+  graphicKeyvalueRowsMax: 3,
+  graphicKeyvalueKeyMax: 14,
+  graphicKeyvalueValueMax: 10,
+  graphicStatusTextMax: 28,
   itemMax: 64,
   titleMax: 64,
   maxItems: 20,

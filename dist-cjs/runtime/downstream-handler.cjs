@@ -12,6 +12,7 @@ const { DEFAULT_EVEN_AI_DEDICATED_SESSION_KEY } = require("../domain/even-ai-ses
 const { isAdoptableHermesSessionKey, isForeignHermesSessionKey } = require("./hermes-session-keys.cjs");
 const { normalizeSessionListFixture } = require("./session-list-fixture.cjs");
 const { normalizeAndValidateCustomSystemPrompt } = require("../domain/custom-system-prompt-limit.cjs");
+const { parseOptionalSetupRequest, optionalSetupFailure, optionalSetupResult } = require("../setup/optional-setup-protocol.cjs");
 
 const PROTOCOL_SECRET_KEYS = new Set([
   "accesstoken",
@@ -42,6 +43,7 @@ function isProtocolSecretKey(key) {
 
 function sanitizeProtocolFrame(value, seen = new WeakSet(), depth = 0) {
   if (value === null || typeof value !== "object") return value;
+  if (value.type === "ocuclaw.optional.setup.request") return { type: value.type, private: true };
   if (depth >= 16 || seen.has(value)) return "[REDACTED]";
   seen.add(value);
   if (Array.isArray(value)) {
@@ -109,6 +111,18 @@ function createDownstreamHandler(opts) {
   const onNewSession = opts.onNewSession;
   const onSlashCommand = opts.onSlashCommand;
   const onGetModelsCatalog = opts.onGetModelsCatalog;
+  const onInputPrediction = typeof opts.onInputPrediction === "function" ? opts.onInputPrediction : null;
+  const onClientSessionSelected =
+    typeof opts.onClientSessionSelected === "function" ? opts.onClientSessionSelected : null;
+
+  function noteClientSessionSelected(clientId, sessionKey) {
+    if (!onClientSessionSelected || typeof sessionKey !== "string" || !sessionKey) return;
+    try {
+      onClientSessionSelected(clientId, sessionKey);
+    } catch (err) {
+      logger.warn(`[downstream] client session note failed: ${err && err.message ? err.message : err}`);
+    }
+  }
   const onGetSkillsCatalog = opts.onGetSkillsCatalog;
   const onGetLiveuiLibrary = opts.onGetLiveuiLibrary || null;
   const onOpenLiveuiLibraryItem = opts.onOpenLiveuiLibraryItem || null;
@@ -152,6 +166,8 @@ function createDownstreamHandler(opts) {
   const onSetEvenAiSettings = opts.onSetEvenAiSettings;
   const onGetOcuClawSettings = opts.onGetOcuClawSettings;
   const onSetOcuClawSettings = opts.onSetOcuClawSettings;
+  const onGetSavedPrompts = opts.onGetSavedPrompts || null;
+  const onWriteSavedPrompts = opts.onWriteSavedPrompts || null;
   const onRequestSonioxTemporaryKey = opts.onRequestSonioxTemporaryKey || null;
   const onRequestCartesiaAccessToken = opts.onRequestCartesiaAccessToken || null;
   const onGetStatus = opts.onGetStatus || null;
@@ -187,6 +203,8 @@ function createDownstreamHandler(opts) {
   const onGlassesUiNavEvent = opts.onGlassesUiNavEvent || null;
 
   const onGlassesUiRenderReceipt = opts.onGlassesUiRenderReceipt || null;
+
+  const onReplyRenderReceipt = opts.onReplyRenderReceipt || null;
   const onGlassesUiRenderError = opts.onGlassesUiRenderError || null;
   const onDeviceInfoResponse = opts.onDeviceInfoResponse || null;
   const onGlassesPresenceChanged = opts.onGlassesPresenceChanged || null;
@@ -263,6 +281,11 @@ function createDownstreamHandler(opts) {
     ocuClawSettingsSet: "ocuclaw.settings.set",
     ocuClawSettingsSetAck: "ocuclaw.settings.set.ack",
     ocuClawSettingsSnapshot: "ocuclaw.settings.snapshot",
+
+    savedPromptsGet: "ocuclaw.prompts.get",
+    savedPromptsSnapshot: "ocuclaw.prompts.snapshot",
+    savedPromptsWrite: "ocuclaw.prompts.write",
+    savedPromptsWriteAck: "ocuclaw.prompts.write.ack",
     messageSend: "ocuclaw.message.send",
     messageSendAck: "ocuclaw.message.send.ack",
     messageStreamDelta: "ocuclaw.message.stream.delta",
@@ -271,6 +294,15 @@ function createDownstreamHandler(opts) {
     thinkingUpdate: "ocuclaw.thinking.update",
     modelCatalogGet: "ocuclaw.model.catalog.get",
     modelCatalogSnapshot: "ocuclaw.model.catalog.snapshot",
+    inputPredictionCapabilities: "ocuclaw.input.prediction.capabilities",
+    inputPredictionCapabilitiesResult: "ocuclaw.input.prediction.capabilities.result",
+    inputPredictionRequest: "ocuclaw.input.prediction.request",
+    inputPredictionResult: "ocuclaw.input.prediction.result",
+    inputPredictionOpen: "ocuclaw.input.prediction.open",
+    inputPredictionOpenResult: "ocuclaw.input.prediction.open.result",
+    inputPredictionCancel: "ocuclaw.input.prediction.cancel",
+    inputPredictionTest: "ocuclaw.input.prediction.test",
+    inputPredictionTestResult: "ocuclaw.input.prediction.test.result",
     providerUsageGet: "ocuclaw.provider.usage.get",
     providerUsageSnapshot: "ocuclaw.provider.usage.snapshot",
     skillsCatalogGet: "ocuclaw.skills.catalog.get",
@@ -733,11 +765,19 @@ function createDownstreamHandler(opts) {
     return JSON.stringify(out);
   }
 
-  function formatSessionSwitched(sessionKey, requestId = "", draft = false) {
+  function formatSessionSwitched(
+    sessionKey,
+    requestId = "",
+    draft = false,
+    agentFallback = "",
+  ) {
+    const droppedAgentRef = parseOptionalTrimmedString(agentFallback);
     return JSON.stringify({
       type: APP_PROTOCOL.sessionSwitchApplied,
       sessionKey,
       ...(draft === true ? { draft: true } : {}),
+
+      ...(droppedAgentRef ? { agentFallback: droppedAgentRef } : {}),
       ...(parseOptionalTrimmedString(requestId)
         ? { requestId: parseOptionalTrimmedString(requestId) }
         : {}),
@@ -1080,6 +1120,14 @@ function createDownstreamHandler(opts) {
           : Date.now(),
       stale: !!(payload && payload.stale),
       unsupported: !!(payload && payload.unsupported),
+
+      ...(Array.isArray(payload && payload.enrolled)
+        ? {
+            enrolled: payload.enrolled
+              .filter((name) => typeof name === "string" && name.trim())
+              .map((name) => name.trim()),
+          }
+        : {}),
     });
   }
 
@@ -1503,6 +1551,67 @@ function createDownstreamHandler(opts) {
       pathways: normalizeOcuClawPathways(payload && payload.pathways),
       evenAi: formatOcuClawEvenAiSnapshot(payload && payload.evenAi),
     });
+  }
+
+  function formatSavedPromptRow(prompt) {
+    const source = prompt && typeof prompt === "object" ? prompt : {};
+    const rawRouting =
+      source.routing && typeof source.routing === "object" ? source.routing : {};
+    const routing = { target: rawRouting.target === "new" ? "new" : "current" };
+    for (const key of ["agentId", "modelId", "thinking"]) {
+      if (typeof rawRouting[key] === "string" && rawRouting[key]) {
+        routing[key] = rawRouting[key];
+      }
+    }
+    return {
+      id: typeof source.id === "string" ? source.id : "",
+      name: typeof source.name === "string" ? source.name : "",
+      body: typeof source.body === "string" ? source.body : "",
+      order: Number.isFinite(source.order) ? source.order : 0,
+      routing,
+      updatedAtMs: Number.isFinite(source.updatedAtMs) ? source.updatedAtMs : 0,
+    };
+  }
+
+  function savedPromptsBody(payload) {
+    const source = payload && typeof payload === "object" ? payload : {};
+    const prompts = Array.isArray(source.prompts) ? source.prompts : [];
+    return {
+      hostId: typeof source.hostId === "string" ? source.hostId : "",
+      cap: Number.isFinite(source.cap) ? source.cap : 0,
+      count: Number.isFinite(source.count) ? source.count : prompts.length,
+      orderUpdatedAtMs: Number.isFinite(source.orderUpdatedAtMs) ? source.orderUpdatedAtMs : 0,
+      prompts: prompts.map(formatSavedPromptRow),
+    };
+  }
+
+  function formatSavedPrompts(payload) {
+    return JSON.stringify({
+      type: APP_PROTOCOL.savedPromptsSnapshot,
+      ...savedPromptsBody(payload),
+    });
+  }
+
+  function formatSavedPromptsAck(payload) {
+    const source = payload && typeof payload === "object" ? payload : {};
+    const out = {
+      type: APP_PROTOCOL.savedPromptsWriteAck,
+      status: source.status === "accepted" ? "accepted" : "rejected",
+    };
+
+    if (typeof source.hostId === "string" && source.hostId) {
+      Object.assign(out, savedPromptsBody(source));
+    }
+    if (out.status !== "accepted") {
+      out.reason = typeof source.reason === "string" && source.reason
+        ? source.reason
+        : "rejected";
+    }
+
+    if (typeof source.requestId === "string" && source.requestId) {
+      out.requestId = source.requestId;
+    }
+    return JSON.stringify(out);
   }
 
   function formatOcuClawSettingsAck(payload) {
@@ -2888,6 +2997,10 @@ function createDownstreamHandler(opts) {
       return payload;
     }
 
+    if (action === "webui-silent-input-prediction-test") {
+      return payload;
+    }
+
     if (action === "webui-open-tab") {
       const value = parseOptionalTrimmedString(msg.value);
       if (!value) {
@@ -2927,7 +3040,7 @@ function createDownstreamHandler(opts) {
     if (action === "webui-session-sheet") {
       const value = parseOptionalTrimmedString(msg.value);
 
-      if (!value || !["open", "rename", "preview", "input", "save", "done", "cancel", "backdrop", "scroll-start", "scroll-end", "close", "pin", "hide", "confirm-hide", "switch", "continue", "copy", "take-over"].includes(value)) {
+      if (!value || !["open", "rename", "preview", "input", "save", "done", "cancel", "backdrop", "scroll-start", "scroll-end", "close", "pin", "hide", "confirm-hide", "switch", "continue", "copy", "take-over", "delete"].includes(value)) {
         throw new Error("remote-control webui-session-sheet requires a supported value");
       }
       if ((value === "open" || value === "input") && typeof msg.text !== "string") {
@@ -2948,6 +3061,27 @@ function createDownstreamHandler(opts) {
       }
       return { ...payload, text: agentId };
     }
+
+    if (action === "webui-agent-enrol" || action === "webui-agent-remove" || action === "webui-agent-retry") {
+      const agentId = parseOptionalTrimmedString(msg.text);
+      if (!agentId || agentId.length > 160) {
+        throw new Error(`remote-control ${action} requires a bounded agent id in text`);
+      }
+      return { ...payload, text: agentId };
+    }
+
+    if (action === "webui-default-agent-set") {
+      const surface = parseOptionalTrimmedString(msg.value);
+      if (surface !== "ocuclaw" && surface !== "even-ai") {
+        throw new Error("remote-control webui-default-agent-set requires value ocuclaw|even-ai");
+      }
+      const agentId = parseOptionalTrimmedString(msg.text) || "";
+      if (agentId.length > 160) {
+        throw new Error("remote-control webui-default-agent-set requires a bounded agent id in text");
+      }
+      return { ...payload, value: surface, text: agentId };
+    }
+
     if (action === "webui-machine-browse" || action === "webui-machine-profile") {
       const identity = parseOptionalTrimmedString(msg.text);
       if (!identity || identity.length > 160) {
@@ -2966,6 +3100,33 @@ function createDownstreamHandler(opts) {
         throw new Error("remote-control webui-machine-settings requires a valid selection or preference");
       }
       return { ...payload, value: operation, ...(text ? { text } : {}) };
+    }
+    if (action === "webui-silent-input-word") {
+
+      const operation = parseOptionalTrimmedString(msg.value);
+
+      const storeOps = ["add", "remove", "favourite", "unfavourite", "hide", "restore"];
+      const sectionOps = [
+        "open", "open-words", "back", "search", "draft", "submit", "edit", "edit-draft", "save", "cancel", "remove-row", "star", "undo", "dismiss", "replace-stored",
+        "hide-row", "restore-row", "find", "hide-found", "favourite-found", "restore-hidden",
+
+        "storage-fault",
+      ];
+      if (!operation || (!storeOps.includes(operation) && !sectionOps.includes(operation))) {
+        throw new Error("remote-control webui-silent-input-word requires a supported operation");
+      }
+      if (storeOps.includes(operation)) {
+        const word = parseOptionalTrimmedString(msg.text);
+        if (!word || !/^[A-Za-z]{1,31}$/.test(word)) {
+          throw new Error("remote-control webui-silent-input-word requires text: 1-31 English letters");
+        }
+        return { ...payload, value: operation, text: word };
+      }
+      const text = typeof msg.text === "string" ? msg.text : "";
+      if (text.length > 200 || text.includes("\n")) {
+        throw new Error("remote-control webui-silent-input-word requires a single line of at most 200 chars");
+      }
+      return { ...payload, value: operation, text };
     }
     if (action === "webui-temple-editor") {
 
@@ -3004,9 +3165,34 @@ function createDownstreamHandler(opts) {
         operation === "choose" || operation === "search";
       return { ...payload, value: operation, text: carriesText ? text : "" };
     }
+    if (action === "webui-saved-prompts") {
+
+      const operation = parseOptionalTrimmedString(msg.value);
+      if (!operation || !["list", "close", "open", "new", "set", "choose", "apply",
+        "cancel", "delete"].includes(operation)) {
+        throw new Error(
+          "remote-control webui-saved-prompts requires " +
+            "list|close|open|new|set|choose|apply|cancel|delete",
+        );
+      }
+      const text = typeof msg.text === "string" ? msg.text : "";
+
+      if ((operation === "set" || operation === "choose") &&
+          (typeof msg.text !== "string" || !/^[A-Z]{1,16}=[\s\S]{0,4000}$/.test(text))) {
+        throw new Error(
+          `remote-control webui-saved-prompts ${operation} requires FIELD=value in text ` +
+            "(max 4000 chars)",
+        );
+      }
+      if (operation === "open" && !/^[^|,\r\n]{1,200}$/.test(text)) {
+        throw new Error("remote-control webui-saved-prompts open requires a prompt id in text");
+      }
+      const carriesText = operation === "set" || operation === "choose" || operation === "open";
+      return { ...payload, value: operation, text: carriesText ? text : "" };
+    }
     if (action === "webui-menu-editor") {
       const operation = parseOptionalTrimmedString(msg.value);
-      if (!operation || !["open", "picker", "search", "review", "select", "add", "up", "down", "remove", "cancel", "apply"].includes(operation)) {
+      if (!operation || !["open", "picker", "search", "review", "select", "add", "up", "down", "highlight-up", "highlight-down", "remove", "cancel", "apply"].includes(operation)) {
         throw new Error("remote-control webui-menu-editor requires a supported editor operation");
       }
       if (typeof msg.text !== "string" || msg.text.length > 8192) {
@@ -3091,7 +3277,9 @@ function createDownstreamHandler(opts) {
     }
     if (action === "webui-settings-scroll") {
       const text = parseOptionalTrimmedString(msg.text);
-      if (!text || !["start", "end", "up", "down"].includes(text)) throw new Error("Invalid settings scroll direction");
+
+      const direction = text?.startsWith("sheet:") ? text.slice("sheet:".length) : text;
+      if (!direction || !(["start", "end", "up", "down"].includes(direction) || /^to:\d{1,6}$/.test(direction) || (direction === text && /^anchor:[a-z0-9-]{1,64}$/.test(direction)))) throw new Error("Invalid settings scroll direction");
       return { ...payload, text };
     }
     if (action === "webui-hermes-approvals-edit") {
@@ -3117,6 +3305,22 @@ function createDownstreamHandler(opts) {
       const text = typeof msg.text === "string" ? msg.text : "";
       if (!/^(?:(?:mcp-enabled|test|reauth|channel-enabled|pause|resume):[^\x00-\x1f]{1,160}|confirm|cancel|refresh|cancel-auth|review-unknown|authorize)$/.test(text)) throw new Error("Invalid Hermes connection action");
       return { ...payload, text };
+    }
+    if (action === "webui-hermes-disclosure") {
+
+      const text = typeof msg.text === "string" ? msg.text : "";
+      if (!/^[a-z][a-z0-9-]{0,39}(?::(?:open|close|toggle))?$/.test(text)) throw new Error("Invalid Hermes disclosure action");
+      return { ...payload, text };
+    }
+    if (action === "webui-hermes-needs-you") {
+
+      const text = typeof msg.text === "string" ? msg.text : "";
+      if (!/^[a-z][a-z_-]{0,31}$/.test(text)) throw new Error("Invalid Hermes needs-you action");
+      return { ...payload, text };
+    }
+    if (action === "webui-hermes-try-again") {
+
+      return payload;
     }
     if (action === "webui-hermes-learning") {
       const text = typeof msg.text === "string" ? msg.text : "";
@@ -3151,7 +3355,8 @@ function createDownstreamHandler(opts) {
     }
     if (action === "webui-settings-scroll") {
       const text = parseOptionalTrimmedString(msg.text);
-      if (!text || !["start", "end", "up", "down"].includes(text)) throw new Error("Invalid settings scroll direction");
+      const direction = text?.startsWith("sheet:") ? text.slice("sheet:".length) : text;
+      if (!direction || !(["start", "end", "up", "down"].includes(direction) || /^to:\d{1,6}$/.test(direction) || (direction === text && /^anchor:[a-z0-9-]{1,64}$/.test(direction)))) throw new Error("Invalid settings scroll direction");
       return { ...payload, text };
     }
 
@@ -3169,6 +3374,13 @@ function createDownstreamHandler(opts) {
 
     if (action === "webui-connection-toggle") {
       return payload;
+    }
+    if (action === "webui-connection-control") {
+      const value = parseOptionalTrimmedString(msg.value)?.toLowerCase();
+      if (!["manual-open", "manual-close", "connect", "reconnect", "disconnect", "pair", "setup", "discord"].includes(value || "")) {
+        throw new Error("remote-control webui-connection-control requires a supported connection action");
+      }
+      return { ...payload, value };
     }
 
     if (action === "webui-session-chips-scroll") {
@@ -3189,6 +3401,72 @@ function createDownstreamHandler(opts) {
         );
       }
       return { ...payload, value: state };
+    }
+
+    if (action === "webui-graphic-fault") {
+      const code = parseOptionalTrimmedString(msg.value)?.toLowerCase();
+      if (
+        code !== "atlas_invalid" &&
+        code !== "atlas_face_missing" &&
+        code !== "raster_failed" &&
+        code !== "slot_overflow" &&
+        code !== "off"
+      ) {
+        throw new Error(
+          "remote-control webui-graphic-fault requires value atlas_invalid|atlas_face_missing|raster_failed|slot_overflow|off",
+        );
+      }
+      return { ...payload, value: code };
+    }
+
+    if (action === "webui-system-appearance") {
+      const value = parseOptionalTrimmedString(msg.value)?.toLowerCase();
+      if (value !== "dark" && value !== "light" && value !== "reset") {
+        throw new Error(
+          "remote-control webui-system-appearance requires value dark|light|reset",
+        );
+      }
+      return { ...payload, value };
+    }
+
+    if (action === "webui-overlay") {
+      const target = parseOptionalTrimmedString(msg.value)?.toLowerCase();
+      const text = typeof msg.text === "string" ? msg.text.trim() : "";
+      const patterns = new Map([
+        ["channel-update", /^(stable|beta|hermes)(:prompt)?$/],
+        ["whats-new", /^$/],
+        ["setting-help", /^[A-Z][A-Z0-9_]{1,80}$/],
+        ["language-hints", /^(open|dismiss)?$/],
+        ["voice-setup", /^(open|dismiss|select-soniox)$/],
+        ["voice-test", /^start$/],
+        ["voice-test-hint", /^dismiss$/],
+        ["optional-home", /^(voice|even-ai|dismiss)$/],
+        ["display-debug", /^(expand|collapse|diagnostics)$/],
+        ["manual-even-ai", /^(open|dismiss|unlock-agent-configuration|store-private-secret|enable-runtime|verify-private-route|configure-even-realities-app|exercise-glasses-request)?$/],
+        ["agent-filter", /^(open|dismiss)?$/],
+        ["liveui", /^((review|task|edit|delete):[^\x00-\x1f]{1,200}|dismiss)$/],
+        ["dismiss", /^$/],
+      ]);
+      const pattern = target ? patterns.get(target) : undefined;
+      if (!pattern || !pattern.test(text)) {
+        throw new Error("remote-control webui-overlay requires a supported target and argument");
+      }
+      return { ...payload, value: target, ...(text ? { text } : {}) };
+    }
+    if (action === "webui-optional-setup") {
+      const value = parseOptionalTrimmedString(msg.value)?.toLowerCase();
+      if (!/^(open|close|status|dismiss-home|refresh|next|back|test-voice|test-even-ai|open-even-ai-test|press-even-ai-test|cancel-even-ai-test|activation-(review|cancel)|route-(review|cancel)|skip-(voice|even_ai)|resume-(voice|even_ai)|diagnostics-(open|back|cancel|review|access-(allow|deny)|handoff-(allow|deny)))$/.test(value || "")) {
+        throw new Error("remote-control webui-optional-setup requires a supported visible action");
+      }
+      return { ...payload, value };
+    }
+    if (action === "webui-relay-offline") {
+      const value = parseOptionalTrimmedString(msg.value)?.toLowerCase();
+      const ms = value && /^\d{4,6}$/.test(value) ? Number(value) : NaN;
+      if (value !== "restore" && !(ms >= 1000 && ms <= 120000)) {
+        throw new Error("remote-control webui-relay-offline requires value 1000..120000 or restore");
+      }
+      return { ...payload, value };
     }
 
     if (
@@ -3601,6 +3879,8 @@ function createDownstreamHandler(opts) {
       msg.sessionKey || null,
       attachment,
       clientDisplaySignals,
+      typeof opts.isPhoneClient === "function" && opts.isPhoneClient(clientId) === true,
+      clientId,
     ).then(
       (result) => {
         const status = (result && result.status) || "accepted";
@@ -4693,6 +4973,8 @@ function createDownstreamHandler(opts) {
     return onNewChat().then(
       (result) => {
         if (result && typeof result === "object" && typeof result.sessionKey === "string") {
+
+          noteClientSessionSelected(clientId, result.sessionKey);
           return {
             broadcast: [
               formatSessionSwitched(result.sessionKey, "", result.draft === true),
@@ -4770,6 +5052,69 @@ function createDownstreamHandler(opts) {
       (err) => {
         logger.error(`[downstream] getSessionDiff failed: ${err.message}`);
         return { unicast: formatEmptySessionDiff(kind, limit) };
+      },
+    );
+  }
+
+  function handleInputPrediction(clientId, op, msg) {
+    const payload = msg && typeof msg === "object" ? msg : {};
+    const requestId = typeof payload.requestId === "string" ? payload.requestId : "";
+
+    const testRequestId = /^[A-Za-z0-9._:@/-]{1,128}$/.test(requestId) ? requestId : "";
+    const resultType =
+      op === "capabilities"
+        ? APP_PROTOCOL.inputPredictionCapabilitiesResult
+        : op === "test"
+          ? APP_PROTOCOL.inputPredictionTestResult
+          : op === "cancel"
+            ? `${APP_PROTOCOL.inputPredictionCancel}.ack`
+            : op === "open"
+              ? APP_PROTOCOL.inputPredictionOpenResult
+              : APP_PROTOCOL.inputPredictionResult;
+
+    const noIdentity = { agentId: "", profileId: "", sessionKey: "" };
+    const frame = (body) => ({
+      unicast: JSON.stringify({
+        type: resultType,
+        ...(op === "cancel" ? {} : noIdentity),
+        ...body,
+      }),
+    });
+    if (!onInputPrediction) {
+      if (op === "capabilities") {
+        return frame({
+          protocolVersion: 1,
+          supported: false,
+          unsupportedReason: "input prediction service not wired on this host",
+          structuredOutput: false,
+          abort: false,
+          policyRevision: "",
+          limits: null,
+          models: [],
+          connectionDefault: null,
+        });
+      }
+      if (op === "cancel") return frame({ requestId, accepted: false, abort: false });
+
+      if (op === "open") {
+        return frame({ requestId, status: "unavailable", replies: [], words: [], provider: "", model: "", elapsedMs: 0, usage: null, reason: "input prediction service not wired on this host" });
+      }
+      return frame({ requestId: op === "test" ? testRequestId : requestId, status: "unavailable", candidates: [], provider: "", model: "", elapsedMs: 0, usage: null, reason: "input prediction service not wired on this host" });
+    }
+
+    const { type: _type, ...rest } = payload;
+    return Promise.resolve(onInputPrediction(clientId, op, rest)).then(
+      (result) => frame(result && typeof result === "object" ? result : {}),
+      (err) => {
+        logger.error(`[downstream] input prediction ${op} failed: ${err && err.message ? err.message : err}`);
+        if (op === "capabilities") {
+          return frame({ protocolVersion: 1, supported: false, unsupportedReason: "input prediction failed", structuredOutput: false, abort: false, policyRevision: "", limits: null, models: [], connectionDefault: null });
+        }
+        if (op === "cancel") return frame({ requestId, accepted: false, abort: false });
+        if (op === "open") {
+          return frame({ requestId, status: "error", replies: [], words: [], provider: "", model: "", elapsedMs: 0, usage: null, reason: "input prediction failed" });
+        }
+        return frame({ requestId: op === "test" ? testRequestId : requestId, status: "error", candidates: [], provider: "", model: "", elapsedMs: 0, usage: null, reason: "input prediction failed" });
       },
     );
   }
@@ -5507,7 +5852,7 @@ function createDownstreamHandler(opts) {
     );
   }
 
-  function handleGetAgentsCatalog(clientId) {
+  function handleGetAgentsCatalog(clientId, msg = {}) {
     if (!onGetAgentsCatalog) {
       return {
         unicast: formatAgentsCatalog({
@@ -5518,7 +5863,7 @@ function createDownstreamHandler(opts) {
         }),
       };
     }
-    return Promise.resolve(onGetAgentsCatalog()).then(
+    return Promise.resolve(onGetAgentsCatalog({ forceRefresh: msg.forceRefresh === true })).then(
       (payload) => ({
         unicast: formatAgentsCatalog(payload || {}),
       }),
@@ -6140,6 +6485,80 @@ function createDownstreamHandler(opts) {
     );
   }
 
+  function handleGetSavedPrompts(clientId) {
+    if (!onGetSavedPrompts) {
+      return {
+        unicast: formatError("saved prompts are not available", {
+          code: "saved_prompts_unavailable",
+          op: APP_PROTOCOL.savedPromptsGet,
+        }),
+      };
+    }
+
+    return Promise.resolve()
+      .then(() => onGetSavedPrompts())
+      .then(
+        (payload) => ({ unicast: formatSavedPrompts(payload || {}) }),
+        (err) => {
+          const message = err && err.message ? err.message : "getSavedPrompts failed";
+          logger.error(`[downstream] getSavedPrompts failed: ${message}`);
+          return {
+            unicast: formatError(message, {
+              code: "saved_prompts_read_failed",
+              op: APP_PROTOCOL.savedPromptsGet,
+            }),
+          };
+        },
+      );
+  }
+
+  function handleWriteSavedPrompts(clientId, msg) {
+    const requestId = msg && typeof msg.requestId === "string" ? msg.requestId : "";
+    if (!onWriteSavedPrompts) {
+
+      return {
+        unicast: formatError("saved prompts are not available", {
+          code: "saved_prompts_unavailable",
+          op: APP_PROTOCOL.savedPromptsWrite,
+          requestId,
+        }),
+      };
+    }
+    const request = {
+      op: msg && typeof msg.op === "string" ? msg.op : "",
+      prompt: msg && typeof msg.prompt === "object" ? msg.prompt : null,
+      id: msg && typeof msg.id === "string" ? msg.id : "",
+      ids: msg && Array.isArray(msg.ids) ? msg.ids : null,
+      updatedAtMs: Number.isFinite(msg && msg.updatedAtMs) ? msg.updatedAtMs : undefined,
+    };
+    return Promise.resolve()
+      .then(() => onWriteSavedPrompts(request))
+      .then(
+      (result) => {
+        const payload = result || { status: "rejected", reason: "rejected" };
+        const action = {
+          unicast: formatSavedPromptsAck({ ...payload, requestId }),
+        };
+        if (payload.status === "accepted") {
+          action.broadcast = [formatSavedPrompts(payload)];
+        }
+        return action;
+      },
+      (err) => {
+        const message = err && err.message ? err.message : "writeSavedPrompts failed";
+        logger.error(`[downstream] writeSavedPrompts failed: ${message}`);
+
+        return {
+          unicast: formatError(message, {
+            code: "saved_prompts_write_failed",
+            op: APP_PROTOCOL.savedPromptsWrite,
+            requestId,
+          }),
+        };
+      },
+    );
+  }
+
   function handleSwitchSession(clientId, msg) {
     if (!msg.sessionKey) return null;
     if (isRetiredEvenTerminalSessionKey(msg.sessionKey)) {
@@ -6153,12 +6572,15 @@ function createDownstreamHandler(opts) {
       };
     }
     return onSwitchSession(msg.sessionKey).then(
-      (pages) => ({
-        broadcast: [
-          formatSessionSwitched(msg.sessionKey),
-          formatPages(pages),
-        ],
-      }),
+      (pages) => {
+        noteClientSessionSelected(clientId, msg.sessionKey);
+        return {
+          broadcast: [
+            formatSessionSwitched(msg.sessionKey),
+            formatPages(pages),
+          ],
+        };
+      },
       (err) => {
 
         if (
@@ -6209,6 +6631,7 @@ function createDownstreamHandler(opts) {
         };
 
         if (result.superseded === true) return ack;
+        noteClientSessionSelected(clientId, result.sessionKey);
         return {
           ...ack,
           broadcast: [
@@ -6297,6 +6720,7 @@ function createDownstreamHandler(opts) {
           }),
         };
         if (result.superseded === true) return ack;
+        noteClientSessionSelected(clientId, result.sessionKey);
         return {
           ...ack,
           broadcast: [
@@ -6332,8 +6756,14 @@ function createDownstreamHandler(opts) {
     }
     return Promise.resolve(onNewSession(payload)).then(
       (result) => {
+        noteClientSessionSelected(clientId, result && result.sessionKey);
         const broadcast = [
-          formatSessionSwitched(result.sessionKey, payload.requestId, result.draft),
+          formatSessionSwitched(
+            result.sessionKey,
+            payload.requestId,
+            result.draft,
+            result && result.agentFallback,
+          ),
           formatPages(result.pages),
         ];
         if (result && result.sessionModelConfig) {
@@ -7000,6 +7430,17 @@ function createDownstreamHandler(opts) {
       }
 
       switch (msg.type) {
+        case "ocuclaw.optional.setup.request": {
+          const request = parseOptionalSetupRequest(msg);
+          const respond = (result) => ({ unicast: JSON.stringify({ type: "ocuclaw.optional.setup.result", ...result }) });
+          if (typeof opts.isPhoneClient !== "function" || opts.isPhoneClient(clientId) !== true) return respond(optionalSetupFailure(msg, "phone_only"));
+          if (!request) return respond(optionalSetupFailure(msg, "invalid_request"));
+          if (typeof opts.onOptionalSetup !== "function") return respond(optionalSetupFailure(request, "unsupported", "unsupported"));
+          return Promise.resolve().then(() => opts.onOptionalSetup(clientId, request, transportContext.workerEpoch))
+            .then((result) => respond(optionalSetupResult(request, result)))
+            .catch(() => respond(optionalSetupFailure(request, "unavailable", "outcome_unknown")))
+            .finally(() => { if (request.credential) request.credential = ""; msg = null; });
+        }
         case APP_PROTOCOL.ledgerCursor:
           return handleLedgerSync(msg, onLedgerCursor);
         case APP_PROTOCOL.ledgerResyncRequest:
@@ -7066,6 +7507,16 @@ function createDownstreamHandler(opts) {
           return handleSearchTranscripts(clientId, msg);
         case APP_PROTOCOL.modelCatalogGet:
           return handleGetModelsCatalog(clientId);
+        case APP_PROTOCOL.inputPredictionCapabilities:
+          return handleInputPrediction(clientId, "capabilities", msg);
+        case APP_PROTOCOL.inputPredictionRequest:
+          return handleInputPrediction(clientId, "request", msg);
+        case APP_PROTOCOL.inputPredictionOpen:
+          return handleInputPrediction(clientId, "open", msg);
+        case APP_PROTOCOL.inputPredictionCancel:
+          return handleInputPrediction(clientId, "cancel", msg);
+        case APP_PROTOCOL.inputPredictionTest:
+          return handleInputPrediction(clientId, "test", msg);
         case APP_PROTOCOL.skillsCatalogGet:
         case "getSkills":
           return handleGetSkillsCatalog(clientId);
@@ -7108,7 +7559,7 @@ function createDownstreamHandler(opts) {
           return handleGetCommandCatalog(clientId);
         case APP_PROTOCOL.agentsCatalogGet:
         case "getAgentsCatalog":
-          return handleGetAgentsCatalog(clientId);
+          return handleGetAgentsCatalog(clientId, msg);
         case APP_PROTOCOL.openclawAgentCreate:
           return handleCreateOpenClawAgent(clientId, msg);
         case APP_PROTOCOL.hermesProfileCreate:
@@ -7167,6 +7618,10 @@ function createDownstreamHandler(opts) {
           return handleGetOcuClawSettings(clientId);
         case APP_PROTOCOL.ocuClawSettingsSet:
           return handleSetOcuClawSettings(clientId, msg);
+        case APP_PROTOCOL.savedPromptsGet:
+          return handleGetSavedPrompts(clientId);
+        case APP_PROTOCOL.savedPromptsWrite:
+          return handleWriteSavedPrompts(clientId, msg);
         case APP_PROTOCOL.commandSlash:
           return handleSlashCommand(clientId, msg);
         case "console":
@@ -7253,6 +7708,8 @@ function createDownstreamHandler(opts) {
           if (typeof onGlassesUiResult === "function") {
             try {
               onGlassesUiResult({
+                clientId,
+                phoneClient: isPhoneClient(clientId),
                 surfaceId: typeof msg.surfaceId === "string" ? msg.surfaceId : "",
                 outcome: msg.outcome,
               });
@@ -7317,6 +7774,10 @@ function createDownstreamHandler(opts) {
               seq: Number.isSafeInteger(msg.seq) && msg.seq > 0 ? msg.seq : null,
               code: typeof msg.code === "string" ? msg.code : "",
               sdkCode: Number.isSafeInteger(msg.sdkCode) ? msg.sdkCode : null,
+
+              sessionKey: typeof msg.sessionKey === "string" ? msg.sessionKey : null,
+              activeSessionKey:
+                typeof msg.activeSessionKey === "string" ? msg.activeSessionKey : null,
               authoritative: transportContext.liveuiRenderErrorAuthority?.eligible === true,
               authorityReason: transportContext.liveuiRenderErrorAuthority?.eligible === true
                 ? null : transportContext.liveuiRenderErrorAuthority?.reason || "unbound_send",
@@ -7334,6 +7795,21 @@ function createDownstreamHandler(opts) {
             } catch (err) {
               logger.warn(
                 `[downstream] surface_render_receipt handler threw: ${err && err.message ? err.message : err}`,
+              );
+            }
+          }
+          return null;
+        case "reply_render_receipt":
+
+          if (typeof onReplyRenderReceipt === "function") {
+            try {
+              onReplyRenderReceipt(
+                { clientId, clientKind: isPhoneClient(clientId) === true ? "app" : "debug" },
+                msg,
+              );
+            } catch (err) {
+              logger.warn(
+                `[downstream] reply_render_receipt handler threw: ${err && err.message ? err.message : err}`,
               );
             }
           }
@@ -7540,6 +8016,8 @@ function createDownstreamHandler(opts) {
     formatSessionModelConfigAck,
     formatEvenAiSettings,
     formatOcuClawSettings,
+    formatSavedPrompts,
+    formatSavedPromptsAck,
     formatEvenAiSessions,
     formatEvenAiSettingsAck,
     formatOcuClawSettingsAck,
@@ -7573,6 +8051,7 @@ function createDownstreamHandler(opts) {
 
     removeClient(clientId) {
       protocolSubscribers.delete(clientId);
+      if (typeof opts.onOptionalSetupDisconnect === "function") opts.onOptionalSetupDisconnect(clientId);
       return hermesSttUpload?.removeClient(clientId);
     },
   };

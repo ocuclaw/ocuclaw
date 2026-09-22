@@ -93,6 +93,8 @@ RUNTIME_STATE_DIRS: Sequence[str] = ("internal-agent-runs",)
 PROFILE_STATE_FILES: Sequence[str] = (
     ".ocuclaw.relay-credential.json.lock",
     "ocuclaw.app-presence.json",
+    "ocuclaw.cloudways-restart-pending.json",
+    "ocuclaw.cloudways-setup.json",
     "ocuclaw.desktop-credentials.json",
     "ocuclaw.desktop-credentials.lock",
     "ocuclaw.desktop-pairing-activation.json",
@@ -101,6 +103,7 @@ PROFILE_STATE_FILES: Sequence[str] = (
     "ocuclaw.first-run-proof-attempt.json",
     "ocuclaw.first-run-proof.json",
     "ocuclaw.first-run-proof.lock",
+    "ocuclaw.first-run-reply-delivery.json",
     "ocuclaw.pairing-completion.json",
     "ocuclaw.relay-credential.json",
     "ocuclaw.tui-pairing-capability.json",

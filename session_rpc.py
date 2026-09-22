@@ -641,7 +641,7 @@ class SessionRpc:
             f"agent:{ns}:{OCUCLAW_PLATFORM_SEGMENT}:{OCUCLAW_CHAT_TYPE_SEGMENT}:{chat_id}"
         )
 
-    def _resolve_target(self, identity: Any, *, fail_closed: bool = False, allow_ended: bool = False) -> str:
+    def _resolve_target(self, identity: Any, *, fail_closed: bool = False, allow_ended: bool = False, latest_ended: bool = False) -> str:
         """Validated target; historical actions explicitly opt into ended rows."""
         ident = identity if isinstance(identity, dict) else {}
         ns = str(ident.get("ns") or self._ns)
@@ -654,7 +654,7 @@ class SessionRpc:
                 f"{OCUCLAW_CHAT_TYPE_SEGMENT}:{chat_id}"
             )
             try:
-                return str(resolve_conversation(db, native_key, allow_ended=allow_ended)["id"])
+                return str(resolve_conversation(db, native_key, allow_ended=allow_ended, latest_ended=latest_ended)["id"])
             except ConversationUnavailable as error:
                 if error.reason == "conversation_missing":
                     raise ValueError("no such session") from None
@@ -662,7 +662,7 @@ class SessionRpc:
         if isinstance(remainder, str) and remainder:
             # Foreign gateway row: reconstruct the native session_key.
             try:
-                return str(resolve_conversation(db, f"agent:{ns}:{remainder}", allow_ended=allow_ended)["id"])
+                return str(resolve_conversation(db, f"agent:{ns}:{remainder}", allow_ended=allow_ended, latest_ended=latest_ended)["id"])
             except ConversationUnavailable as error:
                 if error.reason != "conversation_missing":
                     raise
@@ -818,7 +818,7 @@ class SessionRpc:
             # make old-but-valid sessions vanish from key lookups (Codex
             # review W05 finding) — then fetch the rich row by exact id.
             try:
-                tip = self._resolve_target(key_identity, allow_ended=True)
+                tip = self._resolve_target(key_identity, allow_ended=True, latest_ended=True)
             except ValueError:
                 return {"sessions": []}
             # The exact-key path must hydrate a HIDDEN row too: the wearer's
@@ -1139,7 +1139,7 @@ class SessionRpc:
     @_session_operation
     def _sync_history(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
-        tip = self._resolve_target(p.get("identity"), fail_closed=True, allow_ended=True)
+        tip = self._resolve_target(p.get("identity"), fail_closed=True, allow_ended=True, latest_ended=True)
         rows = self._conversation_rows_with_identity(tip)
         # Conversational shaping happens HERE, before serialization: only
         # user/assistant rows with content survive, and the tail slice
@@ -1219,7 +1219,7 @@ class SessionRpc:
     @_session_operation
     def _sync_describe(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
-        tip = self._resolve_target(p.get("identity"), fail_closed=True, allow_ended=True)
+        tip = self._resolve_target(p.get("identity"), fail_closed=True, allow_ended=True, latest_ended=True)
         row = self._get_reader().get_session(tip)
         if row is None:
             raise ValueError(f"no such session: {tip}")
@@ -1295,7 +1295,7 @@ class SessionRpc:
     @_session_operation
     def _sync_compaction_info(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
-        tip = self._resolve_target(p.get("identity"), fail_closed=True, allow_ended=True)
+        tip = self._resolve_target(p.get("identity"), fail_closed=True, allow_ended=True, latest_ended=True)
         # Compaction count = compression-chain hops (map compaction.list row;
         # in-place archive_and_compact events are invisible to a hop count —
         # documented undercount, synthesized/medium).
@@ -1318,7 +1318,7 @@ class SessionRpc:
         target_chat_id = str(chat_id or "").strip()
         if not target_chat_id:
             raise ValueError("copy target requires chatId")
-        source_tip = self._resolve_target(identity, fail_closed=True, allow_ended=True)
+        source_tip = self._resolve_target(identity, fail_closed=True, allow_ended=True, latest_ended=True)
         source = self._get_reader().get_session(source_tip)
         messages = self.conversation_by_id(source_tip)
         if not messages:
@@ -1449,9 +1449,19 @@ class ProfileSessionRpc:
         default_db_path: Path,
         routing_provider: Callable[[], Tuple[bool, Dict[str, Path]]],
         session_store_provider: Optional[Callable[[str], Any]] = None,
+        routable_provider: Optional[
+            Callable[[], Tuple[bool, Dict[str, Path]]]
+        ] = None,
     ) -> None:
         self._default_db_path = Path(default_db_path)
         self._routing_provider = routing_provider
+        # Admitted PLUS draining (#2940). Used by exactly one caller,
+        # :meth:`_ambient_rpc`, so a turn finishing inside a profile the wearer
+        # just removed can still read its own transcript and deliver its
+        # outcome. Every wearer-facing lane keeps the narrower table: removal
+        # takes an agent out of the list at once, it does not cut off work
+        # already running there.
+        self._routable_provider = routing_provider if routable_provider is None else routable_provider
         self._session_store_provider = session_store_provider
         self._lock = threading.RLock()
         self._rpcs: Dict[str, SessionRpc] = {
@@ -1482,8 +1492,9 @@ class ProfileSessionRpc:
             DB_METHOD_CHAT_WATERMARK: self.chat_watermark,
         }
 
-    def _routing(self) -> Tuple[bool, Dict[str, Path]]:
-        enabled, homes = self._routing_provider()
+    def _normalize(
+        self, enabled: Any, homes: Dict[str, Path]
+    ) -> Tuple[bool, Dict[str, Path]]:
         normalized = {
             str(ns or DEFAULT_SESSION_NAMESPACE): Path(home)
             for ns, home in homes.items()
@@ -1493,6 +1504,13 @@ class ProfileSessionRpc:
             self._default_db_path.parent,
         )
         return bool(enabled), normalized
+
+    def _routing(self) -> Tuple[bool, Dict[str, Path]]:
+        return self._normalize(*self._routing_provider())
+
+    def _routable(self) -> Tuple[bool, Dict[str, Path]]:
+        """Admitted plus draining — only the ambient finalizer may use this."""
+        return self._normalize(*self._routable_provider())
 
     @staticmethod
     def _namespace_from_params(params: Any) -> str:
@@ -1511,16 +1529,11 @@ class ProfileSessionRpc:
             or isinstance(p.get("keyIdentity"), dict)
         )
 
-    def _rpc_for_namespace(self, ns: str) -> SessionRpc:
-        namespace = str(ns or DEFAULT_SESSION_NAMESPACE)
-        if namespace == DEFAULT_SESSION_NAMESPACE:
-            return self._rpcs[DEFAULT_SESSION_NAMESPACE]
-        enabled, homes = self._routing()
-        if not enabled or namespace not in homes:
-            raise RuntimeError("session_profile_unserved")
+    def _rpc_for_home(self, namespace: str, home: Path) -> SessionRpc:
+        """The cached reader for one namespace's own state DB."""
         with self._lock:
             rpc = self._rpcs.get(namespace)
-            db_path = homes[namespace] / "state.db"
+            db_path = Path(home) / "state.db"
             if rpc is None or rpc._db_path != db_path:
                 if rpc is not None:
                     rpc.close()
@@ -1532,6 +1545,15 @@ class ProfileSessionRpc:
                 self._rpcs[namespace] = rpc
             return rpc
 
+    def _rpc_for_namespace(self, ns: str) -> SessionRpc:
+        namespace = str(ns or DEFAULT_SESSION_NAMESPACE)
+        if namespace == DEFAULT_SESSION_NAMESPACE:
+            return self._rpcs[DEFAULT_SESSION_NAMESPACE]
+        enabled, homes = self._routing()
+        if not enabled or namespace not in homes:
+            raise RuntimeError("session_profile_unserved")
+        return self._rpc_for_home(namespace, homes[namespace])
+
     def _ambient_rpc(self) -> SessionRpc:
         # VERIFIED Hermes 0.20 anchors: gateway.run._profile_runtime_scope
         # covers the whole turn, the ContextVar crosses into the agent worker
@@ -1542,7 +1564,13 @@ class ProfileSessionRpc:
         db_path = default_state_db_path()
         if db_path == self._default_db_path:
             return self._rpcs[DEFAULT_SESSION_NAMESPACE]
-        _enabled, homes = self._routing()
+        # Admitted PLUS draining (#2940). This is the finalizer's own reader:
+        # the turn running here is already running, and an agent the wearer
+        # removed a moment ago must still be able to write down how its last
+        # turn ended. Refusing here would drop the outcome the wearer is owed
+        # and is exactly the "it never redirects to default" failure — silence
+        # instead of a wrong answer, but still not the answer.
+        _enabled, homes = self._routable()
         namespace = next(
             (
                 ns
@@ -1555,7 +1583,9 @@ class ProfileSessionRpc:
             raise RuntimeError(
                 f"ambient Hermes profile DB is not served: {db_path}"
             )
-        return self._rpc_for_namespace(namespace)
+        if namespace == DEFAULT_SESSION_NAMESPACE:
+            return self._rpcs[DEFAULT_SESSION_NAMESPACE]
+        return self._rpc_for_home(namespace, homes[namespace])
 
     async def list_sessions(self, params: Any) -> Dict[str, Any]:
         return await asyncio.to_thread(self._sync_list_sessions, params)

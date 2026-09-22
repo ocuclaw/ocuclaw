@@ -10,7 +10,7 @@ const WIRE_KIND_ENUM = [
   "paged_text_surface",
 ];
 
-const WIRE_TEMPLATE_FIELD_ENUM = ["image_caption"];
+const WIRE_TEMPLATE_FIELD_ENUM = ["image_caption", "graphic"];
 
 const TEMPLATE_STATUSES = ["shipped", "specified", "sketch"];
 const TEMPLATE_LANES = ["registry_entry_only", "kinds_licensed"];
@@ -123,6 +123,105 @@ const entries = [
       "extensions/ocuclaw/src/tools/glasses-ui-descriptors.ts — validateImageCaptionTemplate, GLASSES_UI_IMAGE_ASSETS",
     ],
     relatedTo: [],
+    openQuestions: [],
+  },
+  {
+    name: "graphic",
+    version: 1,
+    status: "shipped",
+    lane: "registry_entry_only",
+    disposition: "active",
+    renderableToday: true,
+    dependencies: [],
+    wireKind: { status: "existing", name: "text_surface" },
+    wireTemplateField: "graphic",
+    intent:
+      "Show a reading by its shape — one number that matters, a trend over time, a share of a goal, a value against its target, a per-hour pattern, a few facts or a plain state — drawn above a caption line that leads with the numbers.",
+    summary:
+      "A Graphic (#2856): the Agent describes typed Graphic Slots and the client rasterises them onto the image-caption plate (288x144) with vendored glyph core. The Agent never sends pixels, paths, coordinates or sizes. body is the caption AND the whole fallback on clients without the renderer, which render any unknown template as plain text, so no kinds license and no client floor. This version accepts one or two slots side by side: metric, the trend slots sparkline, bars and heatstrip (#2861), and the goal slots progress, ring, bullet and gauge (#2862), and the detail slots keyvalue and status (#2863); a metric or status can carry one of glyph's 140 named icons. Overlong slot text is cut with an ellipsis, a long sparkline is downsampled, long bars and heatstrips keep their most recent values, a progress or ring value above 1 and at most 100 is read as a percent, out-of-range values are clamped, extra slots and key-value rows are dropped, an unknown icon name is removed (never guessed), and the result lists each repair.",
+    fieldSet: {
+      closed: true,
+      fields: [
+        { name: "kind", type: "string", requirement: "required", limit: 'const "text_surface"', note: "" },
+        { name: "template", type: "string", requirement: "required", limit: 'const "graphic"', note: "the wire template field" },
+        { name: "body", type: "string", requirement: "required", limit: "1-64 chars", note: "the caption AND the fallback text; numbers lead the line" },
+        { name: "graphic", type: "object", requirement: "required", limit: "slots: 1-2 of metric, sparkline, bars, heatstrip, progress, ring, bullet, gauge, keyvalue, status", note: "metric = {type:\"metric\", value<=8 chars, unit?<=6, label?<=18, delta?:number, icon?: icon name}; keyvalue = {rows: 1-3 [key<=14, value<=10] text pairs, label?<=18}; status = {text<=28, icon?: icon name}; icon names are glyph's closed set of 140 (references/graphic-icons.md); sparkline = {values: 2-60 numbers, label?<=18}; bars = {values: 2-14 numbers, highlight?: index, label?<=18}; heatstrip = {values: 2-24 numbers in 0..1, label?<=18}; progress, ring = {value: number 0..1, label?<=18}; bullet = {value: number, target: number, max: number above 0, label?<=18}; gauge = {value: number, min?: number (default 0), max?: number (default 100) above min, label?<=18}; longer text is cut (text_truncated), a longer sparkline is downsampled (series_downsampled), longer bars/heatstrip keep the most recent (series_trimmed_to_recent), a progress/ring value above 1 and at most 100 is divided by 100 (percent_read_as_fraction), out-of-range heatstrip, progress, ring, bullet and gauge values are clamped (value_clamped), a third slot is dropped (slots_trimmed), a fourth key-value row is dropped (rows_trimmed), an unknown icon name is removed and never guessed (icon_dropped), a short or non-numeric series, a non-numeric goal number, a bullet max not above 0, a gauge max not above min, a row that is not a [key, value] pair or a blank key, value or status text is rejected (graphic_slot_data_invalid), an unknown type is rejected (graphic_slot_type_unknown)" },
+        { name: "title", type: "string", requirement: "forbidden", limit: "", note: "rejected with graphic_title_unsupported — one Name Line per page, same as image_caption" },
+        { name: "refresh", type: "object", requirement: "forbidden", limit: "", note: "rejected with graphic_refresh_unsupported — re-render with update:\"patch\"" },
+        { name: "imageAsset", type: "string", requirement: "forbidden", limit: "", note: "image fields belong to image_caption" },
+        { name: "imageBase64", type: "string", requirement: "forbidden", limit: "", note: "the Agent never supplies pixels" },
+        { name: "imageWidth", type: "integer", requirement: "forbidden", limit: "", note: "the client owns the plate size" },
+        { name: "imageHeight", type: "integer", requirement: "forbidden", limit: "", note: "the client owns the plate size" },
+      ],
+    },
+    layoutBudgets: {
+      measured: true,
+      source: "live validation code and the client plate constant (see codeAnchors)",
+      budgets: {
+        captionMaxChars: 64,
+        slotsMax: 2,
+        metricValueMaxChars: 8,
+        metricUnitMaxChars: 6,
+        metricLabelMaxChars: 18,
+        seriesMinValues: 2,
+        sparklineMaxValues: 60,
+        barsMaxValues: 14,
+        heatstripMaxValues: 24,
+        gaugeMinDefault: 0,
+        gaugeMaxDefault: 100,
+        keyvalueRowsMax: 3,
+        keyvalueKeyMaxChars: 14,
+        keyvalueValueMaxChars: 10,
+        statusTextMaxChars: 28,
+        iconNames: 140,
+        plateWidthPx: 288,
+        plateHeightPx: 144,
+        inkBudgetPercent: 18,
+        minContrastDelta: 4,
+      },
+    },
+    lifecycle: {
+      move: "replace",
+      timeoutMs: null,
+      staleAfterMs: null,
+      refresh: null,
+      outcomePolicy:
+        "Display-only paint. No refresh or cron. A patch or replace re-renders the whole plate; one whose normalised Graphic equals the surface's current one sends no frame and returns unchanged:true with the existing delivery state. A client raster failure reports paint_failed and leaves the caption on the page.",
+    },
+    consent: {
+      actuatesOnExpiry: false,
+      actuatesOnTick: false,
+      requiresStaleAfterMs: false,
+      policy: "read_only_display",
+      assertion:
+        "Display-only. The surface has no expiry-actuated and no tick-actuated consequence. Silence is never consent.",
+    },
+    example: {
+      synthetic: true,
+      renderableToday: true,
+      note: "One metric slot. Synthetic reading.",
+      spec: {
+        kind: "text_surface",
+        template: "graphic",
+        body: "12.5 kt at the pier, gusting",
+        graphic: { slots: [{ type: "metric", value: "12.5", unit: "kt", label: "Wind", delta: 1.5 }] },
+      },
+    },
+    provenance: {
+      seedGroup: "shipped_code",
+      sources: [
+        { doc: "extensions/ocuclaw/src/tools/glasses-ui-descriptors.ts", anchor: "validateGraphicTemplate" },
+        { doc: "docs/adr/0025-liveui-graphic-client-raster-glyph-core.md", anchor: "Decision" },
+      ],
+    },
+    codeAnchors: [
+      "extensions/ocuclaw/src/tools/glasses-ui-limits.ts — GLASSES_UI_LIMITS.graphicCaptionMax / graphicSlotsMax / graphicMetricValueMax / graphicMetricUnitMax / graphicMetricLabelMax / graphicSeriesMin / graphicSparklineValuesMax / graphicBarsValuesMax / graphicHeatstripValuesMax / graphicGaugeMinDefault / graphicGaugeMaxDefault / graphicKeyvalueRowsMax / graphicKeyvalueKeyMax / graphicKeyvalueValueMax / graphicStatusTextMax",
+      "extensions/ocuclaw/src/tools/glasses-ui-descriptors.ts — validateGraphicTemplate, GLASSES_UI_GRAPHIC_SCHEMA, downsampleGraphicSeries",
+      "extensions/ocuclaw/src/tools/glasses-ui-graphic-icons.ts — GRAPHIC_ICON_NAMES (generated from vendor/glyph-core/dist/icons.js)",
+      "composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/screens/DynamicUiGraphic.kt — DynamicUiGraphic.PLATE_WIDTH / PLATE_HEIGHT",
+      "vendor/glyph-core/facade/index.js — GRAPHIC_INK_BUDGET_PERCENT / GRAPHIC_MIN_CONTRAST_DELTA",
+    ],
+    relatedTo: ["image_caption@1"],
     openQuestions: [],
   },
 

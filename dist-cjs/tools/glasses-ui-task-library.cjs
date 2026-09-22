@@ -1398,7 +1398,12 @@ function createLiveuiTaskLibrary(opts = {}) {
           err && err.message ? err.message : "current surface cannot be saved as a Template",
         );
       }
-      const templateSaved = saveHelperTemplate(abstraction.template, { taskId: current.taskId });
+
+      const templateSaved = saveHelperTemplate(
+        abstraction.template,
+        { taskId: current.taskId },
+        abstraction.slotValues,
+      );
       if (templateSaved && templateSaved.status === "rejected" &&
           templateSaved.code === "library_conflict") {
         return rejected("template_exists", `template already exists: ${templateId}`);

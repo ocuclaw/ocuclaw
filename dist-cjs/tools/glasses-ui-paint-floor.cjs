@@ -88,7 +88,12 @@ function createPaintFloorCoalescer(deps) {
     bySurface.delete(surfaceId);
   }
 
-  return { enqueue, dispose, _bySurface: bySurface };
+  function hasPending(surfaceId) {
+    const st = bySurface.get(surfaceId);
+    return !!(st && st.pendingPatch);
+  }
+
+  return { enqueue, dispose, hasPending, _bySurface: bySurface };
 }
 
 module.exports = { createPaintFloorCoalescer, DEFAULT_PAINT_FLOOR_MS };

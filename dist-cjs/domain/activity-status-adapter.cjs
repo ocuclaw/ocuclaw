@@ -449,6 +449,16 @@ function createActivityStatusAdapter(opts) {
       phase: preserveErrorPhase ? "error" : phase,
     };
 
+    delete result.buildKind;
+    const buildKind = intent === "interface.build"
+      ? ((!hasCurrentToolContext && previousToolContext && previousToolContext.buildKind) ||
+        (mappedTool && mappedTool.buildKind)) : null;
+    if (buildKind) result.buildKind = buildKind;
+    if (activity.tool && activityId && label) {
+      const context = runState.toolContextByActivityId.get(activityId);
+      if (context && buildKind) context.buildKind = buildKind;
+    }
+
     if (suppressThinkingContent) {
       delete result.label;
       delete result.detail;

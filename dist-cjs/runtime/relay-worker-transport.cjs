@@ -54,7 +54,7 @@ function createRelayWorkerTransport(options = {}) {
     Number.isFinite(options.listenRetryMaxAttempts) && options.listenRetryMaxAttempts >= 0
       ? Math.floor(options.listenRetryMaxAttempts)
       : 5;
-  let manifest = null;
+  let manifest = JSON.parse("null");
   let backendKind = "openclaw";
   let httpServer = null;
   let wss = null;
@@ -427,6 +427,11 @@ function createRelayWorkerTransport(options = {}) {
       state.clientCapabilities.includes("ledgerV1");
     const entriesLaneActive = supportsLedgerV1 && !!cache.entries;
     const pagesLaneActive = !entriesLaneActive && !!cache.pages;
+
+    if (entriesLaneActive && cache.status) {
+      enqueueFrame(clientId, cache.status);
+      sentStatus = true;
+    }
     if (entriesLaneActive) {
       const clientEntriesRevision = parseNonNegativeRevision(parsed.entriesRevision);
       const hasEntriesState = parsed.hasEntriesState === true;
@@ -442,7 +447,7 @@ function createRelayWorkerTransport(options = {}) {
         sentPages = true;
       }
     }
-    if (cache.status) {
+    if (cache.status && !sentStatus) {
       enqueueFrame(clientId, cache.status);
       sentStatus = true;
     }
@@ -833,6 +838,7 @@ function createRelayWorkerTransport(options = {}) {
       const requestId = `http-${manifest.workerEpoch}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
       const timer = setTimeout(() => {
         pendingHttp.delete(requestId);
+        postToMain({ kind: "http.cancel", requestId, workerEpoch: manifest.workerEpoch });
         if (!responseEnded(res)) {
           res.statusCode = 503;
           res.setHeader("content-type", "text/plain; charset=utf-8");
@@ -1015,10 +1021,11 @@ function createRelayWorkerTransport(options = {}) {
     if (message.kind === "http.response") {
       const pending = pendingHttp.get(message.requestId);
       if (!pending) return;
-      pendingHttp.delete(message.requestId);
-      clearTimeout(pending.timer);
       const body = Buffer.from(message.bodyBase64 || "", "base64");
       if (body.length > manifest.rpc.httpMaxResponseBytes) {
+        pendingHttp.delete(message.requestId);
+        clearTimeout(pending.timer);
+        postToMain({ kind: "http.cancel", requestId: message.requestId, workerEpoch: manifest.workerEpoch });
         pending.res.statusCode = 502;
         pending.res.setHeader("content-type", "text/plain; charset=utf-8");
         pending.res.end(`${activeBackendDisplayName()} response exceeded relay worker HTTP response limit.`);
@@ -1028,6 +1035,11 @@ function createRelayWorkerTransport(options = {}) {
       for (const [key, value] of Object.entries(message.headers || {})) {
         pending.res.setHeader(key, value);
       }
+      pending.res.once("finish", () => {
+        if (!pendingHttp.delete(message.requestId)) return;
+        clearTimeout(pending.timer);
+        postToMain({ kind: "http.finish", requestId: message.requestId, workerEpoch: manifest.workerEpoch });
+      });
       pending.res.end(body);
       return;
     }

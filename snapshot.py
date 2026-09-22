@@ -79,6 +79,16 @@ PROOF_PROVEN = "proven"
 PROOF_NOT_PROVEN = "notProven"
 PROOF_UNKNOWN = "unknown"
 PROOF_METHOD = "phone-origin-g2-wearer-confirmed"
+#: The second, distinct arming path (#3030): the originating phone's SDK
+#: accepted a slice of the exact committed reply. Never conflated with, and
+#: never rendered as, wearer confirmation.
+PROOF_METHOD_SDK_RECEIPT = "phone-origin-g2-sdk-receipt"
+PROOF_REPLY_EVIDENCE_WEARER = "wearer_confirmed"
+PROOF_REPLY_EVIDENCE_SDK_RECEIPT = "client_sdk_receipt"
+PROOF_REPLY_EVIDENCE_VALUES = (
+    PROOF_REPLY_EVIDENCE_WEARER,
+    PROOF_REPLY_EVIDENCE_SDK_RECEIPT,
+)
 
 FRESHNESS_FRESH = "fresh"
 FRESHNESS_HISTORICAL = "historical"
@@ -323,6 +333,7 @@ FIRST_RUN_PROOF_KEY_SET_V1 = frozenset(
         "hermesRelease",
         "hermesPackageVersion",
         "ocuclawVersion",
+        "replyEvidence",
     }
 )
 FINDING_KEY_SET_V1 = frozenset(
@@ -406,7 +417,7 @@ _FINDINGS: Dict[str, Tuple[str, str, str, Optional[str]]] = {
         "setup",
         "error",
         "This Hermes host is outside the supported OcuClaw contract. "
-        "Use Hermes 0.21.x (recommended release v2026.8.31 / engine 0.21.0), "
+        "Use Hermes 0.21.x (recommended release v2026.9.14 / engine 0.21.3), "
         "then restart and run hermes ocuclaw doctor --json. "
         "Do not force-load this bundle on older or 0.22+ engines.",
         "install_supported_hermes",
@@ -496,7 +507,7 @@ _FINDINGS: Dict[str, Tuple[str, str, str, Optional[str]]] = {
 
 _TOKEN_RE = re.compile(r"[^A-Za-z0-9._+\-]")
 # A version RANGE legitimately carries comparison operators and a comma; a
-# separate, still-bounded allowlist keeps ">=0.21.0,<0.22.0" readable without
+# separate, still-bounded allowlist keeps ">=0.21.1,<0.22.0" readable without
 # widening the charset that producer/profile identity strings pass through.
 _RANGE_RE = re.compile(r"[^A-Za-z0-9._+\-<>=!~^,* ]")
 _TOKEN_MAX_CHARS = 40
@@ -1306,6 +1317,7 @@ def _derive_first_run_proof(
         "hermesRelease": None,
         "hermesPackageVersion": None,
         "ocuclawVersion": None,
+        "replyEvidence": None,
     }
     status = facts["firstRunProofStatus"]
     record = facts["firstRunProofRecord"]
@@ -1359,10 +1371,22 @@ def _derive_first_run_proof(
         FRESHNESS_FRESH,
         "proof_committed",
     )
+    # One discriminator, two renderings: `method` is derived from it rather
+    # than stored twice, so the two can never disagree. A record written
+    # before the field existed reads as wearer-confirmed and is never
+    # rewritten.
+    reply_evidence = record.get("replyEvidence")
+    if reply_evidence not in PROOF_REPLY_EVIDENCE_VALUES:
+        reply_evidence = PROOF_REPLY_EVIDENCE_WEARER
     return {
         "state": PROOF_PROVEN,
         "provenAt": proven_at,
-        "method": PROOF_METHOD,
+        "method": (
+            PROOF_METHOD_SDK_RECEIPT
+            if reply_evidence == PROOF_REPLY_EVIDENCE_SDK_RECEIPT
+            else PROOF_METHOD
+        ),
+        "replyEvidence": reply_evidence,
         "profileFingerprint": _sanitize_token(
             record.get("profileFingerprint"), max_chars=64
         ),

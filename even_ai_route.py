@@ -8,7 +8,10 @@ must classify a fresh live Serve document afterward.
 
 from __future__ import annotations
 
+import os
 import re
+import shlex
+import shutil
 from typing import Any, Callable, Mapping, NamedTuple, Optional, Tuple
 
 from . import serve as serve_contract
@@ -33,9 +36,33 @@ class EvenAiRouteDecision(NamedTuple):
     explanation: str
 
 
-def _apply_command(relay_port: int) -> str:
+def _valid_cli(argv: Any) -> bool:
+    return (isinstance(argv, (tuple, list)) and 1 <= len(argv) <= 2
+            and all(isinstance(part, str) and part and not re.search(r"[\x00-\x1f]", part) for part in argv)
+            and os.path.isabs(argv[0])
+            and (len(argv) == 1 or argv[1].startswith("--socket=") and os.path.isabs(argv[1][9:])))
+
+
+def resolve_host_cli() -> Optional[Tuple[str, ...]]:
+    """Resolve once; a broken managed-host receipt never falls back to PATH."""
+    from . import cloudways, receipts
+
+    receipt_path = receipts.tailscale_cli_path()
+    if receipt_path is None:
+        return None
+    receipt = receipts.read_tailscale_cli()
+    if receipt is not None:
+        return receipt.argv if _valid_cli(receipt.argv) else None
+    if receipt_path.exists() or cloudways.detect().verdict != cloudways.DETECT_NO:
+        return None
+    binary = shutil.which("tailscale")
+    argv = (binary,) if binary else None
+    return argv if _valid_cli(argv) else None
+
+
+def _apply_command(relay_port: int, cli_argv: Tuple[str, ...]) -> str:
     return (
-        f"tailscale serve --bg --https={EVEN_AI_SERVE_PORT} "
+        f"{shlex.join(cli_argv)} serve --bg --https={EVEN_AI_SERVE_PORT} "
         f"http://{LOOPBACK}:{int(relay_port)}"
     )
 
@@ -76,6 +103,9 @@ def _funnel_exposes_8443(document: Mapping[str, Any]) -> Optional[bool]:
     funnel = document["AllowFunnel"]
     if not isinstance(funnel, Mapping):
         return None
+    if any(not isinstance(key, str) or not isinstance(value, bool)
+           or not re.fullmatch(r".+:[0-9]+|8443", key) for key, value in funnel.items()):
+        return None
     return any(
         isinstance(key, str)
         and key.rsplit(":", 1)[-1] == str(EVEN_AI_SERVE_PORT)
@@ -108,6 +138,8 @@ def _foreground_route_at_8443(document: Mapping[str, Any]) -> Optional[str]:
             return "foreground_route"
         funnel = session.get("AllowFunnel", {})
         if not isinstance(funnel, Mapping):
+            return "ambiguous_target"
+        if _funnel_exposes_8443({"AllowFunnel": funnel}) is None:
             return "ambiguous_target"
         if any(
             isinstance(key, str)
@@ -159,6 +191,7 @@ def plan(
     relay_port: int,
     selected_runtime: str = "hermes",
     known_runtime_ports: Optional[Mapping[str, int]] = None,
+    cli_argv: Optional[Tuple[str, ...]] = None,
 ) -> EvenAiRouteDecision:
     """Plan the private route from already-read live Tailscale evidence."""
     normalized_dns = normalize_dns_name(dns_name)
@@ -210,7 +243,7 @@ def plan(
             dns_name=dns_name,
             explanation="The live Serve document has unknown routing fields; no route will be changed.",
         )
-    if "Services" in document and not isinstance(document["Services"], Mapping):
+    if "Services" in document and (not isinstance(document["Services"], Mapping) or document["Services"]):
         return _decision(
             state="refused",
             reason="ambiguous_target",
@@ -254,7 +287,7 @@ def plan(
             explanation="The live :8443 TCP state is unreadable; no route will be changed.",
         )
     tcp = tcp_value
-    if any(not isinstance(key, str) for key in tcp):
+    if any(not isinstance(key, str) or not key.isdecimal() or not 1 <= int(key) <= 65535 for key in tcp):
         return _decision(
             state="refused",
             reason="ambiguous_target",
@@ -264,11 +297,14 @@ def plan(
     port = str(EVEN_AI_SERVE_PORT)
     web_state, target, route_host = _web_route_at_8443(document)
     if port not in tcp and web_state == "absent":
+        if not _valid_cli(cli_argv):
+            return _decision(state="refused", reason="tailscale_context_unavailable", dns_name=dns_name,
+                             explanation="This host's exact Tailscale binary/socket is unavailable; preserve existing routes and check host setup.")
         return _decision(
             state="approval_required",
             reason="route_absent",
             dns_name=dns_name,
-            command=_apply_command(relay_port),
+            command=_apply_command(relay_port, cli_argv),
             requires_approval=True,
             may_mutate=True,
             explanation=(
@@ -361,12 +397,29 @@ def plan_live(
     relay_port: int,
     selected_runtime: str = "hermes",
     known_runtime_ports: Optional[Mapping[str, int]] = None,
-    serve_reader: Callable[..., Tuple[Optional[Mapping[str, Any]], str]] = serve_contract.read_serve_status,
-    dns_reader: Callable[..., Tuple[Optional[str], str]] = serve_contract.read_node_dns_name,
+    serve_reader: Optional[Callable[..., Tuple[Optional[Mapping[str, Any]], str]]] = None,
+    dns_reader: Optional[Callable[..., Tuple[Optional[str], str]]] = None,
+    cli_reader: Callable[[], Optional[Tuple[str, ...]]] = resolve_host_cli,
+    runner: Optional[Callable[..., Any]] = None,
 ) -> EvenAiRouteDecision:
     """Read the two supported Tailscale surfaces and return one safe plan."""
-    document, serve_code = serve_reader()
-    dns_name, dns_code = dns_reader()
+    cli_argv = cli_reader()
+    if not _valid_cli(cli_argv):
+        return _decision(state="refused", reason="tailscale_context_unavailable", dns_name=None,
+                         explanation="Check this host's Tailscale setup and private binary/socket receipt. No guessed command was produced.")
+    document, serve_code = (serve_reader() if serve_reader else serve_contract._run_json(
+        cli_argv + ("serve", "status", "--json"), timeout_s=serve_contract.READ_TIMEOUT_S, runner=runner))
+    if dns_reader:
+        dns_name, dns_code = dns_reader()
+    else:
+        node, dns_code = serve_contract._run_json(cli_argv + ("status", "--json"),
+                                                timeout_s=serve_contract.READ_TIMEOUT_S, runner=runner)
+        own = node.get("Self") if isinstance(node, Mapping) else None
+        dns_name = (normalize_dns_name(own.get("DNSName")) if isinstance(own, Mapping)
+                    and own.get("Online") is True and node.get("BackendState") == "Running" else None)
+    if cli_reader() != cli_argv:
+        return _decision(state="refused", reason="host_context_changed", dns_name=None,
+                         explanation="The host Tailscale context changed during observation. Run the command again before applying any route.")
     if document is None:
         return _decision(
             state="refused",
@@ -387,6 +440,7 @@ def plan_live(
         relay_port=relay_port,
         selected_runtime=selected_runtime,
         known_runtime_ports=known_runtime_ports,
+        cli_argv=cli_argv,
     )
 
 

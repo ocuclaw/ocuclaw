@@ -1,21 +1,12 @@
 # OcuClaw installed
 
-Restart the gateway to load OcuClaw, then pair your glasses.
+Restart your agent, then run one command.
 
-**Hermes Desktop (recommended)**
-Open Hermes Desktop with `hermes desktop`.
-On the OcuClaw card at the top right of the status bar, click
-**Restart gateway**, then **Pair your glasses**.
-If the card is missing, run `hermes gateway restart` in a terminal and reopen Desktop.
+- **Cloudways host:** `hermes ocuclaw cloudways setup`
+- **Anywhere else:** open `hermes --tui` and enter `/ocuclaw-setup`
 
-**Terminal**
-Run `hermes gateway restart`, then open `hermes --tui`
-and enter `/ocuclaw-setup`.
+Have your phone and glasses nearby. It pairs them and ends with a reply on your
+glasses display.
 
-Have your phone and glasses nearby. Setup walks you through pairing.
-
-To resume an interrupted setup, say “continue OcuClaw setup”
-in the same conversation.
-
-For troubleshooting, run `hermes ocuclaw doctor --json`,
-see the bundled `README.md`, or just ask your agent for help.
+Full guide and troubleshooting: **https://ocuclaw.com/setup**
+Also in the bundled `README.md`, or run `hermes ocuclaw doctor`.

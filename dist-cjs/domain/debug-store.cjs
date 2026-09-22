@@ -32,6 +32,10 @@ const DEFAULT_DEBUG_CATEGORIES = Object.freeze([
   "screen.nav",
   "screen.dim",
   "glasses.lifecycle",
+
+  "silentInput.gesture",
+  "silentInput.selection",
+  "silentInput.prediction",
   "probe.webview.trace",
   "session.timeline",
   "approvals.timeline",

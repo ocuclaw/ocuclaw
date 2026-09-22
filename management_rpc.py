@@ -12,6 +12,8 @@ from .health_management import OPERATIONS as HEALTH_OPERATIONS, capabilities as 
 from .saved_rpc import OPERATIONS as SAVED_OPERATIONS, capabilities as saved_capabilities, handle_saved
 from .tools_management import OPERATIONS as TOOLS_OPERATIONS, tools_capabilities, handle_tools
 from .connections_management import OPERATIONS as CONNECTION_OPERATIONS, capabilities as connection_capabilities, handle_connections
+from .enrollment_management import OPERATIONS as AGENT_OPERATIONS, capabilities as agent_capabilities, handle_agents
+from .management_summary import overview_summary
 
 
 def _text(value: Any, limit: int = 160) -> str | None:
@@ -66,7 +68,9 @@ def read_management(rpc: Any, params: Any) -> dict:
     permission_operation = identity["operation"] in PERMISSION_OPERATIONS
     from .learning_management import OPERATIONS as LEARNING_OPERATIONS
     learning_operation = identity["operation"] in LEARNING_OPERATIONS
+    agent_operation = identity["operation"] in AGENT_OPERATIONS
     allowed = set(identity) | ({"memory"} if identity["operation"] in MEMORY_OPERATIONS else set()) | ({"jobs"} if job_operation else set()) | ({"approvals"} if approval_operation else set())
+    allowed |= {"agents"} if agent_operation else set()
     allowed |= {"skills"} if identity["operation"] in SKILLS_OPERATIONS else set()
     allowed |= {"automations"} if automation_operation else set()
     allowed |= {"permissions"} if permission_operation else set()
@@ -81,12 +85,24 @@ def read_management(rpc: Any, params: Any) -> dict:
         return fail("invalid_request", "Request identity is invalid.")
     if identity["scope"] not in ("profile", "gateway"):
         return fail("invalid_scope", "Choose profile or shared gateway scope.")
-    if identity["operation"] not in ("capabilities", "overview", *MEMORY_OPERATIONS, *SKILLS_OPERATIONS, *HEALTH_OPERATIONS, *SAVED_OPERATIONS, *TOOLS_OPERATIONS, *CONNECTION_OPERATIONS) and not job_operation and not approval_operation and not automation_operation and not permission_operation and not learning_operation:
+    if identity["operation"] not in ("capabilities", "overview", *MEMORY_OPERATIONS, *SKILLS_OPERATIONS, *HEALTH_OPERATIONS, *SAVED_OPERATIONS, *TOOLS_OPERATIONS, *CONNECTION_OPERATIONS, *AGENT_OPERATIONS) and not job_operation and not approval_operation and not automation_operation and not permission_operation and not learning_operation:
         return fail("unsupported", "This operation is not supported by the connected Hermes adapter.", "unsupported")
     if identity["operation"] == "overview" and identity["scope"] != "profile":
         return fail("invalid_scope", "Overview requires a selected profile.")
     if identity["operation"] in (*MEMORY_OPERATIONS, *SKILLS_OPERATIONS, *SAVED_OPERATIONS) and identity["scope"] != "profile":
         return fail("invalid_scope", "Memory requires a selected profile.")
+    if agent_operation and identity["scope"] != "gateway":
+        # The enrollment set is one host-wide answer, not a property of any one
+        # profile (#2940).
+        return fail("invalid_scope", "Agents are shared across this gateway.")
+    if agent_operation:
+        # Dispatched BEFORE the served-profile read below on purpose. Agents is
+        # the surface a wearer uses to RECOVER a host whose enrollment set is
+        # unset or unreadable; gating it behind an unrelated native read would
+        # leave exactly that wearer with no way to reselect. The scope check
+        # above already pinned this to the default profile, which is always
+        # admitted, so the lookup would prove nothing here anyway.
+        return handle_agents(rpc, identity, p.get("agents"))
     try:
         snapshot = rpc._sync_profiles_list({})
     except (ImportError, AttributeError):
@@ -136,6 +152,7 @@ def read_management(rpc: Any, params: Any) -> dict:
     result = {**identity, "status": "ok", "capabilities": capabilities + memory_capabilities() + skills_capabilities() + health_capabilities() + saved_capabilities()}
     result["capabilities"].extend(tools_capabilities())
     result["capabilities"].extend(connection_capabilities())
+    result["capabilities"].extend(agent_capabilities())
     from .jobs_management import jobs_capabilities
     result["capabilities"].extend(jobs_capabilities(identity["profileId"]))
     from .approvals_management import approvals_capabilities
@@ -163,5 +180,11 @@ def read_management(rpc: Any, params: Any) -> dict:
             for capability in result["capabilities"]:
                 if capability["operation"] == "attentionCount":
                     capability["supported"] = True
+        # #3069: the hub states each section's live fact, and this lane refuses a second
+        # in-flight read, so the facts ride this read. Each is gated by its own capability
+        # and simply absent when its native read has nothing honest to say.
+        summary = overview_summary(rpc, identity, result["capabilities"])
+        if summary:
+            overview["summary"] = summary
         result["overview"] = overview
     return result

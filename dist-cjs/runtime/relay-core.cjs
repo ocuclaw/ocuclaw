@@ -2,6 +2,9 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const os = require("node:os");
+const { createFirstUseStore, createFirstUseObserver, runFirstUseOperation, firstUseBinding, classifyFirstUseReplyEvidence } = require("../setup/first-use.cjs");
+const { setupInstallation } = require("../setup/setup-journey.cjs");
+const { createSetupWelcome } = require("../setup/welcome.cjs");
 const { EventEmitter } = require("node:events");
 const { createPluginVersionService } = require("./plugin-version-service.cjs");
 const conversationStateModule = require("../domain/conversation-state.cjs");
@@ -20,11 +23,15 @@ const { composeGlassesDisplaySystemPrompt } = require("../domain/glasses-display
 const { createStablePromptSnapshotStore } = require("./stable-prompt-snapshot.cjs");
 const { createActivityStatusAdapter } = require("../domain/activity-status-adapter.cjs");
 const { createEvenAiEndpoint } = require("../even-ai/even-ai-endpoint.cjs");
+const { createEvenAiRequestObservation } = require("../even-ai/even-ai-request-observation.cjs");
 const { createEvenAiRouter } = require("../even-ai/even-ai-router.cjs");
 const { createEvenAiRunWaiter } = require("../even-ai/even-ai-run-waiter.cjs");
 const { createEvenAiSettingsStore, normalizeEvenAiDefaultAgent } = require("../even-ai/even-ai-settings-store.cjs");
 const { createPluginOpenclawClient } = require("../gateway/openclaw-client.cjs");
-const { createPluginRpcGatewayBridge } = require("../gateway/gateway-bridge.cjs");
+const { createPluginRpcGatewayBridge, scopeOpenClawSessionKey } = require("../gateway/gateway-bridge.cjs");
+const { createInputPredictionService } = require("./input-prediction-service.cjs");
+const { resolveInputPredictionIdentity } = require("./input-prediction-identity.cjs");
+const { createSilentInputJevAnswerer } = require("./silent-input-jev-answerer.cjs");
 const { createOpenClawAgentCreator } = require("../gateway/openclaw-agent-create.cjs");
 const { createOpenClawAgentEmojiUpdater } = require("../gateway/openclaw-agent-emoji.cjs");
 const { createOpenClawAgentSettings } = require("../gateway/openclaw-agent-settings.cjs");
@@ -32,7 +39,7 @@ const { isKnownBackendKind, setActiveBackendKind, getActiveBackendKind } = requi
 const { createAgentTurnTracker } = require("../tools/glasses-ui-wake.cjs");
 const { mintPreloadedChildren, preloadedChildrenAreMinted } = require("../tools/glasses-ui-children.cjs");
 const { gatewaySessionKeyFor } = require("./openclaw-session-key.cjs");
-const { getRegisteredLiveuiGlassesLibraryController } = require("../tools/glasses-ui-tool.cjs");
+const { getRegisteredLiveuiGlassesLibraryController, getRegisteredGlassesUiHandler } = require("../tools/glasses-ui-tool.cjs");
 const { createLiveuiTaskRunController } = require("../tools/glasses-ui-task-run.cjs");
 const { projectTaskRunRecord } = require("../tools/glasses-ui-task-run-records.cjs");
 const { compareRungs } = require("../tools/glasses-ui-delivery-ladder.cjs");
@@ -43,6 +50,7 @@ const { createBundleCache } = require("../domain/debug-bundle-cache.cjs");
 const { createClientEventFoldCache } = require("../domain/debug-client-fold-cache.cjs");
 const { saveBundleToDisk } = require("../domain/debug-bundle-save.cjs");
 const { createOcuClawSettingsStore, normalizeOcuClawDefaultAgent } = require("./ocuclaw-settings-store.cjs");
+const { createSavedPromptsStore } = require("./saved-prompts-store.cjs");
 const { buildCapabilitySnapshot, buildPushMessage } = require("./capability-snapshot.cjs");
 const { createRelayHealthMonitor } = require("./relay-health-monitor.cjs");
 const { createGlassesBackpressureLatch } = require("./glasses-backpressure-latch.cjs");
@@ -55,11 +63,12 @@ const { createPairingExchangeHost } = require("../domain/pairing/pairing-exchang
 const { resolveNoiseSuite } = require("../domain/pairing/noise-suite.cjs");
 const { activeNewSessionGreetingPrompt, createSessionService, isSupersededSessionSwitchError } = require("./session-service.cjs");
 const { GREETING_SEND_HOLD_DEADLINE_MS } = require("./greeting-send-gate.cjs");
-const { createUpstreamRuntime } = require("./upstream-runtime.cjs");
+const { createUpstreamRuntime, classifyRunOutcomeFrame } = require("./upstream-runtime.cjs");
 const { createDemandRouter } = require("./demand-router.cjs");
 const { buildDemandFrame } = require("./demand-surface.cjs");
 const { createHermesSlashConfirmRouter } = require("./hermes-slash-confirm-router.cjs");
 const { createHermesClarifyRouter } = require("./hermes-clarify-router.cjs");
+const { createReplyDeliveryCoordinator } = require("./reply-delivery-coordinator.cjs");
 const { createOpenClawQuestionRouter } = require("./openclaw-question-router.cjs");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
 const { normalizeSonioxTemporaryKeyErrorCodeForRelay: normalizeSonioxTemporaryKeyErrorCode } = require("../domain/soniox-temp-key-errors.cjs");
@@ -374,6 +383,127 @@ function createBufferedHttpResponse(maxResponseBytes) {
 }
 
 function createRelay(opts) {
+  const firstUseStore = opts.setupStateDir ? createFirstUseStore(opts.setupStateDir) : null;
+  const firstUseObserver      = firstUseStore ? createFirstUseObserver(firstUseStore, { readPhone: readSetupPhone }) : null;
+  const setupWelcome = firstUseStore ? createSetupWelcome(firstUseStore, readSetupPhone,
+    () => typeof opts.getSetupWelcomeRenderer === "function" ? opts.getSetupWelcomeRenderer() : getRegisteredGlassesUiHandler(),
+    undefined, (runId     , signal     ) => awaitRunSettled(runId, signal)) : null;
+
+  function readSetupPhone() {
+    const snapshot = server?.getReadinessSnapshot();
+    if (snapshot?.connectedClientCount !== 1 || snapshot?.clients?.length !== 1) throw new Error("setup-phone-session-ambiguous-or-disconnected");
+    const clientId = snapshot.clients[0].clientId;
+    const sessionKey = server.getClientSessionKey(clientId);
+    if (!sessionKey) throw new Error("setup-phone-session-unavailable");
+    return { clientId, sessionKey, generation: ensureLiveUiSessionGeneration(sessionKey) };
+  }
+
+  const RUN_OUTCOME_MAX = 64;
+
+  const RUN_SETTLE_GRACE_MS = 1000;
+
+  const RUN_SETTLE_MAX_WAIT_MS = 15000;
+  const runOutcomes = new Map();
+  function noteRunActivity(runId     , terminal     , errored     , code     ) {
+    if (typeof runId !== "string" || !runId) return;
+    const previous = runOutcomes.get(runId);
+    runOutcomes.delete(runId);
+    runOutcomes.set(runId, {
+
+      errored: previous?.errored === true || errored === true,
+      code: (errored === true && typeof code === "string" && code ? code : null) ?? previous?.code ?? null,
+      terminal: previous?.terminal === true || terminal === true,
+      terminalAt: previous?.terminal === true ? previous.terminalAt : (terminal === true ? Date.now() : null),
+    });
+    while (runOutcomes.size > RUN_OUTCOME_MAX) {
+      runOutcomes.delete(runOutcomes.keys().next().value);
+    }
+  }
+  function runErrored(runId     ) {
+    return runOutcomes.get(runId)?.errored === true;
+  }
+
+  function awaitRunSettled(runId     , signal      = null) {
+    return new Promise      ((resolve) => {
+      if (typeof runId !== "string" || !runId || !runOutcomes.has(runId)) return resolve();
+      const deadline = Date.now() + RUN_SETTLE_MAX_WAIT_MS;
+      let timer      = null;
+      const done = () => {
+        if (timer) clearTimeout(timer);
+        timer = null;
+        signal?.removeEventListener?.("abort", done);
+        resolve();
+      };
+      const tick = () => {
+        if (signal?.aborted) return done();
+        const outcome = runOutcomes.get(runId);
+        if (!outcome || Date.now() >= deadline) return done();
+        if (outcome.terminal === true) {
+          const waited = Date.now() - (outcome.terminalAt ?? 0);
+          if (waited >= RUN_SETTLE_GRACE_MS) return done();
+          timer = setTimeout(tick, Math.max(1, RUN_SETTLE_GRACE_MS - waited));
+          return;
+        }
+        timer = setTimeout(tick, 100);
+      };
+      signal?.addEventListener?.("abort", done, { once: true });
+      tick();
+    });
+  }
+
+  function observeFirstUseReplyEvidence(record     ) {
+    const candidateKey = firstUseBinding(record);
+    if (!candidateKey || !record?.reply?.runId || !record?.sessionKey) {
+      return { accepted: false, reason: "attribution_unavailable" };
+    }
+    const marked = (globalThis       ).process?.env?.OCUCLAW_ALLOW_SIMULATOR_REPLY_EVIDENCE === "1";
+
+    const named = (verdict     ) => {
+      if (verdict?.reason !== "reply_run_errored") return verdict;
+      if (runOutcomes.get(record.reply.runId)?.code !== "provider_rate_limited") return verdict;
+      return { ...verdict, reason: "reply_run_rate_limited" };
+    };
+    const before = replyDelivery.status(candidateKey);
+    if (before?.status === "sdk_accepted" || before?.status === "pending") {
+      return named(classifyFirstUseReplyEvidence(before, marked));
+    }
+
+    const settled = before && before.reason && before.reason !== "unknown_candidate" ? before : null;
+    replyDelivery.observe({ candidateKey, sessionKey: record.sessionKey, runId: record.reply.runId });
+    const after = replyDelivery.status(candidateKey);
+    if (after?.status === "sdk_accepted") return named(classifyFirstUseReplyEvidence(after, marked));
+    return named(classifyFirstUseReplyEvidence(after?.status === "pending" && settled ? settled : after, marked));
+  }
+
+  let setupHintPhase      = null;
+  function readSetupHintPhase() {
+
+    if (typeof opts.getSetupHintPhase === "function") {
+      try { return opts.getSetupHintPhase() === "awaiting-first-reply" ? "awaiting-first-reply" : null; }
+      catch (_) { return null; }
+    }
+    if (!firstUseStore) return null;
+
+    try { return firstUseStore.read()?.status === "awaiting-reply" ? "awaiting-first-reply" : null; }
+    catch (_) { return null; }
+  }
+  function refreshSetupHint() {
+    const next = readSetupHintPhase();
+    if (next === setupHintPhase) return false;
+    setupHintPhase = next;
+    return true;
+  }
+
+  function publishSetupHintIfChanged() {
+    try { if (refreshSetupHint()) broadcastStatus(); } catch (_) {  }
+  }
+  setupHintPhase = readSetupHintPhase();
+
+  const observeFirstUse = (method     , ...args       ) => {
+    try { firstUseObserver?.[method](...args); } catch (_) {  }
+
+    if (setupHintPhase === "awaiting-first-reply") publishSetupHintIfChanged();
+  };
   const logger = normalizeLogger(opts.logger);
   const externalDebugToolsEnabled = opts.externalDebugToolsEnabled !== false;
   const debugAutoArm = typeof opts.debugAutoArm === "boolean"
@@ -405,7 +535,56 @@ function createRelay(opts) {
     opts.gatewayBridge ||
     createPluginRpcGatewayBridge({
       openclawClient,
+
+      inputPrediction: opts.inputPrediction,
     });
+
+  const inputPredictionService = createInputPredictionService({
+    gatewayBridge,
+    now: opts.now,
+    logger,
+    timeoutMs: opts.inputPredictionTimeoutMs,
+
+    jevRanker: createSilentInputJevAnswerer({ config: opts.silentInputJev }),
+    emitDebug: (category     , event     , data     ) => {
+      try {
+        emitDebug(category, event, "debug", {}, () => data);
+      } catch {
+
+      }
+    },
+
+    resolveIdentity: (clientId     ) => {
+      const backendKind = gatewayBridge && gatewayBridge.kind ? gatewayBridge.kind : "openclaw";
+      const connectionId = `${backendKind}:${opts.gatewayUrl || "local"}`;
+      if (typeof opts.inputPredictionAgentId === "function") {
+        return { connectionId, agentId: opts.inputPredictionAgentId(clientId) };
+      }
+      const identity = resolveInputPredictionIdentity({
+        backendKind,
+        clientSessionKey:
+          server && typeof (server       ).getClientSessionKey === "function"
+            ? (server       ).getClientSessionKey(clientId)
+            : null,
+        getSessionAgentId: (shortKey     , fullKey     ) => sessionService.getSessionAgentId(shortKey, fullKey),
+        getSessionProfileId:
+          typeof (sessionService       ).getSessionProfileId === "function"
+            ? (shortKey     , fullKey     ) => (sessionService       ).getSessionProfileId(shortKey, fullKey)
+            : undefined,
+        extractShortKey:
+          typeof (sessionService       ).extractShortKey === "function"
+            ? (key     ) => (sessionService       ).extractShortKey(key)
+            : undefined,
+      });
+      return {
+        connectionId,
+        agentId: identity.agentId,
+        profileId: identity.profileId,
+        sessionKey: identity.sessionKey,
+        unroutable: (identity       ).unroutable === true,
+      };
+    },
+  });
 
   if (gatewayBridge && isKnownBackendKind(gatewayBridge.kind)) {
     setActiveBackendKind(gatewayBridge.kind);
@@ -507,6 +686,23 @@ function createRelay(opts) {
   let cachedStatus = null;
 
   let statusRevision = 0;
+
+  const optionalSetupGeneration = crypto.randomUUID();
+  const optionalSetupConnections = new Map();
+  let evenAiTestOwner      = null;
+  const optionalSetupConnection = (clientId     , workerEpoch     ) => `${optionalSetupGeneration}-${workerEpoch}-${clientId}`;
+  function disconnectOptionalSetup(clientId     ) {
+    const connectionId = optionalSetupConnections.get(clientId);
+    optionalSetupConnections.delete(clientId);
+    if (!connectionId) return;
+    if (evenAiTestOwner === connectionId) {
+      evenAiTestOwner = null;
+      evenAiRequestObservation.cancel();
+    }
+    if (getActiveBackendKind() === "hermes") {
+      Promise.resolve(gatewayBridge.request("optional.setup.disconnect", { connectionId })).catch(() => {});
+    } else if (typeof opts.optionalSetup?.disconnect === "function") opts.optionalSetup.disconnect(connectionId);
+  }
 
   const liveUiSessionGenerationBootId =
     typeof opts.liveUiSessionGenerationBootId === "string" &&
@@ -1363,6 +1559,12 @@ function createRelay(opts) {
       systemPrompt: opts.ocuClawSystemPrompt,
     },
   });
+
+  const savedPromptsStore = createSavedPromptsStore({
+    logger,
+    emitDebug,
+    stateDir: opts.stateDir,
+  });
   const setOcuClawLocalSettings =
     typeof opts.setOcuClawSettings === "function"
       ? opts.setOcuClawSettings
@@ -1427,6 +1629,221 @@ function createRelay(opts) {
     }
     appBindingMismatchLogged = false;
     return typeof binding.agentRef === "string" ? binding.agentRef.trim() : "";
+  }
+
+  const HERMES_DEFAULT_PROFILE = "default";
+  const HERMES_ENROLLMENT_TTL_MS = 60_000;
+
+  let hermesEnrolledAgents      = null;
+  let hermesEnrollmentFetchedAtMs = 0;
+  let hermesEnrollmentRefreshInFlight      = null;
+
+  function noteHermesEnrollmentView(view     ) {
+    if (!view || typeof view !== "object" || !Array.isArray(view.agents)) {
+      return false;
+    }
+    const enrolled = new Set([HERMES_DEFAULT_PROFILE]);
+    for (const row of view.agents) {
+      if (!row || typeof row !== "object") continue;
+      if (row.enrolled !== true) continue;
+      const name = typeof row.name === "string" ? row.name.trim() : "";
+      if (name) enrolled.add(name);
+    }
+    hermesEnrolledAgents = enrolled;
+    hermesEnrollmentFetchedAtMs = Date.now();
+    return true;
+  }
+
+  function refreshHermesEnrollment(reason = "lazy") {
+    if (getActiveBackendKind() !== "hermes") return Promise.resolve(false);
+    if (hermesEnrollmentRefreshInFlight) return hermesEnrollmentRefreshInFlight;
+    hermesEnrollmentRefreshInFlight = Promise.resolve()
+      .then(() =>
+        gatewayBridge.request("hermes.management", {
+          requestId: crypto.randomUUID(),
+          profileId: HERMES_DEFAULT_PROFILE,
+          scope: "gateway",
+          operation: "agents.list",
+          agents: {},
+        }),
+      )
+      .then((result     ) => {
+        const noted = noteHermesEnrollmentView(result && result.agents);
+        emitDebug(
+          "relay.session",
+          "hermes_enrollment_refreshed",
+          "info",
+          {},
+          () => ({
+            reason,
+            noted,
+            enrolled: hermesEnrolledAgents
+              ? Array.from(hermesEnrolledAgents).sort()
+              : null,
+          }),
+        );
+        return noted;
+      })
+      .catch((error     ) => {
+
+        emitDebug(
+          "relay.session",
+          "hermes_enrollment_refresh_failed",
+          "warn",
+          {},
+          () => ({ reason, message: error?.message || String(error) }),
+        );
+        return false;
+      })
+      .then((noted     ) => {
+        hermesEnrollmentRefreshInFlight = null;
+        return noted;
+      });
+    return hermesEnrollmentRefreshInFlight;
+  }
+
+  function resolveHermesEnrolledAgentRef(rawAgent     , reason = "mint") {
+    if (getActiveBackendKind() !== "hermes") return "";
+    const normalized = typeof rawAgent === "string" ? rawAgent.trim() : "";
+    if (!normalized || normalized === HERMES_DEFAULT_PROFILE) return "";
+    if (!hermesEnrollmentIsFresh()) {
+
+      refreshHermesEnrollment(reason).catch(() => {});
+    }
+    if (hermesEnrolledAgents === null) return "";
+    return hermesEnrolledAgents.has(normalized) ? normalized : "";
+  }
+
+  function hermesAgentRefIsUnenrolled(rawAgent     ) {
+    if (getActiveBackendKind() !== "hermes") return false;
+    const normalized = typeof rawAgent === "string" ? rawAgent.trim() : "";
+    if (!normalized || normalized === HERMES_DEFAULT_PROFILE) return false;
+    return resolveHermesEnrolledAgentRef(normalized, "unenrolled_check") === "";
+  }
+
+  async function hermesManagementRequest(input     ) {
+    if (getActiveBackendKind() !== "hermes") {
+      const error      = new Error("Hermes management is unavailable on this backend.");
+      error.code = "capability_unavailable";
+      throw error;
+    }
+    const result      = await gatewayBridge.request("hermes.management", input);
+    if (result && noteHermesEnrollmentView(result.agents) && upstreamRuntime) {
+      Promise.resolve(upstreamRuntime.getAgentsCatalogSnapshot())
+        .then((fresh     ) => broadcastAgentsCatalog(fresh))
+        .catch(() => {});
+    }
+    return result;
+  }
+
+  function hermesEnrollmentIsFresh() {
+    return (
+      hermesEnrolledAgents !== null &&
+      Date.now() - hermesEnrollmentFetchedAtMs <= HERMES_ENROLLMENT_TTL_MS
+    );
+  }
+
+  function ensureHermesEnrollmentFresh(reason = "mint") {
+    if (getActiveBackendKind() !== "hermes") return Promise.resolve(false);
+    if (hermesEnrollmentIsFresh()) return Promise.resolve(true);
+    return refreshHermesEnrollment(reason);
+  }
+
+  function withHermesEnrollment(snapshot     ) {
+    if (getActiveBackendKind() !== "hermes") return snapshot;
+    if (!hermesEnrollmentIsFresh()) {
+      refreshHermesEnrollment("agents_catalog").then((noted     ) => {
+
+        if (!noted || !upstreamRuntime) return;
+        Promise.resolve(upstreamRuntime.getAgentsCatalogSnapshot())
+          .then((fresh     ) => broadcastAgentsCatalog(fresh))
+          .catch(() => {});
+      }).catch(() => {});
+    }
+    if (hermesEnrolledAgents === null) return snapshot;
+    return {
+      ...(snapshot && typeof snapshot === "object" ? snapshot : {}),
+      enrolled: Array.from(hermesEnrolledAgents).sort(),
+    };
+  }
+
+  function getOcuClawDefaultAgentRefForMint() {
+    return resolveHermesEnrolledAgentRef(
+      normalizeOcuClawDefaultAgent(ocuClawSettingsStore.getSnapshot().defaultAgent),
+      "ocuclaw_default_agent",
+    );
+  }
+
+  function getEvenAiDefaultAgentRefForMint() {
+    return resolveHermesEnrolledAgentRef(
+      normalizeEvenAiDefaultAgent(evenAiSettingsStore.getSnapshot().defaultAgent),
+      "even_ai_default_agent",
+    );
+  }
+
+  function getAppPathwayAgentRefForMint() {
+    const raw = getAppPathwayAgentRef();
+    if (!raw) return "";
+    if (!hermesAgentRefIsUnenrolled(raw)) return raw;
+    emitDebug(
+      "relay.session",
+      "hermes_agent_ref_not_enrolled",
+      "warn",
+      {},
+      () => ({
+        source: "app_pathway_binding",
+        requested: raw,
+        fallback: getOcuClawDefaultAgentRefForMint() || HERMES_DEFAULT_PROFILE,
+      }),
+    );
+    return "";
+  }
+
+  function getDefaultSessionAgentRef() {
+    return getAppPathwayAgentRefForMint() || getOcuClawDefaultAgentRefForMint();
+  }
+
+  async function resolveEvenAiMintAgentRef(input      = {}) {
+    const oneShotAgentRef =
+      typeof input.oneShotAgentRef === "string" ? input.oneShotAgentRef.trim() : "";
+    const bindingAgentRef =
+      typeof input.bindingAgentRef === "string" ? input.bindingAgentRef.trim() : "";
+    await ensureHermesEnrollmentFresh("even_ai_mint");
+    if (getActiveBackendKind() !== "hermes") {
+      return {
+        agentRef: oneShotAgentRef || bindingAgentRef || "",
+        oneShotHonoured: !!oneShotAgentRef,
+      };
+    }
+    const noteFallback = (source     , requested     ) => {
+      emitDebug(
+        "relay.session",
+        "hermes_agent_ref_not_enrolled",
+        "warn",
+        {},
+        () => ({
+          source,
+          requested,
+          fallback: getEvenAiDefaultAgentRefForMint() || HERMES_DEFAULT_PROFILE,
+        }),
+      );
+    };
+    if (oneShotAgentRef) {
+      if (!hermesAgentRefIsUnenrolled(oneShotAgentRef)) {
+        return { agentRef: oneShotAgentRef, oneShotHonoured: true };
+      }
+      noteFallback("even_ai_agent_once", oneShotAgentRef);
+    }
+    if (bindingAgentRef) {
+      if (!hermesAgentRefIsUnenrolled(bindingAgentRef)) {
+        return { agentRef: bindingAgentRef, oneShotHonoured: false };
+      }
+      noteFallback("hey_even_pathway_binding", bindingAgentRef);
+    }
+    return {
+      agentRef: getEvenAiDefaultAgentRefForMint(),
+      oneShotHonoured: false,
+    };
   }
 
   const stablePromptSnapshots = createStablePromptSnapshotStore({
@@ -1813,7 +2230,7 @@ function createRelay(opts) {
     defaultSessionKeyPrefix: opts.defaultSessionKeyPrefix,
     supportedSessionKeyPrefixes: opts.supportedSessionKeyPrefixes,
     sessionKeyPrefixForAgentRef: opts.sessionKeyPrefixForAgentRef,
-    getDefaultSessionAgentRef: getAppPathwayAgentRef,
+    getDefaultSessionAgentRef,
 
     sessionReadStateSupported: () =>
 
@@ -1865,6 +2282,9 @@ function createRelay(opts) {
     },
     broadcastSessions: () => broadcastSessions(),
     broadcastEvenAiSessions: () => broadcastEvenAiSessions(),
+
+    broadcastActivity: (activity     , activitySource     ) =>
+      broadcastActivity(activity, activitySource),
   });
 
   const relayHealth = createRelayHealthMonitor({
@@ -2036,6 +2456,11 @@ function createRelay(opts) {
       liveuiTaskRunController.observeTurnIdle(
         (activity && activity.sessionKey) || sessionService.ensureSessionKey(),
       );
+    }
+
+    if (runId) {
+      const outcome = classifyRunOutcomeFrame(activity, phase, origin);
+      noteRunActivity(runId, outcome.terminal, outcome.errored, outcome.code);
     }
 
     emitDebug(
@@ -2323,7 +2748,13 @@ function createRelay(opts) {
   function buildCapabilitySnapshotFrame(agentCatalogSnapshot, options = {}) {
     const snapshot = buildCapabilitySnapshot({
       source: getActiveBackendKind(),
+      optionalSetupCommandsVersion: opts.optionalSetupCommandsVersion,
+      optionalSetupGeneration,
+      optionalSetupEvenAiCommands: opts.optionalSetupEvenAiCommands,
+      evenAiRequestObservation: evenAiRequestObservation.getSnapshot(),
       stale: options.stale === true,
+      externalDebugToolsEnabled,
+      allowDebugUpload,
       sessionOptionsSupported:
         opts.hermesSessionOptionsSupported === true,
       agentCatalogSnapshot,
@@ -2549,7 +2980,7 @@ function createRelay(opts) {
     if (agents.length === 0 && !(snapshot && snapshot.unsupported)) {
       return snapshot;
     }
-    server.broadcast(handler.formatAgentsCatalog(snapshot || {}));
+    server.broadcast(handler.formatAgentsCatalog(withHermesEnrollment(snapshot || {})));
     broadcastCapabilitySnapshot(snapshot || {});
     return snapshot;
   }
@@ -2571,6 +3002,41 @@ function createRelay(opts) {
         sessionKey: sessionKey || "",
         reason: "glasses_disconnected",
       });
+    }
+  }
+
+  const appClientSessionLeftHandlers      = new Set();
+  function onAppClientSessionLeft(handler     ) {
+    if (typeof handler !== "function") return () => {};
+    appClientSessionLeftHandlers.add(handler);
+    return () => appClientSessionLeftHandlers.delete(handler);
+  }
+  function dispatchAppClientSessionLeft(sessionKey     , nextSessionKey     ) {
+    for (const handler of appClientSessionLeftHandlers) {
+      try { handler({ sessionKey, nextSessionKey }); } catch (err     ) {
+        logger.warn(`[relay] app_client_session_left handler threw: ${err && err.message ? err.message : err}`);
+      }
+    }
+  }
+
+  function noteAppClientSessionSelected(clientId     , sessionKey     ) {
+    if (!server || typeof (server       ).setClientSessionKey !== "function") return;
+    const previous =
+      typeof (server       ).getClientSessionKey === "function"
+        ? (server       ).getClientSessionKey(clientId)
+        : null;
+    if (!(server       ).setClientSessionKey(clientId, sessionKey)) return;
+
+    const next = typeof sessionKey === "string" ? sessionKey.trim() : "";
+    if (
+      previous &&
+      next &&
+      previous !== next &&
+      typeof (server       ).getAppClientCountOnSession === "function" &&
+      (server       ).getAppClientCountOnSession(next) > 0 &&
+      (server       ).getAppClientCountOnSession(previous) === 0
+    ) {
+      dispatchAppClientSessionLeft(previous, next);
     }
   }
 
@@ -2601,6 +3067,23 @@ function createRelay(opts) {
       }
     }
   }
+
+  const replyDelivery = createReplyDeliveryCoordinator({
+    getLedger: () => ({
+      sessionKey: sessionService.peekSessionKey() || null,
+      entries: typeof conversationState.getEntries === "function"
+        ? conversationState.getEntries().entries
+        : [],
+    }),
+    listClients: () =>
+      server && typeof server.getReadinessSnapshot === "function"
+        ? (server.getReadinessSnapshot().clients || [])
+        : [],
+    unicast: (clientId     , frame     ) => { if (server) server.unicast(clientId, frame); },
+    emitDebug: (event     , data     ) =>
+      emitDebug("relay.session", event, "debug", {}, () => data),
+    isRunErrored: runErrored,
+  });
 
   const logicalSessionResetHandlers      = new Set();
   function ensureLiveUiSessionGeneration(sessionKey     ) {
@@ -3000,6 +3483,10 @@ function createRelay(opts) {
           seq: Number.isFinite(data.seq) ? Math.floor(data.seq) : null,
           code: typeof data.code === "string" ? data.code : "",
           sdkCode: Number.isFinite(data.sdkCode) ? data.sdkCode : null,
+
+          sessionKey: typeof data.sessionKey === "string" ? data.sessionKey : null,
+          activeSessionKey:
+            typeof data.activeSessionKey === "string" ? data.activeSessionKey : null,
           channel: authority ? "render_error" : "debug",
           authoritative: authority?.authoritative === true,
           authorityReason: authority?.authorityReason || null,
@@ -3351,7 +3838,7 @@ function createRelay(opts) {
     return operation;
   }
 
-  function dispatchOcuClawUserSendOnce(params = {}) {
+  function dispatchOcuClawUserSendOnce(params      = {}) {
     const id = params.id;
     const text = params.text;
     const sessionKey = params.sessionKey;
@@ -3461,6 +3948,17 @@ function createRelay(opts) {
         resolvedSessionKey,
         () => {
           upstreamDispatchedAt = Date.now();
+          if (params.firstUsePhoneOrigin === true) {
+            let phone      = null;
+            try {
+              const current = readSetupPhone();
+              if (current.clientId === params.firstUseClientId) phone = current;
+            } catch (_) {  }
+            observeFirstUse("sent", {
+              backend: getActiveBackendKind(), source: params.source, sessionKey: resolvedSessionKey, messageId: id, phone,
+              gatewaySessionKey: scopeOpenClawSessionKey(resolvedSessionKey, stableSendOptions(resolvedSessionKey, frozenOcuClawPrompt)),
+            });
+          }
           emitLocalPublishTiming();
           agentTurnTracker.markBusy(resolvedSessionKey);
           const promptTurnTicket =
@@ -3539,7 +4037,12 @@ function createRelay(opts) {
             sessionService.releaseDraftSessionSend(resolvedSessionKey);
           }
           const ackAt = Date.now();
+          observeFirstUse("ack", id, result);
           const runId = result && result.runId ? result.runId : null;
+
+          if (params.sentByAppClient === true) {
+            replyDelivery.noteRunOrigin(runId, params.firstUseClientId);
+          }
           if (
             runId &&
             conversationState &&
@@ -3586,6 +4089,7 @@ function createRelay(opts) {
           return result;
         },
         (err) => {
+          observeFirstUse("failed", id);
           if (materializesHermesDraft) {
             sessionService.releaseDraftSessionSend(resolvedSessionKey);
           }
@@ -3782,6 +4286,34 @@ function createRelay(opts) {
   let evenAiRouter = null;
   let evenAiRunWaiter = null;
   const pendingBufferedEvenAiResponses = new Map();
+  let observationBroadcastPending = false;
+  const evenAiRequestObservation = createEvenAiRequestObservation({
+    stateDir: opts.stateDir,
+    readContext() {
+
+      const { trackedThrowawayKeys: _tracked, ...settings } = getEvenAiEndpointSettingsSnapshot();
+      return {
+        settings,
+        backend: getActiveBackendKind(),
+        credential: opts.evenAiToken,
+        enabled: opts.evenAiEnabled,
+        activeSession: settings.routingMode === "active" ? sessionService.peekSessionKey() : null,
+      };
+    },
+    readProofContext() {
+      const { trackedThrowawayKeys: _tracked, ...settings } = getEvenAiEndpointSettingsSnapshot();
+      return { settings, backend: getActiveBackendKind(), credential: opts.evenAiToken, enabled: opts.evenAiEnabled,
+        activeAgent: settings.routingMode === "active" ? sessionService.getSessionAgentId(sessionService.peekSessionKey(), undefined) : null };
+    },
+    onChange() {
+      if (observationBroadcastPending) return;
+      observationBroadcastPending = true;
+      getCapabilityAgentCatalogSnapshot().then((catalog) => {
+        observationBroadcastPending = false;
+        broadcastCapabilitySnapshot(catalog);
+      });
+    },
+  });
   let relayApi      = null;
 
   async function applyOcuClawSettingsPatch(patch = {}) {
@@ -3826,6 +4358,7 @@ function createRelay(opts) {
     if (!localResult || localResult.status !== "accepted") return localResult;
     const settings = await getOcuClawSettingsSnapshot();
     const result = { status: "accepted", settings };
+    evenAiRequestObservation.refresh();
     if (result && result.status === "accepted" && result.settings && server) {
       server.broadcast(handler.formatOcuClawSettings(result.settings));
     }
@@ -4058,7 +4591,7 @@ function createRelay(opts) {
       return null;
     },
 
-    onSend(id, text, sessionKey, attachment, clientDisplaySignals) {
+    onSend(id, text, sessionKey, attachment, clientDisplaySignals, firstUsePhoneOrigin     , firstUseClientId     ) {
       return dispatchOcuClawUserSend({
         id,
         text,
@@ -4066,6 +4599,10 @@ function createRelay(opts) {
         attachment,
         clientDisplaySignals: clientDisplaySignals || null,
         source: "phone_ui",
+        firstUsePhoneOrigin: firstUsePhoneOrigin === true && !pendingRemoteSendRunBindings.has(id),
+
+        sentByAppClient: firstUsePhoneOrigin === true,
+        firstUseClientId,
       });
     },
     onCreateOpenClawAgent(input     ) {
@@ -4079,14 +4616,31 @@ function createRelay(opts) {
       }
       return gatewayBridge.request("profiles.create", input);
     },
-    onHermesManagement(input     ) {
-      if (getActiveBackendKind() !== "hermes") {
-        const error      = new Error("Hermes management is unavailable on this backend.");
-        error.code = "capability_unavailable";
-        throw error;
+    onHermesManagement: hermesManagementRequest,
+    onOptionalSetup(clientId     , request     , workerEpoch     ) {
+      if (!Number.isInteger(workerEpoch) || workerEpoch < 1) return { status: "rejected", code: "not_connected" };
+      const connectionId = optionalSetupConnection(clientId, workerEpoch);
+      optionalSetupConnections.set(clientId, connectionId);
+      const context = { connectionId };
+
+      if (request.operation === "credential.save") { evenAiRequestObservation.cancel(); evenAiTestOwner = null; }
+
+      if (request.operation === "evenai.test.arm") {
+        if (opts.evenAiEnabled !== true || !opts.evenAiToken) return { status: "rejected", code: "unavailable" };
+        if (!evenAiRequestObservation.arm()) return { status: "rejected", code: "busy" };
+        evenAiTestOwner = connectionId;
+        return { status: "ok" };
       }
-      return gatewayBridge.request("hermes.management", input);
+      if (request.operation === "evenai.test.cancel") {
+        evenAiRequestObservation.cancel();
+        evenAiTestOwner = null;
+        return { status: "cancelled" };
+      }
+      if (getActiveBackendKind() === "hermes") return gatewayBridge.request("optional.setup", { request, context });
+      return typeof opts.optionalSetup?.handle === "function" ? opts.optionalSetup.handle(request, context)
+        : { status: "unsupported", code: "unsupported" };
     },
+    onOptionalSetupDisconnect: disconnectOptionalSetup,
     async onSetAgentEmoji({ agentId, emoji }     ) {
       if (getActiveBackendKind() === "openclaw") {
         return openClawAgentEmojiUpdater.setEmoji({ agentId, emoji });
@@ -4160,6 +4714,7 @@ function createRelay(opts) {
       });
     },
     onGlassesUiResult(frame) {
+      if (setupWelcome && !setupWelcome.admitOutcome(frame)) return;
       const liveuiController = resolveLiveuiGlassesLibraryController();
       const taskSessionKey =
         liveuiController && typeof liveuiController.sessionForSurface === "function"
@@ -4217,6 +4772,9 @@ function createRelay(opts) {
     },
     onGlassesUiRenderError(frame     ) {
       dispatchGlassesUiClientFailure(frame.clientId, frame, frame);
+    },
+    onReplyRenderReceipt(sender     , receipt     ) {
+      replyDelivery.acceptReceipt(sender, receipt);
     },
     onGlassesUiRenderReceipt(frame     ) {
 
@@ -5363,6 +5921,30 @@ function createRelay(opts) {
       }
 
       clearSyntheticWorkForSession(sessionService.ensureSessionKey());
+
+      await ensureHermesEnrollmentFresh("new_session");
+
+      let agentFallback = "";
+      if (hasRequestedAgentRef && hermesAgentRefIsUnenrolled(resolvedAgentRef)) {
+        agentFallback = resolvedAgentRef;
+        resolvedAgentRef = getOcuClawDefaultAgentRefForMint();
+      } else if (!hasRequestedAgentRef) {
+        const rawBinding = getAppPathwayAgentRef();
+        if (hermesAgentRefIsUnenrolled(rawBinding)) agentFallback = rawBinding;
+      }
+      if (agentFallback) {
+        emitDebug(
+          "relay.session",
+          "hermes_agent_ref_not_enrolled",
+          "warn",
+          {},
+          () => ({
+            source: hasRequestedAgentRef ? "new_session_pick" : "app_pathway_binding",
+            requested: agentFallback,
+            fallback: getOcuClawDefaultAgentRefForMint() || HERMES_DEFAULT_PROFILE,
+          }),
+        );
+      }
       const hermesDraft = getActiveBackendKind() === "hermes";
       const result = await sessionService.newSession({
         ...(hasRequestedAgentRef ? { agentRef: resolvedAgentRef } : {}),
@@ -5388,15 +5970,44 @@ function createRelay(opts) {
         ? {
             ...result,
             draft: hermesDraft,
+            ...(agentFallback ? { agentFallback } : {}),
             sessionModelConfig,
           }
-        : { ...result, draft: hermesDraft };
+        : {
+            ...result,
+            draft: hermesDraft,
+            ...(agentFallback ? { agentFallback } : {}),
+          };
     },
 
     onGetModelsCatalog() {
       return upstreamRuntime
         ? upstreamRuntime.getModelsCatalogSnapshot()
         : Promise.resolve({ models: [], fetchedAtMs: Date.now(), stale: true });
+    },
+
+    onClientSessionSelected(clientId     , sessionKey     ) {
+      noteAppClientSessionSelected(clientId, sessionKey);
+    },
+
+    onInputPrediction(clientId     , op     , payload     ) {
+      switch (op) {
+        case "capabilities":
+          return inputPredictionService.capabilities(clientId);
+        case "request":
+          return inputPredictionService.request(clientId, payload);
+        case "open":
+          return inputPredictionService.open(clientId, payload);
+        case "cancel":
+          return inputPredictionService.cancel(clientId, payload).then((ack     ) => ({
+            requestId: payload && typeof payload.requestId === "string" ? payload.requestId : "",
+            ...ack,
+          }));
+        case "test":
+          return inputPredictionService.test(clientId, payload);
+        default:
+          return Promise.reject(new Error(`unknown input prediction op: ${op}`));
+      }
     },
 
     onGetSkillsCatalog() {
@@ -5592,9 +6203,11 @@ function createRelay(opts) {
           });
     },
 
-    onGetAgentsCatalog() {
+    onGetAgentsCatalog({ forceRefresh = false }      = {}) {
       return upstreamRuntime
-        ? upstreamRuntime.getAgentsCatalogSnapshot()
+        ? Promise.resolve(upstreamRuntime.getAgentsCatalogSnapshot(forceRefresh)).then(
+            (snapshot     ) => withHermesEnrollment(snapshot),
+          )
         : Promise.resolve({
             agents: [],
             defaultId: null,
@@ -5700,12 +6313,21 @@ function createRelay(opts) {
       return getOcuClawSettingsSnapshot();
     },
 
+    onGetSavedPrompts() {
+      return savedPromptsStore.list();
+    },
+
+    onWriteSavedPrompts(request      = {}) {
+      return savedPromptsStore.write(request || {});
+    },
+
     async onGetEvenAiSessions() {
       return buildEvenAiSessionsSnapshot();
     },
 
     async onSetEvenAiSettings(patch) {
       const result = await evenAiSettingsStore.setSettings(patch || {});
+      evenAiRequestObservation.refresh();
       if (result && result.status === "accepted" && result.settings && server) {
         server.broadcast(handler.formatEvenAiSettings(result.settings));
       }
@@ -6379,6 +7001,7 @@ function createRelay(opts) {
     cancelBufferedEvenAiHttpRequest(envelope) {
       return cancelBufferedEvenAiHttpRequest(envelope);
     },
+    completeBufferedEvenAiHttpRequest,
     onPairingAuthenticatedHello(hello     ) {
       notePairingAuthenticatedHello(hello);
     },
@@ -6391,6 +7014,12 @@ function createRelay(opts) {
       if (server && server.getConnectedAppCount() === 0) {
         demandRouter.forgetDecisions("client_disconnect");
       }
+    },
+
+    onAppClientClosed(clientId     ) {
+      inputPredictionService.onClientDisconnect(clientId);
+
+      replyDelivery.forgetClient(clientId);
     },
     onAppClientIdentified(clientId, entry     ) {
       if (upstreamRuntime && typeof upstreamRuntime.refreshSessionAttention === "function") {
@@ -6425,7 +7054,8 @@ function createRelay(opts) {
   function buildStatusObject(options = {}) {
     const includeDownstreamReadiness = options.includeDownstreamReadiness === true;
     const activeSessionKey = sessionService.ensureSessionKey();
-    const status = {
+
+    const status      = {
       openclaw:
         upstreamRuntime && upstreamRuntime.isConnected()
           ? "connected"
@@ -6438,6 +7068,8 @@ function createRelay(opts) {
       evenAiEnabled: opts.evenAiEnabled === true,
       ledgerV1: activeConversationSupportsLedger(),
     };
+
+    if (setupHintPhase) status.setupHint = setupHintPhase;
     if (includeDownstreamReadiness) {
       status.downstreamReadiness =
         server && typeof server.getReadinessSnapshot === "function"
@@ -6505,9 +7137,12 @@ function createRelay(opts) {
   }
 
   function broadcastEntriesForActiveLedgerClients(reason      = null) {
-    if (!hasActiveLedgerClient()) return;
-    const snapshot = activeLedgerSnapshot();
-    if (snapshot !== null) server.broadcast(cacheEntries(snapshot, reason));
+    if (hasActiveLedgerClient()) {
+      const snapshot = activeLedgerSnapshot();
+      if (snapshot !== null) server.broadcast(cacheEntries(snapshot, reason));
+    }
+
+    replyDelivery.notifyEntriesChanged();
   }
 
   function cacheEntries(snapshot      = {}, reason      = null, sourceRowCount      = null) {
@@ -6603,10 +7238,13 @@ function createRelay(opts) {
       cachedEntries = "";
       entriesLastSeq = -1;
     }
+
+    replyDelivery.notifyEntriesChanged();
     return preserveLedgerLane;
   }
 
   function broadcastSessions() {
+    evenAiRequestObservation.refresh();
     return sessionService
       .getSessions()
       .then((sessions) => {
@@ -6716,6 +7354,10 @@ function createRelay(opts) {
   let demandRouter      = null;
 
   upstreamRuntime = createUpstreamRuntime({
+    observeSetupEvent: (name     , data     ) => {
+      if (name === "message") observeFirstUse("reply", data);
+      if (name === "error" || name === "connectFailed" || (name === "status" && data === "disconnected")) observeFirstUse("clear");
+    },
     logger,
     stateDir: opts.stateDir,
     gatewayBridge,
@@ -6835,6 +7477,12 @@ function createRelay(opts) {
     }
     const sessionModelConfig = await seedOcuClawSessionConfigForNewSession(result.sessionKey);
     if (server) {
+
+      if (typeof (server       ).getAppClientIds === "function") {
+        for (const clientId of (server       ).getAppClientIds()) {
+          noteAppClientSessionSelected(clientId, result.sessionKey);
+        }
+      }
       server.broadcast(handler.formatSessionSwitched(result.sessionKey, "", hermesDraft));
       server.broadcast(handler.formatPages(result.pages, {}));
       if (sessionModelConfig) {
@@ -6987,6 +7635,17 @@ function createRelay(opts) {
         return evenAiSettingsStore.getSnapshot().routingMode;
       },
       dedicatedSessionKey: opts.evenAiDedicatedSessionKey,
+
+      resolveDedicatedSessionKey(agentRef     ) {
+        if (getActiveBackendKind() !== "hermes") return "";
+        const ref = typeof agentRef === "string" ? agentRef.trim() : "";
+        if (!ref || ref === HERMES_DEFAULT_PROFILE) return "";
+        try {
+          return mintedHermesSessionKey("even-ai", ref);
+        } catch {
+          return "";
+        }
+      },
       ...evenAiRouterOptions,
     });
     evenAiRunWaiter = createEvenAiRunWaiter({
@@ -6995,6 +7654,7 @@ function createRelay(opts) {
       emitDebug,
     });
     evenAiEndpoint = createEvenAiEndpoint({
+      requestObservation: evenAiRequestObservation,
       logger,
       httpServer: sharedHttpServer,
       enabled: true,
@@ -7108,6 +7768,10 @@ function createRelay(opts) {
         if (routingMode === "active") {
           return sessionKey ? sessionService.getSessionAgentId(sessionKey) : "";
         }
+
+        if (getActiveBackendKind() === "hermes") {
+          return "";
+        }
         const evenAiDefault = normalizeEvenAiDefaultAgent(
           evenAiSettingsStore.getSnapshot().defaultAgent,
         );
@@ -7116,6 +7780,15 @@ function createRelay(opts) {
           sessionService.setSessionAgentId(sessionKey, evenAiDefault);
         }
         return evenAiDefault;
+      },
+
+      async getDefaultMintAgentRef() {
+        await ensureHermesEnrollmentFresh("even_ai_mint");
+        return getEvenAiDefaultAgentRefForMint();
+      },
+
+      resolveMintAgentRef(input     ) {
+        return resolveEvenAiMintAgentRef(input);
       },
       getAgentsCatalogSnapshot() {
         return getCapabilityAgentCatalogSnapshot();
@@ -7126,6 +7799,12 @@ function createRelay(opts) {
       onSessionActivated(route) {
         if (!route || !route.sessionChanged) {
           return;
+        }
+
+        if (server && typeof (server       ).getAppClientIds === "function") {
+          for (const clientId of (server       ).getAppClientIds()) {
+            noteAppClientSessionSelected(clientId, route.sessionKey);
+          }
         }
         server.broadcast(handler.formatSessionSwitched(route.sessionKey));
         if (cachedPages !== null) {
@@ -7319,9 +7998,24 @@ function createRelay(opts) {
       return res.toResult();
     } finally {
       if (requestId) {
-        pendingBufferedEvenAiResponses.delete(requestId);
+        const pending = pendingBufferedEvenAiResponses.get(requestId);
+        if (pending && res.listenerCount("finish") > 0) {
+          pending.timer = setTimeout(() => cancelBufferedEvenAiHttpRequest({ requestId }), 30_000);
+          pending.timer.unref?.();
+        } else {
+          pendingBufferedEvenAiResponses.delete(requestId);
+        }
       }
     }
+  }
+
+  function completeBufferedEvenAiHttpRequest(envelope     ) {
+    const pending = pendingBufferedEvenAiResponses.get(envelope?.requestId);
+    if (!pending) return false;
+    pendingBufferedEvenAiResponses.delete(envelope.requestId);
+    clearTimeout(pending.timer);
+    pending.res.emit("finish");
+    return true;
   }
 
   function cancelBufferedEvenAiHttpRequest(envelope) {
@@ -7334,6 +8028,8 @@ function createRelay(opts) {
     if (!pending) {
       return false;
     }
+    pendingBufferedEvenAiResponses.delete(requestId);
+    clearTimeout(pending.timer);
     pending.res.emit("close");
     pending.req.emit("close");
     return true;
@@ -7517,14 +8213,17 @@ function createRelay(opts) {
         });
         refreshUploadCaptureArming = uploadCaptureArmingDisposer.refresh;
       }
-      const startGateway = () => Promise.resolve(gatewayBridge.start()).then(() => {
-        prefetchSonioxModels("relay_start").catch((err) => {
-          logger.warn(`[relay] Soniox models prefetch failed: ${err.message}`);
+      const startGateway = () => Promise.resolve(gatewayBridge.start())
+
+        .then(() => refreshHermesEnrollment("relay_start").catch(() => false))
+        .then(() => {
+          prefetchSonioxModels("relay_start").catch((err) => {
+            logger.warn(`[relay] Soniox models prefetch failed: ${err.message}`);
+          });
+          if (upstreamRuntime && typeof upstreamRuntime.start === "function") {
+            return upstreamRuntime.start();
+          }
         });
-        if (upstreamRuntime && typeof upstreamRuntime.start === "function") {
-          return upstreamRuntime.start();
-        }
-      });
       if (server && typeof server.start === "function") {
         return Promise.resolve(server.start()).then(startGateway);
       }
@@ -7532,6 +8231,7 @@ function createRelay(opts) {
     },
 
     stop() {
+      setupWelcome?.cancel();
       if (liveuiTaskRunController) {
         liveuiTaskRunController.observeHostLoss();
       }
@@ -7539,6 +8239,7 @@ function createRelay(opts) {
       clearSyntheticWork();
       sessionService.discardDraftSession("runtime_stop");
       demandRouter.forgetAll("runtime_stop");
+      replyDelivery.dispose();
       if (bundleCacheSweepTimer) {
         clearInterval(bundleCacheSweepTimer);
         bundleCacheSweepTimer = null;
@@ -7555,6 +8256,10 @@ function createRelay(opts) {
       if (evenAiEndpoint) {
         evenAiEndpoint.close();
       }
+      evenAiRequestObservation.close();
+      for (const requestId of pendingBufferedEvenAiResponses.keys()) {
+        cancelBufferedEvenAiHttpRequest({ requestId });
+      }
       if (evenAiRunWaiter) {
         evenAiRunWaiter.close();
       }
@@ -7567,6 +8272,8 @@ function createRelay(opts) {
       gatewayBridge.stop();
       return Promise.all([
         sessionService.flushFirstSentUserMessageCache(),
+
+        Promise.resolve(savedPromptsStore.flush()).catch(() => {}),
         Promise.resolve(server.close()),
       ]).then(() => undefined);
     },
@@ -7579,6 +8286,9 @@ function createRelay(opts) {
     },
 
     handleBufferedEvenAiHttpRequest,
+    completeBufferedEvenAiHttpRequest,
+    cancelBufferedEvenAiHttpRequest,
+    getEvenAiRequestObservation: () => evenAiRequestObservation.getSnapshot(),
 
     get pairingEndpoint() {
       return pairingEndpointService;
@@ -7739,6 +8449,43 @@ function createRelay(opts) {
     peekSessionKey() {
       return sessionService.peekSessionKey();
     },
+    setupFirstUse(operation     , input      = {}) {
+      if (getActiveBackendKind() !== "openclaw" || !firstUseStore) throw new Error("setup-first-use-unavailable");
+      if (input.installationId && input.installationId !== setupInstallation(opts.setupStateDir).id) throw new Error("installation-mismatch");
+
+      try {
+        if (operation === "begin") {
+
+          let phone      = null;
+          try { phone = readSetupPhone(); } catch (_) { phone = null; }
+          return firstUseStore.begin(input.sessionKey || firstUseStore.read()?.sessionKey || sessionService.peekSessionKey(), input.retry === true, phone);
+        }
+        return runFirstUseOperation(firstUseStore, operation, input, () => readSetupPhone().sessionKey, readSetupPhone, observeFirstUseReplyEvidence);
+      } finally {
+        publishSetupHintIfChanged();
+      }
+    },
+    setupFirstUseToolAvailable() {
+      return getActiveBackendKind() === "openclaw" && !!firstUseStore;
+    },
+
+    refreshSetupHint() {
+      publishSetupHintIfChanged();
+      return setupHintPhase;
+    },
+    setupWelcomeAvailable() {
+      return getActiveBackendKind() === "openclaw" && setupWelcome?.available() === true;
+    },
+    setupWelcome(input     , signal     ) {
+      if (getActiveBackendKind() !== "openclaw" || !setupWelcome) throw new Error("setup-welcome-unavailable");
+      if (input.installationId !== setupInstallation(opts.setupStateDir).id) throw new Error("installation-mismatch");
+      return setupWelcome.run(input, signal);
+    },
+
+    cancelSetupWelcome() {
+      if (getActiveBackendKind() !== "openclaw" || !setupWelcome) return false;
+      return setupWelcome.cancel("cancelled") === true;
+    },
 
     flushFirstSentUserMessageCache() {
       return sessionService.flushFirstSentUserMessageCache();
@@ -7762,6 +8509,10 @@ function createRelay(opts) {
 
     _handleDownstreamMessageForTest(clientId, raw) {
       return handler.handleMessage(clientId, raw);
+    },
+
+    onHermesManagementForTest(input     ) {
+      return hermesManagementRequest(input);
     },
 
     _clearLogicalSessionState(sessionKey) {
@@ -7880,6 +8631,19 @@ function createRelay(opts) {
       return server ? server.getConnectedAppCount() > 0 : false;
     },
 
+    getAppViewedSessionKeys() {
+      if (!server || typeof (server       ).getAppClientSessionKeys !== "function") return null;
+      if (!(server.getConnectedAppCount() > 0)) return null;
+      const keys = new Set();
+      for (const key of (server       ).getAppClientSessionKeys()) {
+        if (typeof key === "string" && key.trim()) keys.add(key.trim());
+      }
+      if (keys.size === 0) return null;
+      const current = sessionService.peekSessionKey();
+      if (typeof current === "string" && current.trim()) keys.add(current.trim());
+      return [...keys];
+    },
+
     getConnectedAppActiveSessionKey() {
       try {
         const snapshot =
@@ -7959,10 +8723,23 @@ function createRelay(opts) {
       return onAppClientDisconnect(handler);
     },
 
+    onAppClientSessionLeft(handler     ) {
+      return onAppClientSessionLeft(handler);
+    },
+
     onAppPresenceChanged(handler     ) {
       return onAppPresenceChanged(handler);
     },
 
+    observeReplyDelivery(params     ) {
+      return replyDelivery.observe(params || {});
+    },
+    getReplyDeliveryStatus(candidateKey     ) {
+      return replyDelivery.status(candidateKey);
+    },
+    onReplyDeliverySettled(handler     ) {
+      return replyDelivery.onSettled(handler);
+    },
     onPairingCompleted(handler     ) {
       return onPairingCompleted(handler);
     },

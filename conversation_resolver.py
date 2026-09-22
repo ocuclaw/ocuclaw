@@ -107,25 +107,33 @@ def carriers_for_key(reader, key, *, limit=10000):
     if len(rows) >= limit:
         raise ConversationUnavailable("discovery_truncated")
     carriers = [dict(row) for row in rows if row.get("session_key") == key]
-    def order(row):
-        value = row.get("started_at")
-        try:
-            timestamp = float(value) if value is not None and not isinstance(value, bool) else 0.0
-        except (TypeError, ValueError, OverflowError):
-            raise ConversationUnavailable("session_timestamp_invalid") from None
-        if not math.isfinite(timestamp) or isinstance(value, bool):
-            raise ConversationUnavailable("session_timestamp_invalid")
-        return row.get("ended_at") is None, timestamp
-    carriers.sort(key=order, reverse=True)
+    carriers.sort(key=lambda row: (row.get("ended_at") is None, _started_at(row)), reverse=True)
     return carriers
 
 
-def resolve_conversation(reader, key, *, allow_ended=False, include_history=False):
+def _started_at(row):
+    value = row.get("started_at")
+    try:
+        timestamp = float(value) if value is not None and not isinstance(value, bool) else 0.0
+    except (TypeError, ValueError, OverflowError):
+        raise ConversationUnavailable("session_timestamp_invalid") from None
+    if not math.isfinite(timestamp) or isinstance(value, bool):
+        raise ConversationUnavailable("session_timestamp_invalid")
+    return timestamp
+
+
+def resolve_conversation(reader, key, *, allow_ended=False, latest_ended=False, include_history=False):
     """One validated target, never a recency guess.
 
     Historical metadata/read/copy/delete actions may explicitly accept one
     ended lineage. Execution/navigation callers require a live target.
     Ambiguity is rejected in both modes, before a writer can be borrowed.
+
+    `latest_ended` is for callers that change nothing about the source (reads,
+    copy). A key's lineages are sequential: a reset ends one and a shutdown
+    ends the next with no successor until the next message, so several ended
+    lineages and no live one is an ordinary chat, not a conflict (#3169). Those
+    callers take the strictly newest; a tie is still refused.
     """
     def discover():
         rows = carriers_for_key(reader, key)
@@ -152,6 +160,10 @@ def resolve_conversation(reader, key, *, allow_ended=False, include_history=Fals
                 targets = ended_targets
             if not targets:
                 raise ConversationUnavailable("conversation_ended")
+            if latest_ended and len(targets) > 1:
+                newest, runner_up = sorted(targets.values(), key=_started_at, reverse=True)[:2]
+                if _started_at(newest) > _started_at(runner_up):
+                    return newest
         if len(targets) != 1:
             raise ConversationUnavailable("identity_conflict")
         return next(iter(targets.values()))

@@ -18,6 +18,14 @@ from pathlib import Path
 _OPERATIONS = {"restart.preview", "restart.request", "restart.status"}
 _ID = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 
+# #3113: the phone hides every control whose operation is not in the capability list, and the
+# management reply never carried a restart row, so Restart Hermes has been unreachable since the
+# feature shipped. These are the three operations this class already serves. `read_only` for the
+# two reads; the request applies the moment it is admitted.
+_RESTART_CAPABILITIES = (("restart.preview", "read_only"),
+                         ("restart.request", "active_now"),
+                         ("restart.status", "read_only"))
+
 
 def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
@@ -60,6 +68,33 @@ class RestartRpc:
             "phase": "draining" if runner._draining else "ready",
             "supported": bool(is_gateway_supervisor_process()),
         }
+
+    def _restart_supported(self):
+        """#3113: the honest per-gateway answer, not a constant.
+
+        A gateway this process does not supervise cannot restart itself, and a build whose runner
+        has no `request_restart` cannot either. Both must keep offering no button, which is exactly
+        what `supported: False` asks the phone to do.
+
+        It answers for all three operations together, not one each. Previewing a restart that
+        cannot be requested is a dead end dressed as a control, so the family is offered or it is
+        not.
+
+        This is the cheap half of [_snapshot], because the capability reply must not pay for a
+        profile scan and two stats on every read. It still mirrors the readiness gate [_snapshot]
+        applies: a runner that is not running yet would fail the very call this row invites, and a
+        button that can only answer "Restart could not be confirmed" is worse than no button.
+        `is_gateway_supervisor_process` itself reads four environment variables and nothing else,
+        so it is safe on this path.
+        """
+        runner = getattr(self.adapter, "gateway_runner", None)
+        if runner is None or not callable(getattr(runner, "request_restart", None)):
+            return False
+        if not getattr(runner, "_running", False):
+            return False
+        from gateway.restart import is_gateway_supervisor_process
+
+        return bool(is_gateway_supervisor_process())
 
     @staticmethod
     def _load(path):
@@ -109,6 +144,22 @@ class RestartRpc:
                                                   if row.get("operation") != "activeWork"]
                         result["capabilities"].append({"operation": "activeWork", "scope": "gateway",
                                                        "supported": True, "applyTiming": "read_only"})
+                except Exception:
+                    pass
+            # #3113: say that restart exists. Every reply that carries a capability list gets the
+            # rows, not just the overview, because the phone learns what it may offer from whichever
+            # read it made. A stale row from below is replaced, never doubled.
+            if (isinstance(result, dict) and result.get("status") == "ok"
+                    and isinstance(result.get("capabilities"), list)):
+                # One guard over the whole mutation, like the block above: a malformed row from any
+                # family below must cost the reply its restart rows, never the reply itself.
+                try:
+                    supported = self._restart_supported()
+                    result["capabilities"] = [row for row in result["capabilities"]
+                                              if row.get("operation") not in _OPERATIONS]
+                    result["capabilities"].extend(
+                        {"operation": operation, "scope": "gateway", "supported": supported,
+                         "applyTiming": timing} for operation, timing in _RESTART_CAPABILITIES)
                 except Exception:
                     pass
             return result

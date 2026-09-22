@@ -51,6 +51,13 @@ const STT_TRANSCRIBE_ERROR_CODES = Object.freeze({
   spillFailed: "spill_failed",
 
   transcribeFailed: "transcribe_failed",
+
+  providerQuotaExhausted: "provider_quota_exhausted",
+  providerAuthInvalid: "provider_auth_invalid",
+  providerKeyMissing: "provider_key_missing",
+  providerRateLimited: "provider_rate_limited",
+  providerTimeout: "provider_timeout",
+  providerUnreachable: "provider_unreachable",
 });
 
 const OFFLINE_TRANSCRIBE_MESSAGE =
@@ -86,18 +93,80 @@ function transcribeFailure(provider, code, message) {
   };
 }
 
+function classifySttProviderError(message) {
+  const text = typeof message === "string" ? message.toLowerCase() : "";
+
+  if (
+    /error code:\s*402\b/.test(text) ||
+    /http\s*402\b/.test(text) ||
+
+    /\bquota\b|insufficient_quota|\bcredits?\b|insufficient (balance|funds)|\bbilling\b/.test(text)
+  ) {
+    return STT_TRANSCRIBE_ERROR_CODES.providerQuotaExhausted;
+  }
+
+  if (
+    /error code:\s*40[13]\b/.test(text) ||
+    /http\s*40[13]\b/.test(text) ||
+    text.includes("invalid_api_key") ||
+    text.includes("invalid api key") ||
+    text.includes("incorrect api key") ||
+    text.includes("unauthorized") ||
+    text.includes("authentication")
+  ) {
+    return STT_TRANSCRIBE_ERROR_CODES.providerAuthInvalid;
+  }
+
+  if (
+    text.includes("_api_key not set") ||
+    text.includes("credential found") ||
+    text.includes("credentials found") ||
+    text.includes("api key not set")
+  ) {
+    return STT_TRANSCRIBE_ERROR_CODES.providerKeyMissing;
+  }
+
+  if (
+    /error code:\s*429\b/.test(text) ||
+    /http\s*429\b/.test(text) ||
+    text.includes("rate limit") ||
+    text.includes("rate_limit") ||
+    text.includes("too many requests")
+  ) {
+    return STT_TRANSCRIBE_ERROR_CODES.providerRateLimited;
+  }
+
+  if (text.includes("request timeout") || text.includes("timed out")) {
+    return STT_TRANSCRIBE_ERROR_CODES.providerTimeout;
+  }
+
+  if (
+    text.includes("connection error") ||
+    text.includes("could not connect") ||
+    text.includes("name resolution")
+  ) {
+    return STT_TRANSCRIBE_ERROR_CODES.providerUnreachable;
+  }
+
+  return STT_TRANSCRIBE_ERROR_CODES.transcribeFailed;
+}
+
 function normalizeEnvelopeError(raw) {
   if (typeof raw === "string" && raw.trim()) {
     return {
-      code: STT_TRANSCRIBE_ERROR_CODES.transcribeFailed,
+      code: classifySttProviderError(raw),
       message: raw,
     };
   }
   if (raw && typeof raw === "object") {
     const code = cleanIdentifier(raw.code);
     const message = typeof raw.message === "string" && raw.message ? raw.message : null;
+    const resolvedCode =
+      !code || code === STT_TRANSCRIBE_ERROR_CODES.transcribeFailed
+        ? classifySttProviderError(message || "")
+        : code;
     return {
-      code: code || STT_TRANSCRIBE_ERROR_CODES.transcribeFailed,
+      code: resolvedCode,
       message: message || "transcription failed",
     };
   }

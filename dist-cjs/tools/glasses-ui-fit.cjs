@@ -288,7 +288,8 @@ function checkGlassesUiFit(spec) {
 function checkOwnFit(spec) {
   switch (spec.kind) {
     case "text_surface":
-      if (spec.template === "image_caption") return checkImageCaption(spec);
+
+      if (spec.template === "image_caption" || spec.template === "graphic") return checkImageCaption(spec);
       return checkTextBody(spec);
     case "paged_text_surface":
       return checkPages(spec);

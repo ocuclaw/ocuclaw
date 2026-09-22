@@ -452,7 +452,12 @@ def run_tui_pairing(
             "ok": False,
             "state": "refused",
             "code": "relay_credential_missing",
-            "message": "The host-managed Relay Credential is unavailable.",
+            # #3242: the code keeps the internal name; the sentence a person
+            # reads says what they can act on.
+            "message": (
+                "OcuClaw is installed but your agent has not loaded it yet, so "
+                "there is nothing for a phone to pair with."
+            ),
         }
     callback_token = secrets.token_urlsafe(32)
     presenter_token = secrets.token_urlsafe(32)

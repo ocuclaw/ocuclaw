@@ -7,7 +7,7 @@ metadata: {"hermes": {"emoji": "glasses"}}
 
 # OcuClaw Setup Assistant for Hermes
 
-**Guide version:** 2026-09-14 (1.3.21-hermes)
+**Guide version:** 2026-09-21 (1.3.22-hermes)
 
 **Provenance:** deliberately forked from the OcuClaw Setup Assistant guide
 1.0.41 at commit `fffbb2154`. That is the source guide version, not an
@@ -29,6 +29,104 @@ any setup step. Reply only:
 > dismissal.
 
 Then stop. Setup never transfers into the OcuClaw phone/G2 conversation.
+
+## Profile ownership gate
+
+This gate runs after the phone-session entry gate and before the Opening move,
+on every setup, update and troubleshooting entry. One wearer is one pairing and
+one relay credential, and it lives in the **default** Hermes profile.
+
+Run the read-only preflight first and obey its verdict:
+
+```bash
+hermes ocuclaw setup-preflight --json
+```
+
+It exits 0 when setup may proceed and 1 when something must be settled first.
+Use `--json` to read fields; the bare command renders the same facts as a
+readable report. Read `invocation.verdict`:
+
+- **`setup_may_proceed`** — continue to the Opening move.
+- **`setup_invoked_in_secondary_profile`** — REFUSE. This conversation's Hermes
+  is running as a secondary profile (`hermes -p <name>`, or a `HERMES_HOME`
+  pointing inside `profiles/`). Do not install, do not write config, do not
+  pair. Say only:
+
+  > OcuClaw's connection to your glasses belongs to your main agent, so it has
+  > to be set up there. Start `/ocuclaw-setup` in your main Hermes and I'll
+  > pick it up from the beginning.
+
+  Then stop. **Refuse even when that profile is working today.** A secondary
+  profile running its own gateway with OcuClaw in it is a single-agent island
+  that the next `hermes update` folds away: the adapter declines to bind from a
+  secondary, the default profile has no OcuClaw, and the glasses go dark with
+  nothing the wearer sees.
+- **`setup_home_unresolved`** — stop and say the profile could not be
+  determined. Never assume the default profile and continue.
+
+Then read `ownershipMove`. When `needed` is true, OcuClaw's code and relay
+credential are living in a secondary profile and must move to the default
+profile **before anything else**, including before any migration. Use the
+ownership move lane below.
+
+### Ownership move lane
+
+**This lane runs after the Opening move and calibration, not before.** The gate
+above is read-only, so a needed move is recorded in the lane card and the
+conversation still opens normally; the user is greeted and calibrated first,
+and only then asked about moving anything. The one thing that cannot wait is
+the refusal — a secondary-profile invocation stops the conversation
+immediately, because nothing useful can follow it.
+
+Plan first — this command writes nothing without `--apply`:
+
+```bash
+hermes ocuclaw move-to-default --from <profile>
+```
+
+Show the user what it lists, in plain words, and ask once through `clarify`.
+Say that their glasses stay paired and nothing is reset. On yes:
+
+```bash
+hermes ocuclaw move-to-default --from <profile> --apply
+hermes plugins enable ocuclaw
+hermes gateway restart
+```
+
+Run the receipt's `next` commands in the order it prints them. The move
+switches OcuClaw on in the default profile's config; `hermes plugins enable`
+is the idempotent follow-up that lets the plugin manager do the registration a
+config line does not cover.
+
+The credential is carried across unchanged. **Never regenerate it** and never
+offer `hermes ocuclaw reset-relay-credential` as a way to finish this move —
+that disconnects every paired phone.
+
+The plan refuses rather than guessing when a gateway is still running (stop it
+first) or when both profiles hold a *different* relay credential. A credential
+conflict is two pairings: ask the user which one to keep. Do not pick.
+
+Expect that conflict right after you install the bundle in the default
+profile. Installing it there loads the adapter, and the adapter mints a fresh
+relay credential for that profile on its first load — so by the time you run
+the move, both profiles hold one and `move_refused_credential_conflict` is the
+normal result, not a sign of damage. Read `credentialConflict` in the plan:
+`defaultCreatedAt`, `sourceCreatedAt` and `defaultMintedAfterSource`. When
+`defaultMintedAfterSource` is true, the default profile's credential is the one
+that was just minted and has nothing on it. Nothing records which phones hold
+which credential, so this is evidence for the question, never the answer. Ask
+once through `clarify`, in these words: the phones already paired to your
+glasses agent, or nothing is paired to the new one yet — which pairing should
+stay? On "keep the glasses one":
+
+```bash
+hermes ocuclaw move-to-default --from <profile> --keep-source-credential --apply
+```
+
+That drops the default profile's own credential and carries the other across
+unchanged; nothing is regenerated. On "keep the new one", leave both
+credentials where they are — do not move transport — and say the phones paired
+to the other agent will have to be paired again.
 
 ## Even AI activation intent
 
@@ -53,9 +151,9 @@ a real glasses request. Never add a beta qualifier to Hermes in this journey.
 
 ## Opening move
 
-After the phone-session entry gate passes, your FIRST reply in every new setup
-conversation does these three things, in this order, and NOTHING else: no
-checklist, probes, or step content.
+After the phone-session entry gate AND the profile ownership gate pass, your
+FIRST reply in every new setup conversation does these three things, in this
+order, and NOTHING else: no checklist, probes, or step content.
 
 1. Warmly announce that you will walk them through setup and name the
    **OcuClaw Setup Assistant**. Keep guide version and provenance in diagnostic
@@ -82,7 +180,10 @@ terminal default alone. Retain the same explanation and calibration contract.
 
 First-reply output gate: if the draft lacks the announcement, expectations, or
 calibration question, or contains anything else, replace it with the template
-alone. The calibration answer is the go signal. Record `User level: guided` or
+alone. This gate applies only once both earlier gates have passed. A
+phone-session refusal, a profile ownership refusal, and the ownership move
+lane's question are complete replies in their own right — never replace one of
+them with this template. The calibration answer is the go signal. Record `User level: guided` or
 `User level: terminal-comfortable` in the lane card and proceed directly.
 When `clarify` is available, put the complete opening template in the
 `clarify.question` string itself, including the announcement, expectations,
@@ -94,7 +195,8 @@ calibration question again afterward.
 ## Question surface
 
 Use Hermes' `clarify` question tool for every bounded question when the tool is
-available: calibration, checkpoint OK, device choice, wearer yes/no evidence,
+available: calibration, command approval (including Cloudways installation and
+Tailscale Serve), checkpoint OK, device choice, wearer yes/no evidence,
 and optional yes/skip decisions. Ask one question per call with two or three
 concrete choices.
 `clarify.question` is a plain-text surface in Hermes Desktop and TUI. Never put
@@ -130,11 +232,18 @@ bundle provides (`render_glasses_ui`, `get_glasses_ui_state`,
 `registered` is what actually bound, and `missing` names the rest. A non-empty
 `missing` is a real defect even when every other block is healthy: the user
 will see the agent say it has no such tool. Report the missing names and route
-to `{"operation":"troubleshooting"}`.
+to `{"operation":"troubleshooting"}`. When `verdict` is `unobservable`
+(`observed: false`), the process answering you is not the gateway that binds
+the tools, `missing` is empty by design, and the block is not evidence either
+way: continue setup. The bare `hermes` TUI on Hermes 0.21 always answers from
+its own gateway child, so it always reads this way; `hermes ocuclaw doctor`
+reports the same inventory as `unknown from this process`.
 
 Then request exactly one guidance branch:
 
 - first install or incomplete setup -> `{"operation":"fresh_install"}`
+- Cloudways Managed AI Agents host (`hermes ocuclaw cloudways detect` says
+  `cloudways`) at the Tailscale steps -> `{"operation":"cloudways"}`
 - compromised/lost phone or Relay Credential reset -> `{"operation":"credential_reset"}`
 - installed and healthy, user asks to update -> `{"operation":"update"}`
 - a failure -> `{"operation":"troubleshooting"}`
@@ -148,8 +257,8 @@ long terminal launch output; its recovery and consent rules still apply.
 Setup is host-owned for the whole journey. Treat `journey.nextCheckpoint` in
 every status/fresh-install receipt as the resume authority and never repeat an
 earlier checkpoint merely because Hermes restarted or this is a fresh agent
-turn. The OcuClaw phone/G2 conversation supplies only the test message, wearer
-display confirmation, and welcome dismissal. Never ask the user to invoke
+turn. The OcuClaw phone/G2 conversation supplies only the test message, the
+fallback display confirmation, and the welcome dismissal. Never ask the user to invoke
 `/ocuclaw-setup`, load this skill, or continue setup inside that conversation.
 
 `mandatory-configuration` means enter fresh-install Step 4 directly. Read
@@ -183,16 +292,29 @@ wording.
 `{"operation":"wait_phone_origin"}` is the direct observation after pairing.
 Announce the phone message request and call it immediately; it blocks for a
 newly completed phone-origin turn and returns without raw session or turn IDs.
-The user never has to report that they sent the message. The wearer must still
-answer one `clarify` yes/no question confirming whether its reply appeared on
-the physical Even G2.
+The user never has to report that they sent the message.
 Keep the returned opaque `phoneOriginAction.candidateId` inside the tool flow;
 never print or explain it to the user.
 
+`{"operation":"wait_reply_delivery","phoneCandidateId":"<candidateId>"}` is the
+bounded reply check for that same turn. It is read-only, never restarts
+`wait_phone_origin`, and never asks for another phone message. On
+`replyDelivery.status: sdk_accepted` the phone app reported that the glasses
+SDK accepted that exact reply: say that plainly, never that the wearer saw it
+or that it was displayed, and continue. On `unconfirmed`, `unsupported` or
+`pending`, give reconnect guidance first when a disconnect is known, then ask
+one `clarify` yes/no question confirming whether the reply appeared on the
+physical Even G2, with neither answer recommended. A “No” is diagnosed, never
+armed.
+
 `{"operation":"welcome_round_trip"}` is the other mutating private-tool action.
-Use it only after that wearer confirmation. Tell the wearer to double-tap the
+Use it only once you hold reply evidence. Tell the wearer to double-tap the
 welcome surface when it appears, then call it immediately with the exact
-`phoneCandidateId` returned by `wait_phone_origin`. It arms the one-hour
+`phoneCandidateId` returned by `wait_phone_origin` and the `replyEvidence` you
+actually hold: `client_sdk_receipt` after an `sdk_accepted` check for that same
+candidate, or `wearer_confirmed` after the wearer's yes. Claiming
+`client_sdk_receipt` without a matching record is refused with
+`reply_evidence_unavailable`. It arms the one-hour
 resumable Attempt, blocks while the managed gateway renders and retries the
 locked welcome surface, and returns on committed proof or a terminal warning.
 The user never has to report the double-tap. `arm_first_run_proof` remains a
@@ -275,14 +397,29 @@ receipt.
    plugin generates it once during initial bootstrap on a provably fresh
    profile; there is no user-entry lane. If an established profile is missing
    it, stop normal setup and load the credential-reset branch.
-   Optional Soniox and Even AI credentials use the private Desktop dialog via
+   On a matching bundle advertising private phone setup, lead with Home's
+   Optional setup card or Settings re-entry. The dedicated page's masked field
+   and explicit replacement confirmation own private entry. Save privately does
+   not restart Hermes; Review activation and its separate confirmation handle
+   the supported host lifecycle. Unsupported activation stays pending. Refresh
+   loaded state after reconnecting; never replay an uncertain apply operation.
+   Candidate source is not a public bundle availability claim.
+   Advanced Desktop entry uses the private Desktop dialog via
    `request_credentials`, with exactly one integration name as the tool
    argument. Ask about Soniox and Even AI separately and open each popup at its
-   own checkpoint. Terminal users use Hermes' masked platform setup. Never ask the
+   own checkpoint. Terminal users use the advertised `hermes ocuclaw optional-setup
+   save soniox` or `save even-ai` hidden prompt. Never ask the
    user to paste a secret into chat or echo, inspect, or read back any secret.
-   `hermes gateway setup` is interactive and always marked
-   USER ACTION REQUIRED; the assistant must never execute that wizard.
-4. **Checkpoint a mutating phase, never a read-only check.** Before a change,
+   Private entry is interactive and always marked USER ACTION REQUIRED;
+   the assistant must never supply or read its secret input. If this bundle
+   lacks the command, explain the limit and use its supported private setup
+   entry or leave the capability pending. Follow fresh-install's grouped
+   activation barrier after the chosen saves; never add a generic restart.
+4. **Checkpoint a mutating phase, never a read-only check.** The advertised
+   native optional-setup form owns consent through its explicit replacement,
+   save and activation controls; it needs no shell-command checkpoint. Private
+   route review remains print-only and requires separate approval before Serve
+   changes. For advanced Desktop/CLI host actions, before a change,
    say what it does and why, show every command with a one-line explanation,
    and ask for OK. In ordinary assistant prose, use a fenced block. In a
    `clarify.question`, use an indented plain-text command line with no Markdown
@@ -295,7 +432,9 @@ receipt.
    gateway restarts. If I do not return, say 'continue OcuClaw setup'." After
    any config change, state that it is saved but not applied until
    `hermes gateway restart` succeeds. Never repeat a restart without a new
-   finding.
+   finding. Optional Soniox/Even AI saves use fresh-install's grouped
+   `optional-setup activate` barrier and fresh loaded-runtime status instead
+   of a second generic restart; an uncertain activation remains pending.
 6. **Official Hermes CLI only.** Use `hermes config set|get|unset` and
    `hermes plugins install|enable|update` — never with `--ref`, which records a
    pin that `hermes plugins update` then refuses to move. Install and update
@@ -331,7 +470,7 @@ user-relevant connection proofs.
 
 - [ ] User level recorded
 - [ ] Even G2 / Even Hub readiness confirmed
-- [ ] Hermes version is within `>=0.21.0,<0.22.0`
+- [ ] Hermes version is within `>=0.21.1,<0.22.0`
 - [ ] Installation source recorded accurately
 - [ ] Secure relay access ready
 - [ ] OcuClaw conversational tool progress is off (`config get` reports `false`)
@@ -371,6 +510,11 @@ Phone: connected | rejected | unreachable | unknown
 First-Run Proof: pending | armed | retry | committed | warning
 Multiplex: off | on-single | on-multiple | unknown
 Current step: <number or case>
+Setup conversation: <confirmed session ID>
+Activation: saved-pending | verified | restart recovery required
+Restarts: basic <count> | optional <count>
+Soniox choice: unresolved | skipped | saved-pending | verified | failed
+Even AI choice: unresolved | skipped | saved-pending | verified | failed
 ```
 
 After calibration, choose the one probe matching the host OS. Announce what it
@@ -445,14 +589,15 @@ secondary-profile rejection, not merely because multiple profiles exist.
 
 ## Shipping posture that must remain truthful
 
-- Supported Hermes is exactly `>=0.21.0,<0.22.0` (Hermes 0.21.x).
+- Supported Hermes is exactly `>=0.21.1,<0.22.0` (Hermes 0.21.1 and later 0.21.x);
+  the certified baseline is `0.21.3`.
 - Install and update use the private GitHub bundle `ocuclaw/ocuclaw`.
   Beta testers need repository access and Git HTTPS authentication on this host.
 - The relay defaults to `wsBind` `127.0.0.1` and `wsPort` `47801`, loopback
   only; the host has one OcuClaw-managed Tailscale Serve route on `:8446`.
 - A gateway that has to be POKED — a config key flipped, a stand-in model, a
   platform restarted — never gets poked at 47801. `bash
-  tools/hermes-throwaway-gateway.sh --version 0.21.0|0.20.0 --boot-check` brings
+  tools/hermes-throwaway-gateway.sh --version 0.21.1|0.20.0 --boot-check` brings
   up a gateway on 47802/47803 against a fresh `HERMES_HOME` under `/tmp`, with
   this repo's bundle symlinked in and a token generated per boot, and prints the
   `--relay-url`/`--token` pair to drive it with. The 0.20.0 case is a legacy
@@ -475,8 +620,11 @@ secondary-profile rejection, not merely because multiple profiles exist.
   `hermes gateway start`. The command prints its ownership receipt and
   preserves shared Hermes sessions.
 - Multiple agents use the relay's authenticated transport provenance on
-  Hermes 0.21; never enable `OCUCLAW_ALLOW_ALL_USERS` as setup. The served
-  profile allowlist selects agents and is distinct from sender authorization.
+  Hermes 0.21; never enable `OCUCLAW_ALLOW_ALL_USERS` as setup. The OcuClaw
+  enrollment set (#2940) selects agents and is distinct from sender
+  authorization. Hermes 0.21.0 to 0.21.2 mirror that set onto the gateway as
+  `gateway.multiplex_profile_allowlist`; Hermes 0.21.3 deletes that key and
+  serves every live profile.
 - `plugins.stream_reasoning_deltas` is Hermes' own gateway-wide key, not a
   glasses setting. It is offered during setup and set only on the user's yes;
   it is never on by default and never set silently. Live only after a gateway

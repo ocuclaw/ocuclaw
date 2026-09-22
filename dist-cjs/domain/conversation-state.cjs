@@ -187,6 +187,7 @@ function buildDisplayEntry(msg, options = {}) {
       ? { id: `srv:send:${clientSendId}`, idSource: "send" }
       : { id: `srv:derived:${seq}`, idSource: "derived" };
 
+  const sentAtMs = sentAtMsOf(msg);
   return {
     ...identity,
     seq,
@@ -196,7 +197,23 @@ function buildDisplayEntry(msg, options = {}) {
     name: typeof msg.name === "string" && msg.name ? msg.name : null,
     runId: runId || null,
     clientSendId: clientSendId || null,
+    ...(sentAtMs !== null ? { sentAtMs } : {}),
   };
+}
+
+function sentAtMsOf(msg) {
+  return authoredMsOf(msg) ?? arrivalMsOf(msg);
+}
+
+const EPOCH_MS_FLOOR = 1e12;
+
+function authoredMsOf(msg) {
+  const raw = msg?.timestamp;
+  if (raw === undefined || raw === null || raw === "" || typeof raw === "boolean") return null;
+  let value = Number(raw);
+  if (!Number.isFinite(value) && typeof raw === "string") value = Date.parse(raw);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return Math.floor(value < EPOCH_MS_FLOOR ? value * 1000 : value);
 }
 
 function normalizeSessionStarterCandidate(text) {
@@ -519,6 +536,75 @@ function arrivalMsOf(msg) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function trimmedId(value) {
+  return typeof value === "string" || typeof value === "number" ? String(value).trim() : "";
+}
+
+function arrivalCarryKeys(msg) {
+  const keys = [];
+  const sendId = trimmedId(msg.clientSendId ?? msg.sendId);
+  if (sendId) keys.push(`send:${sendId}`);
+
+  const idempotencyKey = trimmedId(msg.idempotencyKey);
+  if (idempotencyKey) keys.push(`send:${idempotencyKey}`);
+  const serverId = trimmedId(msg.id ?? msg.messageId ?? msg.__openclaw?.id);
+  if (serverId) keys.push(`id:${msg.role}:${serverId}`);
+  const upstream = upstreamMessageIdentity(msg);
+  if (upstream) keys.push(`up:${upstream}`);
+  return keys;
+}
+
+function carryArrivalStamps(previous, next) {
+  if (!Array.isArray(previous) || previous.length === 0) return;
+  const byKey = new Map();
+  const userByText = new Map();
+  for (const msg of previous) {
+    if (!msg || (msg.role !== "user" && msg.role !== "assistant")) continue;
+    const arrival = arrivalMsOf(msg);
+    if (arrival === null) continue;
+    for (const key of arrivalCarryKeys(msg)) {
+      if (!byKey.has(key)) byKey.set(key, arrival);
+    }
+    if (msg.role === "user") {
+      const text = normalizeRetagMatchText(extractText(msg.content));
+      if (!text) continue;
+      const queue = userByText.get(text) ?? [];
+      queue.push(arrival);
+      userByText.set(text, queue);
+    }
+  }
+  if (byKey.size === 0 && userByText.size === 0) return;
+  for (const msg of next) {
+    if (!msg || typeof msg !== "object" || (msg.role !== "user" && msg.role !== "assistant")) continue;
+    if (authoredMsOf(msg) !== null || arrivalMsOf(msg) !== null) continue;
+    const keyed = arrivalCarryKeys(msg).map((key) => byKey.get(key)).find((value) => value !== undefined);
+    if (keyed !== undefined) {
+      stampArrival(msg, keyed);
+      continue;
+    }
+    if (msg.role !== "user") continue;
+    const queue = userByText.get(normalizeRetagMatchText(extractText(msg.content)));
+    if (queue && queue.length > 0) stampArrival(msg, queue.shift());
+  }
+}
+
+function carryCommitRunId(next, runId, text) {
+  const normalizedRunId = typeof runId === "string" ? runId.trim() : "";
+  const target = normalizeRetagMatchText(text);
+  if (!normalizedRunId || !target || !Array.isArray(next)) return;
+  let match = null;
+  for (const msg of next) {
+    if (!msg || typeof msg !== "object" || msg.role !== "assistant") continue;
+    if (normalizeRetagMatchText(extractText(msg.content)) !== target) continue;
+
+    if (match) return;
+    match = msg;
+  }
+
+  if (!match || (typeof match.runId === "string" && match.runId.trim())) return;
+  match.runId = normalizedRunId;
+}
+
 function findNarrationMessageIndex(target, messageId = null) {
   const wantedId = typeof messageId === "string" || typeof messageId === "number"
     ? String(messageId).trim()
@@ -598,10 +684,16 @@ const conversationState = {
 
   hydrate(msgs, name, sessionKeyOrOptions = null, maybeOptions = undefined) {
     const sessionKey = typeof sessionKeyOrOptions === "string" ? sessionKeyOrOptions : null;
+    const previousSequenceState = activeSequenceState;
     if (sessionKey !== null && sessionKey !== undefined) {
       activateSequenceSession(sessionKey);
     }
-    messages = Array.isArray(msgs) ? [...msgs] : [];
+    const previousMessages = conversationState.getRawMessages();
+    const nextMessages = Array.isArray(msgs) ? [...msgs] : [];
+    if (activeSequenceState === previousSequenceState) {
+      carryArrivalStamps(previousMessages, nextMessages);
+    }
+    messages = nextMessages;
     if (name) agentName = name;
     const options = sessionKey === null ? sessionKeyOrOptions : maybeOptions;
     const opts = options && typeof options === "object" ? options : {};
@@ -611,6 +703,8 @@ const conversationState = {
       : opts.truncatedHead === true
         ? HISTORY_TRUNCATED_MARKER
         : null;
+
+    carryCommitRunId(nextMessages, opts.commitRunId, opts.commitText);
     rebuildDisplayCache();
     entriesRevision += 1;
 
@@ -633,6 +727,8 @@ const conversationState = {
         );
         const reconciled = { ...existing, role, content, ...definedMetadata };
         if (name) reconciled.name = name;
+
+        stampArrival(reconciled, arrivalMsOf(existing));
         messages[existingIndex] = reconciled;
         rebuildDisplayCache();
         entriesRevision += 1;
@@ -751,6 +847,7 @@ const conversationState = {
 
     const msg = { role: "user", content };
     if (name) msg.name = name;
+    stampArrival(msg, Date.now());
 
     if (index >= 0) {
       messages = messages.slice(0, index);

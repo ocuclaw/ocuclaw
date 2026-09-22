@@ -3,11 +3,12 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { LIVEUI_LIBRARY_ITEM_TYPES, canonicalSerialize, createLiveuiLibrary, isValidLiveuiLibraryItemId, projectLiveuiLibraryForGlasses, resolveLiveuiLibraryRoot } = require("./glasses-ui-library.cjs");
 const { listKindItemSchemas, validateKindItemAgainstGrammar } = require("./glasses-ui-descriptors.cjs");
+const { isTerminalOutcome } = require("./glasses-ui-surfaces.cjs");
 const { refreshSchemaForToolParams } = require("./glasses-ui-refresh-schema.cjs");
 const { projectLiveuiTaskRunForPhone } = require("./glasses-ui-task-run.cjs");
 const { isLiveuiSwitchedOff, liveuiDisabledResult } = require("./glasses-ui-prefs.cjs");
 const { GLASSES_UI_LIMITS, LIVEUI_TEMPLATE_RENDER_TIMEOUT_MAX_MS } = require("./glasses-ui-limits.cjs");
-const { LIVEUI_TEMPLATE_SLOT_LIST_MAX, LIVEUI_TEMPLATE_SLOT_MAX, LIVEUI_TEMPLATE_SLOT_TEXT_MAX, copyLiveuiStaticJson, fillLiveuiTemplate, previewLiveuiTemplatePresentation, sampleLiveuiTemplateValues, validateLiveuiTemplateSlotContract } = require("./glasses-ui-template-slots.cjs");
+const { LIVEUI_TEMPLATE_SLOT_JSON_MAX_BYTES, LIVEUI_TEMPLATE_SLOT_LIST_MAX, LIVEUI_TEMPLATE_SLOT_MAX, LIVEUI_TEMPLATE_SLOT_TEXT_MAX, copyLiveuiStaticJson, fillLiveuiTemplate, previewLiveuiTemplatePresentation, sampleLiveuiTemplateValues, validateLiveuiTemplateSlotContract } = require("./glasses-ui-template-slots.cjs");
 
 const LIVEUI_TEMPLATE_LIBRARY_SCHEMA_VERSION =
   LIVEUI_LIBRARY_ITEM_TYPES.template.schemaVersion;
@@ -24,6 +25,29 @@ const LIVEUI_TEMPLATE_TOOL_DESCRIPTION = [
   "Use save with template, read/render with templateId, list for Templates",
   "only, or list_library for every saved Library item type.",
 ].join("\n");
+
+const graphicFieldSchema = {
+  type: "object",
+  required: ["slots"],
+  properties: {
+    slots: {
+      type: "array",
+      minItems: 1,
+      maxItems: GLASSES_UI_LIMITS.graphicSlotsMax,
+      items: {
+        type: "object",
+        required: ["type"],
+        properties: {
+          type: { type: "string" },
+          label: { type: "string" },
+          icon: { type: "string" },
+        },
+        additionalProperties: { type: "string" },
+      },
+    },
+  },
+  additionalProperties: false,
+};
 
 const engineFieldProperties = {
   kind: { type: "string" },
@@ -50,6 +74,7 @@ const engineFieldProperties = {
   },
   staleAfterMs: { type: "integer" },
   queueMode: { type: "string" },
+  graphic: graphicFieldSchema,
 };
 
 const engineFieldsSchema = {
@@ -59,7 +84,7 @@ const engineFieldsSchema = {
 };
 
 const assetProperties = {
-  template: { type: "string", enum: ["image_caption"] },
+  template: { type: "string", enum: ["image_caption", "graphic"] },
   imageAsset: { type: "string" },
   imageBase64: { type: "string" },
   imageWidth: { type: "integer" },
@@ -115,6 +140,17 @@ const slotsSchema = {
         properties: {
           ...slotCommonProperties,
           type: { const: "image" },
+        },
+        additionalProperties: false,
+      },
+      {
+
+        type: "object",
+        required: ["key", "type"],
+        properties: {
+          ...slotCommonProperties,
+          type: { const: "json" },
+          maxBytes: { type: "integer", minimum: 1, maximum: LIVEUI_TEMPLATE_SLOT_JSON_MAX_BYTES },
         },
         additionalProperties: false,
       },
@@ -201,7 +237,17 @@ const liveuiTemplateToolParametersSchema = {
         anyOf: [
           { type: "string" },
           { type: "number" },
-          { type: "array", items: { type: "string" } },
+          {
+
+            type: "array",
+            items: {
+              anyOf: [
+                { type: "string" },
+                { type: "number" },
+                { type: "array", items: { anyOf: [{ type: "string" }, { type: "number" }] } },
+              ],
+            },
+          },
           {
             type: "object",
             properties: {
@@ -424,6 +470,7 @@ function createLiveuiTemplateLibrary(opts = {}) {
       if (envelope.status !== "accepted") return envelope;
       const artifact = envelope.template;
       const hasSlotContract = artifact.slots !== undefined || artifact.presentations !== undefined;
+
       const sampleValues = hasSlotContract ? sampleLiveuiTemplateValues(artifact) : {};
       const filled = hasSlotContract
         ? fillLiveuiTemplate(artifact, sampleValues)
@@ -439,17 +486,32 @@ function createLiveuiTemplateLibrary(opts = {}) {
       const validation = validateSpec
         ? validateSpec(spec)
         : { ok: true, normalizedSpec: spec, errors: [] };
-      if (!validation || validation.ok !== true || !validation.normalizedSpec) {
+      let validationOk = !!(validation && validation.ok === true && validation.normalizedSpec);
+
+      if (!validationOk && hasSlotContract && options.helperOf !== undefined &&
+          options.selfCheckValues && typeof options.selfCheckValues === "object" &&
+          !Array.isArray(options.selfCheckValues)) {
+        const realFilled = fillLiveuiTemplate(artifact, options.selfCheckValues);
+        const realValidation = realFilled.status === "filled" && validateSpec
+          ? validateSpec(realFilled.spec)
+          : { ok: false };
+        validationOk = !!(realValidation && realValidation.ok === true);
+      }
+      if (!validationOk) {
         const first = validation && Array.isArray(validation.errors) ? validation.errors[0] : null;
         return rejected(
           first && first.code ? first.code : "template_spec_invalid",
           first && first.message ? first.message : "template spec failed LiveUI Engine validation",
         );
       }
+
+      const persistedSpec = validation && validation.ok === true && validation.normalizedSpec
+        ? validation.normalizedSpec
+        : spec;
       if (artifact.recipe !== undefined) {
         const droppedPath = firstEngineDroppedPath(
           artifact.recipe,
-          validation.normalizedSpec.refresh,
+          persistedSpec.refresh,
         );
         if (droppedPath) {
           return rejected(
@@ -496,10 +558,10 @@ function createLiveuiTemplateLibrary(opts = {}) {
         ...(helperValidation.helperOf === undefined
           ? {}
           : { helperOf: helperValidation.helperOf }),
-        ...(validation.normalizedSpec.refresh === undefined
+        ...(persistedSpec.refresh === undefined
           ? {}
-          : { recipe: validation.normalizedSpec.refresh }),
-        spec: validation.normalizedSpec,
+          : { recipe: persistedSpec.refresh }),
+        spec: persistedSpec,
       };
 
       const saved = library.saveItem("template", artifact.templateId, digestInput, options);
@@ -573,6 +635,8 @@ async function runLiveuiTemplateRenderLifecycle(opts) {
       signal: opts.signal,
       onOpened: opts.onOpened,
       wearerInitiated: opts.wearerInitiated === true,
+
+      requireViewedSession: opts.requireViewedSession === true,
     });
   } catch (err) {
     if (!opts.restoreDepth) {
@@ -879,9 +943,12 @@ function createLiveuiGlassesLibraryController(opts) {
 
         const ended = lifecycle.then(
           (result) => {
-            const details = getActiveTemplateSurface();
-            if (details && details.surfaceId === openedSurfaceId) {
-              setActiveTemplateSurface(null);
+
+            if (isTerminalOutcome(result && result.outcome)) {
+              const details = getActiveTemplateSurface();
+              if (details && details.surfaceId === openedSurfaceId) {
+                setActiveTemplateSurface(null);
+              }
             }
             return { kind: "ended", result, error: null, details: null };
           },

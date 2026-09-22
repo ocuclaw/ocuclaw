@@ -77,7 +77,9 @@ function createPairingEndpointService(
       if (tag !== null && (copy.type === "pairing.failed" || copy.type === "pairing.rejected")) {
         for (let i = outbox.length - 1; i >= 0; i -= 1) {
           const entry = outbox[i]               ;
-          if (entry.exchangeId === tag && entry.frame.type === "pairing.credential") {
+
+          if (entry.exchangeId === tag &&
+              (entry.frame.type === "pairing.credential" || entry.frame.type === "pairing.complete")) {
             outbox.splice(i, 1);
           }
         }

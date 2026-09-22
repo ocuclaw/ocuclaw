@@ -4,7 +4,7 @@ WHAT THIS IS
 ------------
 
 Q4 puts the approval of a Pairing Exchange at an interactive terminal owned by
-OcuClaw, with an exact yes/no prompt that shows only a sanitized phone label and
+OcuClaw, with an explicit approve/refuse/cancel prompt that shows a sanitized phone label and
 the four-word safety phrase. This module is that terminal.
 
 WHY IT TALKS TO THE RELAY OVER HTTP
@@ -37,6 +37,7 @@ import json
 import math
 import os
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -105,9 +106,9 @@ POLL_INTERVAL_S = 1.0
 POLL_DEADLINE_S = 135.0
 
 #: How many unreadable answers to tolerate before treating the prompt as refused.
-MAX_PROMPT_RETRIES = 3
+MAX_PROMPT_RETRIES = 5
 
-PROMPT_TEXT = "Do these four words match, in this order, on the phone? [yes/no]: "
+PROMPT_TEXT = "Type approve, refuse, or cancel: "
 
 RESET_WARNING = (
     "Reset immediately invalidates ALL existing app pairings, disconnects "
@@ -131,11 +132,16 @@ PERSISTENCE_AMBIGUOUS = relay_credential.PERSISTENCE_AMBIGUOUS
 #: Terminal states, from PairingState in pairing-exchange.ts.
 _TERMINAL_STATES = frozenset({"completed", "failed"})
 
+#: "The code ran out with nothing claiming it", in the core's own vocabulary.
+#: The host reports it as a failure reason; the local deadline below reaches the
+#: same end without the host having said anything, and reports the same word.
+EXPIRED_REASON = "expired"
+
 #: Plain-language endings, keyed by the core's secret-free failure reasons.
 _FAILURE_TEXT: Dict[str, str] = {
     "expired": (
         "The pairing request expired before it finished. Nothing was sent to the "
-        "phone. Run `hermes ocuclaw pair` again to start a new one."
+        "phone."
     ),
     "approval-denied": (
         "Pairing was refused here, so nothing was sent to the phone. If the words "
@@ -145,7 +151,7 @@ _FAILURE_TEXT: Dict[str, str] = {
     "cancelled": "Pairing was cancelled. Nothing was sent to the phone.",
     "too-many-attempts": (
         "Too many attempts were made against this pairing request, so it was "
-        "closed. Run `hermes ocuclaw pair` again to start a new one."
+        "closed."
     ),
     "pairing-code-mismatch": (
         "The pairing code was entered incorrectly too many times. Start again to "
@@ -164,9 +170,20 @@ _FAILURE_TEXT: Dict[str, str] = {
 }
 
 _GENERIC_FAILURE = (
-    "Pairing stopped without completing, and nothing was saved on the phone. Run "
-    "`hermes ocuclaw pair` again to start a new one."
+    "Pairing stopped without completing, and nothing was saved on the phone."
 )
+
+#: How the STANDALONE verb tells a user to start over (#3234c). A caller that
+#: DRIVES this ceremony never prints it: `hermes ocuclaw pair` needs an
+#: `--address` that a user copying this line does not have, and the Cloudways
+#: ladder offers a fresh code in place instead (#3233). A driven run is told to
+#: run the same command again, by the command that drove it.
+START_A_NEW_ONE = " Run `hermes ocuclaw pair` again to start a new one."
+
+#: The endings a standalone run follows with :data:`START_A_NEW_ONE`. Any reason
+#: this module does not know falls through to :data:`_GENERIC_FAILURE` and gets
+#: it too.
+_START_A_NEW_ONE_REASONS = frozenset({"expired", "too-many-attempts"})
 
 
 class ControlError(Exception):
@@ -902,7 +919,18 @@ def _refusal_text(status: int) -> str:
 _SAFE_LABEL = re.compile(r"[^A-Za-z0-9 ._+\-]")
 
 
-def _render_prompt_block(phone_label: str, phrase: Any) -> str:
+def _render_words_box(words: Any, *, unicode: bool = False) -> str:
+    """The four words in a box of their own, so the eye lands on them first."""
+    inner = "   " + "   ".join(words) + "   "
+    tl, tr, bl, br, h, v = "\u250c\u2510\u2514\u2518\u2500\u2502" if unicode else "++++-|"
+    return (
+        f"    {tl}{h * len(inner)}{tr}\n"
+        f"    {v}{inner}{v}\n"
+        f"    {bl}{h * len(inner)}{br}\n"
+    )
+
+
+def _render_prompt_block(phone_label: str, phrase: Any, *, unicode: bool = False) -> str:
     """Render the approval question.
 
     Shows the two things Q4 permits and nothing else. Both arrive already
@@ -914,56 +942,94 @@ def _render_prompt_block(phone_label: str, phrase: Any) -> str:
     words = [str(word) for word in phrase] if isinstance(phrase, (list, tuple)) else []
     return (
         "\n"
-        "  A phone is asking to pair.\n"
+        f"  Phone: {label}\n"
+        "  Match these four words with your phone, in order.\n"
+        f"{_render_words_box(words, unicode=unicode)}"
         "\n"
-        f"    Phone:  {label}\n"
-        f"    Words:  {' '.join(words)}\n"
-        "\n"
-        "  Approve only if the phone shows these four words, in this order.\n"
-        "  If even one word differs, answer no.\n"
-        "\n"
+        "  If any word differs, type refuse.\n"
     )
 
 
-def _ask_yes_no(
+_APPROVE_ANSWERS = frozenset({"approve", "approved", "yes"})
+_DENY_ANSWERS = frozenset({"refuse", "refused", "no", "deny", "cancel"})
+
+
+def _ask_approval(
     stdin: TextIO,
     stdout: TextIO,
     *,
     prompt: str = PROMPT_TEXT,
     max_retries: int = MAX_PROMPT_RETRIES,
-) -> bool:
-    """Ask the exact yes/no question. Anything unreadable ends as a refusal.
+    deadline: Optional[float] = None,
+    monotonic_fn: Callable[[], float] = time.monotonic,
+) -> str:
+    """Return the explicit decision. Typos never authorize a phone."""
+    from .terminal_output import styled
 
-    Only the whole words "yes" and "no" are accepted. A bare "y" is deliberately
-    NOT enough: this is the one question standing between an unverified peer and
-    the Relay Credential, and a single keystroke is too easy to fire off by
-    reflex at a prompt the user has not read.
-    """
     for _attempt in range(max_retries):
-        stdout.write(prompt)
+        stdout.write(styled(prompt, stdout, role="prompt"))
         stdout.flush()
         try:
-            line = stdin.readline()
+            line = _approval_line(stdin, deadline=deadline, monotonic_fn=monotonic_fn)
+            if line is None:
+                return "expired"
         except (KeyboardInterrupt, EOFError):
-            return False
+            return "cancel"
         if line == "":  # EOF
-            return False
+            return "cancel"
         answer = line.strip().lower()
-        if answer == "yes":
-            return True
-        if answer == "no":
-            return False
-        stdout.write('  Please answer "yes" or "no".\n')
+        if answer in _APPROVE_ANSWERS:
+            return "approve"
+        if answer in _DENY_ANSWERS:
+            return "cancel" if answer == "cancel" else "refuse"
+        stdout.write("  Not approved. Type approve, refuse, or cancel.\n")
     stdout.write("  No clear answer, so pairing was not approved.\n")
-    return False
+    return "cancel"
 
 
-def _outcome_text(state: str, failure: Any, credential_exposure: str) -> str:
-    """The last thing printed. Never claims more than the host can know."""
+def _approval_line(
+    stdin: TextIO, *, deadline: Optional[float], monotonic_fn: Callable[[], float]
+) -> Optional[str]:
+    """Read a terminal line without letting silence outlive this exchange.
+
+    Reading one byte at a time avoids TextIO buffering a second queued answer
+    beyond select's view. Non-file streams are the existing injected test seam.
+    None means deadline, while an empty string retains EOF/cancellation meaning.
+    """
+    if deadline is None:
+        return stdin.readline()
+    try:
+        fd = stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        return stdin.readline() if monotonic_fn() < deadline else None
+    answer = bytearray()
+    while True:
+        remaining = deadline - monotonic_fn()
+        if remaining <= 0:
+            return None
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            return None
+        chunk = os.read(fd, 1)
+        if not chunk:
+            return ""
+        answer.extend(chunk)
+        if chunk == b"\n":
+            return answer.decode("utf-8", errors="replace")
+
+
+def _outcome_text(
+    state: str, failure: Any, credential_exposure: str, *, driven: bool = False,
+    phase: str = "unknown",
+) -> str:
+    """The last thing printed. Never claims more than the host can know.
+
+    ``driven`` says another command is running this ceremony (#3234c). That
+    command owns "what to do next", because `hermes ocuclaw pair` needs an
+    `--address` the user cannot copy out of this text.
+    """
     if state == "completed":
-        return (
-            "\n  Paired. The phone connected back and confirmed it.\n"
-        )
+        return "" if driven else "\n  Paired. Your phone is connected.\n"
     reason = ""
     if isinstance(failure, Mapping):
         reason = str(failure.get("reason") or "")
@@ -978,9 +1044,24 @@ def _outcome_text(state: str, failure: Any, credential_exposure: str) -> str:
             "  The phone was sent what it needs but did not connect back in time, "
             "so this computer cannot confirm the pairing.\n"
             "  Open the app on the phone. If it does not connect, run "
-            "`hermes ocuclaw pair` again.\n"
+            + ("the same command again.\n" if driven else "`hermes ocuclaw pair` again.\n")
         )
-    return "\n  " + _FAILURE_TEXT.get(reason, _GENERIC_FAILURE) + "\n"
+    text = _FAILURE_TEXT.get(reason, _GENERIC_FAILURE)
+    if reason == "expired":
+        text = _expiry_text(phase)
+    if not driven and (
+        reason in _START_A_NEW_ONE_REASONS or reason not in _FAILURE_TEXT
+    ):
+        text += START_A_NEW_ONE
+    return "\n  " + text + "\n"
+
+
+def _expiry_text(phase: str) -> str:
+    return {
+        "waiting-for-phone": "Code expired before a phone joined.",
+        "awaiting-approval": "Pairing expired while waiting for approval.",
+        "awaiting-phone-connection": "Approval was sent, but your phone's connection was not confirmed in time. Check your phone before retrying.",
+    }.get(phase, "Pairing did not finish before the code expired.")
 
 
 #: Environment variables that name the terminal's character set, most specific
@@ -1156,7 +1237,7 @@ def terminal_supports_color(
     escape sequences are unwelcome. A non-TTY never gets colour.
     """
     env = os.environ if environ is None else environ
-    if env.get("NO_COLOR"):
+    if "NO_COLOR" in env:
         return False
     term = (env.get("TERM") or "").strip().lower()
     if term in ("", "dumb"):
@@ -1192,6 +1273,7 @@ def _terminal_capabilities(
         "unicode": terminal_supports_unicode(stream, environ, stdin),
         "color": terminal_supports_color(stream, environ),
         "columns": terminal_columns(),
+        "rows": shutil.get_terminal_size(fallback=(0, 0)).lines,
     }
 
 
@@ -1209,12 +1291,20 @@ def run_pair(
     isatty_fn: Optional[Callable[[], bool]] = None,
     sleep_fn: Optional[Callable[[float], None]] = None,
     monotonic_fn: Optional[Callable[[], float]] = None,
+    outcome_fn: Optional[Callable[[Mapping[str, Any]], None]] = None,
 ) -> int:
     """Run one interactive pairing session. Returns the process exit code.
 
     Every collaborator is injectable, which is what lets the whole surface —
     the TTY gate, the prompt wording, the poll loop, the outcome text — run in
     tests exactly as it runs against a real host.
+
+    ``outcome_fn`` is a REPORTING seam for a caller that drives this verb, the
+    Cloudways ladder's step 7 (#3105). It is handed the core's own terminal
+    state and secret-free failure reason, and it changes nothing: not what is
+    printed, not what is polled, not the exit code. It exists because the exit
+    code alone cannot tell "the person here refused the four words" — which is
+    the user stopping, not a fault — from "the pairing broke".
     """
     out = sys.stdout if stdout is None else stdout
     err = sys.stderr if stderr is None else stderr
@@ -1224,6 +1314,25 @@ def run_pair(
     post_fn = _post if post_fn is None else post_fn
     sleep_fn = time.sleep if sleep_fn is None else sleep_fn
     monotonic_fn = time.monotonic if monotonic_fn is None else monotonic_fn
+
+    # #3234c. A caller that takes the ending also owns "what to do next": the
+    # ladder offers a fresh code in place, and `hermes ocuclaw pair` needs an
+    # `--address` nobody can copy out of this terminal.
+    driven = outcome_fn is not None
+    phase = "waiting-for-phone"
+
+    def report_outcome(state_name: str, failure: Any) -> None:
+        """Pass the ending to `outcome_fn`, if there is one. Never raises."""
+        if outcome_fn is None:
+            return
+        reason = failure.get("reason") if isinstance(failure, Mapping) else None
+        try:
+            outcome_fn(
+                {"state": state_name, "reason": str(reason) if reason else None, "phase": phase}
+            )
+        except Exception:  # noqa: BLE001 - a reporting seam never fails a pairing
+            pass
+
     if isatty_fn is None:
 
         def isatty_fn() -> bool:  # type: ignore[misc]
@@ -1246,7 +1355,7 @@ def run_pair(
         err.write(
             "hermes ocuclaw pair needs an interactive terminal.\n"
             "\n"
-            "Pairing asks a human to compare four words and answer yes or no, and "
+            "Pairing asks a human to compare four words and approve, refuse or cancel, and "
             "there is deliberately no way to answer that without a terminal.\n"
             "Both the question and the answer must go through it, so this also "
             "refuses when the output is redirected or piped.\n"
@@ -1265,6 +1374,7 @@ def run_pair(
         return EXIT_PROBLEM
 
     url = control_url_fn()
+    terminal = _terminal_capabilities(out, None, inp)
 
     try:
         status, created = post_fn(
@@ -1276,7 +1386,7 @@ def run_pair(
                 "lightTerminal": light_terminal,
                 # The host renders the block, but only this side can see the
                 # terminal it will be printed on (#2505).
-                "terminal": _terminal_capabilities(out, None, inp),
+                "terminal": terminal,
             },
             credential=credential,
         )
@@ -1315,16 +1425,27 @@ def run_pair(
             out.write(f"  Code contents: {payload_text}\n\n")
     out.flush()
 
-    deadline = monotonic_fn() + POLL_DEADLINE_S
+    lifetime = created.get("expiresInSeconds")
+    lifetime = float(lifetime) if isinstance(lifetime, (int, float)) and not isinstance(lifetime, bool) else POLL_DEADLINE_S
+    if not math.isfinite(lifetime) or lifetime <= 0:
+        lifetime = POLL_DEADLINE_S
+    deadline = monotonic_fn() + min(POLL_DEADLINE_S, lifetime)
     prompt_shown = False
     decided = False
 
     while True:
         if monotonic_fn() >= deadline:
             out.write(
-                "\n  The pairing request expired before the phone finished.\n"
-                "  Run `hermes ocuclaw pair` again to start a new one.\n"
+                "\n  " + _expiry_text(phase) + "\n"
+                + ("" if driven else f"  {START_A_NEW_ONE.strip()}\n")
             )
+            # The other way this exchange ends as expired: this side stopped
+            # watching before the host said anything. A caller driving the verb
+            # is told the same thing it would have been told had the host
+            # answered, so "the code ran out" reads alike on both paths. Nothing
+            # printed here changes, and `outcome_fn` is None for the standalone
+            # verb, so this is invisible to `hermes ocuclaw pair`.
+            report_outcome("failed", {"reason": EXPIRED_REASON})
             return EXIT_PROBLEM
 
         try:
@@ -1349,27 +1470,45 @@ def run_pair(
                     current,
                     state.get("failure"),
                     str(state.get("credentialExposure") or "none"),
+                    driven=driven,
+                    phase=phase,
                 )
             )
+            report_outcome(current, state.get("failure"))
             return EXIT_OK if current == "completed" else EXIT_PROBLEM
 
         prompt = state.get("prompt")
         if not decided and isinstance(prompt, Mapping) and prompt.get("safetyPhrase"):
+            phase = "awaiting-approval"
             if not prompt_shown:
                 out.write(
                     _render_prompt_block(
-                        prompt.get("phoneLabel"), prompt.get("safetyPhrase")
+                        prompt.get("phoneLabel"),
+                        prompt.get("safetyPhrase"),
+                        unicode=bool(terminal.get("unicode")),
                     )
                 )
                 prompt_shown = True
 
-            approved = _ask_yes_no(inp, out)
+            answer = _ask_approval(inp, out, deadline=deadline, monotonic_fn=monotonic_fn)
+            if answer == "expired" or monotonic_fn() >= deadline:
+                # Retire the local attempt without approving a late answer.
+                # An already-expired host may have retired its secret first.
+                try:
+                    post_fn(url, {"v": 1, "op": "cancel"}, credential=credential,
+                            control_secret=control_secret)
+                except ControlError:
+                    pass
+                out.write("\n  " + _expiry_text(phase) + "\n")
+                report_outcome("failed", {"reason": EXPIRED_REASON})
+                return EXIT_PROBLEM
+            approved = answer == "approve"
             decided = True
 
             try:
                 status, decision = post_fn(
                     url,
-                    {"v": 1, "op": "approve" if approved else "deny"},
+                    {"v": 1, "op": "deny" if answer == "refuse" else answer},
                     credential=credential,
                     control_secret=control_secret,
                 )
@@ -1396,11 +1535,15 @@ def run_pair(
                         decided_state,
                         decision.get("failure"),
                         str(decision.get("credentialExposure") or "none"),
+                        driven=driven,
+                        phase=phase,
                     )
                 )
+                report_outcome(decided_state, decision.get("failure"))
                 return EXIT_OK if decided_state == "completed" else EXIT_PROBLEM
 
             if approved:
+                phase = "awaiting-phone-connection"
                 out.write("\n  Approved. Waiting for the phone to connect back...\n")
             # Otherwise keep polling: an approval is not yet an ending, and the
             # terminal state carries the real outcome — including Q2's

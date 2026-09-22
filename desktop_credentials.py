@@ -36,7 +36,8 @@ def _read(home: Path) -> dict[str, Any] | None:
     try:
         row = json.loads((state_dir(home) / REQUEST_FILE).read_text())
         if (
-            set(row) != {"v", "id", "selected", "createdAt", "state"}
+            set(row) not in ({"v", "id", "selected", "createdAt", "state"},
+                            {"v", "id", "selected", "createdAt", "state", "changed"})
             or row["v"] != 1
             or not isinstance(row["id"], str)
             or len(row["id"]) != 32
@@ -45,9 +46,10 @@ def _read(home: Path) -> dict[str, Any] | None:
             or any(name not in FIELDS for name in row["selected"])
             or type(row["createdAt"]) not in (int, float)
             or row["state"] not in {"pending", "saved", "cancelled"}
+            or ("changed" in row and not isinstance(row["changed"], bool))
         ):
             return None
-        if not 0 <= time.time() - row["createdAt"] < REQUEST_TTL:
+        if row["state"] == "pending" and not 0 <= time.time() - row["createdAt"] < REQUEST_TTL:
             row["state"] = "expired"
         return row
     except (OSError, ValueError, TypeError, KeyError):
@@ -59,6 +61,7 @@ def _public(row: dict[str, Any] | None, *, direct: bool = False) -> dict[str, An
         "state": row["state"] if row else "idle",
         "selected": row["selected"] if row else [],
         "present": _presence(),
+        "changed": row.get("changed") if row else None,
     }
     if direct and row:
         result["requestId"] = row["id"]
@@ -86,17 +89,54 @@ def request(selected: Any) -> dict[str, Any]:
             if not locked:
                 return {"state": "busy"}
             row = _read(home)
-            if row and row["state"] == "pending":
+            interrupted_change = bool(row and row["state"] == "expired" and row.get("changed"))
+            if row and (row["state"] == "pending" or interrupted_change):
                 # Never replace a live form or invalidate another window's input.
                 if row["selected"] != selected:
                     return {"state": "busy", "selected": row["selected"]}
-                return _public(row)
+                if row["state"] == "pending":
+                    return _public(row)
             row = {"v": 1, "id": secrets.token_hex(16), "selected": selected,
-                   "createdAt": time.time(), "state": "pending"}
+                   "createdAt": time.time(), "state": "pending", "changed": interrupted_change}
             write_json_receipt(state_dir(home) / REQUEST_FILE, row)
             return _public(row)
     except Exception:
         return {"state": "unavailable"}
+
+
+def save_selected_value(home: Path, name: str, value: str) -> bool:
+    """Domain writer; callers own their authorization and LOCK_FILE admission.
+
+    Desktop keeps its presenter-capability endpoint and pending form. The phone
+    has a separate authenticated transaction; it never creates a Desktop form.
+    """
+    from hermes_cli.config import get_env_value, invalidate_env_cache, load_env, save_env_value
+    from .optional_setup import begin_save, finish_save, PENDING, _read as read_optional
+
+    if name not in FIELDS or not isinstance(value, str) or len(value) > 4096 or any(
+        ord(char) < 32 or ord(char) > 126 for char in value
+    ):
+        raise ValueError("invalid_value")
+    value = value.strip()
+    if not value:
+        return False
+    if value != str(get_env_value(FIELDS[name]) or "").strip():
+        revision = begin_save(home, name)
+        try:
+            save_env_value(FIELDS[name], value)
+            invalidate_env_cache()
+            if load_env().get(FIELDS[name]) != value:
+                raise ValueError("save_failed")
+            finish_save(home, revision, name, saved=True)
+        except Exception:
+            finish_save(home, revision, name, saved=False)
+            raise ValueError("save_failed") from None
+        return True
+    pending = read_optional(home, PENDING)
+    if (pending.get("choices") or {}).get(name) in {"saving", "save_failed"}:
+        revision = begin_save(home, name)
+        finish_save(home, revision, name, saved=True)
+    return False
 
 
 def submit(request_id: Any, values: Any = None, *, cancel: bool = False) -> dict[str, Any]:
@@ -130,14 +170,22 @@ def submit(request_id: Any, values: Any = None, *, cancel: bool = False) -> dict
                 present = _presence()
                 if any(not values.get(name, "").strip() and not present[name] for name in row["selected"]):
                     return {"state": "missing_value", "present": present}
-                from hermes_cli.config import invalidate_env_cache, load_env, save_env_value
+                from hermes_cli.config import get_env_value
 
                 for name, value in values.items():
-                    if value.strip():
-                        save_env_value(FIELDS[name], value.strip())
-                        invalidate_env_cache()
-                        if load_env().get(FIELDS[name]) != value.strip():
+                    if value.strip() and value.strip() != str(get_env_value(FIELDS[name]) or "").strip():
+                        # Keep activation pending across a crash after the secret
+                        # writer succeeds but before the saved receipt is committed.
+                        row["changed"] = True
+                        write_json_receipt(state_dir(home) / REQUEST_FILE, row, durable=True)
+                        try:
+                            save_selected_value(home, name, value)
+                        except Exception:
                             return {"state": "save_failed", "present": _presence()}
+                    elif value.strip():
+                        # A previous writer may have succeeded before reporting a
+                        # failure. A retry verifies its value without replacing it.
+                        save_selected_value(home, name, value)
                 row["state"] = "saved"
             write_json_receipt(state_dir(home) / REQUEST_FILE, row)
             return _public(row, direct=True)

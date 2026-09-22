@@ -651,6 +651,7 @@ function createRelayWorkerSupervisor(options = {}) {
       return;
     }
     if (message.kind === "app.message") {
+      if (message.operation === "ocuclaw.optional.setup.request" && message.workerEpoch !== workerEpoch) return;
       if (!handler || typeof handler.handleMessage !== "function") return;
       const processOptions = {};
       if (message.operation === "message.send" && message.requestId) {
@@ -676,7 +677,7 @@ function createRelayWorkerSupervisor(options = {}) {
             handler.handleMessage(
               message.clientId,
               message.raw,
-              { liveuiRenderErrorAuthority: message.liveuiRenderErrorAuthority },
+              { liveuiRenderErrorAuthority: message.liveuiRenderErrorAuthority, workerEpoch: message.workerEpoch },
             ),
             processOptions,
           );
@@ -707,6 +708,11 @@ function createRelayWorkerSupervisor(options = {}) {
     }
     if (message.kind === "http.cancel") {
       handleHttpCancel(message);
+      return;
+    }
+    if (message.kind === "http.finish") {
+      if (message.workerEpoch !== workerEpoch) return;
+      options.completeBufferedEvenAiHttpRequest?.(message);
       return;
     }
     if (message.kind === "client.identified") {
@@ -839,6 +845,14 @@ function createRelayWorkerSupervisor(options = {}) {
       if (disconnectedEntry && disconnectedEntry.clientKind === "app") {
 
         notifyAppPresenceChanged("disconnected");
+
+        if (typeof options.onAppClientClosed === "function") {
+          try {
+            options.onAppClientClosed(message.clientId);
+          } catch (err) {
+            logger.warn(`[relay-worker] onAppClientClosed threw: ${err && err.message ? err.message : err}`);
+          }
+        }
       }
       return;
     }
@@ -903,6 +917,8 @@ function createRelayWorkerSupervisor(options = {}) {
           entry.readinessSnapshot && typeof entry.readinessSnapshot.activeSessionKey === "string"
             ? entry.readinessSnapshot.activeSessionKey
             : null;
+
+        applyReportedSessionKey(entry, nextActiveSessionKey);
         if (entry.clientKind === "app" && (
           deviceFactsKey(getDeviceProjection()) !== previousDeviceFacts ||
           nextActiveSessionKey !== previousActiveSessionKey
@@ -933,6 +949,8 @@ function createRelayWorkerSupervisor(options = {}) {
             emittedAtMs: Number.isFinite(ack.emittedAtMs) ? ack.emittedAtMs : Date.now(),
           };
           ackEntry.updatedAtMs = Date.now();
+
+          applyReportedSessionKey(ackEntry, ack.activeSessionKey);
           if (ackEntry.clientKind === "app" && ack.activeSessionKey !== previousActiveSessionKey) {
             notifyAppPresenceChanged("readiness");
           }
@@ -1237,6 +1255,25 @@ function createRelayWorkerSupervisor(options = {}) {
       : { connected: null, batteryPercent: null, charging: null, inCase: null, observedAt: null };
   }
 
+  function applyReportedSessionKey(entry, sessionKey) {
+    const reported = typeof sessionKey === "string" ? sessionKey.trim() : "";
+    if (!reported) return;
+    const replacedGuardActive =
+      reported === entry.replacedSessionKey &&
+      Date.now() - (Number.isFinite(entry.replacedAtMs) ? entry.replacedAtMs : 0) < 5_000;
+    if (replacedGuardActive) return;
+
+    const wasGuarding = !!entry.replacedSessionKey;
+    entry.replacedSessionKey = null;
+    const effective =
+      typeof entry.selectedSessionKey === "string" && entry.selectedSessionKey
+        ? entry.selectedSessionKey
+        : typeof entry.sessionKey === "string" ? entry.sessionKey.trim() : "";
+    if (wasGuarding || reported !== effective) {
+      entry.selectedSessionKey = reported;
+    }
+  }
+
   function deviceFactsKey(device) {
     return JSON.stringify({
       connected: device?.connected ?? null,
@@ -1353,6 +1390,54 @@ function createRelayWorkerSupervisor(options = {}) {
     notifyAgentAvatarChanged,
     getClientIds() {
       return Array.from(clients.keys());
+    },
+
+    getClientSessionKey(clientId) {
+      const entry = clients.get(clientId);
+      if (!entry) return null;
+      if (typeof entry.selectedSessionKey === "string" && entry.selectedSessionKey) return entry.selectedSessionKey;
+      return typeof entry.sessionKey === "string" && entry.sessionKey ? entry.sessionKey : null;
+    },
+
+    setClientSessionKey(clientId, sessionKey) {
+      const entry = clients.get(clientId);
+      if (!entry || typeof sessionKey !== "string" || !sessionKey.trim()) return false;
+      const next = sessionKey.trim();
+      const previous =
+        typeof entry.selectedSessionKey === "string" && entry.selectedSessionKey
+          ? entry.selectedSessionKey
+          : typeof entry.sessionKey === "string" && entry.sessionKey ? entry.sessionKey.trim() : "";
+
+      entry.replacedSessionKey = previous && previous !== next ? previous : null;
+      entry.replacedAtMs = Date.now();
+      entry.selectedSessionKey = next;
+      return true;
+    },
+
+    getAppClientCountOnSession(sessionKey, excludeClientId = null) {
+      const wanted = typeof sessionKey === "string" ? sessionKey.trim() : "";
+      if (!wanted) return 0;
+      let count = 0;
+      for (const entry of getConnectedAppEntries(excludeClientId)) {
+        const selected = typeof entry.selectedSessionKey === "string" ? entry.selectedSessionKey : "";
+        const own = typeof entry.sessionKey === "string" ? entry.sessionKey.trim() : "";
+        if ((selected || own) === wanted) count += 1;
+      }
+      return count;
+    },
+
+    getAppClientSessionKeys(excludeClientId = null) {
+      const keys = [];
+      for (const entry of getConnectedAppEntries(excludeClientId)) {
+        const selected = typeof entry.selectedSessionKey === "string" ? entry.selectedSessionKey : "";
+        const own = typeof entry.sessionKey === "string" ? entry.sessionKey.trim() : "";
+        if (selected || own) keys.push(selected || own);
+      }
+      return keys;
+    },
+
+    getAppClientIds(excludeClientId = null) {
+      return getConnectedAppEntries(excludeClientId).map((entry) => entry.clientId);
     },
     getConnectedAppCount(excludeClientId = null, sessionKey = null) {
       return getConnectedAppEntries(excludeClientId, sessionKey).length;

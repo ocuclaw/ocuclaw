@@ -5,12 +5,15 @@ const { buildHermesLiveUiHelloPayload, createHermesLiveUiBridge, mergeLiveConfig
 
 const { buildHermesPhoneToolsHelloPayload, createHermesPhoneToolsBridge } = require("./hermes-phone-tools-bridge.cjs");
 const { createHermesPresencePush } = require("./hermes-presence-push.cjs");
+
+const { createHermesSetupHint, LINK_SETUP_HINT_METHOD } = require("./hermes-setup-hint.cjs");
 const { createHermesSttLane } = require("./hermes-stt-lane.cjs");
 const { createHermesPairingCompletionPush } = require("./hermes-pairing-completion-push.cjs");
+const { createHermesReplyDeliveryLink } = require("./hermes-reply-delivery-link.cjs");
 const { createHermesRuntimeReadiness } = require("./hermes-runtime-readiness.cjs");
 const { DEFAULT_HERMES_NAMESPACE, hermesDefaultSessionKeyPrefix, hermesSupportedSessionKeyPrefixes, parseHermesPublicKey } = require("./hermes-session-keys.cjs");
 const { createRelay } = require("./relay-core.cjs");
-const { HERMES_BUNDLE_DEFAULT_WS_PORT } = require("../config/runtime-config.cjs");
+const { HERMES_BUNDLE_DEFAULT_WS_PORT, resolveSilentInputJev } = require("../config/runtime-config.cjs");
 const { setActiveBackendKind } = require("../gateway/backend-contract.cjs");
 
 setActiveBackendKind("hermes");
@@ -58,6 +61,7 @@ const linkMethods = {
     presented: false,
     reason: "relay_unavailable",
   }),
+  [LINK_SETUP_HINT_METHOD]: (_params) => ({ phase: null }),
 };
 
 const link = createHermesControlLink({
@@ -79,6 +83,9 @@ const hostHooks = createHermesHostHooks({ logger });
 const sttLane = createHermesSttLane({ link, logger });
 const readiness = createHermesRuntimeReadiness({ dispatchBackendEvent, logger });
 let activeRelay = null;
+
+const setupHint = createHermesSetupHint({ getRelay: () => activeRelay, logger });
+Object.assign(linkMethods, setupHint.methods);
 linkMethods[LINK_BACKEND_EVENT_METHOD] = (params) => {
   const name = params && typeof params.name === "string" ? params.name : "";
   if (!name) {
@@ -184,6 +191,8 @@ function bootRelay(ackPayload) {
     });
   };
   relay = createRelay({
+    optionalSetupCommandsVersion: 1,
+    optionalSetupEvenAiCommands: true,
       port,
       host,
       token: typeof config.relayToken === "string" ? config.relayToken : "",
@@ -207,6 +216,8 @@ function bootRelay(ackPayload) {
 
       hermesSttTranscribe: (request) => sttLane.transcribe(request),
       hermesSttUpload: sttLane.upload,
+
+      getSetupHintPhase: setupHint.getPhase,
       hermesVersion:
         ackPayload && typeof ackPayload.hermesVersion === "string"
           ? ackPayload.hermesVersion
@@ -232,6 +243,9 @@ function bootRelay(ackPayload) {
       evenAiRequestTimeoutMs: config.evenAiRequestTimeoutMs,
       evenAiMaxBodyBytes: config.evenAiMaxBodyBytes,
       evenAiDedupWindowMs: config.evenAiDedupWindowMs,
+      inputPredictionTimeoutMs: config.inputPredictionTimeoutMs,
+
+      silentInputJev: resolveSilentInputJev(config.silentInputJev, {}, {}),
       evenAiRoutingMode:
         typeof config.evenAiRoutingMode === "string"
           ? config.evenAiRoutingMode
@@ -289,6 +303,8 @@ function bootRelay(ackPayload) {
       Object.assign(linkMethods, presence.methods);
       presence.push();
       createHermesPairingCompletionPush({ relay, link, logger });
+
+      Object.assign(linkMethods, createHermesReplyDeliveryLink({ relay, link, logger }).methods);
       return relay;
     });
 }

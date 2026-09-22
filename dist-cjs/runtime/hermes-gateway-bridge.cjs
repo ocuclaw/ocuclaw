@@ -1,5 +1,6 @@
 const { METHOD_NOT_FOUND_CODE } = require("../gateway/backend-contract.cjs");
 const { managementRequest, validManagementRequest, managementResult } = require("./hermes-management.cjs");
+const { createHermesInputPredictionTranslators } = require("./hermes-input-prediction-bridge.cjs");
 const { discardLinkSpillFile, writeLinkSpillFile } = require("./link-attachment-spill.cjs");
 const { buildAgentRequestParams } = require("../gateway/gateway-bridge.cjs");
 const { DEFAULT_HERMES_NAMESPACE, deriveHermesPublicKey, isAdoptableHermesSessionKey, isForeignHermesSessionKey, isHermesSessionKey, mintedHermesSessionKey, parseHermesPublicKey } = require("./hermes-session-keys.cjs");
@@ -232,6 +233,28 @@ const HERMES_COMMAND_CATEGORY = Object.freeze({
   Info: "status",
   "Tools & Skills": "tools",
 });
+
+function sessionOptionsFallbackCommands(options) {
+  const commands = [];
+  if (hasOwn(options, "model")) {
+    const model = String(options.model || "").trim();
+    if (!model) {
+      throw new Error(
+        "clearing the session model needs a Hermes with structured session options (upstream PR #92187); pick a model instead",
+      );
+    }
+    const provider = String(options.provider || "").trim();
+    commands.push(`/model ${model}${provider ? ` --provider ${provider}` : ""}`);
+  }
+  if (hasOwn(options, "reasoning_effort")) {
+    const effort = String(options.reasoning_effort || "").trim();
+    commands.push(effort ? `/reasoning ${effort}` : "/reasoning reset");
+  }
+  if (hasOwn(options, "fast")) {
+    commands.push(options.fast ? "/fast on" : "/fast off");
+  }
+  return commands;
+}
 
 const REASONING_DISPLAY_TO_HERMES_COMMANDS = Object.freeze({
   off: Object.freeze(["/reasoning hide"]),
@@ -725,6 +748,8 @@ function createHermesGatewayBridge(opts) {
   }
 
   const translators = {
+
+    ...createHermesInputPredictionTranslators({ link }),
     async agent(params) {
       return dispatchTurn(params);
     },
@@ -1027,10 +1052,12 @@ function createHermesGatewayBridge(opts) {
       if (!id || !profileName) {
         throw new Error("Hermes returned an invalid created profile");
       }
+
+      const restartRequired = result.restartRequired === false ? false : true;
       return {
         status: result.status,
         profile: { id, name: profileName },
-        restartRequired: true,
+        restartRequired,
         ...(result.errorMessage ? { errorCode: "setup_incomplete", errorMessage: result.errorMessage } : {}),
       };
     },
@@ -1067,6 +1094,14 @@ function createHermesGatewayBridge(opts) {
       if (!validManagementRequest(identity)) throw new Error("Invalid Hermes management request");
       const result = await link.request(LINK_GW_METHODS.hermesManagement, identity, DB_READ_TIMEOUT);
       return managementResult(identity, result);
+    },
+
+    async "optional.setup"(params) {
+      return link.request("gw.optional.setup", params, DB_READ_TIMEOUT);
+    },
+
+    async "optional.setup.disconnect"(params) {
+      return link.request("gw.optional.setup.disconnect", { context: { connectionId: params?.connectionId } }, DB_READ_TIMEOUT);
     },
 
     async "profiles.settings.get"(params) {
@@ -1495,6 +1530,7 @@ function createHermesGatewayBridge(opts) {
         commands.push(...displayCommands);
       }
       let structured = null;
+      let structuredFallback = null;
       if (Object.keys(options).some((key) => !["confirm_model_selection", "initial"].includes(key))) {
 
         const { pending } = await serializeSend(target.publicKey, () => ({
@@ -1505,7 +1541,16 @@ function createHermesGatewayBridge(opts) {
           }),
         }));
         structured = await pending;
-        if (!structured || structured.status !== "accepted") {
+        if (structured && structured.status === "unsupported") {
+
+          const fallback = sessionOptionsFallbackCommands(options);
+          logger.warn(
+            `[hermes-bridge] structured session options unsupported on this Hermes; falling back to ${fallback.join(", ")}`,
+          );
+          commands.unshift(...fallback);
+          structuredFallback = "slash_commands";
+          structured = null;
+        } else if (!structured || structured.status !== "accepted") {
           throw new Error(
             (structured && structured.error) ||
               `structured session options ${structured && structured.status ? structured.status : "failed"}`,
@@ -1528,6 +1573,7 @@ function createHermesGatewayBridge(opts) {
         commands,
         results,
         structured,
+        ...(structuredFallback ? { fallback: structuredFallback } : {}),
         ...(structured && structured.effective
           ? { applied: structured.effective }
           : {}),

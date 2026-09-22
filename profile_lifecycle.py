@@ -15,7 +15,13 @@ import re
 import tempfile
 import threading
 
-PROFILE_MUTATION_LOCK = threading.Lock()
+# Reentrant: profile creation holds this for the whole create-and-set-up
+# sequence (``models_rpc._sync_profiles_create``) and ``admit_profile`` writes
+# the enrollment set from inside it (#2940). Both edit the default profile's
+# config.yaml, so they must serialize against each other and against any other
+# thread — but a plain Lock would deadlock the one thread that legitimately
+# holds it twice.
+PROFILE_MUTATION_LOCK = threading.RLock()
 WORKSPACE_UNSUPPORTED = "Per-agent folders need a newer supported Hermes release. Keep the existing starting folder."
 INFERENCE_CONFIG_KEYS = ("model", "providers", "custom_providers", "bedrock", "vertex")
 # Native SDK/OAuth providers intentionally have empty api_key_env_vars in
@@ -101,19 +107,29 @@ def bootstrap_profile(source: Path, target: Path) -> None:
 
 
 def admit_profile(source: Path, name: str) -> None:
-    """Admit the just-created profile without broadening unrelated routes."""
-    from hermes_cli.config import atomic_config_write, read_user_config_raw
+    """Enrol the just-created profile into OcuClaw's own set (#2940).
 
-    path = source / "config.yaml"
-    config = read_user_config_raw(path)
-    gateway = config.setdefault("gateway", {})
-    if not isinstance(gateway, dict):
-        raise ValueError("Gateway configuration is invalid")
-    allowed = gateway.get("multiplex_profile_allowlist")
-    if allowed is None:
-        return  # Already serves all profiles; do not narrow an operator's policy.
-    if not isinstance(allowed, list) or any(not isinstance(item, str) for item in allowed):
-        raise ValueError("Served-agent list is invalid. Repair it before activating this agent.")
-    if name not in allowed:
-        gateway["multiplex_profile_allowlist"] = [*allowed, name]
-        atomic_config_write(path, config, sort_keys=False)
+    Called at the end of ``models_rpc._create_profile_with_setup``, after the
+    inherited settings are written and immediately before the completion
+    receipt. That position is the contract "discovery is not admission": a
+    creation that fails earlier returns ``status: "partial"``, leaves the
+    receipt incomplete, and :func:`.profile_routes.creation_is_incomplete`
+    keeps the half-built profile out of the routes until setup is retried.
+
+    Before #2940 this wrote ``gateway.multiplex_profile_allowlist`` directly,
+    and returned early when that key was absent — "already serves all
+    profiles; do not narrow an operator's policy". On 0.21.3 the key is always
+    absent, so that early return meant every profile on the host was
+    selectable. The enrollment set replaces it; on 0.21.0-0.21.2 the store
+    still mirrors the gateway key, so those hosts keep serving what OcuClaw
+    enrols.
+    """
+    from . import profile_routes
+    from .profile_enrollment import STORE, EnrollmentStore
+
+    # The caller knows which home it created into, so the write is aimed there
+    # rather than re-resolved; the shared store is then invalidated so the very
+    # next route resolution sees the new agent.
+    EnrollmentStore(home_resolver=lambda: Path(source)).enrol(name)
+    STORE.invalidate()
+    profile_routes.RESOLVER.invalidate()

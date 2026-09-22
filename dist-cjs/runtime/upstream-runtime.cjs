@@ -56,6 +56,38 @@ function isToolProgressCommit(data) {
 
 const STREAMING_REBROADCAST_THROTTLE_MS = 33;
 
+function isTerminalActivityBoundary(state, phase, origin) {
+  const normalizedOrigin = typeof origin === "string" ? origin.trim().toLowerCase() : "";
+  if (normalizedOrigin !== "lifecycle") {
+    return false;
+  }
+  const normalizedState = typeof state === "string" ? state.trim().toLowerCase() : "";
+  if (normalizedState === "idle" || normalizedState === "error") {
+    return true;
+  }
+  const normalizedPhase = typeof phase === "string" ? phase.trim().toLowerCase() : "";
+  return (
+    normalizedPhase === "error" ||
+    normalizedPhase === "end" ||
+    normalizedPhase === "complete" ||
+    normalizedPhase === "completed" ||
+    normalizedPhase === "done" ||
+    normalizedPhase === "failed" ||
+    normalizedPhase === "finish" ||
+    normalizedPhase === "finished"
+  );
+}
+
+function classifyRunOutcomeFrame(activity, phase, origin) {
+  const failoverPending = !!activity && activity.failoverPending === true;
+  const normalizedPhase = typeof phase === "string" ? phase.trim().toLowerCase() : "";
+  const errored = !failoverPending && !!activity && activity.isError === true && normalizedPhase === "error";
+  const terminal = !failoverPending
+    && (errored || isTerminalActivityBoundary(activity && activity.state, phase, origin));
+  const code = errored && activity && typeof activity.code === "string" && activity.code ? activity.code : null;
+  return { terminal, errored, code };
+}
+
 function normalizeStreamingToken(raw) {
   return typeof raw === "string" && raw.trim() ? raw.trim() : null;
 }
@@ -862,9 +894,12 @@ function createUpstreamRuntime(opts = {}) {
   function onGatewayEvent(eventName, listener) {
     if (!gatewayListenersByEvent.has(eventName)) gatewayListenersByEvent.set(eventName, []);
     gatewayListenersByEvent.get(eventName).push(listener);
-    return gatewayBridge.on(eventName, (data) =>
-      listener(normalizeGatewaySessionEvent(data)),
-    );
+    return gatewayBridge.on(eventName, (data) => {
+
+      const observeSetupEvent = Reflect.get(opts, "observeSetupEvent");
+      if (typeof observeSetupEvent === "function") observeSetupEvent(eventName, data);
+      return listener(normalizeGatewaySessionEvent(data));
+    });
   }
 
   function ingestSimulatedGatewayEvent(eventName = "", data = JSON.parse("null")) {
@@ -2367,11 +2402,11 @@ function createUpstreamRuntime(opts = {}) {
     return snapshot;
   }
 
-  async function getAgentsCatalogSnapshot() {
+  async function getAgentsCatalogSnapshot(forceRefresh = false) {
     const snapshot = agentsCatalogSnapshot();
     const fleetRefreshDue = getActiveBackendKind() === "hermes" &&
       now() - cachedAgentsCatalogFetchedAt >= 15000;
-    if ((snapshot.stale || fleetRefreshDue) && !agentsListUnsupported && openclawConnected) {
+    if ((forceRefresh || snapshot.stale || fleetRefreshDue) && !agentsListUnsupported && openclawConnected) {
       return refreshAgentsCatalog(true);
     }
 
@@ -2539,7 +2574,11 @@ function createUpstreamRuntime(opts = {}) {
             : msg,
         )
       : data.messages;
-    conversationState.hydrate(sanitizedMessages, agentIdentity.name, data.sessionKey);
+
+    conversationState.hydrate(sanitizedMessages, agentIdentity.name, data.sessionKey, {
+      commitRunId: typeof data.commitRunId === "string" ? data.commitRunId : undefined,
+      commitText: typeof data.commitText === "string" ? data.commitText : undefined,
+    });
 
     broadcastPages({
       reason: "gateway_history",
@@ -2748,6 +2787,7 @@ function createUpstreamRuntime(opts = {}) {
     }
 
     const dropNarrationPage = isNarrationCommit(data);
+    let committedReplyActivity = null;
     if (runId && turnActive) {
       clearStreamingThrottleTimer();
       flushPendingStreamingText();
@@ -2771,7 +2811,7 @@ function createUpstreamRuntime(opts = {}) {
         "assistant_message_committed",
       );
 
-      broadcastActivity({
+      const terminalActivity = {
         state: "idle",
         runId,
         sessionKey: data.sessionKey || sessionService.ensureSessionKey(),
@@ -2779,7 +2819,16 @@ function createUpstreamRuntime(opts = {}) {
         phase: "end",
         category: "run_complete_synth",
         activityId: `run-complete-synth-${runId}`,
-      }, data.sessionKey ? null : "unattributed");
+      };
+      if (data.finalReplyCommitted === true && data.role === "assistant" &&
+          typeof data.sessionKey === "string" && data.sessionKey.trim() &&
+          !dropNarrationPage && !data.messageKind && normalizeOriginAtMs(data.originAtMs) === null &&
+          fullMessageText(sanitizeAssistantContentBlocks(data.content)).trim()) {
+
+        committedReplyActivity = { ...terminalActivity, finalReplyCommitted: true };
+      } else {
+        broadcastActivity(terminalActivity, data.sessionKey ? null : "unattributed");
+      }
     }
 
     const runPipeline = runId && !turnActive ? upstreamRunPipeline.get(runId) : null;
@@ -2890,6 +2939,7 @@ function createUpstreamRuntime(opts = {}) {
     } else {
       conversationState.addMessage(data.role, sanitizedContent, null, messageMetadata);
     }
+    if (committedReplyActivity) broadcastActivity(committedReplyActivity);
     if (data.role === "assistant") {
       emitDebug(
         "openclaw.message",
@@ -3748,28 +3798,6 @@ function createUpstreamRuntime(opts = {}) {
     trackAcceptedRun,
   };
 
-  function isTerminalActivityBoundary(state, phase, origin) {
-    const normalizedOrigin = typeof origin === "string" ? origin.trim().toLowerCase() : "";
-    if (normalizedOrigin !== "lifecycle") {
-      return false;
-    }
-    const normalizedState = typeof state === "string" ? state.trim().toLowerCase() : "";
-    if (normalizedState === "idle" || normalizedState === "error") {
-      return true;
-    }
-    const normalizedPhase = typeof phase === "string" ? phase.trim().toLowerCase() : "";
-    return (
-      normalizedPhase === "error" ||
-      normalizedPhase === "end" ||
-      normalizedPhase === "complete" ||
-      normalizedPhase === "completed" ||
-      normalizedPhase === "done" ||
-      normalizedPhase === "failed" ||
-      normalizedPhase === "finish" ||
-      normalizedPhase === "finished"
-    );
-  }
-
   function isProviderRateLimitedLifecycleError(activity) {
     return !!(
       activity &&
@@ -3863,4 +3891,4 @@ function createUpstreamRuntime(opts = {}) {
   }
 }
 
-module.exports = { createUpstreamRuntime, STREAMING_REBROADCAST_THROTTLE_MS, normalizeAgentsCatalogRows, parseWorkspaceIdentityFallback, applyIdentityFallback, overlayRawAgentRowsWithFallback, buildModelAliasIndex, resolveConfiguredDefaultModelRef, mapConfiguredCatalogRows, mapHermesConfiguredCatalogRows };
+module.exports = { createUpstreamRuntime, STREAMING_REBROADCAST_THROTTLE_MS, normalizeAgentsCatalogRows, parseWorkspaceIdentityFallback, applyIdentityFallback, overlayRawAgentRowsWithFallback, buildModelAliasIndex, resolveConfiguredDefaultModelRef, mapConfiguredCatalogRows, mapHermesConfiguredCatalogRows, isTerminalActivityBoundary, classifyRunOutcomeFrame };

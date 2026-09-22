@@ -64,6 +64,19 @@ NATIVE_BUILDS = (
         "hermes_cli/doctor.py": "8c852b643dc40cb781870cd723ca8497ecffb509668e8b5b3248e7977418f7b2",
         "hermes_cli/security_audit.py": "fea5b62d8fef337474d921e634f9fa226c228ec391a6d7f5b682bc2422fb34d3",
     },
+    {  # Hermes 0.21.3 — release v2026.9.14, anchor 345cd2b0 (#2846 recert).
+       # doctor.py and security_audit.py are byte-identical to 0.21.1. Only
+       # hermes_state.py moved (WAL generation capture, retired-generation
+       # handling, mode=ro reader retry on transient SQLITE_IOERR); the
+       # surface used here is intact: SessionDB(db_path, read_only=True)
+       # still opens `file:...?mode=ro` with no schema init and no write
+       # lock, ._conn keeps the sqlite3.Row factory, .close() is unchanged.
+       # `sessions` and `session_model_usage` keep every column these
+       # queries name (model, started_at, *_tokens, *_cost_usd, task).
+        "hermes_state.py": "c92415eeb6bba298ff9bd3f823a6c3f9f9ff762c32af5d058923a7ba740dd5ec",
+        "hermes_cli/doctor.py": "8c852b643dc40cb781870cd723ca8497ecffb509668e8b5b3248e7977418f7b2",
+        "hermes_cli/security_audit.py": "fea5b62d8fef337474d921e634f9fa226c228ec391a6d7f5b682bc2422fb34d3",
+    },
 )
 
 

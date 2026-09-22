@@ -35,8 +35,9 @@ const FAILURE_MESSAGES                                       = {
     "Secure pairing could not be started on this computer, so nothing was sent.",
   "invalid-address":
     "The relay address is not usable for pairing, so pairing did not start.",
+
   "credential-unavailable":
-    "This computer could not read its own relay credential, so nothing was sent.",
+    "This computer could not read the settings OcuClaw pairs with, so nothing was sent.",
   expired: "The pairing window closed before the phone finished. Start pairing again.",
   "exchange-not-found":
     "That pairing request is no longer active. Start pairing again.",

@@ -34,6 +34,7 @@ from .tui_pairing import (
 PLUGIN_DIRNAME = "ocuclaw"
 PLUGIN_FILENAME = "plugin.js"
 PLUGIN_MARKER = "// OCUCLAW-OWNED-DESKTOP-PAIRING-PLUGIN v1"
+COMPANION_VERSION_MARKER = "// OCUCLAW-DESKTOP-COMPANION version="
 # The Desktop source template is INERT build input, deliberately parked
 # outside every Hermes Desktop entry shape (#2084).
 #
@@ -429,6 +430,32 @@ def reconcile_pairing_plugin(
     ).replace(THEME_REQUEST_PLACEHOLDER, theme_request)
     try:
         current = target.read_text(encoding="utf-8") if target.exists() else None
+        if current and COMPANION_VERSION_MARKER in current:
+            companion_version = re.findall(
+                r"^// OCUCLAW-DESKTOP-COMPANION version=(\d+\.\d+\.\d+)$", current, re.M
+            )
+            bundle_version = re.search(
+                r"^version: (\d+\.\d+\.\d+)$",
+                (Path(__file__).resolve().parent / "plugin.yaml").read_text(encoding="utf-8"),
+                re.M,
+            )
+            if len(companion_version) != 1 or bundle_version is None:
+                return {"status": "preserved", "reason": "desktop_companion_version_invalid"}
+            if tuple(map(int, companion_version[0].split("."))) >= tuple(map(int, bundle_version[1].split("."))):
+                # Local startup may supply local authority, but must not erase
+                # a newer independently installed remote-status UI.
+                rendered_source = current
+                for slot, value in (("PRESENTER_CAPABILITY", presenter_capability),
+                                    ("THEME_REQUEST", theme_request)):
+                    pattern = rf"^const {slot} = '[^'\n]*';?$"
+                    if len(re.findall(pattern, rendered_source, re.M)) != 1:
+                        return {"status": "preserved", "reason": "desktop_companion_slot_invalid"}
+                    rendered_source = re.sub(pattern, f"const {slot} = '{value}'", rendered_source, flags=re.M)
+            else:
+                rendered_source = rendered_source.replace(
+                    PLUGIN_MARKER + "\n",
+                    PLUGIN_MARKER + "\n" + COMPANION_VERSION_MARKER + bundle_version[1] + "\n", 1,
+                )
         if current == rendered_source:
             return {"status": "unchanged", "path": str(target)}
         # The deep-link modal copies the shipped bytes verbatim, so a pristine

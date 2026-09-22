@@ -22,18 +22,12 @@ Two rules the listing half exists to hold:
   import-time flags, ``importlib.find_spec``, PATH lookups, and config/env/
   credential-pool reads.
 
-**Where the no-install boundary runs.** ``stt.transcribe`` is the other side of
-that line and is deliberately exempt: transcribing with the ``local`` backend
-IS the moment Hermes installs faster-whisper (``_transcribe_local`` →
-``_try_lazy_install_stt``, transcription_tools.py:1942), and the wearer asked
-for a transcription. So the guarantee is scoped to the lane, not the module:
-*opening the settings screen installs nothing; committing an utterance may
-install exactly what Hermes itself would have installed for the same
-transcription.* The two lanes share no helper that crosses the line — the
-listing lane calls only the read-only probes pinned by
-``test_no_probe_the_lane_calls_can_reach_a_lazy_install``, and the transcribe
-lane's single Hermes entry point is ``_dispatch_stt_provider``, which that same
-test lists as an installing entry point the listing lane may never reach.
+**Local downloads require a separate human decision.** Both listing and
+transcription refuse an absent faster-whisper dependency. Transcription also
+requires the selected model to be present as a complete local model directory.
+Cached models are passed to Hermes by their local path, so its
+normal loader cannot turn a test into a network download. Preparation stays in
+Hermes's own local setup, chosen by the person; this lane adds no installer.
 
 Three more rules the transcribe half holds:
 
@@ -349,6 +343,36 @@ def _probe_local(tt: Any, stt_config: Dict[str, Any]) -> Tuple[bool, Optional[st
     if _has_module(tt, "faster_whisper", "_HAS_FASTER_WHISPER"):
         return True, None
     return False, "faster-whisper is not installed. " + _LAZY_INSTALL_NOTE
+
+
+def _local_model_without_download(tt: Any, stt_config: Dict[str, Any], model: Optional[str]) -> Optional[str]:
+    """Resolve the exact local pick without invoking a model/download resolver."""
+    section = stt_config.get("local") or {}
+    selected = model or _clean_str(section.get("model")) or _clean_str(getattr(tt, "DEFAULT_LOCAL_MODEL", None))
+    if not selected:
+        return None
+    def complete(path: Path) -> bool:
+        # A missing tokenizer makes faster-whisper fetch a fallback tokenizer.
+        return all((path / name).is_file() for name in ("model.bin", "config.json", "tokenizer.json"))
+
+    candidate = Path(selected).expanduser()
+    if candidate.is_dir():
+        return str(candidate.resolve()) if complete(candidate) else None
+    try:
+        # Import only at the explicit transcription seam, after dependency checks.
+        # try_to_load_from_cache is filesystem-only and never contacts the Hub.
+        from faster_whisper.utils import _MODELS
+        from huggingface_hub import try_to_load_from_cache
+        repo = _MODELS.get(selected)
+        if not repo:
+            return None
+        cached = try_to_load_from_cache(repo, "model.bin")
+        if not isinstance(cached, str):
+            return None
+        candidate = Path(cached).parent
+        return str(candidate) if complete(candidate) else None
+    except Exception:
+        return None
 
 
 def _probe_local_command(
@@ -1825,6 +1849,14 @@ class SttRpc:
                 f"The Hermes STT provider {provider!r} is not available right "
                 f"now: {unavailable}",
             )
+
+        if provider == "local":
+            local_model = _local_model_without_download(tt, stt_config, model)
+            if local_model is None:
+                return _failed(provider, "The selected local speech model is not installed. "
+                               "OcuClaw did not download anything. Prepare this model explicitly "
+                               "in Hermes on your computer, then retry the same provider.")
+            model = local_model
 
         # One object, both tweak channels: the overlay Hermes resolves the
         # command/plugin lanes from, and the `pre_transcription` hook that

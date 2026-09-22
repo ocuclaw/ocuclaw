@@ -52,6 +52,8 @@ const RENDER_FAILURE_CODES = Object.freeze([
   "spec_unparseable",
 ]);
 
+const RENDER_DROP_CODES = Object.freeze(["session_mismatch"]);
+
 const MAX_TRACKED_CLIENT_FAILURES = 4;
 
 const MAX_TRACKED_SEND_ATTEMPTS = 32;
@@ -357,6 +359,8 @@ function createSurfaceStore(deps = {}) {
   function makeEntry(sessionKey, kind, prior) {
     return {
       sessionKey, kind: kind || null, pending: null, lastContent: null,
+      declarationId: null,
+      settleOnSupersede: false,
 
       wearerInitiated: false,
       agentRunEnded: false,
@@ -418,8 +422,11 @@ function createSurfaceStore(deps = {}) {
     return new Promise((resolve) => {
       const existing = bySurface.get(surfaceId);
       if (existing) {
+        settleSupersededDeclaration(existing);
 
         existing.pending = resolve;
+        existing.declarationId = meta?.declarationId ?? null;
+        existing.settleOnSupersede = meta?.settleOnSupersede === true;
         existing.wearerInitiated = meta && meta.wearerInitiated === true;
         existing.agentRunEnded = false;
         if (meta && meta.kind) existing.kind = meta.kind;
@@ -445,11 +452,20 @@ function createSurfaceStore(deps = {}) {
       entry.staleAfterMs = meta && Number.isFinite(meta.staleAfterMs) ? meta.staleAfterMs : null;
       if (meta && typeof meta.title === "string") entry.title = meta.title;
       entry.pending = resolve;
+      entry.declarationId = meta?.declarationId ?? null;
+      entry.settleOnSupersede = meta?.settleOnSupersede === true;
       entry.wearerInitiated = meta && meta.wearerInitiated === true;
       stampAuthoredAndValidated(entry);
       bySurface.set(surfaceId, entry);
       syncStageBusySince();
     });
+  }
+
+  function settleSupersededDeclaration(entry) {
+    if (entry?.settleOnSupersede !== true || !entry.pending) return;
+    const pending = entry.pending;
+    entry.pending = null;
+    pending(decorateDelivery(entry, { result: "preempted", origin: "system", reason: "superseded" }));
   }
 
   function decorateDelivery(entry, outcome) {
@@ -892,6 +908,7 @@ function createSurfaceStore(deps = {}) {
     }
 
     const priorTop = bySurface.get(top);
+    settleSupersededDeclaration(priorTop);
 
     stopCron(top, { silent: true });
     bySurface.set(top, makeEntry(sessionKey, params && params.kind, priorTop));
@@ -1133,10 +1150,10 @@ function createSurfaceStore(deps = {}) {
     };
   }
 
-  function validateClientRenderError(surfaceId, report) {
+  function validateTerminalClientReport(surfaceId, report, allowedCodes) {
     const entry = bySurface.get(surfaceId);
     if (!entry) return { ok: false, reason: "unknown_surface" };
-    if (!RENDER_FAILURE_CODES.includes(report?.code)) return { ok: false, reason: "invalid_code" };
+    if (!allowedCodes.includes(report?.code)) return { ok: false, reason: "invalid_code" };
     if (report?.channel !== "render_error" || report?.authoritative !== true) {
       return { ok: false, reason: report?.authorityReason || "evidence_only" };
     }
@@ -1147,6 +1164,14 @@ function createSurfaceStore(deps = {}) {
     if (!attempt) return { ok: false, reason: "no_send_attempt" };
     if (attempt.receiptAtMs !== null) return { ok: false, reason: "already_receipted" };
     return { ok: true, surfaceUuid: entry.uuid };
+  }
+
+  function validateClientRenderError(surfaceId, report) {
+    return validateTerminalClientReport(surfaceId, report, RENDER_FAILURE_CODES);
+  }
+
+  function validateClientRenderDrop(surfaceId, report) {
+    return validateTerminalClientReport(surfaceId, report, RENDER_DROP_CODES);
   }
 
   function hasClientReceipt(surfaceUuid, seq) {
@@ -1169,9 +1194,20 @@ function createSurfaceStore(deps = {}) {
     };
   }
 
+  function lastRenderSendOf(surfaceId) {
+    const entry = bySurface.get(surfaceId);
+    if (!entry) return null;
+    for (const attempt of entry.sendAttempts.values()) {
+      if (attempt.mode === "render") return { seq: attempt.seq, atMs: attempt.atMs };
+    }
+    return null;
+  }
+
   return {
     storeId,
     register, resolve, hasSurface, isPending, drainSession, drainAll, settlePending,
+    isCurrentDeclaration: (surfaceId, declarationId) =>
+      typeof declarationId === "string" && bySurface.get(surfaceId)?.declarationId === declarationId,
     isWearerInitiated: (surfaceId) => bySurface.get(surfaceId)?.wearerInitiated === true,
     hasAgentRunEnded: (surfaceId) => bySurface.get(surfaceId)?.agentRunEnded === true,
     markAgentRunEnded,
@@ -1180,8 +1216,9 @@ function createSurfaceStore(deps = {}) {
     planStageGrant, commitStageGrant, stageState, activeSessionCount,
     uuidOf, titleOf, markerFor, clearAwaitingResponse, breadcrumbFor, surfaceFactsFor,
     peekEvents, reduceForDelivery, peekDeadLetter, deadLetterEventCount, drainDeadLetter,
-    recordSendAttempt, recordClientReceipt, hasClientReceipt, deliveryEvidenceOf,
+    recordSendAttempt, recordClientReceipt, hasClientReceipt, deliveryEvidenceOf, lastRenderSendOf,
     recordClientFailureEvidence, clientFailuresOf, validateClientRenderError,
+    validateClientRenderDrop,
     recordContent, recordSpec, currentSurfaceSpecForSession,
     _bySurface: bySurface,
   };
@@ -1189,4 +1226,4 @@ function createSurfaceStore(deps = {}) {
 
 const createPendingRenderMap = createSurfaceStore;
 
-module.exports = { createPendingRenderMap, createSurfaceStore, isTerminalOutcome, isSettlementOutcome, GLASS_EVENT_ORIGINS, normalizeGlassesSessionKey, SETTLEMENT_OUTCOME_RESULTS, TERMINAL_OUTCOME_RESULTS, SURFACE_REAP_REASONS, SURFACE_EVICTION_REASONS, DEAD_LETTER_REASONS, RECEIPT_REJECTION_REASONS, RENDER_FAILURE_CODES };
+module.exports = { createPendingRenderMap, createSurfaceStore, isTerminalOutcome, isSettlementOutcome, GLASS_EVENT_ORIGINS, normalizeGlassesSessionKey, SETTLEMENT_OUTCOME_RESULTS, TERMINAL_OUTCOME_RESULTS, SURFACE_REAP_REASONS, SURFACE_EVICTION_REASONS, DEAD_LETTER_REASONS, RECEIPT_REJECTION_REASONS, RENDER_FAILURE_CODES, RENDER_DROP_CODES };

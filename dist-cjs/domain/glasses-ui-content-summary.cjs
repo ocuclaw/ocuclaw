@@ -37,6 +37,19 @@ function summarizeGlassesUiContent(specOrPatch) {
     if (Number.isInteger(imageHeight)) Object.assign(out, { imageHeight });
   }
 
+  if (Reflect.get(o, "template") === "graphic") {
+    const graphic = Reflect.get(o, "graphic");
+    const slots = graphic && typeof graphic === "object" ? Reflect.get(graphic, "slots") : null;
+    const slotTypes = Array.isArray(slots)
+      ? slots
+        .map((slot) => (slot && typeof slot === "object" ? Reflect.get(slot, "type") : null))
+        .filter((type) => typeof type === "string")
+        .slice(0, ITEMS_SHOWN)
+        .map((type) => truncate(type, LABEL_MAX))
+      : [];
+    Object.assign(out, { template: "graphic", slotTypes });
+  }
+
   if (rawItems) {
     const labels = rawItems
       .map((i) =>

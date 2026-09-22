@@ -712,6 +712,59 @@ function createEvenAiEndpoint(opts = {}) {
     typeof opts.resolveAgentForRoute === "function"
       ? opts.resolveAgentForRoute
       : null;
+
+  const configuredGetDefaultMintAgentRef = Reflect.get(
+    opts,
+    "getDefaultMintAgentRef",
+  );
+  const getDefaultMintAgentRef =
+    typeof configuredGetDefaultMintAgentRef === "function"
+      ? configuredGetDefaultMintAgentRef
+      : null;
+  async function defaultMintAgentRef() {
+    if (!getDefaultMintAgentRef) return "";
+    try {
+      return trimString(await Promise.resolve(getDefaultMintAgentRef()));
+    } catch (err) {
+      logger.warn(
+        `[evenai] default mint agent lookup failed: ${err && err.message ? err.message : err}`,
+      );
+      return "";
+    }
+  }
+
+  const configuredResolveMintAgentRef = Reflect.get(opts, "resolveMintAgentRef");
+  const resolveMintAgentRefHook =
+    typeof configuredResolveMintAgentRef === "function"
+      ? configuredResolveMintAgentRef
+      : null;
+  async function resolveMintAgentRef(oneShotAgentRef, bindingAgentRef) {
+    if (resolveMintAgentRefHook) {
+      try {
+        const resolved = await Promise.resolve(
+          resolveMintAgentRefHook({ oneShotAgentRef, bindingAgentRef }),
+        );
+        if (resolved && typeof resolved === "object") {
+          return {
+            agentRef: trimString(resolved.agentRef),
+            oneShotHonoured: resolved.oneShotHonoured === true,
+          };
+        }
+      } catch (err) {
+        logger.warn(
+          `[evenai] mint agent resolution failed: ${err && err.message ? err.message : err}`,
+        );
+      }
+    }
+    const fallbackRef =
+      trimString(oneShotAgentRef) ||
+      trimString(bindingAgentRef) ||
+      (await defaultMintAgentRef());
+    return {
+      agentRef: fallbackRef,
+      oneShotHonoured: !!trimString(oneShotAgentRef),
+    };
+  }
   const configuredGetAgentsCatalogSnapshot = Reflect.get(
     opts,
     "getAgentsCatalogSnapshot",
@@ -1941,20 +1994,27 @@ function createEvenAiEndpoint(opts = {}) {
         const bindingAgentRef = trimString(
           routeDecision.binding && routeDecision.binding.agentRef,
         );
+
+        const mintAgent = await resolveMintAgentRef(
+          claimedOneShotAgentRef,
+          bindingAgentRef,
+        );
         route = await resolveLocalTargetRoute({
           requestId,
           responseModel,
           userText,
-          agentRef: claimedOneShotAgentRef || bindingAgentRef,
+          agentRef: mintAgent.agentRef,
         });
         if (
           claimedOneShotAgentRef &&
+          mintAgent.oneShotHonoured &&
           (
             !route ||
             route.sessionMinted !== true ||
             trimString(route.mintedAgentRef) !== claimedOneShotAgentRef
           )
         ) {
+
           restoreClaimedOneShot();
         }
       } catch (err) {
@@ -2066,6 +2126,16 @@ function createEvenAiEndpoint(opts = {}) {
       fingerprint,
       startedAtMs,
     };
+    const observation = Reflect.get(opts, "requestObservation");
+    const observationTicket = observation?.begin();
+    let observationSettled = false;
+    const settleObservation = (outcome = "") => {
+      if (observationSettled) return;
+      observationSettled = true;
+      observation?.complete(observationTicket, outcome);
+    };
+
+    res.once("close", () => settleObservation("failed"));
 
     let activeRunId = null;
     let clientDisconnected = false;
@@ -2274,7 +2344,9 @@ function createEvenAiEndpoint(opts = {}) {
       const emptyText = !trimString(filteredAssistantText);
       const completionContent = emptyText
         ? "Even AI finished without a text reply."
-        : filteredAssistantText;
+        : (observation?.decorateReply?.(observationTicket, filteredAssistantText) ?? filteredAssistantText);
+      if (emptyText) settleObservation("failed");
+      else res.once("finish", () => settleObservation("succeeded"));
 
       emitDebug(
         "evenai",
@@ -2301,6 +2373,7 @@ function createEvenAiEndpoint(opts = {}) {
       settleFinalContent(completionContent);
       return true;
     } catch (err) {
+      settleObservation("failed");
       const handled = classifyHandledError(err);
       emitDebug(
         "evenai",

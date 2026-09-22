@@ -2,11 +2,12 @@ const { GLASSES_UI_IMAGE_ASSETS, getKindDescriptor } = require("./glasses-ui-des
 const { GLASSES_UI_LIMITS } = require("./glasses-ui-limits.cjs");
 const { substituteTemplate, validateTemplate } = require("./glasses-ui-template.cjs");
 
-const LIVEUI_TEMPLATE_SLOT_TYPES = Object.freeze(["text", "number", "list", "image"]);
+const LIVEUI_TEMPLATE_SLOT_TYPES = Object.freeze(["text", "number", "list", "image", "json"]);
 const LIVEUI_TEMPLATE_SLOT_MAX = 16;
 const LIVEUI_TEMPLATE_SLOT_TEXT_MAX = 4000;
 const LIVEUI_TEMPLATE_SLOT_LIST_MAX = 64;
 const LIVEUI_TEMPLATE_SLOT_LIST_ITEM_MAX = 200;
+const LIVEUI_TEMPLATE_SLOT_JSON_MAX_BYTES = 4000;
 const LIVEUI_TEMPLATE_ERROR_PREFIX = "⚠ Update failed: ";
 
 const SLOT_KEY_RE = /^[a-z][a-z0-9_]{0,31}$/;
@@ -16,6 +17,7 @@ const SLOT_BOUND_FIELDS = Object.freeze({
   number: new Set(["min", "max"]),
   list: new Set(["maxItems"]),
   image: new Set(),
+  json: new Set(["maxBytes"]),
 });
 const PRESENTATION_FIELDS = new Set(["loading", "empty", "error", "pages"]);
 const FRAGMENT_FIELDS = new Set(["title", "body", "items"]);
@@ -278,6 +280,14 @@ function validateLiveuiTemplateSlotContract(template) {
         `list slot ${slot.key} maxItems must be 1-${LIVEUI_TEMPLATE_SLOT_LIST_MAX}`,
       );
     }
+    if (slot.type === "json" && slot.maxBytes !== undefined &&
+        (!Number.isInteger(slot.maxBytes) || slot.maxBytes < 1 ||
+         slot.maxBytes > LIVEUI_TEMPLATE_SLOT_JSON_MAX_BYTES)) {
+      return rejected(
+        "template_slot_bound_invalid",
+        `json slot ${slot.key} maxBytes must be 1-${LIVEUI_TEMPLATE_SLOT_JSON_MAX_BYTES}`,
+      );
+    }
     slotByKey.set(slot.key, slot);
   }
 
@@ -418,6 +428,14 @@ function validateImageValue(value) {
     : null;
 }
 
+function jsonByteLength(value) {
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).length;
+  } catch (_) {
+    return Infinity;
+  }
+}
+
 function validateSlotValue(slot, value) {
   if (slot.type === "text") {
     const maxLength = slot.maxLength === undefined
@@ -439,6 +457,14 @@ function validateSlotValue(slot, value) {
       value.every((item) => typeof item === "string" &&
         item.length <= LIVEUI_TEMPLATE_SLOT_LIST_ITEM_MAX);
     return valid ? { ok: true, value: [...value] } : { ok: false };
+  }
+  if (slot.type === "json") {
+    const maxBytes = slot.maxBytes === undefined
+      ? LIVEUI_TEMPLATE_SLOT_JSON_MAX_BYTES
+      : slot.maxBytes;
+    return value !== undefined && jsonByteLength(value) <= maxBytes
+      ? { ok: true, value }
+      : { ok: false };
   }
   const image = validateImageValue(value);
   return image ? { ok: true, value: image } : { ok: false };
@@ -492,20 +518,23 @@ function templateBaseSpec(template) {
   return base;
 }
 
-function substituteValue(value, data, opts = {}) {
+function substituteValue(value, data, opts = {}, depth = 0) {
   if (typeof value === "string") {
     return substituteTemplate(value, data, {
       preserveWholeValue: opts.preserveWholeValue === true,
       arraySeparator: ", ",
     });
   }
-  if (Array.isArray(value)) return value.map((entry) => substituteValue(entry, data));
+  if (Array.isArray(value)) {
+    return value.map((entry) => substituteValue(entry, data, opts, depth + 1));
+  }
   if (!isPlainObject(value)) return value;
   const output = {};
   for (const [key, child] of Object.entries(value)) {
-    output[key] = substituteValue(child, data, {
-      preserveWholeValue: key === "items" && typeof child === "string",
-    });
+    const preserveWholeValue = opts.preserveWholeValue === true ||
+      (depth === 0 && key === "graphic") ||
+      (depth === 0 && key === "items" && typeof child === "string");
+    output[key] = substituteValue(child, data, { preserveWholeValue }, depth + 1);
   }
   return output;
 }
@@ -605,6 +634,8 @@ function sampleLiveuiTemplateValues(template) {
     if (slot.type === "text") values[slot.key] = "x";
     else if (slot.type === "number") values[slot.key] = Math.min(slot.max, Math.max(slot.min, 0));
     else if (slot.type === "list") values[slot.key] = ["x"];
+
+    else if (slot.type === "json") values[slot.key] = [];
     else values[slot.key] = GLASSES_UI_IMAGE_ASSETS[0];
   }
   return values;
@@ -685,4 +716,4 @@ function readLiveuiTemplateRefreshPath(output, path) {
   return substituteTemplate(`{{${path.trim()}}}`, data, { preserveWholeValue: true });
 }
 
-module.exports = { LIVEUI_TEMPLATE_SLOT_TYPES, LIVEUI_TEMPLATE_SLOT_MAX, LIVEUI_TEMPLATE_SLOT_TEXT_MAX, LIVEUI_TEMPLATE_SLOT_LIST_MAX, LIVEUI_TEMPLATE_SLOT_LIST_ITEM_MAX, LIVEUI_TEMPLATE_ERROR_PREFIX, copyLiveuiStaticJson, validateLiveuiTemplateSlotContract, previewLiveuiTemplatePresentation, sampleLiveuiTemplateValues, fillLiveuiTemplate, liveuiTemplateHasErrorPresentation, readLiveuiTemplateRefreshPath };
+module.exports = { LIVEUI_TEMPLATE_SLOT_TYPES, LIVEUI_TEMPLATE_SLOT_MAX, LIVEUI_TEMPLATE_SLOT_TEXT_MAX, LIVEUI_TEMPLATE_SLOT_LIST_MAX, LIVEUI_TEMPLATE_SLOT_LIST_ITEM_MAX, LIVEUI_TEMPLATE_SLOT_JSON_MAX_BYTES, LIVEUI_TEMPLATE_ERROR_PREFIX, copyLiveuiStaticJson, validateLiveuiTemplateSlotContract, previewLiveuiTemplatePresentation, sampleLiveuiTemplateValues, fillLiveuiTemplate, liveuiTemplateHasErrorPresentation, readLiveuiTemplateRefreshPath };

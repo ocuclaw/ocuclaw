@@ -9,7 +9,6 @@ in a worker thread via ``asyncio.to_thread``.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import hashlib
 import json
 import os
@@ -23,6 +22,17 @@ from . import desktop_fleet
 from .profile_lifecycle import (
     PROFILE_MUTATION_LOCK, WORKSPACE_UNSUPPORTED, admit_profile,
     bootstrap_profile, write_private,
+)
+# The served-route question has ONE answer for the whole bundle (#2942). The
+# namespace/profile mapping and the snapshot loader live with the resolver and
+# are re-exported here so every existing importer keeps working unchanged.
+from .profile_routes import (  # noqa: F401 - re-exported bundle surface
+    CREATE_RECEIPT_FILENAME,
+    DEFAULT_NAMESPACE,
+    DEFAULT_PROFILE,
+    load_profile_routing_snapshot,
+    namespace_for_profile,
+    profile_for_namespace,
 )
 
 GW_METHOD_MODELS_LIST = "gw.models.list"
@@ -39,14 +49,81 @@ GW_METHOD_PROFILES_SOUL = "gw.profiles.soul"
 GW_METHOD_SKILLS_STATUS = "gw.skills.status"
 GW_METHOD_COMMANDS_LIST = "gw.commands.list"
 
-DEFAULT_NAMESPACE = "main"
-DEFAULT_PROFILE = "default"
 ROUTABLE_USAGE_PROVIDERS: Tuple[str, ...] = (
     "anthropic",
     "openai-codex",
     "openrouter",
 )
 CODEX_SESSION_WINDOW_MAX_SECONDS = (5 * 60 * 60) + 60
+
+#: How long :meth:`retry_incomplete_setup` waits for the profile mutation lock
+#: before reporting that a creation owns this receipt right now. Long enough to
+#: sit behind an enrollment write (milliseconds), short of blocking the wearer
+#: for a whole native create.
+#:
+#: It MUST stay well under the phone's agents-request expiry (``PhoneUI.kt``,
+#: `delay(20_000)` on `agents.state.request`), and the margin has to cover the
+#: setup run after the lock as well. The phone starts its clock when the request
+#: is created -- before it leaves the device -- so a host that waited the full
+#: 20s would have its `creation_in_flight` sentence arrive after the request was
+#: already expired and dropped, replacing the one precise refusal this lane
+#: authored with "Hermes did not answer."
+RETRY_LOCK_TIMEOUT_S = 8.0
+
+#: The setup a creation receipt replays on retry. Stored in the receipt so the
+#: rerun needs nothing from the caller but the profile's name — the create
+#: popup's draft is gone by the time the Agents list offers Retry (#2940).
+RECEIPT_SETUP_KEY = "setup"
+
+
+class IncompleteRetryRefused(Exception):
+    """A retry this bundle will not run, with a typed reason for the wearer.
+
+    Every refusal here is a *decision*, never a leaked native error: the caller
+    turns ``code`` into one wearer-safe sentence and leaves the row retryable.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _validated_setup(setup: Any) -> Tuple[Dict[str, str], str, List[str]]:
+    """``(fields, folder, blockedTools)`` for one agent setup, or ``ValueError``.
+
+    Shared by the first creation and by :meth:`retry_incomplete_setup`, so a
+    setup replayed from a receipt is held to exactly the rules it was accepted
+    under. That matters in one direction in particular: a setup that a NEWER
+    bundle would now refuse (a workspace, once ``terminal_scope`` lands and is
+    later withdrawn) is refused on retry too, rather than half-applied.
+    """
+    if not isinstance(setup, dict) or set(setup) - {"instructions", "model", "provider", "workspace", "blockedTools"}:
+        raise ValueError("Invalid agent setup")
+    fields = {}
+    for key, limit in (("instructions", 8000), ("model", 200), ("provider", 100), ("workspace", 500)):
+        value = setup.get(key, "")
+        if not isinstance(value, str) or len(value) > limit or "\0" in value:
+            raise ValueError(f"Invalid {key}")
+        fields[key] = value.strip()
+    if bool(fields["model"]) != bool(fields["provider"]):
+        raise ValueError("Choose a model and its provider")
+    folder = fields["workspace"]
+    # Stable 0.21 lacks terminal_scope. Do not fake profile isolation by
+    # mutating os.environ; retire this guard only after the upstream gate.
+    if folder:
+        raise ValueError(WORKSPACE_UNSUPPORTED)
+    if folder and (not (folder.startswith("/") or folder.startswith("~/")) or "\n" in folder or "\r" in folder):
+        raise ValueError("Use an absolute folder path or ~/")
+    blocked = setup.get("blockedTools", [])
+    if not isinstance(blocked, list) or len(blocked) > 3 or any(x not in ("web", "files", "terminal") for x in blocked):
+        raise ValueError("Invalid tool blocks")
+    return fields, folder, list(blocked)
+
+
+def _setup_fingerprint(setup: Any) -> str:
+    """The receipt's fingerprint for *setup*. One definition, two callers."""
+    return hashlib.sha256(json.dumps(setup, sort_keys=True).encode()).hexdigest()
 
 
 def _usage_window_label(
@@ -72,49 +149,6 @@ def _usage_window_label(
     ):
         return "Weekly"
     return label
-
-
-def profile_for_namespace(ns: Any) -> str:
-    """Map the W07 gw.agent.identity namespace to a Hermes profile name."""
-    text = str(ns or "").strip()
-    return DEFAULT_PROFILE if text in ("", DEFAULT_NAMESPACE) else text
-
-
-def namespace_for_profile(profile: Any) -> str:
-    """Map a Hermes profile name to the OcuClaw session namespace."""
-    name = profile_for_namespace(profile)
-    return DEFAULT_NAMESPACE if name == DEFAULT_PROFILE else name
-
-
-def load_profile_routing_snapshot() -> Tuple[bool, Dict[str, Path]]:
-    """Fail-closed snapshot of the profiles this gateway can route."""
-    try:
-        from gateway.config import load_gateway_config
-
-        gateway_config = load_gateway_config()
-        multiplex = bool(gateway_config.multiplex_profiles)
-    except Exception:  # noqa: BLE001
-        return False, {}
-    if not multiplex:
-        return False, {}
-
-    try:
-        from hermes_cli.profiles import profiles_to_serve
-
-        kwargs: Dict[str, Any] = {"multiplex": True}
-        if "profile_allowlist" in inspect.signature(profiles_to_serve).parameters:
-            kwargs["profile_allowlist"] = getattr(
-                gateway_config,
-                "multiplex_profile_allowlist",
-                None,
-            )
-        rows = profiles_to_serve(**kwargs)
-        return True, {
-            namespace_for_profile(name): Path(home)
-            for name, home in rows
-        }
-    except Exception:  # noqa: BLE001
-        return True, {}
 
 
 def _clean_str(value: Any) -> Optional[str]:
@@ -230,26 +264,25 @@ class GwRpc:
         # host (`allow_admin_from` lists the wearer id). Read live per list so
         # the capability snapshot tracks the config the gateway booted with.
         self._adopt_supported_provider = adopt_supported_provider
-        self._multiplex_enabled = False
-        self._served_profile_homes: Dict[str, Path] = {}
+        # #2942: the routes are READ, never frozen. This reader used to copy
+        # the adapter's boot snapshot here, which meant a profile created from
+        # the glasses could not appear in the agent list until the gateway was
+        # restarted — even after Hermes 0.21.3 started serving it within ~30 s.
+        # The provider is now called per read; the construction-time answer is
+        # kept only as the fallback for a read that proves nothing.
+        self._routing_provider = routing_provider
+        self._boot_multiplex = False
+        self._boot_profile_homes: Dict[str, Path] = {}
         self._management_default_home: Optional[Path] = None
         try:
             from hermes_constants import get_process_hermes_home
             self._management_default_home = Path(get_process_hermes_home()).resolve()
         except (ImportError, AttributeError, OSError):
             pass
-        if routing_provider is not None:
-            try:
-                enabled, homes = routing_provider()
-                if (
-                    bool(enabled)
-                    and isinstance(homes, dict)
-                    and DEFAULT_NAMESPACE in homes
-                ):
-                    self._multiplex_enabled = True
-                    self._served_profile_homes = dict(homes)
-            except Exception:  # noqa: BLE001 - capability discovery fails closed
-                pass
+        enabled, homes = self._read_routing_provider()
+        if enabled:
+            self._boot_multiplex = True
+            self._boot_profile_homes = homes
 
     def handlers(self) -> Dict[str, Callable[[Any], Any]]:
         """method -> async handler, for LinkProcess.register_request_handler."""
@@ -556,6 +589,16 @@ class GwRpc:
     def _sync_agent_identity(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
         profile = profile_for_namespace(p.get("ns", self._namespace))
+        # #2940: ``ns`` arrives off the wire, so without this gate any direct
+        # RPC could name an un-enrolled profile and read back its SOUL-declared
+        # display name -- and, because an unknown name echoes back as itself,
+        # use the call to enumerate which profiles exist on the host. The
+        # sibling reader of this same file (_sync_profiles_soul) is gated the
+        # same way. This lane degrades rather than raising: the default agent's
+        # own identity call must keep working on a host whose route table is
+        # still resolving.
+        if profile not in self._routable_profiles()[1]:
+            return {"agentId": profile, "name": profile}
         soul_name: Optional[str] = None
         try:
             from hermes_cli.profiles import get_profile_dir
@@ -601,13 +644,7 @@ class GwRpc:
     def _sync_profiles_list(self, _params: Any) -> Dict[str, Any]:
         from hermes_cli.profiles import list_profiles
 
-        multiplex, served_homes = self._routing_snapshot()
-        routable_profiles = {DEFAULT_PROFILE}
-        if multiplex:
-            routable_profiles.update(
-                profile_for_namespace(namespace)
-                for namespace in served_homes
-            )
+        multiplex, routable_profiles = self._routable_profiles()
         rows = []
         for profile in list_profiles():
             profile_name = str(getattr(profile, "name"))
@@ -649,9 +686,45 @@ class GwRpc:
             "desktopFleet": desktop_fleet.read(),
         }
 
+    def _read_routing_provider(self) -> Tuple[bool, Dict[str, Path]]:
+        """The provider's answer, validated. ``(False, {})`` proves nothing.
+
+        A multiplex route table without the default namespace is not one this
+        bundle can act on — the default profile owns transport — so it is
+        treated as an unproven read rather than as "no secondary profiles".
+        """
+        provider = self._routing_provider
+        if provider is None:
+            return False, {}
+        try:
+            enabled, homes = provider()
+        except Exception:  # noqa: BLE001 - capability discovery fails closed
+            return False, {}
+        if (
+            bool(enabled)
+            and isinstance(homes, dict)
+            and DEFAULT_NAMESPACE in homes
+        ):
+            return True, dict(homes)
+        return False, {}
+
     def _routing_snapshot(self) -> Tuple[bool, Dict[str, Path]]:
-        """The adapter's boot-frozen multiplex routes, or a closed gate."""
-        return self._multiplex_enabled, dict(self._served_profile_homes)
+        """The multiplex routes this gateway serves RIGHT NOW (#2942)."""
+        enabled, homes = self._read_routing_provider()
+        if enabled:
+            return True, homes
+        return self._boot_multiplex, dict(self._boot_profile_homes)
+
+    @property
+    def _multiplex_enabled(self) -> bool:
+        return self._routing_snapshot()[0]
+
+    @property
+    def _served_profile_homes(self) -> Dict[str, Path]:
+        """Live served homes. A property so every existing reader — including
+        ``restart_rpc`` and ``management_profiles`` — tracks the live set
+        without each holding its own stale copy."""
+        return self._routing_snapshot()[1]
 
     def _sync_profiles_create(self, params: Any) -> Dict[str, Any]:
         p = dict(params) if isinstance(params, dict) else {}
@@ -668,32 +741,24 @@ class GwRpc:
         lets reconnect/restart retries apply missing settings without another create.
         No process-global HERMES_HOME change and no writes to another profile.
         """
-        if not self._routing_snapshot()[0]:
+        # ONE routing read for the whole creation. The routes are live now
+        # (#2942), so re-reading between the bootstrap and the activation below
+        # could hand this method two different answers — including an empty one
+        # from a read that proved nothing, which would be a bare KeyError in
+        # the middle of an irreversible native create.
+        multiplex, served_homes = self._routing_snapshot()
+        default_home = served_homes.get(DEFAULT_NAMESPACE)
+        if not multiplex or default_home is None:
             raise RuntimeError("Hermes profile creation requires gateway multiplexing")
         from hermes_cli.profiles import get_profile_dir, normalize_profile_name, validate_profile_name
-        import yaml
+        # Imported here, not where it is used: the setup body now runs inside a
+        # try that turns failures into `status: "partial"`, and an unimportable
+        # yaml must still raise BEFORE the irreversible native create, as it did
+        # when this import sat at the top of this method.
+        import yaml  # noqa: F401 - import-time check; the writer re-imports it
 
         setup = params["setup"]
-        if not isinstance(setup, dict) or set(setup) - {"instructions", "model", "provider", "workspace", "blockedTools"}:
-            raise ValueError("Invalid agent setup")
-        fields = {}
-        for key, limit in (("instructions", 8000), ("model", 200), ("provider", 100), ("workspace", 500)):
-            value = setup.get(key, "")
-            if not isinstance(value, str) or len(value) > limit or "\0" in value:
-                raise ValueError(f"Invalid {key}")
-            fields[key] = value.strip()
-        if bool(fields["model"]) != bool(fields["provider"]):
-            raise ValueError("Choose a model and its provider")
-        folder = fields["workspace"]
-        # Stable 0.21 lacks terminal_scope. Do not fake profile isolation by
-        # mutating os.environ; retire this guard only after the upstream gate.
-        if folder:
-            raise ValueError(WORKSPACE_UNSUPPORTED)
-        if folder and (not (folder.startswith("/") or folder.startswith("~/")) or "\n" in folder or "\r" in folder):
-            raise ValueError("Use an absolute folder path or ~/")
-        blocked = setup.get("blockedTools", [])
-        if not isinstance(blocked, list) or len(blocked) > 3 or any(x not in ("web", "files", "terminal") for x in blocked):
-            raise ValueError("Invalid tool blocks")
+        fields, folder, blocked = _validated_setup(setup)
         request_id = params.get("requestId")
         if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 120:
             raise ValueError("Missing or invalid setup request id")
@@ -705,9 +770,20 @@ class GwRpc:
         if canon == "default":
             raise ValueError("Choose a name other than default")
         profile_dir = Path(get_profile_dir(canon))
-        receipt_path = profile_dir / ".ocuclaw-create.json"
-        fingerprint = hashlib.sha256(json.dumps(setup, sort_keys=True).encode()).hexdigest()
-        receipt = {"requestId": request_id, "fingerprint": fingerprint}
+        receipt_path = profile_dir / CREATE_RECEIPT_FILENAME
+        fingerprint = _setup_fingerprint(setup)
+        # The setup rides in the receipt so a later retry needs nothing but the
+        # profile's name. The wearer's create popup is gone by then (#2940's
+        # Agents list is the only place the row still exists), and asking the
+        # phone to resend a draft it no longer has is how the gap arose.
+        #
+        # It carries the wearer's instructions, so it is no more exposed than the
+        # SOUL.md beside it: `write_private` lands 0600 in the profile's own
+        # directory, and nothing reads the receipt back off this host.
+        receipt = {"requestId": request_id, "fingerprint": fingerprint, RECEIPT_SETUP_KEY: setup}
+        # Resolved once, so every exit from this call agrees about whether the
+        # wearer must restart Hermes to use the agent they just made.
+        restart_required = self._restart_required_to_activate()
         if profile_dir.exists():
             try:
                 old = json.loads(receipt_path.read_text())
@@ -716,55 +792,253 @@ class GwRpc:
             if old.get("requestId") != request_id or old.get("fingerprint") != fingerprint:
                 raise ValueError("Profile already exists and belongs to another creation request")
             if old.get("complete"):
-                return {"status": "created", "profile": {"id": canon, "name": canon}, "restartRequired": True}
+                return {"status": "created", "profile": {"id": canon, "name": canon}, "restartRequired": restart_required}
         else:
             self._create_fresh_profile({"name": raw_name})
             # Failure here leaves an existing profile, which fails closed above.
             write_private(receipt_path, json.dumps(receipt))
-        result = {"status": "created", "profile": {"id": canon, "name": canon}, "restartRequired": True}
+        result = {"status": "created", "profile": {"id": canon, "name": canon}, "restartRequired": restart_required}
         try:
-            bootstrap_profile(self._served_profile_homes[DEFAULT_NAMESPACE], profile_dir)
-            if fields["instructions"]:
-                soul = profile_dir / "SOUL.md"
-                tmp = profile_dir / ".ocuclaw-soul.tmp"
-                tmp.write_text(fields["instructions"], encoding="utf-8")
-                os.replace(tmp, soul)
-            if fields["model"] or folder or blocked:
-                config_path = profile_dir / "config.yaml"
-                cfg = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
-                if cfg is None:
-                    cfg = {}
-                if not isinstance(cfg, dict):
-                    raise ValueError("Invalid profile config")
-                if fields["model"]:
-                    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
-                    if fields["provider"] != model_cfg.get("provider"):
-                        # A different provider must not inherit the old endpoint/key.
-                        model_cfg = {}
-                    cfg["model"] = {**model_cfg, "default": fields["model"], "provider": fields["provider"]}
-                if folder:
-                    cfg["terminal"] = {**(cfg.get("terminal") or {}), "cwd": folder}
-                if blocked:
-                    agent = cfg.get("agent") or {}
-                    groups = {"web": "web", "files": "file", "terminal": "terminal"}
-                    agent["disabled_toolsets"] = sorted(set(agent.get("disabled_toolsets") or []) | {groups[x] for x in blocked})
-                    cfg["agent"] = agent
-                tmp = profile_dir / ".ocuclaw-config.tmp"
-                tmp.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
-                tmp.chmod(0o600)
-                os.replace(tmp, config_path)
-            admit_profile(self._served_profile_homes[DEFAULT_NAMESPACE], canon)
-            write_private(receipt_path, json.dumps({**receipt, "complete": True}))
+            self._run_receipt_setup(
+                default_home=default_home,
+                profile_dir=profile_dir,
+                canon=canon,
+                receipt_path=receipt_path,
+                receipt=receipt,
+                fields=fields,
+                folder=folder,
+                blocked=blocked,
+            )
         except Exception:
             result.update(status="partial", errorMessage="Profile created, but setup or activation could not finish. Retry setup on this same profile before restarting.")
         return result
 
-    def _create_fresh_profile(self, params: Any) -> Dict[str, Any]:
-        """Create one native Hermes profile, pending the required restart.
+    def _run_receipt_setup(
+        self,
+        *,
+        default_home: Path,
+        profile_dir: Path,
+        canon: str,
+        receipt_path: Path,
+        receipt: Dict[str, Any],
+        fields: Dict[str, str],
+        folder: str,
+        blocked: List[str],
+    ) -> None:
+        """Apply the half of creation this receipt owns, then stamp it complete.
 
-        The gateway's routing snapshot is intentionally frozen at adapter boot.
-        Therefore the new profile cannot leak into ``gw.profiles.list`` until
-        Hermes completes its native ``/restart`` drain and reconnect cycle.
+        Idempotent by construction — every step is a whole-value write of a
+        setting this receipt already declared — which is what lets
+        :meth:`retry_incomplete_setup` replay it over a profile the first
+        attempt left half-built. Raises on any failure; the caller decides what
+        a failure means to its wearer.
+        """
+        import yaml
+
+        bootstrap_profile(default_home, profile_dir)
+        if fields["instructions"]:
+            soul = profile_dir / "SOUL.md"
+            tmp = profile_dir / ".ocuclaw-soul.tmp"
+            tmp.write_text(fields["instructions"], encoding="utf-8")
+            os.replace(tmp, soul)
+        if fields["model"] or folder or blocked:
+            config_path = profile_dir / "config.yaml"
+            cfg = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+            if cfg is None:
+                cfg = {}
+            if not isinstance(cfg, dict):
+                raise ValueError("Invalid profile config")
+            if fields["model"]:
+                model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+                if fields["provider"] != model_cfg.get("provider"):
+                    # A different provider must not inherit the old endpoint/key.
+                    model_cfg = {}
+                cfg["model"] = {**model_cfg, "default": fields["model"], "provider": fields["provider"]}
+            if folder:
+                cfg["terminal"] = {**(cfg.get("terminal") or {}), "cwd": folder}
+            if blocked:
+                agent = cfg.get("agent") or {}
+                groups = {"web": "web", "files": "file", "terminal": "terminal"}
+                agent["disabled_toolsets"] = sorted(set(agent.get("disabled_toolsets") or []) | {groups[x] for x in blocked})
+                cfg["agent"] = agent
+            tmp = profile_dir / ".ocuclaw-config.tmp"
+            tmp.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+            tmp.chmod(0o600)
+            os.replace(tmp, config_path)
+        # Enrolment BEFORE the completion stamp, deliberately. The stamp is
+        # what makes a retry short-circuit ("if old.get('complete'): return
+        # created" in the creation path), so stamping first would turn a failed
+        # enrol into a permanently un-enrolled agent whose retry reports
+        # success. R5's promise -- not reachable until setup completes -- is
+        # kept by `creation_is_incomplete`, which gates routing independently
+        # of the set, so the window this order opens is cosmetic: an enrolled
+        # agent whose receipt never completed shows as "setup incomplete", and
+        # agents_view keeps it removable so it is never a dead end.
+        #
+        # #2940 follow-up: swapping these two strands agents, and the retry
+        # lane below relies on the same order -- it is the incomplete stamp
+        # that keeps the row retryable when the enrol is what failed.
+        admit_profile(default_home, canon)
+        write_private(receipt_path, json.dumps({**receipt, "complete": True}))
+
+    def retry_incomplete_setup(self, name: Any, *, home: Optional[Path] = None) -> Dict[str, Any]:
+        """Finish a profile whose creation receipt never completed (#2940).
+
+        The caller names a profile and nothing else. Everything the rerun needs
+        — the owning request id, the fingerprint, the setup itself — is read
+        back from that profile's own receipt, which is the whole point: the
+        create popup that held the draft is long gone by the time the Agents
+        list offers Retry, and a caller-supplied request id would be a way to
+        talk over a creation that is still running.
+
+        The existing "belongs to another creation request" guard is therefore
+        untouched and, if anything, tighter here:
+
+        * a **complete** receipt is refused outright — this lane only ever
+          finishes something unfinished, it never re-applies settled setup;
+        * an **in-flight** creation holds :data:`PROFILE_MUTATION_LOCK` for its
+          whole irreversible body, so a retry that cannot take that lock within
+          :data:`RETRY_LOCK_TIMEOUT_S` reports ``creation_in_flight`` rather
+          than racing it (one process; a second gateway on the same home is out
+          of this bundle's reach either way);
+        * a receipt whose stored setup does not hash to its own fingerprint is
+          **foreign** — a half-written or hand-edited record this bundle will
+          not speak for — and is refused rather than replayed.
+
+        Enrollment order is exactly #2940's: :func:`admit_profile` then the
+        completion stamp, inside :meth:`_run_receipt_setup`. A failed retry
+        leaves the receipt incomplete, so the row stays "setup incomplete" and
+        stays retryable; it is never a dead end.
+
+        Returns the same ``{status, profile, restartRequired}`` shape as a
+        creation. Raises :class:`IncompleteRetryRefused` with a typed code and
+        one wearer-safe sentence; no native error text ever escapes.
+        """
+        from hermes_cli.profiles import get_profile_dir, normalize_profile_name, validate_profile_name
+
+        raw_name = _clean_str(name)
+        if not raw_name:
+            raise IncompleteRetryRefused("invalid_request", "That is not a valid agent name.")
+        try:
+            canon = normalize_profile_name(raw_name)
+            validate_profile_name(canon)
+        except Exception:  # noqa: BLE001 - a name the engine rejects is not a target
+            raise IncompleteRetryRefused("invalid_request", "That is not a valid agent name.")
+        if canon == DEFAULT_PROFILE:
+            # The default profile carries the pairing and has no creation
+            # receipt; a "retry" there could only mean rewriting the host's own
+            # agent from a record that does not exist.
+            raise IncompleteRetryRefused("invalid_request", "The default agent is not set up by OcuClaw.")
+
+        if not self._create_lock.acquire(timeout=RETRY_LOCK_TIMEOUT_S):
+            raise IncompleteRetryRefused(
+                "creation_in_flight",
+                "This agent is being set up right now. Wait a moment, then try again.",
+            )
+        try:
+            multiplex, served_homes = self._routing_snapshot()
+            default_home = served_homes.get(DEFAULT_NAMESPACE)
+            if not multiplex or default_home is None:
+                raise IncompleteRetryRefused(
+                    "multiplex_required",
+                    "Hermes is not serving multiple agents right now. Restart Hermes, then try again.",
+                )
+            # The home the caller read the `incomplete` flag out of, when it has
+            # one. The flag comes from `creation_is_incomplete(homes[name])` where
+            # `homes` is upstream's `profiles_to_serve()` answer, so reading and
+            # stamping the receipt anywhere else would be a second premise in a
+            # design whose whole point is "replay that profile's OWN receipt".
+            profile_dir = Path(home) if home is not None else Path(get_profile_dir(canon))
+            if not profile_dir.is_dir():
+                raise IncompleteRetryRefused(
+                    "profile_missing",
+                    "This agent no longer exists on this host. Create it again.",
+                )
+            receipt_path = profile_dir / CREATE_RECEIPT_FILENAME
+            try:
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError):
+                receipt = None
+            if not isinstance(receipt, dict):
+                # No readable receipt means OcuClaw never owned this creation —
+                # the wearer made the profile in Hermes — so there is no setup
+                # to finish and nothing here may invent one.
+                raise IncompleteRetryRefused(
+                    "receipt_unreadable",
+                    "OcuClaw has no setup record for this agent, so it cannot finish it. Create it again under a new name.",
+                )
+            if receipt.get("complete"):
+                raise IncompleteRetryRefused(
+                    "already_complete",
+                    "This agent's setup already finished. Refresh the agent list.",
+                )
+            request_id = receipt.get("requestId")
+            if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 120:
+                raise IncompleteRetryRefused(
+                    "receipt_foreign",
+                    "This agent's setup record does not name the request that made it. Create it again under a new name.",
+                )
+            setup = receipt.get(RECEIPT_SETUP_KEY)
+            if not isinstance(setup, dict):
+                # Receipts written before this change kept only the hash of the
+                # setup, which cannot be turned back into settings. Saying so is
+                # better than completing the agent WITHOUT the instructions and
+                # model the wearer asked for.
+                raise IncompleteRetryRefused(
+                    "setup_unrecoverable",
+                    "This agent was started by an older OcuClaw that did not keep its setup, so it cannot be finished. Create it again under a new name.",
+                )
+            if _setup_fingerprint(setup) != receipt.get("fingerprint"):
+                raise IncompleteRetryRefused(
+                    "receipt_foreign",
+                    "This agent's setup record belongs to another creation request. Create it again under a new name.",
+                )
+            try:
+                fields, folder, blocked = _validated_setup(setup)
+            except ValueError:
+                # Authored here, not forwarded. `_validated_setup` speaks to the
+                # create lane's own caller in its words ("Invalid tool blocks"),
+                # which is not a sentence to hand a wearer looking at a row.
+                raise IncompleteRetryRefused(
+                    "setup_rejected",
+                    "This agent's saved setup is no longer valid. Create it again under a new name.",
+                )
+
+            try:
+                self._run_receipt_setup(
+                    default_home=default_home,
+                    profile_dir=profile_dir,
+                    canon=canon,
+                    receipt_path=receipt_path,
+                    receipt=dict(receipt),
+                    fields=fields,
+                    folder=folder,
+                    blocked=blocked,
+                )
+            except Exception:  # noqa: BLE001 - native detail never reaches the wearer
+                raise IncompleteRetryRefused(
+                    "setup_failed",
+                    "Setup could not finish. Check that Hermes is running, then try again.",
+                )
+            # No `restartRequired`: this profile is already in the gateway's served
+            # set -- that is how its row exists to be retried -- so there is nothing
+            # for a restart to activate, on either supported engine.
+            return {"status": "finished", "profile": {"id": canon, "name": canon}}
+        finally:
+            self._create_lock.release()
+
+    def _create_fresh_profile(self, params: Any) -> Dict[str, Any]:
+        """Create one native Hermes profile.
+
+        A new profile still cannot leak into ``gw.profiles.list``, but since
+        #2940 that is because nothing enrols a profile by creating it — the
+        enrollment set does, after the receipt-owned setup completes — and not,
+        as it was before #2942, because the routes were frozen at adapter boot.
+
+        Whether the wearer must restart Hermes for it to become routable is the
+        engine's business: 0.21.3 reconciles its served set live, older engines
+        publish theirs once at gateway start. See
+        :meth:`_restart_required_to_activate`.
         """
         if not self._routing_snapshot()[0]:
             raise RuntimeError(
@@ -799,7 +1073,7 @@ class GwRpc:
         return {
             "status": "created",
             "profile": {"id": canon, "name": canon},
-            "restartRequired": True,
+            "restartRequired": self._restart_required_to_activate(),
         }
 
     def _sync_profiles_emoji_set(self, params: Any) -> Dict[str, Any]:
@@ -817,13 +1091,7 @@ class GwRpc:
 
         from hermes_cli.profiles import list_profiles
 
-        multiplex, served_homes = self._routing_snapshot()
-        routable_profiles = {DEFAULT_PROFILE}
-        if multiplex:
-            routable_profiles.update(
-                profile_for_namespace(namespace) for namespace in served_homes
-            )
-        if profile_id not in routable_profiles:
+        if profile_id not in self._routable_profiles()[1]:
             raise ValueError("profile is not served by this gateway")
         profile = next(
             (row for row in list_profiles() if str(getattr(row, "name")) == profile_id),
@@ -869,17 +1137,54 @@ class GwRpc:
             "emoji": emoji,
         }
 
+    def _restart_required_to_activate(self) -> bool:
+        """Must the wearer restart Hermes before a new agent works?
+
+        Probed, never inferred from a version string: the question is whether
+        the running engine re-publishes its served set while it runs
+        (``gateway.run_profile_reconcile``, #2942's ``hot_reconcile``).
+
+        * **0.21.3** reconciles live — a profile created from the glasses
+          becomes routable within about half a minute, with no restart. #2942's
+          sim leg measured 15-22 s and zero restarts.
+        * **0.21.0-0.21.2** write the served record once at gateway start, so
+          the boot snapshot really is the answer until the gateway restarts.
+
+        Telling a 0.21.3 wearer to restart for nothing is not a harmless extra
+        step: it teaches them to restart the gateway whenever something seems
+        missing, which is the opposite of what the live reconcile bought them.
+        Fails CLOSED — an unprobeable engine is treated as the older one, so
+        the wearer is told to restart rather than left waiting for a
+        reconcile that will never come.
+        """
+        try:
+            from .profile_routes import RESOLVER
+
+            return not RESOLVER.capabilities().hot_reconcile
+        except Exception:  # noqa: BLE001 - unprobeable means "older engine"
+            return True
+
+    def _routable_profiles(self) -> Tuple[bool, Set[str]]:
+        """``(multiplex, profile names)`` this gateway may act on for the wearer.
+
+        Since #2940 the routing snapshot is already bounded by OcuClaw's
+        enrollment set, so the names are "served AND enrolled" — resolved in
+        one place, so a new profile-taking RPC cannot quietly get a wider
+        answer than the menu shows.
+        """
+        multiplex, served_homes = self._routing_snapshot()
+        routable = {DEFAULT_PROFILE}
+        if multiplex:
+            routable.update(
+                profile_for_namespace(namespace) for namespace in served_homes
+            )
+        return bool(multiplex), routable
+
     def _settings_profile(self, profile_id: str) -> Tuple[Any, Path]:
         """Resolve one profile only when this gateway can route it."""
         from hermes_cli.profiles import list_profiles
 
-        multiplex, served_homes = self._routing_snapshot()
-        routable_profiles = {DEFAULT_PROFILE}
-        if multiplex:
-            routable_profiles.update(
-                profile_for_namespace(namespace) for namespace in served_homes
-            )
-        if profile_id not in routable_profiles:
+        if profile_id not in self._routable_profiles()[1]:
             raise ValueError("profile is not served by this gateway")
         profile = next(
             (row for row in list_profiles() if str(getattr(row, "name")) == profile_id),
@@ -1123,6 +1428,12 @@ class GwRpc:
     def _sync_profiles_soul(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
         profile = profile_for_namespace(p.get("profile", self._namespace))
+        # #2940: SOUL.md is the agent's own instructions — profile content, and
+        # before this gate any direct RPC could read it for a profile the
+        # wearer had never enrolled, simply by naming it. Hiding the menu row
+        # was never enough.
+        if profile not in self._routable_profiles()[1]:
+            raise ValueError("profile is not served by this gateway")
         try:
             from hermes_cli.profiles import get_profile_dir
 

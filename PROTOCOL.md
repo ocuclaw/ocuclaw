@@ -179,10 +179,13 @@ generation after file replacement. The adapter serializes reader use and
 closes its own reader after active RPCs finish, on profile-path replacement
 and on disconnect. It never calls the registry's process-wide close sweep.
 
-The supported version floor is unchanged. The certified 0.21.0 engine
-(`29112bef099274229cadff79cdff7bf7b99c4b77`) has no safe public registry;
-mutations report `session_writer_unsupported` there, while reads remain
-available. There is no standalone-writer or ambient `SessionStore._db`
+The supported version floor is now 0.21.1 (#3147). The 0.21.0 engine
+(`29112bef099274229cadff79cdff7bf7b99c4b77`, the previous certified pin) has
+no safe public registry; it sits below the floor and the adapter refuses to
+start there. The `session_writer_unsupported` branch stays as defence in depth
+for a host without the registry, while reads remain available. Hermes 0.21.1 (`2237be355906fbe6065ce1815711eee52b2d646e`)
+and the certified 0.21.3 engine (`345cd2b057a452236de401d3534b8502a7465e8d`) ship
+`hermes_state_registry`, so the same mutations run through the registry there. There is no standalone-writer or ambient `SessionStore._db`
 fallback. Missing/unserved stores report `session_store_unavailable` /
 `session_profile_unserved`; read probes report `session_schema_unsupported`
 without bootstrapping, migration, repair or checkpoint. SQLite contention
@@ -534,6 +537,61 @@ sources omit the count rather than invent zero. Other sections remain
 unsupported unless their individual native capabilities are present. Native
 exceptions are not sent to the phone.
 
+Overview may also carry `summary`, an optional object of per-section facts for
+the phone's Hermes hub. The hub states each section's live state in one line and
+the management lane refuses a second in-flight read, so these facts ride this one
+read instead of five of their own. Fields, all optional:
+
+| Field | Meaning | Source |
+| --- | --- | --- |
+| `approvalsMode` | `smart`, `manual` or `off` | the effective approval mode the Approvals page shows |
+| `toolsets` | toolsets that are enabled **and usable** (`allowed_by_setting`) | the Tools & skills read; omitted when that host reported `not_checked`, which says nothing about usable |
+| `skills` | installed skills left enabled | the Tools & skills read |
+| `mcp` | configured MCP connections | the Connections read |
+| `mcpNeedsAuth` | connections waiting to be signed in again | see below |
+| `jobs` | scheduled jobs | the Jobs read; omitted when that read returned its 100-job cap, where the count is a floor. The read's own `truncated` flag is deliberately not the test: on the native reader it is the job-list cap, but the stock fallback also raises it when the execution history was capped at 50, which says nothing about how many jobs there are |
+| `nextJobAtMs` | epoch ms of the soonest unpaused job's next run | derived from that job's ISO-8601 `nextRunAt`; omitted when it carries no offset, when the job list hit its cap (the soonest run may be off the end), and past runs are dropped before the soonest is chosen |
+| `failedJobs7d` | failed job runs in the last seven days | the health snapshot's execution ledger |
+| `reviewsOn` | Hermes asks before it writes what it learned | see below |
+| `savedEntries` | saved learning entries | the Saved read |
+| `diskFreeBytes` | free bytes where this profile lives | the health snapshot |
+
+Every field is gated by the capability of the read that produces it and is
+omitted when that read fails or reports nothing: an absent field means that row
+has no second line, which is honest, where a zero would be a fact the wearer
+acts on. `summary` itself is absent when no field survived. Only numbers, one
+boolean and one enum cross; no name, path, command or job text is admitted. The
+relay whitelists each field individually the way it whitelists `attentionCount`,
+and the phone parses each one again, so a malformed field arrives as absent
+rather than as a wrong fact.
+
+The overview is the read the settings tab waits on, so the summary runs under a
+wall-clock budget (1.5 s) with its readers ordered cheapest first: the health
+snapshot, approvals, learning, jobs, connections, tools, then saved. Once the
+budget is spent the remaining readers are not called and their fields are absent,
+which is the same thing an unreadable field already means. The budget bounds when
+a reader may **start**, not how long it may run: a reader already under way is
+never interrupted, so one slow read can carry the summary past 1.5 s. Ordering
+therefore decides which facts survive a slow host and is part of this contract.
+
+`reviewsOn` reports the two **write-review gates** (Review memory writes, Review
+skill writes): true when either is on, false only when both are off, absent when
+the pair could not be read. It is not `auxiliary.background_review.enabled`.
+The Learning row reads "Reviews on · N saved" beside the pending-proposals card,
+and proposals exist because the write reviews are on; automatic background review
+is a separate setting on the same page.
+
+`mcpNeedsAuth` counts configured MCP connections that are set to `auth: oauth`,
+that this phone could actually run an OAuth flow for (`oauthSupported`), and that
+have no token file on disk — the same three things the adapter already weighs
+before it reports `oauth_required` on a connection test. `oauthSupported` alone
+is not the test: it is also true of a plain HTTP connection that uses no auth at
+all, which is not waiting for anyone. **The count is a floor.** A token that is
+present but expired reads as signed in until something tries to refresh it, and
+the native token check answers "present" when it cannot tell, deliberately, so
+that a doubtful read never blocks a working connection. The field is omitted
+when the token check or the config read fails; `mcp` still reports in that case.
+
 Gateway restart uses the same envelope and authenticated connection:
 
 | Operation | Payload | Result |
@@ -541,6 +599,16 @@ Gateway restart uses the same envelope and authenticated connection:
 | `restart.preview` | absent or `{}` | `restart:{gatewayId,bootId,scopeRevision,affectedProfiles,activeWork,waitSeconds,drainSeconds,phase,supported}` |
 | `restart.request` | `{operationId,gatewayId,bootId,scopeRevision}` | Same snapshot plus a bounded restart receipt; one native admission at most. |
 | `restart.status` | `{operationId,gatewayId}` | Read-only receipt reconciliation against the current native process. |
+
+Each operation has its own capability record, at `scope:gateway`, present in every
+general `capabilities` and `overview` result. Timing is `read_only` for
+`restart.preview` and `restart.status`, `active_now` for `restart.request`. The three
+share one `supported` value: a client that cannot request a restart is not offered a
+preview of one either. It is false unless this process supervises a running gateway,
+so a gateway that cannot restart itself, and one still starting up, both advertise
+unsupported rather than inviting a call that could only fail. `supported:true` is an
+invitation, never an admission: `restart.request` is still gated natively on the
+restart snapshot, so a client that ignores the record gains nothing.
 
 All three require `scope:gateway` and a selected served `profileId`. The gateway
 identifier hashes the native host and canonical process-home filesystem identity.
@@ -1141,8 +1209,18 @@ session. Initial defaults are silent and do not create a transcript turn.
 Hermes validates the whole patch before changing state, stores non-secret
 session options in its own session store, and clears them on `/new`. OcuClaw
 does not write global Hermes config or keep a second override file. A missing
-host API returns `unsupported`; it never falls back to hidden or visible
-command injection.
+host API returns `unsupported`.
+
+**Fallback on `unsupported` (#2934).** `GatewayRunner.apply_session_options`
+ships only in upstream PR #92187; no tagged Hermes release carries it (checked
+through 0.21.3 / v2026.9.14). When the adapter answers `unsupported`, the
+runtime applies the same patch through Hermes's session-scoped slash commands
+as visible conversation turns, in this order: `/model <id> [--provider <p>]`,
+`/reasoning <effort>` (`reasoning_effort:""` → `/reasoning reset`; effort off
+is `/reasoning none`, because `/reasoning off` hides the display), then
+`/fast on|off`. An empty `model` (inherit) has no slash form and is rejected
+with a reason. The `sessions.patch` result carries `fallback: "slash_commands"`
+and `structured: null`. Any other non-accepted status is still an error.
 
 Presentation-only `reasoningLevel` changes still use visible `/reasoning
 show|hide|clamp|full` commands. A deliberate one-turn model action still uses
@@ -1787,7 +1865,7 @@ Parent → child RPCs:
 
 | Method | Params | Result |
 |---|---|---|
-| `liveui.render` | `{callId, sessionKey, args}` | `{result, content:[{type:"text", text:<JSON result>}]}` — Node owns the per-call listen window and consumes Layer A `createGlassesUiToolHandler` unchanged. |
+| `liveui.render` | `{callId, sessionKey, args, hostOriginated?}` | `{result, content:[{type:"text", text:<JSON result>}]}` — Node owns the per-call listen window and consumes Layer A `createGlassesUiToolHandler` unchanged. An agent call that would open a new surface in a session no app client is on is refused with `session_not_viewed` (#3209); `hostOriginated: true` (the managed first-run welcome only) skips that refusal. |
 | `liveui.abort` | `{callId?, sessionKey?, reason?}` | `{status:"accepted", aborted}` — aborts matching active render calls; Python sends this when the Hermes tool worker sees the cooperative interrupt flag or the render link deadline fires. |
 | `liveui.prompt` | `{sessionKey}` | `{context|null, fragments:[...], fragmentsConcatenated, ephemeralOnly:true}` — Node composes Channel-2 state and previews owed voicemail into a plugin-generated JSON fence for Hermes `pre_llm_call`, which injects only into the current user message. |
 | `liveui.promptAck` | `{sessionKey, ackToken}` | `{status:"accepted", consumed:boolean}` — Python sends the token returned by `liveui.prompt` only after receiving a prompt context that contains voicemail, so transport timeouts do not consume owed voicemail silently and ack cannot consume entries outside that preview. |
@@ -1907,8 +1985,9 @@ drain and no `agent_end` subscription of its own.
 | `tools.setSessionTitle` | `{sessionKey, params}` | `{status:"accepted"}`, the same body OpenClaw's `execute` returns, or `{error, code}`. The relay mirrors the title into the Hermes SessionDB and rebroadcasts the session list; this glue writes neither again. |
 
 The SessionDB half of that mirror depends on the host's session writer. Hermes
-2026.9.7 and newer accept the write with user rank. Hermes 2026.8.31 (Hermes
-Agent 0.21.0, the certified pin) has no `hermes_state_registry`, so it keeps
+2026.9.7 (Hermes Agent 0.21.1, the certified pin) and newer accept the write
+with user rank. Hermes 2026.8.31 (Hermes Agent 0.21.0, the previous certified
+pin) has no `hermes_state_registry`, so it keeps
 its own auto-title and only the phone's session picker shows the new name. That
 limit predates this lane and applies to hand renames on that host too.
 
@@ -2021,8 +2100,8 @@ error document; the child never fabricates health. OpenClaw has no parent
 method and attaches no `connection-health.json`.
 
 `producer.hermesSource` has exactly three advisory states. `certified-source`
-means package `0.21.0` and a complete clean checkout at the certified
-`v2026.8.31` commit; `drifted` means a complete inspectable checkout differs;
+means package `0.21.3` and a complete clean checkout at the certified
+`v2026.9.14` commit; `drifted` means a complete inspectable checkout differs;
 `unknown` covers shallow/non-Git installs, missing objects or package metadata,
 timeouts, and any inspection ambiguity, including partial/promisor clones. The
 observed/certified short commits, shallow result, and cache timestamp use the
@@ -2144,13 +2223,135 @@ message text, phone metadata, and credentials never enter it.
 `wait_phone_origin` returns a secret-free opaque candidate binding derived from
 those fingerprints. Every host-only fresh arm, including the compatibility
 `arm_first_run_proof` operation, must present that exact binding; replacement
-by a newer candidate refuses the arm. The operation then consumes the bound
+by a newer candidate refuses the arm. Each arm also states which evidence it
+claims (`replyEvidence`, below). The operation then consumes the bound
 fingerprints into the existing private Attempt receipt. The gateway later enumerates its own
 OcuClaw sessions and selects the one whose fingerprint matches the armed
 Attempt, so the exact welcome surface renders to the phone/G2 conversation
 without moving setup into it. A missing, expired, unreadable, or malformed
 candidate refuses arming and asks for a fresh phone test message. The candidate
-is OcuClaw-owned profile state and the supported uninstall removes it.
+and the reply-delivery record below are OcuClaw-owned profile state; the
+supported uninstall removes them and the profile move carries them across.
+
+**Armed is not "the reply is over" (#3231).** The Attempt is armed on the
+phone's SDK receipt for a SLICE of the reply, so the gateway's 1 s welcome
+watcher must not render on `armed` alone: it would paint the welcome over a
+reply the wearer is still reading. Each cycle the watcher skips while an
+OcuClaw phone-origin run is still processing or still holds a deferred stream
+tail, and then for the same `STREAM_FINALIZE_GRACE_SECONDS` the stream tail
+already uses. The deferral is bounded: a run whose terminal boundary never
+arrives stops holding the welcome back after
+`FIRST_RUN_WELCOME_REPLY_WAIT_SECONDS`. Nothing is consumed by a skipped
+cycle; the Attempt stays armed and the watcher retries.
+
+## Reply-delivery lane (#3030 — machine evidence for the phone-origin reply)
+
+Setup used to ask the wearer "did the reply appear on your Even G2?" on every
+install. The originating phone already knows whether its own SDK accepted a
+conversation frame carrying the exact committed assistant reply, so this lane
+carries that one fact to the gateway and lets setup skip the question when it
+holds. It is trusted-client telemetry about an SDK write, **not** pixel
+attestation and **not** wearer confirmation; the two never merge.
+
+Two additive control-link methods, both internal Node↔Python only. Neither adds
+a phone protocol field, QR field, snapshot field, dashboard field, doctor field
+or support-attachment field.
+
+| Direction | Method | Params | Result |
+|---|---|---|---|
+| Python → Node | `replyDelivery.observe` | `{candidateId, sessionKey, runId}` | `{ok:true,status:"pending"\|"sdk_accepted"\|"unconfirmed"\|"unsupported",reason:<str\|null>}` or `{ok:false,error:<str>}` |
+| Node → Python | `replyDelivery.report` | `{candidateId, status, reason, evidence}` | `{ok:true}`, or `{ok:false,error:"invalid_params"\|"candidate_unknown"\|"receipt_unavailable"\|…}` |
+
+`candidateId` is the same 64-character lowercase-hex opaque binding
+`wait_phone_origin` returns. `status` on a report is one of `sdk_accepted`,
+`unconfirmed`, `unsupported` — never `pending`, which is an observation state.
+`evidence` is `{"kind":"client_sdk_receipt","lane":"device"|"simulator",
+"coveredChars":<positive int>}` **iff** `status` is `sdk_accepted`, and `null`
+otherwise. Python validates the report as a closed shape: an extra key, a wrong
+type, an out-of-range status or lane, a non-positive `coveredChars`, or an
+evidence block that disagrees with the status all answer
+`{ok:false,error:"invalid_params"}` and settle nothing. Node retries anything
+that is not `{ok:true}`; a repeat of the same observation for the same
+candidate answers `{ok:true}` so the bounded retry terminates.
+
+The gateway sends `replyDelivery.observe` where it records a phone-turn
+candidate — fire and forget, bounded, on its own task. It never blocks, delays
+or fails the turn. A child without the method answers the link's
+`-32601 method not found`; the adapter then records `unsupported` with reason
+`runtime_lacks_contract` itself, so an older runtime degrades immediately to
+the wearer question instead of waiting out the host's bound.
+
+Python persists one secret-free record per profile at
+`<HERMES_HOME>/state/ocuclaw.first-run-reply-delivery.json`, written under the
+same `ocuclaw.first-run-proof.lock` as the Attempt, so joining and arming are
+one ordered state transition:
+
+```json
+{
+  "schemaVersion": 1,
+  "profileFingerprint": "<sha256>",
+  "candidateId": "<opaque 64-hex binding>",
+  "credentialGenerationId": "<or null>",
+  "pairingCompletionId": "<or null>",
+  "status": "sdk_accepted",
+  "reason": null,
+  "evidence": "client_sdk_receipt",
+  "lane": "device",
+  "coveredChars": 128,
+  "receivedAt": "<iso8601>"
+}
+```
+
+Reply text, credentials, phone metadata, and raw session/run identifiers never
+enter it, and never appear in setup output. The record binds the CURRENT
+candidate only: an unknown or already-replaced candidate is refused and nothing
+is written. A later `sdk_accepted` upgrades a stored `unconfirmed`/
+`unsupported` for the same candidate; nothing downgrades a stored
+`sdk_accepted`. Arrival order does not matter — the report may land before or
+after the host starts waiting. A changed credential generation, pairing
+completion or profile makes the record ineligible (`binding_changed`).
+
+`reason` is a closed vocabulary, never prose: `attribution_unavailable`,
+`binding_changed`, `client_disconnected`, `client_lacks_contract`,
+`observation_expired`, `record_unavailable`, `reply_run_errored`,
+`reply_run_rate_limited`, `runtime_lacks_contract`,
+`runtime_unavailable` (the child was not ready or refused the observation),
+`sdk_write_failed`, `sdk_write_timeout`, `simulator_lane_not_eligible`,
+`unspecified`, `unsupported_reply_shape`, `wait_timeout`. Anything else a peer
+sends is stored as `unspecified`.
+
+**Errored runs are never evidence (#3232).** A run that errored still paints
+its error text to the glasses, so the SDK accepts it and a receipt is
+produced. The two `reply_run_*` reasons say the RUN errored, whatever status
+rides with them: `reply_run_errored` in general, `reply_run_rate_limited` when
+the peer knows the model is rate-limiting the account. `hermes ocuclaw
+first-use` refuses both before it looks at the status, names the model as the
+thing to fix, records no Core Setup Completion and arms no welcome.
+
+**Simulator isolation.** `lane: "simulator"` evidence must never arm a real
+installation. It qualifies only where the environment variable
+`OCUCLAW_HERMES_ALLOW_SIMULATOR_REPLY_EVIDENCE=1` marks an explicit test
+installation; this is a test-lane marker and must not be set on a user's
+machine. Without it the projection reports `unconfirmed` with reason
+`simulator_lane_not_eligible`.
+
+**Host interface.** `{"operation":"wait_reply_delivery","phoneCandidateId":…}`
+polls the record for about 40 s — Node's own deadline is 30 s — and returns
+`replyDelivery: {status, reason, evidence, lane}`. A timeout is
+`unconfirmed`/`wait_timeout`. It never mutates anything and never requires a
+new `wait_phone_origin`: the same candidate still arms through the wearer path
+afterwards.
+
+**Two arming paths, discriminated.** The Attempt and the durable proof carry
+`replyEvidence: "wearer_confirmed" | "client_sdk_receipt"`. `arm_first_run_proof`
+and `welcome_round_trip` take the same field; `client_sdk_receipt` is refused
+with `reply_evidence_unavailable` unless this exact candidate already has an
+eligible `sdk_accepted` record. Records written before this field existed read
+as `wearer_confirmed` and are never rewritten. The snapshot derives
+`firstRunProof.method` from the discriminator:
+`phone-origin-g2-wearer-confirmed` or `phone-origin-g2-sdk-receipt`. A receipt
+alone never commits proof and never completes setup — only the live Hermes
+Welcome Round Trip dismissal does.
 
 ## Readiness synthesis (W06 — census-gap `connect` row)
 
@@ -2206,10 +2407,41 @@ Legacy yaml secret keys remain readable for backward compatibility, but a
 non-empty environment value wins and the adapter logs a value-free shadow
 warning.
 
+Two NON-secret platform settings may also come from that env file, so an
+unattended installer never has to type them (#3098): `allow_admin_from` via
+`OCUCLAW_ALLOW_ADMIN_FROM` and `evenAiEnabled` via `OCUCLAW_EVEN_AI_ENABLED`.
+**Env wins.** Hermes commits the plugin's `env_enablement_fn` seed with
+`platform_config.extra.update(seed)` (`gateway/config_env.py`
+`_enable_plugin_platform`), so for every key the env file names, the env value
+replaces the `config.yaml` value outright — exactly the precedence the three
+secrets already have. An env name that is absent or blank changes nothing, so
+a hand-edited `config.yaml` keeps working. A value that cannot be parsed is
+refused with one plain, value-free warning line (once per process per name and
+reason) and then treated as absent: gateway start never fails over an env typo,
+and the rest of the seed (the Relay Credential included) still lands. Because
+the effective value can come from `.env`, the passive status reads layer the env
+seed over the parsed `config.yaml` block before they judge
+`continueHereConfigured` / `mandatoryConfiguration.adoptConfigured` and
+`evenAiEnabled`.
+
+**The seed only commits past Hermes' own gate**, so those reads apply the env
+layer only where the gateway would. `_enable_plugin_platform` reaches
+`extra.update(seed)` only after three refusals: an explicit `enabled: false`
+returns at once; a platform not already enabled must pass `is_connected`, which
+for OcuClaw means a supported host **and an existing Relay Credential**; and
+`check_fn` (supported host plus node) must pass, since OcuClaw registers no
+`ensure_deps_fn`. A fresh install that has written `OCUCLAW_ALLOW_ADMIN_FROM`
+into `.env` but has no Relay Credential yet therefore has no effective value —
+the seed starts counting once bootstrap has generated the credential.
+
+`wsBind` deliberately has no env name. It is the relay bind address, and an
+env name for it would be a remote way to widen the listener past loopback.
+
 | Key | Declared | Stored | Required | Precedence | Default / meaning |
 |---|---|---|---|---|---|
 | `wsPort` | `adapter.py` | `config.yaml` `extra.wsPort` | Optional, code-defaulted | yaml > code default | `47801`; relay WS listener. Fresh Hermes setup falls back to `43118`, then `38272`, only after a bind conflict. Even-AI shares this HTTP server. |
-| `wsBind` | `adapter.py` | `config.yaml` `extra.wsBind` | Optional, code-defaulted | yaml > code default | `127.0.0.1`; relay bind address. |
+| `wsBind` | `adapter.py` | `config.yaml` `extra.wsBind` | Optional, code-defaulted | yaml > code default | `127.0.0.1`; relay bind address. No env name on purpose (see above). |
+| `allow_admin_from` | Hermes `gateway/slash_access.py`; OcuClaw bridges the env name `OCUCLAW_ALLOW_ADMIN_FROM` | `.env` via `OCUCLAW_ALLOW_ADMIN_FROM`, or `config.yaml` `extra.allow_admin_from` | Optional; **required for "Continue here"** (`/resume <tip> --all`) | env > yaml > unset | The wearer admin allow-list. Written as JSON (`["ocuclaw-wearer"]`) or a comma list (`ocuclaw-wearer`); either shape reaches Hermes' own `_coerce_id_list`. A non-empty list turns slash-command gating ON for the whole platform, which is safe only because `ocuclaw-wearer` is the only user id the adapter ever stamps. An empty list, a JSON object, or unparseable JSON is refused. |
 | `relayToken` | Host-generated Relay Credential; `adapter.py` bridge as `OCUCLAW_RELAY_TOKEN`; no `requires_env`, prompt, reveal, or return surface | `.env` via `OCUCLAW_RELAY_TOKEN` (the only supported source; no status, doctor, or setup surface reads a yaml secret) | **Required**; initial plugin bootstrap generates it on a provably fresh profile and validation refuses boot without it | env > unset | Downstream client auth token, constant-time checked and forwarded in `link.hello.ack`; reinstall/update/restart/re-pair preserve it, and only the locally confirmed all-device reset replaces it. |
 | `sonioxApiKey` | `adapter.py` bridge as `OCUCLAW_SONIOX_API_KEY`; deliberately absent from `requires_env` | `.env` via `OCUCLAW_SONIOX_API_KEY` (the only supported source) | Optional; required for Soniox STT only | env > unset | Credential for temporary-key mint; unset returns `soniox_temp_key_not_configured`. |
 | `stateDir` | `adapter.py` | `config.yaml` `extra.stateDir` | Optional, code-defaulted | yaml > code default | `$HERMES_HOME/ocuclaw`; Node runtime state directory. |
@@ -2221,7 +2453,7 @@ warning.
 | `debugUploadMaxZipBytes` | `adapter.py` | `config.yaml` `extra.debugUploadMaxZipBytes` | Optional, code-defaulted | yaml > code default | `4000000`; clamped to 100000–4300000 bytes. |
 | `debugUploadCapturePreset` | `adapter.py` | `config.yaml` `extra.debugUploadCapturePreset` | Optional | yaml > unset | Category-list override for the support capture preset. |
 | `debugBundleSaveDir` | `adapter.py` | `config.yaml` `extra.debugBundleSaveDir` | Optional | yaml > unset | Host directory override for locally saved support bundles. |
-| `evenAiEnabled` | `adapter.py` | `config.yaml` `extra.evenAiEnabled` | Optional, code-defaulted | yaml > code default | `false`; enables the OpenAI-compatible Even-AI route. |
+| `evenAiEnabled` | `adapter.py`; OcuClaw bridges the env name `OCUCLAW_EVEN_AI_ENABLED` | `.env` via `OCUCLAW_EVEN_AI_ENABLED`, or `config.yaml` `extra.evenAiEnabled` | Optional, code-defaulted | env > yaml > code default | `false`; enables the OpenAI-compatible Even-AI route. The env value accepts `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` in any case; anything else is refused. |
 | `evenAiToken` | `adapter.py` bridge as `OCUCLAW_EVEN_AI_TOKEN`; deliberately absent from `requires_env` | `.env` via `OCUCLAW_EVEN_AI_TOKEN` (the only supported source) | **Conditional**; required when `evenAiEnabled=true` | env > unset | Bearer token for Even-AI only; the relay token is not reused. |
 | `evenAiSystemPrompt` | `adapter.py` | `config.yaml` `extra.evenAiSystemPrompt` | Optional | yaml > unset | Default system prompt for Even-AI turns. |
 | `evenAiRequestTimeoutMs` | `adapter.py` | `config.yaml` `extra.evenAiRequestTimeoutMs` | Optional, code-defaulted | yaml > code default | `60000`; Even-AI request timeout. |
@@ -2236,6 +2468,30 @@ warning.
 | `terminateGraceS` | `adapter.py` | `config.yaml` `extra.terminateGraceS` | Optional, code-defaulted | yaml > code default | `5`; SIGTERM-to-SIGKILL grace. |
 | `linkDebugStderr` | `adapter.py` | `config.yaml` `extra.linkDebugStderr` | Optional, code-defaulted | yaml > code default | `false`; when true, all child console/logger output reaches the durable gateway log. |
 | `emoji` | `models_rpc.py` | `config.yaml` `extra.emoji`, in **that profile's own** home | Optional | yaml > unset | The agent avatar glyph for this profile, forwarded as `gw.profiles.list[].emoji` and on to the phone's agent entry. Hermes has no emoji or avatar field; OcuClaw owns the value. Unset/blank/non-string → key absent, and the phone falls back to the first letter of the agent name (same fallback an emoji-less OpenClaw agent gets). |
+
+#### Phone diagnostics permissions
+
+The private optional-setup RPC supports `diagnostics.preview` with exactly one
+`permission` (`access` or `handoff`) and a boolean `allowed`, followed by an
+explicitly confirmed `diagnostics.apply` carrying its `operationId`. The preview
+is single-use, expires after 180 seconds, and is bound to the authenticated phone
+connection, Primary Runtime home and configuration revision. Disconnect clears it.
+Each save uses Hermes's supported config writer and changes only the selected
+`externalDebugToolsEnabled` or `allowDebugUpload` key. Ambiguous config, stale
+previews and unconfirmed writes fail closed; an uncertain write is never replayed.
+
+Saving neither restarts Hermes nor captures or sends a report. The change joins
+pending Voice/Even AI saves in the existing **Review saved changes** flow, whose
+separate confirmation warns that restarting affects every profile. Snapshot
+diagnostics distinguish configured `access`/`handoff` from
+`activeAccess`/`activeHandoff`. Active values require a recent loaded-relay
+observation tied to the live gateway process; missing or stale evidence is null.
+The shared capability snapshot also advertises version-1 permission readback
+for Hermes only when both loaded flags are known booleans.
+
+These host permissions are independent of the phone's **Enable Debug** capture
+switch. Full report handoff requires both host permissions. Upload remains a
+separate user-reviewed Send action. Existing defaults remain unchanged.
 
 #### `extra.emoji` is read per served profile
 

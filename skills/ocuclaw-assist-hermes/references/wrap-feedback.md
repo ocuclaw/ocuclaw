@@ -1,6 +1,6 @@
 # OcuClaw Hermes wrap-up and feedback
 
-**Guide version:** 2026-09-14 (1.3.21-hermes)
+**Guide version:** 2026-09-21 (1.3.22-hermes)
 
 Use this `ocuclaw_setup` response only at a genuine finish: fresh install,
 update, or standalone fix completed. Never after an unresolved failure or
@@ -10,7 +10,8 @@ A genuine finish delivers, in order:
 
 1. one brief success sentence specific to the completed lane;
 2. at most three user-relevant proof facts: the private route, phone pairing,
-   and the bidirectional G2 proof;
+   and the bidirectional G2 proof, each stated with the evidence actually
+   obtained;
 3. an optional security-review offer;
 4. the WRAP note, ending with its donation line.
 
@@ -32,11 +33,25 @@ never imply those facts were re-proved. If an applicable item remains open,
 return to it instead of closing. The ordered wrap becomes complete when this
 finish response is delivered.
 
-For a completed fresh install, keep the user-facing result close to this shape:
+For a completed fresh install, report the evidence you actually obtained. When
+the wearer confirmed the reply on the Even G2, keep the result close to this
+shape:
 
 > OcuClaw is set up and verified. Your phone paired over the private Tailscale
 > route, a Hermes reply appeared on your Even G2, and its welcome double-tap
 > returned successfully.
+
+When the reply evidence was the phone app's accepted glasses SDK receipt and
+the wearer never answered a display question, use this shape instead:
+
+> OcuClaw is set up and verified. Your phone paired over the private Tailscale
+> route, your phone app confirmed the glasses accepted the Hermes reply, and
+> the welcome double-tap returned successfully.
+
+Never write “you confirmed seeing the reply” or an unqualified claim that the
+reply appeared on the display when the only evidence was an SDK receipt. The
+welcome dismissal proves interaction with the welcome surface; it is never
+retrospective proof that the earlier reply was seen.
 
 Do not mention internal checklist rows, configuration keys, credential storage,
 installation provenance, port numbers, or profile posture in this success
@@ -47,11 +62,15 @@ that the relay remains loopback-bound and only Tailscale Serve fronts it.
 
 ## WRAP
 
-- Community and support: `https://discord.ocuclaw.com`.
+- Community and support: [Discord](https://discord.ocuclaw.com/).
 - Future problems: open OcuClaw's built-in **Report a bug** feature and send
   the diagnostic report. It includes relevant conversation details while
   scrubbing secrets, tokens, and addresses. If disconnected, create the
   offline client-only report or save it to the phone for manual sharing.
 - End the wrap message with this exact final line:
 
-> Finally, OcuClaw is a one man project. Donations are optional but appreciated and directly funds the project: https://buymeacoffee.com/ocuclaw
+> Finally, OcuClaw is a one-person project. Donations are optional, appreciated, and help fund development: [Support OcuClaw on Buy Me a Coffee](https://buymeacoffee.com/ocuclaw).
+
+Preserve these link labels and destinations. Do not replace them with fetched
+page titles, site descriptions, or product taglines. If Markdown links are not
+supported, keep the label followed by the literal URL.

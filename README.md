@@ -25,17 +25,17 @@ This installable repository is generated from the OcuClaw monorepo. Published
 copies include the generated-artifact provenance notice and are updated only by
 the bundle publisher; do not hand-edit an installed checkout.
 
-The human-facing baseline is Hermes release `v2026.8.31`. Its package version
-`0.21.0` and certified commit
-`29112bef099274229cadff79cdff7bf7b99c4b77` are separate identities. The
-current bundle, shared plugin, and client train is 2.0.6; the bundled setup
-guide has its own `1.3.21-hermes` version. The bidirectional client/plugin
+The human-facing baseline is Hermes release `v2026.9.14`. Its package version
+`0.21.3` and certified commit
+`345cd2b057a452236de401d3534b8502a7465e8d` are separate identities. The
+current bundle, shared plugin, and client train is 2.0.9; the bundled setup
+guide has its own `1.3.22-hermes` version. The bidirectional client/plugin
 compatibility floors are `2.0.2`. This beta bundle ships from the GitHub
 repository only; it has no npm or ClawHub publication leg.
 
 ## Requirements
 
-- Hermes `>=0.21.0,<0.22.0` (the complete Hermes 0.21.x line).
+- Hermes `>=0.21.1,<0.22.0` (Hermes 0.21.1 and later 0.21.x; certified baseline `0.21.3`).
 - Tailscale on the Hermes host and the phone for the authenticated external
   relay route.
 - The OcuClaw app installed through Even Hub on the phone and Even G2.
@@ -79,8 +79,10 @@ profiles as a repair.
 ## Install and update
 
 <!-- ocuclaw:install-block:start -->
-OcuClaw needs Hermes `>=0.21.0,<0.22.0`; the certified baseline is Hermes
-`0.21.0`.
+OcuClaw needs Hermes `>=0.21.1,<0.22.0`; the certified baseline is Hermes
+`0.21.3`. Install it once, in the default Hermes profile: that profile owns the
+relay the glasses pair to, and a second copy in another profile is never the
+answer.
 
 **Repository access.** `ocuclaw/ocuclaw` is a public repository and needs no
 invitation or GitHub sign-in to clone. Git must still be installed and working
@@ -91,6 +93,58 @@ invitation, and the software itself is still beta.
 
 **Terminal first.** This is the supported path and the one every beta build is
 tested on:
+
+**Cloudways managed Hermes: install, restart once, then one command.**
+
+```bash
+hermes plugins install ocuclaw/ocuclaw --enable
+hermes gateway restart
+hermes ocuclaw cloudways setup
+```
+
+`hermes ocuclaw cloudways setup` takes the host from an installed plugin to a
+paired phone and an evidenced first reply, in numbered steps `[1/8]` to `[8/8]`
+in your own terminal. It reads live state before every step and skips what is
+already done. It asks twice, showing exactly what changes and defaulting to no.
+There is no retry flag: run the same command again and it continues where it
+stopped.
+
+**One restart, one run.** The restart above is the only one this install needs.
+If anything interrupts the run, including a restart that closes SSH, Hermes and
+tmux, reconnect with the Cloudways SSH command and run the same command again:
+it skips what is done and carries on from there.
+
+**The command looks for your phone before it pairs it.** Step 5 asks you to
+install Tailscale on the phone and approve the link there. Step 7 then checks
+whether a phone is on your private network. If one is, it says so and carries
+on. If none is, it explains what Tailscale is, gives you three short steps, and
+waits, checking again every few seconds; it carries on by itself the moment
+your phone turns up, and pressing Enter carries on anyway. The wait stops after
+ten minutes, having changed nothing, and running the same command again picks
+up right there. Leave Tailscale switched on afterwards: the phone needs it to
+reach this server.
+
+**The pairing code waits for you.** It lasts two minutes, so step 7 asks you to
+have the phone in your hand with the Even app open, and waits for you to press
+Enter before it makes the code. If a code does run out before anyone uses it,
+the command does not give up: press Enter for a new one, or type `stop` to
+finish there.
+
+**Check your agent's model before you start.** Step 8 sends a real message
+through your agent and waits for its reply on the glasses. Run `hermes -z hello`
+first. If your model answers, step 8 will too. If it returns an error, such as a
+rate limit, step 8 says so, records nothing, and asks you to fix the model and
+run the same command again.
+
+The guided assistant remains the fallback: open a fresh `hermes --tui`, enter
+`/ocuclaw-setup`, and it walks the same path with you. It loads the setup skill
+and tools in that fresh process, saves your agent choice and required settings,
+gives you the SSH reconnect command and the exact saved-session resume command,
+and requests one planned activation restart. Resume that setup session by its
+ID; do not blindly reopen the latest chat. Saved configuration is not gateway
+activation: the assistant must verify the new gateway and relay.
+
+For other hosts, the direct install/restart sequence is:
 
 ```bash
 hermes plugins install ocuclaw/ocuclaw --enable
@@ -106,7 +160,8 @@ Then, in bare `hermes` or in Hermes Desktop:
 
 `hermes plugins install` prints that restart instruction and stops there — it
 never restarts the gateway for you. Until the gateway restarts, OcuClaw is
-installed but not loaded, and nothing about the glasses works yet.
+installed but not loaded by that managed gateway, and nothing about the glasses
+works through it yet. A fresh TUI can prepare setup before that activation.
 
 **Run `hermes` in a real terminal.** The TUI boots only when stdin *and*
 stdout are a TTY, so a piped or captured run — `hermes | tee log`, a CI
@@ -158,7 +213,40 @@ Unlike install, `hermes plugins update` does **not** print the restart
 instruction, and it does not restart the gateway. The new code loads on the next
 gateway start and not a moment sooner, so restart it yourself — then run
 `/ocuclaw-setup` and let it re-verify health.
+
+**Cloudways Managed AI Agents.** The same install block applies. That host has
+no root and no system Tailscale, so OcuClaw carries its own path for it, and
+`hermes ocuclaw cloudways setup` runs the whole of it: a user-owned userspace
+Tailscale under `~/bin` and `~/.tailscale`, a Hermes cron watchdog that starts
+it again after every `hermes gateway restart` (a container restart there), the
+private tailnet route, the pairing ceremony and the first message. Cloudways has
+approved those pieces. Your only manual steps are opening the Tailscale
+authorization link it prints and the phone.
+
+The same work is still available one verb at a time (`hermes ocuclaw cloudways
+detect`, `install`, `enroll`, `status`, `retry`, `enable`, `disable`,
+`rollback`), and `/ocuclaw-setup` still guides the whole path when you would
+rather be walked through it.
 <!-- ocuclaw:install-block:end -->
+
+**Cloudways SSH: optional local status.** After saving and testing the Cloudways
+connection in Desktop, choose **Show OcuClaw in Hermes Desktop** if you want its
+glasses icon, battery and activity on your computer. Chat works without this step,
+and existing phone/glasses pairing remains on Cloudways. Run the local installer
+from the matching bundle's `desktop-companion` directory on the computer hosting
+Desktop, not in the SSH session. It requires Python 3.9+ but no local Hermes CLI,
+gateway or second Runtime Bundle. Read that directory's README for install,
+update and removal commands. Never copy Cloudways' generated desktop plugin:
+that file carries the remote backend's presenter authority.
+
+Remote mode uses Desktop's saved connection and shows its selected connection
+and profile. It is read-only: pairing, Soniox/Even AI forms, gateway controls and
+fleet publication remain local-only. A stopped, unconfirmed or unreachable
+gateway is shown as unavailable; successful chat does not override health facts.
+The shipped desktop status contracts must match; unsupported contracts produce
+a compatibility message. Native Mac/Windows and Cloudways SSH acceptance remain
+separate from container tests. Final website copy and download publication retain
+their review checkpoint; this source change does not publish them.
 
 Initial plugin bootstrap generates the Relay Credential once on a provably
 fresh profile and atomically stores it through Hermes without displaying or
@@ -198,10 +286,71 @@ Per-device revocation is future work.
   `get_evenrealities_device_info`, `set_session_title`), and `ocuclaw_setup`.
   `/ocuclaw-setup` and `hermes ocuclaw status|doctor` both report which of the
   eight actually registered and name any that did not.
+- A read-only **Profiles** section on `hermes ocuclaw status|doctor` and in the
+  `ocuclaw_setup` status block (#2944). It reports the effective gateway mode
+  (from the live gateway record), the configured mode
+  (`gateway.multiplex_profiles` plus the `GATEWAY_MULTIPLEX_PROFILES`
+  override), OcuClaw's saved `agent_mode`, the transport owner, the live
+  per-profile gateway/service topology, the served and enrolled sets, and the
+  0.21.3 migration receipt when one is present. It names six faults with an
+  exact repair each — including OcuClaw installed outside the default profile,
+  and a secondary standalone gateway that the next `hermes update` would fold.
+  It reports credential PRESENCE only, never a value, and changes nothing.
+  One wearer is one pairing, one relay credential, and the default profile
+  owns transport.
+- Two bundled skills, both registered through Hermes's plugin-skill registry and
+  neither copied into `~/.hermes/skills/`. `ocuclaw:ocuclaw-assist-hermes` is the
+  Setup Assistant that `/ocuclaw-setup` loads. `ocuclaw:glasses-ui` is the
+  authoring skill for the LiveUI tools: when a turn belongs on the wearer's
+  display instead of in chat, which wire kind to send, and how to write the
+  spec. Load either by its qualified name, for example
+  `skill_view("ocuclaw:glasses-ui")`. A bare `glasses-ui` does not resolve,
+  because a plugin skill is not in the flat skills tree, and neither skill
+  appears in the prompt's `<available_skills>` list. The glasses-ui copy at
+  `skills/glasses-ui/` mirrors `extensions/ocuclaw/skills/glasses-ui/` in the
+  monorepo and is kept byte-identical by
+  `node tools/sync-glasses-ui-skill.js`.
 - Optional Soniox speech-to-text and Even AI routing.
 
 These are shipping capabilities, not simulator or real-hardware validation
 claims for any particular release candidate.
+
+### The Cloudways setup ladder
+
+`hermes ocuclaw cloudways setup` walks one Cloudways Managed AI Agents host
+through setup in numbered steps `[1/8]` to `[8/8]`, in one terminal. Every step
+reads live state first and skips what is already done, so re-running after a
+timeout or a dropped SSH session continues where it stopped. Steps 1 (this
+host), 4 (Tailscale binaries and daemon) and 5 (tailnet enrollment) are
+automated; the other five print the manual command that still covers them.
+
+It refuses, changing nothing, on any host whose detection is not the decisive
+Cloudways verdict — "likely" is a refusal — on a package-manager-managed Hermes
+install, and without an interactive terminal unless `--yes` is passed. Each
+refusal names `hermes ocuclaw pair` and the OcuClaw Setup Assistant.
+`--hostname` is the tailnet node name, exactly as on the OpenClaw side; it is
+never a detection override. `--wait` and `--first-use-wait` refuse a value of
+zero or less rather than quietly substituting the default.
+
+`--no-pair` ends the ladder before the first message, since that step needs a
+paired phone; `--no-first-use` ends it at the first message. Both exit 0 and
+print the line that says how to pick up where you left off. `--yes` answers the
+consent questions and nothing else: pairing approval, the reply confirmation and
+anything else the wearer owns go through a separate prompt that ignores `--yes`
+and refuses without a real terminal.
+
+`OCUCLAW_HERMES_ASSUME_CLOUDWAYS_HOST=1` is a **test-lane marker** that makes
+step one treat host detection as the decisive Cloudways verdict, so a pet or CI
+lane can exercise the ladder without weakening the guard. **Never set it on a
+user's machine.** It is deliberately an environment marker and not a flag, and
+the step says out loud that the override is in force whenever it changes the
+answer.
+
+After a run that got past step one, a secret-free diagnostic journal of that run
+is written to `<HERMES_HOME>/state/ocuclaw.cloudways-setup.json`. It is for
+support only: it records a closed vocabulary of step outcomes, never a link, an
+address or a credential, and nothing ever reads it back as truth. Deleting it
+changes nothing.
 
 ### Read-only session ownership data
 
@@ -410,45 +559,82 @@ Python-only recovery command is in
 ## Profiles and multiplex
 
 OcuClaw is a port-binding platform and belongs on the default Hermes profile.
-When `gateway.multiplex_profiles` is enabled, keep the plugin on the default
-profile. Setup offers multiple agents as the recommended choice, with
+It is installed once, there. That profile owns the relay the glasses pair to,
+so a second OcuClaw install or a second relay credential in a secondary profile
+is never the answer. When `gateway.multiplex_profiles` is enabled, keep the
+plugin on the default profile. Setup offers multiple agents as the recommended
+choice, with
 single-agent mode available — on a fresh install and, since #2515, on an
 existing install that never recorded the choice (`hermes ocuclaw status` shows
 `multiple agents  off · agent mode not chosen yet`; the phone's grey "+" says
-"Multiple agents is off on your Hermes host. Run /ocuclaw-setup"). The
-served-profile allowlist contains selected agents; phone-created agents enroll
-before the required restart. Hermes 0.21 uses the shared relay-authenticated
-adapter's provenance for secondary turns and approvals. No
-`OCUCLAW_ALLOW_ALL_USERS` bypass is required.
+"Multiple agents is off on your Hermes host. Run /ocuclaw-setup"). The OcuClaw
+enrollment set (#2940) holds the agents the wearer selected; phone-created
+agents enroll before the required restart. A gateway-served list is not an
+enrollment list. Hermes 0.21 uses the shared relay-authenticated adapter's
+provenance for secondary turns and approvals. No `OCUCLAW_ALLOW_ALL_USERS`
+bypass is required.
 
-**Set the allowlist BEFORE flipping the switch.** With
-`gateway.multiplex_profiles` on and no `gateway.multiplex_profile_allowlist`,
-the gateway serves EVERY profile on the host, and "served" also gates cron
+**Bound the served set BEFORE flipping the switch.** With
+`gateway.multiplex_profiles` on and nothing bounding the served set, the
+gateway serves EVERY profile on the host, and "served" also gates cron
 ticking — each served profile's cron jobs run inside this gateway. A profile
 that already runs its own gateway (a `watcher`, for instance) would then be
-served twice: a relay-token clash plus double cron. Write the allowlist first,
-then the switch, and there is never a restart window where "all" is in force:
+served twice: a relay-token clash plus double cron. Bound it first, then flip
+the switch, and there is never a restart window where "all" is in force.
+
+**The enrollment set is OcuClaw's own key**, on every supported engine:
 
 ```bash
-hermes config set --force gateway.multiplex_profile_allowlist '[default]'
+hermes config set --force platforms.ocuclaw.extra.profile_allowlist '[]'
 hermes config set --force gateway.multiplex_profiles true
 ```
+
+`platforms.ocuclaw.extra.profile_allowlist` lists the secondary agents the
+glasses may reach. The default agent carries the pairing, is always enrolled,
+and is never listed. An empty list is a real answer — "just the default agent"
+— and the wearer adds agents from the phone's Agents list.
+
+An **absent** key is a different answer: OcuClaw reads it as "the wearer has
+not chosen yet" and asks them to reselect on the phone. Absence never means
+"every agent", in any state, on any engine. A malformed value fails the same
+closed way.
 
 `--force` only skips the CLI's `⚠ 'gateway.multiplex_profiles' is not a
 recognized config key — it was saved anyway` notice (with a misleading
 `Did you mean: gateway.multiplex_profile_allowlist`) that the second line
-prints without it; the gateway reads the key as written, and the allowlist key
-is recognized outright. Hermes facts
-these rules rest on (verified on Hermes 0.21.0 / v2026.8.31):
+prints without it; the gateway reads the key as written.
+
+**Version note, Hermes 0.21.0 to 0.21.2.** Those engines bound the *served* set
+by `gateway.multiplex_profile_allowlist`, so OcuClaw mirrors the enrollment set
+onto that key on every create, add and remove — without the mirror a newly
+enrolled agent would never be served there. Add the mirror line to the setup
+above on such a host:
+
+```bash
+hermes config set --force gateway.multiplex_profile_allowlist '[]'
+```
+
+**Version note, Hermes 0.21.3.** Config migration 42 to 43 deletes that key and
+the multiplexer serves every live profile on the host, so no mirror is written
+and enforcement is entirely OcuClaw's. The enrollment set still decides which
+agents reach the glasses. It does not decide which profiles the multiplexer
+runs, so cron and other channels on unenrolled profiles tick there too.
+
+Which case a host is in is decided by **probing the running engine** (does
+`profiles_to_serve` still take `profile_allowlist`?), never by a version
+string.
+
+Hermes facts these rules rest on (verified on Hermes 0.21.0 / v2026.8.31):
 
 - **Precedence:** the `GATEWAY_MULTIPLEX_PROFILES` environment variable
   (`1/true/yes/on`, `0/false/no/off`) beats `gateway.multiplex_profiles` in
   config.yaml, which beats the default of **off**. A blank or unrecognized env
   value falls through to config instead of forcing the switch off.
-- **A malformed allowlist fails safe:** a value that is not a list serves the
-  default profile only (with a warning); invalid entries are skipped;
-  `default` is always served. An ABSENT allowlist is the "serve everything"
-  shape — that is the one to avoid.
+- **A malformed bound fails safe (0.21.0 to 0.21.2):** a value that is not a
+  list serves the default profile only (with a warning); invalid entries are
+  skipped; `default` is always served. An ABSENT value is the "serve
+  everything" shape — that is the one to avoid. Hermes 0.21.3 has no such key
+  and always serves everything.
 - **A secondary profile that enables a port-binding platform is not served.**
   The default profile owns the single shared listener; a secondary profile
   whose config enables OcuClaw (or any port-binding platform) is skipped at

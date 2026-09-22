@@ -718,6 +718,7 @@ function mapToolLabel(toolName, activityPath, args, options) {
           detail: null,
           category: "generic",
           intent: "interface.build",
+          buildKind: args.kind,
         };
       }
       return {

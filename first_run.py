@@ -39,26 +39,159 @@ from .receipts import (
     write_json_receipt,
 )
 from .relay_credential import read_relay_credential_marker
+from .welcome_plates import (
+    HERMES_CLOUDWAYS_PLATE_BASE64,
+    HERMES_PLATE_BASE64,
+    PLATE_HEIGHT,
+    PLATE_WIDTH,
+)
 
 FIRST_RUN_ATTEMPT_FILENAME = "ocuclaw.first-run-proof-attempt.json"
 FIRST_RUN_PHONE_CANDIDATE_FILENAME = "ocuclaw.first-run-phone-candidate.json"
+FIRST_RUN_REPLY_DELIVERY_FILENAME = "ocuclaw.first-run-reply-delivery.json"
 FIRST_RUN_LOCK_FILENAME = FIRST_RUN_BINDING_LOCK_FILENAME
 FIRST_RUN_ATTEMPT_SCHEMA_VERSION = 1
 FIRST_RUN_PHONE_CANDIDATE_SCHEMA_VERSION = 1
+FIRST_RUN_REPLY_DELIVERY_SCHEMA_VERSION = 1
 FIRST_RUN_ATTEMPT_RESUME_SECONDS = 60 * 60
 FIRST_RUN_PROOF_METHOD = "phone-origin-g2-wearer-confirmed"
+#: The machine-evidence arming path's proof method. Deliberately a DIFFERENT
+#: string from the wearer one: a reader must never have to guess which kind of
+#: evidence a committed proof rests on, and the two must never be conflated.
+FIRST_RUN_PROOF_METHOD_SDK_RECEIPT = "phone-origin-g2-sdk-receipt"
 PHONE_ORIGIN_WAIT_SECONDS = 165.0
 WELCOME_ROUND_TRIP_WAIT_SECONDS = 150.0
 FIRST_RUN_WAIT_POLL_SECONDS = 0.1
 PHONE_TURN_CANDIDATE_GATE_TTL_SECONDS = 60.0
 
-WELCOME_SURFACE = {
-    "kind": "text_surface",
-    "template": "image_caption",
-    "imageAsset": "hermes_welcome",
-    "body": "Welcome to OcuClaw on Hermes",
-    "timeoutMs": 60000,
-}
+# -- reply-delivery evidence (#3030) ------------------------------------------
+#
+# The Node relay validates one client SDK receipt for the exact committed
+# assistant reply of a phone-origin turn and reports it over the authenticated
+# control link. This module joins that report to the CURRENT phone-turn
+# candidate and persists a secret-free record beside the Attempt, under the
+# same binding lock. The record is evidence that the originating phone's SDK
+# accepted a slice of that reply — never that a wearer saw anything.
+
+#: Which evidence armed a First-Run Proof Attempt. Historical records that
+#: predate this field read as ``wearer_confirmed``; they are never rewritten.
+REPLY_EVIDENCE_WEARER_CONFIRMED = "wearer_confirmed"
+REPLY_EVIDENCE_CLIENT_SDK_RECEIPT = "client_sdk_receipt"
+REPLY_EVIDENCE_VALUES = (
+    REPLY_EVIDENCE_WEARER_CONFIRMED,
+    REPLY_EVIDENCE_CLIENT_SDK_RECEIPT,
+)
+
+REPLY_DELIVERY_PENDING = "pending"
+REPLY_DELIVERY_SDK_ACCEPTED = "sdk_accepted"
+REPLY_DELIVERY_UNCONFIRMED = "unconfirmed"
+REPLY_DELIVERY_UNSUPPORTED = "unsupported"
+#: The statuses a Node report may carry. ``pending`` is an observation state,
+#: never a reported outcome.
+REPLY_DELIVERY_REPORT_STATUSES = (
+    REPLY_DELIVERY_SDK_ACCEPTED,
+    REPLY_DELIVERY_UNCONFIRMED,
+    REPLY_DELIVERY_UNSUPPORTED,
+)
+REPLY_DELIVERY_STATUSES = (REPLY_DELIVERY_PENDING, *REPLY_DELIVERY_REPORT_STATUSES)
+
+REPLY_DELIVERY_EVIDENCE_KIND = "client_sdk_receipt"
+REPLY_DELIVERY_LANE_DEVICE = "device"
+REPLY_DELIVERY_LANE_SIMULATOR = "simulator"
+REPLY_DELIVERY_LANES = (REPLY_DELIVERY_LANE_DEVICE, REPLY_DELIVERY_LANE_SIMULATOR)
+
+#: Test-lane marker. Simulator evidence must never arm a real installation, so
+#: it qualifies only where an explicit test installation sets this to ``1``.
+SIMULATOR_REPLY_EVIDENCE_ENV = "OCUCLAW_HERMES_ALLOW_SIMULATOR_REPLY_EVIDENCE"
+
+#: Closed diagnostic vocabulary. A reason outside this set is recorded as
+#: ``unspecified`` rather than passed through as prose.
+REPLY_DELIVERY_REASONS = frozenset(
+    {
+        "attribution_unavailable",
+        "binding_changed",
+        "client_disconnected",
+        "client_lacks_contract",
+        "observation_expired",
+        "record_unavailable",
+        # #3232: the run itself errored, so its "reply" is the model's error
+        # text. An errored run yields no receipt, whatever the glasses painted.
+        "reply_run_errored",
+        "reply_run_rate_limited",
+        "runtime_lacks_contract",
+        "runtime_unavailable",
+        "sdk_write_failed",
+        "sdk_write_timeout",
+        "simulator_lane_not_eligible",
+        "unspecified",
+        "unsupported_reply_shape",
+        "wait_timeout",
+    }
+)
+REPLY_DELIVERY_REASON_UNSPECIFIED = "unspecified"
+#: #3232. Reasons that say the agent RUN errored, so what the glasses painted
+#: was the model's error text and there is no first reply to evidence. None of
+#: these may record Core Setup Completion or arm the welcome, whatever status
+#: rode alongside them.
+REPLY_DELIVERY_ERRORED_RUN_REASONS = frozenset(
+    {
+        "reply_run_errored",
+        "reply_run_rate_limited",
+    }
+)
+REPLY_DELIVERY_REASON_MAX_CHARS = 64
+
+REPLY_DELIVERY_OBSERVE_METHOD = "replyDelivery.observe"
+REPLY_DELIVERY_REPORT_METHOD = "replyDelivery.report"
+#: Node holds one 30 s deadline per observation (the wait for the ledger commit
+#: and the probe share it); the host wait outlasts it so a reported outcome
+#: always beats the host's bound.
+REPLY_DELIVERY_WAIT_SECONDS = 40.0
+REPLY_DELIVERY_OBSERVE_TIMEOUT_SECONDS = 35.0
+
+_REPLY_DELIVERY_REPORT_KEYS = frozenset(
+    {"candidateId", "status", "reason", "evidence"}
+)
+_REPLY_DELIVERY_EVIDENCE_KEYS = frozenset({"kind", "lane", "coveredChars"})
+_REPLY_DELIVERY_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "profileFingerprint",
+        "candidateId",
+        "credentialGenerationId",
+        "pairingCompletionId",
+        "status",
+        "reason",
+        "evidence",
+        "lane",
+        "coveredChars",
+        "receivedAt",
+    }
+)
+
+def _welcome_surface(image_base64: str) -> Dict[str, Any]:
+    return {
+        "kind": "text_surface",
+        "template": "image_caption",
+        "title": "Double-tap to continue",
+        "imageBase64": image_base64,
+        "imageWidth": PLATE_WIDTH,
+        "imageHeight": PLATE_HEIGHT,
+        "body": "Welcome to OcuClaw on Hermes",
+        "timeoutMs": 60000,
+    }
+
+
+# The collab lockup (#3187) rides inline: see welcome_plates for why.
+WELCOME_SURFACE = _welcome_surface(HERMES_PLATE_BASE64)
+WELCOME_SURFACE_CLOUDWAYS = _welcome_surface(HERMES_CLOUDWAYS_PLATE_BASE64)
+WELCOME_SURFACES = (WELCOME_SURFACE, WELCOME_SURFACE_CLOUDWAYS)
+
+
+def welcome_surface(*, cloudways: bool) -> Dict[str, Any]:
+    """The locked welcome surface for this host, as a fresh dict."""
+
+    return dict(WELCOME_SURFACE_CLOUDWAYS if cloudways else WELCOME_SURFACE)
 WELCOME_DISMISSALS = frozenset({"dismissed", "back"})
 
 _ATTEMPT_KEYS = frozenset(
@@ -77,6 +210,9 @@ _ATTEMPT_KEYS = frozenset(
         "welcomeFailures",
     }
 )
+#: Added by #3030. A record written before it exists is still valid and reads
+#: as wearer-confirmed; old records are never rewritten.
+_ATTEMPT_OPTIONAL_KEYS = frozenset({"replyEvidence"})
 _PHONE_CANDIDATE_KEYS = frozenset(
     {
         "schemaVersion",
@@ -321,7 +457,14 @@ def record_phone_turn_candidate(
             write_json_receipt(path, body, durable=True)
         except ReceiptUnavailableError:
             return {"state": "write_failed", "recorded": False}
-    return {"state": "ready", "recorded": True}
+    # The caller needs the binding it just wrote so it can ask the Node child
+    # to observe delivery for this exact candidate. It is opaque and
+    # secret-free; the raw session and turn identifiers stay in this process.
+    return {
+        "state": "ready",
+        "recorded": True,
+        "candidateId": _phone_candidate_id(body),
+    }
 
 
 def _read_phone_turn_candidate(
@@ -400,14 +543,324 @@ def wait_for_phone_turn_candidate(
         time.sleep(max(0.001, min(float(poll_seconds), deadline - time.monotonic())))
 
 
-def is_welcome_surface(args: Any) -> bool:
-    """Whether ``args`` is the exact locked Hermes Welcome surface."""
-
-    if not isinstance(args, Mapping) or set(args) != set(WELCOME_SURFACE):
-        return False
+def reply_delivery_path(home: Optional[Path] = None) -> Optional[Path]:
+    directory = state_dir(home)
     return (
-        all(args.get(key) == value for key, value in WELCOME_SURFACE.items())
-        and type(args.get("timeoutMs")) is int
+        None
+        if directory is None
+        else directory / FIRST_RUN_REPLY_DELIVERY_FILENAME
+    )
+
+
+def _reason_code(value: Any) -> Optional[str]:
+    """Project a reported reason onto the closed diagnostic vocabulary."""
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text if text in REPLY_DELIVERY_REASONS else REPLY_DELIVERY_REASON_UNSPECIFIED
+
+
+def validate_reply_delivery_report(
+    params: Any,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Validate one ``replyDelivery.report`` payload as a closed shape.
+
+    Returns ``(normalized, None)`` or ``(None, "invalid_params")``. Extra keys,
+    wrong types, an out-of-range status or lane, and an evidence block that
+    does not match the status are all refusals — a malformed report must never
+    settle an observation.
+    """
+
+    if not isinstance(params, Mapping) or set(params) != _REPLY_DELIVERY_REPORT_KEYS:
+        return None, "invalid_params"
+    candidate_id = params.get("candidateId")
+    if not _is_fingerprint(candidate_id):
+        return None, "invalid_params"
+    status = params.get("status")
+    if status not in REPLY_DELIVERY_REPORT_STATUSES:
+        return None, "invalid_params"
+    reason = params.get("reason")
+    if reason is not None and (
+        not isinstance(reason, str)
+        or not reason.strip()
+        or len(reason) > REPLY_DELIVERY_REASON_MAX_CHARS
+    ):
+        return None, "invalid_params"
+    evidence = params.get("evidence")
+    accepted = status == REPLY_DELIVERY_SDK_ACCEPTED
+    if accepted != isinstance(evidence, Mapping):
+        # `evidence` is non-null iff the status is `sdk_accepted`.
+        return None, "invalid_params"
+    kind: Optional[str] = None
+    lane: Optional[str] = None
+    covered_chars: Optional[int] = None
+    if accepted:
+        if set(evidence) != _REPLY_DELIVERY_EVIDENCE_KEYS:
+            return None, "invalid_params"
+        kind = evidence.get("kind")
+        lane = evidence.get("lane")
+        covered_chars = evidence.get("coveredChars")
+        if (
+            kind != REPLY_DELIVERY_EVIDENCE_KIND
+            or lane not in REPLY_DELIVERY_LANES
+            or isinstance(covered_chars, bool)
+            or not isinstance(covered_chars, int)
+            or covered_chars <= 0
+        ):
+            return None, "invalid_params"
+    return (
+        {
+            "candidate_id": candidate_id,
+            "status": status,
+            "reason": _reason_code(reason),
+            "evidence": kind,
+            "lane": lane,
+            "covered_chars": covered_chars,
+        },
+        None,
+    )
+
+
+def _read_reply_delivery_record(
+    path: Optional[Path], profile_fingerprint: Optional[str]
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    if path is None or profile_fingerprint is None:
+        return None, "unavailable"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, "missing"
+    except (OSError, UnicodeError, ValueError):
+        return None, "unreadable"
+    if (
+        not isinstance(record, dict)
+        or set(record) != _REPLY_DELIVERY_KEYS
+        or record.get("schemaVersion") != FIRST_RUN_REPLY_DELIVERY_SCHEMA_VERSION
+        or record.get("status") not in REPLY_DELIVERY_REPORT_STATUSES
+        or not _is_fingerprint(record.get("candidateId"))
+    ):
+        return None, "malformed"
+    if record.get("profileFingerprint") != profile_fingerprint:
+        return None, "wrong_profile"
+    return record, "ok"
+
+
+def record_reply_delivery(
+    *,
+    home: Optional[Path] = None,
+    now: Optional[datetime] = None,
+    candidate_id: str,
+    status: str,
+    reason: Optional[str] = None,
+    evidence: Optional[str] = None,
+    lane: Optional[str] = None,
+    covered_chars: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Persist one observation for the CURRENT phone-turn candidate.
+
+    Bound to the exact candidate by constant-time comparison: an unknown or
+    already-replaced candidate is refused and nothing is written. A later
+    ``sdk_accepted`` may upgrade a stored ``unconfirmed``/``unsupported`` for
+    the same candidate; nothing downgrades a stored ``sdk_accepted``, and a
+    repeat of the same observation is an idempotent no-op.
+    """
+
+    if status not in REPLY_DELIVERY_REPORT_STATUSES:
+        return {"ok": False, "error": "invalid_params"}
+    accepted = status == REPLY_DELIVERY_SDK_ACCEPTED
+    if accepted:
+        if (
+            evidence != REPLY_DELIVERY_EVIDENCE_KIND
+            or lane not in REPLY_DELIVERY_LANES
+            or isinstance(covered_chars, bool)
+            or not isinstance(covered_chars, int)
+            or covered_chars <= 0
+        ):
+            return {"ok": False, "error": "invalid_params"}
+    elif evidence is not None or lane is not None or covered_chars is not None:
+        return {"ok": False, "error": "invalid_params"}
+
+    resolved = home if home is not None else resolve_receipt_home()
+    profile_fingerprint = fingerprint_home(resolved)
+    path = reply_delivery_path(resolved)
+    if resolved is None or profile_fingerprint is None or path is None:
+        return {"ok": False, "error": "profile_unavailable"}
+
+    with receipt_state_lock(state_dir(resolved), FIRST_RUN_LOCK_FILENAME) as acquired:
+        if not acquired:
+            return {"ok": False, "error": "lock_unavailable"}
+        candidate = _read_phone_turn_candidate(home=resolved, now=now)
+        if candidate.get("state") != "ready" or not hmac.compare_digest(
+            str(candidate_id), str(candidate.get("candidateId") or "")
+        ):
+            # Unknown or replaced candidate: refuse, and persist nothing.
+            return {"ok": False, "error": "candidate_unknown"}
+        existing, existing_status = _read_reply_delivery_record(
+            path, profile_fingerprint
+        )
+        if (
+            existing_status == "ok"
+            and existing is not None
+            and hmac.compare_digest(
+                str(existing.get("candidateId")), str(candidate_id)
+            )
+        ):
+            if existing.get("status") == REPLY_DELIVERY_SDK_ACCEPTED and not accepted:
+                return {"ok": True, "state": "retained"}
+            if (
+                existing.get("status") == status
+                and existing.get("reason") == _reason_code(reason)
+                and existing.get("evidence") == evidence
+                and existing.get("lane") == lane
+                and existing.get("coveredChars") == covered_chars
+            ):
+                return {"ok": True, "state": "duplicate"}
+        generation_id, completion_id = _binding_ids(resolved)
+        body = {
+            "schemaVersion": FIRST_RUN_REPLY_DELIVERY_SCHEMA_VERSION,
+            "profileFingerprint": profile_fingerprint,
+            "candidateId": str(candidate_id),
+            "credentialGenerationId": generation_id,
+            "pairingCompletionId": completion_id,
+            "status": status,
+            "reason": _reason_code(reason),
+            "evidence": evidence,
+            "lane": lane,
+            "coveredChars": covered_chars,
+            "receivedAt": _iso(_as_utc(now or _utc_now())),
+        }
+        try:
+            write_json_receipt(path, body, durable=True)
+        except ReceiptUnavailableError:
+            return {"ok": False, "error": "write_failed"}
+    return {"ok": True, "state": "recorded"}
+
+
+def _simulator_reply_evidence_allowed() -> bool:
+    return str(os.environ.get(SIMULATOR_REPLY_EVIDENCE_ENV, "")).strip() == "1"
+
+
+def _project_reply_delivery(
+    *,
+    home: Optional[Path],
+    candidate_id: str,
+) -> Dict[str, Any]:
+    """Qualify the stored record against the exact candidate and bindings."""
+
+    resolved = home if home is not None else resolve_receipt_home()
+    profile_fingerprint = fingerprint_home(resolved)
+    path = reply_delivery_path(resolved)
+    record, status = _read_reply_delivery_record(path, profile_fingerprint)
+    if status != "ok" or record is None:
+        return {
+            "eligible": False,
+            "settled": False,
+            "status": REPLY_DELIVERY_PENDING,
+            "reason": None,
+            "evidence": None,
+            "lane": None,
+        }
+    if not hmac.compare_digest(
+        str(record.get("candidateId")), str(candidate_id or "")
+    ):
+        # Another candidate's observation. Keep waiting for this one.
+        return {
+            "eligible": False,
+            "settled": False,
+            "status": REPLY_DELIVERY_PENDING,
+            "reason": None,
+            "evidence": None,
+            "lane": None,
+        }
+    generation_id, completion_id = _binding_ids(resolved)
+    if (
+        record.get("credentialGenerationId") != generation_id
+        or record.get("pairingCompletionId") != completion_id
+    ):
+        # Credential rotation, re-pair, reset or a profile change: the record
+        # describes an installation that no longer exists.
+        return {
+            "eligible": False,
+            "settled": True,
+            "status": REPLY_DELIVERY_UNCONFIRMED,
+            "reason": "binding_changed",
+            "evidence": None,
+            "lane": None,
+        }
+    lane = record.get("lane")
+    if (
+        record.get("status") == REPLY_DELIVERY_SDK_ACCEPTED
+        and lane == REPLY_DELIVERY_LANE_SIMULATOR
+        and not _simulator_reply_evidence_allowed()
+    ):
+        return {
+            "eligible": False,
+            "settled": True,
+            "status": REPLY_DELIVERY_UNCONFIRMED,
+            "reason": "simulator_lane_not_eligible",
+            "evidence": None,
+            "lane": REPLY_DELIVERY_LANE_SIMULATOR,
+        }
+    return {
+        "eligible": record.get("status") == REPLY_DELIVERY_SDK_ACCEPTED,
+        "settled": True,
+        "status": record.get("status"),
+        "reason": record.get("reason"),
+        "evidence": record.get("evidence"),
+        "lane": lane,
+    }
+
+
+def _reply_delivery_result(projection: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "status": projection["status"],
+        "reason": projection["reason"],
+        "evidence": projection["evidence"],
+        "lane": projection["lane"],
+    }
+
+
+def wait_for_reply_delivery(
+    *,
+    home: Optional[Path] = None,
+    candidate_id: str,
+    timeout_seconds: float = REPLY_DELIVERY_WAIT_SECONDS,
+    poll_seconds: float = FIRST_RUN_WAIT_POLL_SECONDS,
+) -> Dict[str, Any]:
+    """Bounded poll for this candidate's reply-delivery observation.
+
+    Never restarts the phone-origin wait and never mutates anything: an
+    expired bound simply reports ``unconfirmed``/``wait_timeout``, and the
+    same candidate still arms through the wearer path afterwards.
+    """
+
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    while True:
+        projection = _project_reply_delivery(home=home, candidate_id=candidate_id)
+        if projection["settled"]:
+            return _reply_delivery_result(projection)
+        if time.monotonic() >= deadline:
+            return {
+                "status": REPLY_DELIVERY_UNCONFIRMED,
+                "reason": "wait_timeout",
+                "evidence": None,
+                "lane": None,
+            }
+        time.sleep(max(0.001, min(float(poll_seconds), deadline - time.monotonic())))
+
+
+def is_welcome_surface(args: Any) -> bool:
+    """Whether ``args`` is exactly one of the locked Hermes Welcome surfaces."""
+
+    if not isinstance(args, Mapping) or type(args.get("timeoutMs")) is not int:
+        return False
+    return any(
+        set(args) == set(surface)
+        and all(args.get(key) == value for key, value in surface.items())
+        for surface in WELCOME_SURFACES
     )
 
 
@@ -424,11 +877,42 @@ def _read_attempt(path: Optional[Path]) -> Tuple[Optional[Dict[str, Any]], str]:
         record = json.loads(raw)
     except ValueError:
         return None, "unreadable"
-    if not isinstance(record, dict) or set(record) != _ATTEMPT_KEYS:
+    if (
+        not isinstance(record, dict)
+        or set(record) - _ATTEMPT_OPTIONAL_KEYS != _ATTEMPT_KEYS
+        or (
+            "replyEvidence" in record
+            and record["replyEvidence"] not in REPLY_EVIDENCE_VALUES
+        )
+    ):
         return None, "malformed"
     if record.get("schemaVersion") != FIRST_RUN_ATTEMPT_SCHEMA_VERSION:
         return None, "unsupported_schema"
     return record, "ok"
+
+
+def _reply_evidence_of(record: Any) -> str:
+    """The evidence discriminator, defaulting historical records to the wearer.
+
+    A record written before #3030 carries no field. Reading it as
+    ``wearer_confirmed`` is the only compatible reading: those attempts and
+    proofs were armed by a wearer answering the display question.
+    """
+
+    if not isinstance(record, Mapping):
+        return REPLY_EVIDENCE_WEARER_CONFIRMED
+    value = record.get("replyEvidence")
+    return (
+        value if value in REPLY_EVIDENCE_VALUES else REPLY_EVIDENCE_WEARER_CONFIRMED
+    )
+
+
+def _proof_method_for(record: Any) -> str:
+    return (
+        FIRST_RUN_PROOF_METHOD_SDK_RECEIPT
+        if _reply_evidence_of(record) == REPLY_EVIDENCE_CLIENT_SDK_RECEIPT
+        else FIRST_RUN_PROOF_METHOD
+    )
 
 
 def _proof_is_committed(record: Any) -> bool:
@@ -460,6 +944,7 @@ def inspect_attempt(
             "committed": True,
             "resumeAllowed": False,
             "provenAt": proof.get("provenAt"),
+            "replyEvidence": _reply_evidence_of(proof),
         }
     if proof_status != "missing":
         return {
@@ -573,6 +1058,7 @@ def inspect_attempt(
         "expiresAt": record["expiresAt"],
         "welcomeFailures": failures,
         "retryAllowed": failures == 1,
+        "replyEvidence": _reply_evidence_of(record),
     }
 
 
@@ -619,8 +1105,16 @@ def _arm_first_run_proof_unlocked(
     turn_id: Optional[str],
     session_fingerprint: Optional[str] = None,
     turn_fingerprint: Optional[str] = None,
+    reply_evidence: str = REPLY_EVIDENCE_WEARER_CONFIRMED,
 ) -> Dict[str, Any]:
     """Atomically create a fresh one-hour First-Run Proof Attempt."""
+
+    if reply_evidence not in REPLY_EVIDENCE_VALUES:
+        return {
+            "state": "reply_evidence_invalid",
+            "armed": False,
+            "committed": False,
+        }
 
     resolved = home if home is not None else resolve_receipt_home()
     profile_fingerprint = fingerprint_home(resolved)
@@ -695,6 +1189,7 @@ def _arm_first_run_proof_unlocked(
                 "resumeAllowed": True,
                 "welcomeFailures": existing["welcomeFailures"],
                 "alreadyArmed": True,
+                "replyEvidence": _reply_evidence_of(existing),
             }
         if existing.get("turnFingerprint") == turn_fingerprint:
             return {
@@ -722,6 +1217,9 @@ def _arm_first_run_proof_unlocked(
         "sessionFingerprint": session_fingerprint,
         "turnFingerprint": turn_fingerprint,
         "welcomeFailures": 0,
+        # Which evidence armed this Attempt. Machine evidence never sets, nor
+        # implies, wearer confirmation; there is no wearer field to set.
+        "replyEvidence": reply_evidence,
     }
     try:
         write_json_receipt(path, body, durable=True)
@@ -739,6 +1237,7 @@ def _arm_first_run_proof_unlocked(
         "armedAt": body["armedAt"],
         "expiresAt": body["expiresAt"],
         "resumeAllowed": True,
+        "replyEvidence": reply_evidence,
     }
 
 
@@ -825,7 +1324,11 @@ def _record_welcome_outcome_unlocked(
             "state": "committed",
             "committed": True,
             "provenAt": status.get("provenAt"),
-            "method": FIRST_RUN_PROOF_METHOD,
+            "method": (
+                FIRST_RUN_PROOF_METHOD_SDK_RECEIPT
+                if status.get("replyEvidence") == REPLY_EVIDENCE_CLIENT_SDK_RECEIPT
+                else FIRST_RUN_PROOF_METHOD
+            ),
             "alreadyCommitted": True,
         }
     binding_state = status.get("state")
@@ -881,11 +1384,15 @@ def _record_welcome_outcome_unlocked(
 
     if outcome_name in WELCOME_DISMISSALS:
         proven_at = _iso(_as_utc(now or _utc_now()))
+        reply_evidence = _reply_evidence_of(record)
         proof = {
             "schemaVersion": FIRST_RUN_PROOF_SCHEMA_VERSION,
             "profileFingerprint": profile_fingerprint,
             "provenAt": proven_at,
             **bundle_identity,
+            # Carried from the Attempt so the durable record states which
+            # evidence armed it rather than leaving a reader to assume.
+            "replyEvidence": reply_evidence,
         }
         try:
             claim_json_receipt(proof_path, proof)
@@ -900,6 +1407,7 @@ def _record_welcome_outcome_unlocked(
                     "reason": "proof_claim_race_unreadable",
                 }
             proven_at = existing.get("provenAt")
+            reply_evidence = _reply_evidence_of(existing)
         except ReceiptUnavailableError:
             return {
                 "state": "write_failed",
@@ -911,7 +1419,11 @@ def _record_welcome_outcome_unlocked(
             "state": "committed",
             "committed": True,
             "provenAt": proven_at,
-            "method": FIRST_RUN_PROOF_METHOD,
+            "method": (
+                FIRST_RUN_PROOF_METHOD_SDK_RECEIPT
+                if reply_evidence == REPLY_EVIDENCE_CLIENT_SDK_RECEIPT
+                else FIRST_RUN_PROOF_METHOD
+            ),
         }
 
     return _record_attempt_failure(
@@ -931,6 +1443,7 @@ def arm_first_run_proof(
     ocuclaw_version: Optional[str],
     session_key: Optional[str],
     turn_id: Optional[str],
+    reply_evidence: str = REPLY_EVIDENCE_WEARER_CONFIRMED,
 ) -> Dict[str, Any]:
     """Serialize and atomically arm one First-Run Proof Attempt."""
 
@@ -950,6 +1463,7 @@ def arm_first_run_proof(
             ocuclaw_version=ocuclaw_version,
             session_key=session_key,
             turn_id=turn_id,
+            reply_evidence=reply_evidence,
         )
 
 
@@ -961,8 +1475,15 @@ def arm_first_run_proof_from_candidate(
     hermes_package_version: Optional[str],
     ocuclaw_version: Optional[str],
     expected_candidate_id: str,
+    reply_evidence: str = REPLY_EVIDENCE_WEARER_CONFIRMED,
 ) -> Dict[str, Any]:
-    """Arm in the host process from the gateway's fingerprint-only receipt."""
+    """Arm in the host process from the gateway's fingerprint-only receipt.
+
+    ``reply_evidence`` names which path the caller is claiming. The wearer
+    path is unchanged. ``client_sdk_receipt`` is refused unless this exact
+    candidate already has an eligible ``sdk_accepted`` observation, so a
+    caller can never assert machine evidence it does not have.
+    """
 
     resolved = home if home is not None else resolve_receipt_home()
     with receipt_state_lock(state_dir(resolved), FIRST_RUN_LOCK_FILENAME) as acquired:
@@ -987,6 +1508,17 @@ def arm_first_run_proof_from_candidate(
                 "armed": False,
                 "committed": False,
             }
+        if reply_evidence == REPLY_EVIDENCE_CLIENT_SDK_RECEIPT:
+            projection = _project_reply_delivery(
+                home=resolved, candidate_id=expected_candidate_id
+            )
+            if not projection["eligible"]:
+                return {
+                    "state": "reply_evidence_unavailable",
+                    "armed": False,
+                    "committed": False,
+                    "reason": projection["reason"] or "record_unavailable",
+                }
         return _arm_first_run_proof_unlocked(
             home=resolved,
             now=now,
@@ -997,6 +1529,7 @@ def arm_first_run_proof_from_candidate(
             turn_id=None,
             session_fingerprint=candidate["sessionFingerprint"],
             turn_fingerprint=candidate["turnFingerprint"],
+            reply_evidence=reply_evidence,
         )
 
 
@@ -1036,13 +1569,35 @@ __all__ = [
     "FIRST_RUN_LOCK_FILENAME",
     "FIRST_RUN_ATTEMPT_RESUME_SECONDS",
     "FIRST_RUN_PROOF_METHOD",
+    "FIRST_RUN_PROOF_METHOD_SDK_RECEIPT",
+    "FIRST_RUN_REPLY_DELIVERY_FILENAME",
+    "REPLY_DELIVERY_ERRORED_RUN_REASONS",
+    "REPLY_DELIVERY_OBSERVE_METHOD",
+    "REPLY_DELIVERY_REPORT_METHOD",
+    "REPLY_DELIVERY_OBSERVE_TIMEOUT_SECONDS",
+    "REPLY_DELIVERY_PENDING",
+    "REPLY_DELIVERY_SDK_ACCEPTED",
+    "REPLY_DELIVERY_UNCONFIRMED",
+    "REPLY_DELIVERY_UNSUPPORTED",
+    "REPLY_DELIVERY_WAIT_SECONDS",
+    "REPLY_EVIDENCE_CLIENT_SDK_RECEIPT",
+    "REPLY_EVIDENCE_VALUES",
+    "REPLY_EVIDENCE_WEARER_CONFIRMED",
+    "SIMULATOR_REPLY_EVIDENCE_ENV",
     "WELCOME_DISMISSALS",
     "WELCOME_SURFACE",
+    "WELCOME_SURFACES",
+    "WELCOME_SURFACE_CLOUDWAYS",
     "arm_first_run_proof",
     "first_run_attempt_path",
     "inspect_attempt",
     "is_welcome_surface",
+    "record_reply_delivery",
     "record_welcome_outcome",
+    "reply_delivery_path",
+    "validate_reply_delivery_report",
     "wait_for_first_run_terminal",
     "wait_for_phone_turn_candidate",
+    "wait_for_reply_delivery",
+    "welcome_surface",
 ]
