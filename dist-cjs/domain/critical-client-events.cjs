@@ -8,6 +8,18 @@ const PHONE_CRITICAL_EVENT_NAMES = Object.freeze([
   "latched_screen_watchdog",
   "liveui_render_failed",
   "liveui_render_unparsed",
+  "global_error_hook",
+  "boot_viewport_snapshot",
+  "boot_frame_pump_snapshot",
+  "boot_clock_ledger",
+  "timer_scheduler_driver_recreated",
+  "post_canvas_watchdog_late",
+  "heartbeat_degraded_suppression",
+  "display_fence_timeout",
+  "relay_auto_restore_gate",
+  "getting_started_returning_handoff",
+  "startup_default_session_requested",
+  "message_screen_reentry_requested",
 ]);
 
 const FORCED_CLIENT_EVENT_NAMES = Object.freeze([

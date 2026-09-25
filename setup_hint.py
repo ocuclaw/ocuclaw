@@ -45,7 +45,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, Mapping, Optional
+from typing import Any, Callable, Dict, Iterator, Mapping, Optional
 
 from .receipts import (
     ReceiptUnavailableError,
@@ -228,17 +228,20 @@ async def push_hint_edge(
 @contextlib.contextmanager
 def awaiting_first_reply(
     *, home: Optional[Path] = None, now: Optional[datetime] = None
-) -> Iterator[None]:
+) -> Iterator[Callable[[], None]]:
     """Hold the phone hint for exactly the duration of the phone-turn wait.
 
     ``finally`` is the whole point: a timeout, an unreadable receipt or an
     exception inside the wait all leave the wearer with nothing left to do, so
     all three must take the row away.
+
+    Yields a refresh callable (#3523): the hint's TTL covers one wait, so the
+    quiet re-wait re-publishes it, in place, before it starts.
     """
 
     _quietly(lambda: open_hint(home=home, now=now))
     try:
-        yield
+        yield lambda: _quietly(lambda: open_hint(home=home))
     finally:
         _quietly(lambda: close_hint(home=home))
 

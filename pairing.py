@@ -36,6 +36,7 @@ import hmac
 import json
 import math
 import os
+import queue
 import re
 import select
 import shutil
@@ -104,6 +105,10 @@ POLL_INTERVAL_S = 1.0
 #: A hair over the two-minute exchange lifetime, so an expiry is OBSERVED here
 #: rather than guessed at by a timeout of our own.
 POLL_DEADLINE_S = 135.0
+#: After an approval, how long past the code's lifetime the terminal still
+#: waits for the phone to connect back. Capped by :data:`POLL_DEADLINE_S`, so a
+#: two-minute code is watched for 135 seconds in all, as on OpenClaw.
+CONNECT_BACK_GRACE_S = 15.0
 
 #: How many unreadable answers to tolerate before treating the prompt as refused.
 MAX_PROMPT_RETRIES = 5
@@ -1002,6 +1007,8 @@ def _approval_line(
         fd = stdin.fileno()
     except (AttributeError, OSError, ValueError):
         return stdin.readline() if monotonic_fn() < deadline else None
+    if _select_cannot_wait_on_stdin():
+        return _threaded_approval_line(fd, deadline=deadline, monotonic_fn=monotonic_fn)
     answer = bytearray()
     while True:
         remaining = deadline - monotonic_fn()
@@ -1012,6 +1019,66 @@ def _approval_line(
             return None
         chunk = os.read(fd, 1)
         if not chunk:
+            return ""
+        answer.extend(chunk)
+        if chunk == b"\n":
+            return answer.decode("utf-8", errors="replace")
+
+
+def _select_cannot_wait_on_stdin() -> bool:
+    """Windows select() takes sockets only; a console or pipe raises 10038 (#3376)."""
+    return sys.platform == "win32"
+
+
+_STDIN_READERS: Dict[int, "queue.Queue[bytes]"] = {}
+_STDIN_READERS_LOCK = threading.Lock()
+
+
+def _stdin_reader(fd: int) -> "queue.Queue[bytes]":
+    """One daemon reader per fd for the life of the process.
+
+    A deadline that expires leaves the read blocked. Reusing the same reader
+    means that blocked read serves the next ask, so no second reader can race
+    it and swallow the answer. b"" marks EOF or a read error.
+    """
+    with _STDIN_READERS_LOCK:
+        chunks = _STDIN_READERS.get(fd)
+        if chunks is not None:
+            return chunks
+        chunks = queue.Queue()
+        _STDIN_READERS[fd] = chunks
+
+    def pump() -> None:
+        while True:
+            try:
+                chunk = os.read(fd, 1)
+            except OSError:
+                chunk = b""
+            chunks.put(chunk)
+            if not chunk:
+                return
+
+    threading.Thread(target=pump, name="ocuclaw-pair-stdin", daemon=True).start()
+    return chunks
+
+
+def _threaded_approval_line(
+    fd: int, *, deadline: float, monotonic_fn: Callable[[], float]
+) -> Optional[str]:
+    """The select() loop's contract on a platform where select() cannot wait."""
+    chunks = _stdin_reader(fd)
+    answer = bytearray()
+    while True:
+        remaining = deadline - monotonic_fn()
+        if remaining <= 0:
+            return None
+        try:
+            chunk = chunks.get(timeout=remaining)
+        except queue.Empty:
+            return None
+        if not chunk:
+            # Keep EOF visible to every later ask, as a closed fd would be.
+            chunks.put(b"")
             return ""
         answer.extend(chunk)
         if chunk == b"\n":
@@ -1429,7 +1496,13 @@ def run_pair(
     lifetime = float(lifetime) if isinstance(lifetime, (int, float)) and not isinstance(lifetime, bool) else POLL_DEADLINE_S
     if not math.isfinite(lifetime) or lifetime <= 0:
         lifetime = POLL_DEADLINE_S
-    deadline = monotonic_fn() + min(POLL_DEADLINE_S, lifetime)
+    started = monotonic_fn()
+    deadline = started + min(POLL_DEADLINE_S, lifetime)
+    # Once approved, the terminal keeps watching a little past the code's own
+    # lifetime, so the host's verdict on the phone's connection is OBSERVED
+    # rather than cut off at the same instant it lands. Same total bound as the
+    # OpenClaw ladder: 135 seconds from the start for a two-minute code.
+    connect_back_deadline = started + min(POLL_DEADLINE_S, lifetime + CONNECT_BACK_GRACE_S)
     prompt_shown = False
     decided = False
 
@@ -1504,6 +1577,8 @@ def run_pair(
                 return EXIT_PROBLEM
             approved = answer == "approve"
             decided = True
+            if approved:
+                deadline = max(deadline, connect_back_deadline)
 
             try:
                 status, decision = post_fn(

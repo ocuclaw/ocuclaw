@@ -36,6 +36,9 @@ const APP_PROTOCOL = Object.freeze({
   inputPredictionCancel: "ocuclaw.input.prediction.cancel",
   inputPredictionTest: "ocuclaw.input.prediction.test",
   inputPredictionTestResult: "ocuclaw.input.prediction.test.result",
+
+  inputPredictionModelAllow: "ocuclaw.input.prediction.model.allow",
+  inputPredictionModelAllowResult: "ocuclaw.input.prediction.model.allow.result",
   visibility: "visibility",
 });
 

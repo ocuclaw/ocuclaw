@@ -211,10 +211,35 @@ function normalizeOpenRequest(params) {
   };
 }
 
+const OPEN_REPLY_MODEL_UNREACHABLE_REASON = "model-unreachable";
+
+const UNREACHABLE_CLASSES = [
+  ["runtime-only", /agent runtime/i],
+  ["unknown-model", /\bunknown model\b|no such model|model[ _]not[ _]found|is not a valid model|model does not exist|the model `[^`]{0,120}` does not exist/i],
+  ["no-model", /\bno model\b/i],
+  ["auth", /\b(?:no|missing) api key\b|no credentials|auth lookup failed/i],
+  ["provider", /no llm provider configured|not configured|malformed custom endpoint url/i],
+  ["host-refused", /^\s*Plugin LLM completion failed:/i],
+];
+const MODEL_UNREACHABLE_RE = new RegExp(UNREACHABLE_CLASSES.map((entry) => `(?:${entry[1].source})`).join("|"), "i");
+
+function openReplyFailureClass(err) {
+  const message = err && typeof err.message === "string" ? err.message : String(err || "");
+  if (err && (err.name === "AbortError" || err.code === "ABORT_ERR")) return "aborted";
+  for (const [name, re] of UNREACHABLE_CLASSES) if (re.test(message)) return name;
+  if (/denied|not allowed|not permitted|override|permission|allowed_?models|trust/i.test(message)) return "policy";
+  if (/timed out|timeout/i.test(message)) return "timeout";
+  return "other";
+}
+
 function classifyOpenReplyError(err) {
   const message = err && typeof err.message === "string" ? err.message : String(err || "");
   if (err && (err.name === "AbortError" || err.code === "ABORT_ERR")) {
     return { status: "cancelled", reason: "aborted" };
+  }
+
+  if (MODEL_UNREACHABLE_RE.test(message)) {
+    return { status: "unavailable", reason: OPEN_REPLY_MODEL_UNREACHABLE_REASON };
   }
 
   if (/denied|not allowed|not permitted|override|permission|allowed_?models|trust/i.test(message)) {
@@ -253,4 +278,4 @@ function openReplyTelemetry(result, extra) {
   return Object.assign(out, extra && typeof extra === "object" ? extra : {});
 }
 
-module.exports = { SILENT_INPUT_OPEN_PROMPT_VERSION, SILENT_INPUT_OPEN_LIMITS, SILENT_INPUT_OPEN_TEST_EXAMPLE, SILENT_INPUT_OPEN_TEST_LIMITS, buildOpenReplyMessages, normalizeWholeReply, parseOpenReplyText, normalizeOpenRequest, classifyOpenReplyError, openReplyResult, openReplyTelemetry };
+module.exports = { SILENT_INPUT_OPEN_PROMPT_VERSION, SILENT_INPUT_OPEN_LIMITS, SILENT_INPUT_OPEN_TEST_EXAMPLE, SILENT_INPUT_OPEN_TEST_LIMITS, buildOpenReplyMessages, normalizeWholeReply, parseOpenReplyText, normalizeOpenRequest, classifyOpenReplyError, OPEN_REPLY_MODEL_UNREACHABLE_REASON, openReplyFailureClass, openReplyResult, openReplyTelemetry };

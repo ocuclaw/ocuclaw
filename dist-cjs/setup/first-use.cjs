@@ -3,8 +3,32 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const { randomUUID, createHash } = require("node:crypto");
-const { setupInstallation } = require("./setup-journey.cjs");
+const { setupInstallation, FIRST_USE_ERRORED_RUN_REASONS, firstUseSuccessLines } = require("./setup-journey.cjs");
 const { readJsonReceipt, writeJsonReceiptDurable } = require("./private-route.cjs");
+
+const FIRST_USE_RELAY_ENDINGS = Object.freeze([
+  "passed",
+  "timed-out",
+  "errored",
+  "phone-changed",
+  "tries-exhausted",
+  "needs-wearer-check",
+  "welcome-unavailable",
+]);
+const FIRST_USE_RELAY_STAGES = Object.freeze(["reply", "receipt", "welcome"]);
+
+function validSetupSessionKey(value     ) {
+  return typeof value === "string" && !!value.trim() && value.length <= 512 && !/[\x00-\x1f]/.test(value);
+}
+
+function validRelayRun(v     ) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+  if (!validSetupSessionKey(v.setupSessionKey) || typeof v.deliver !== "boolean" || !Number.isFinite(v.armedAt)) return false;
+  if (v.ending !== undefined && (!v.ending || !FIRST_USE_RELAY_ENDINGS.includes(v.ending.outcome) ||
+      !Number.isFinite(v.ending.at) || (v.ending.stage !== undefined && !FIRST_USE_RELAY_STAGES.includes(v.ending.stage)))) return false;
+  if (v.wake !== undefined && (!v.wake || !["sent", "failed"].includes(v.wake.status) || !Number.isFinite(v.wake.at))) return false;
+  return true;
+}
 
 const FIRST_USE_REPLY_EVIDENCE = "client_sdk_receipt";
 
@@ -21,6 +45,10 @@ const FIRST_USE_REPLY_EVIDENCE_REASONS = Object.freeze([
   "reply_run_rate_limited",
   "unspecified",
 ]);
+
+function firstUseReplyWasProviderError(r     ) {
+  return FIRST_USE_ERRORED_RUN_REASONS.includes(r?.replyEvidenceReason);
+}
 
 const REPLY_EVIDENCE_RELAY_REASONS      = {
   deadline_expired: "observation_expired",
@@ -93,7 +121,8 @@ function createFirstUseStore(stateDir     , options      = {}) {
           (r.welcome.status === "completed" && (r.status !== "completed" || !r.welcome.surfaceId || !Number.isFinite(r.welcome.completedAt) ||
             !["dismissed", "back"].includes(r.welcome.outcome) ||
             r.welcome.source !== (r.confirmation?.source === "test-input" ? "test-input" : "bound-phone-gesture"))))) ||
-        (r.status === "completed" && r.completionPolicy === "reply-and-welcome" && r.welcome?.status !== "completed")) {
+        (r.status === "completed" && r.completionPolicy === "reply-and-welcome" && r.welcome?.status !== "completed") ||
+        (r.relayRun !== undefined && !validRelayRun(r.relayRun))) {
       throw new Error("setup-state-unreadable-or-foreign");
     }
     return r;
@@ -112,22 +141,56 @@ function createFirstUseStore(stateDir     , options      = {}) {
       return after;
     } finally { fs.closeSync(fd); fs.unlinkSync(lock); }
   }
+  function freshRelayRun(input     ) {
+    if (!validSetupSessionKey(input?.setupSessionKey)) throw new Error("setup-session-required");
+    return { setupSessionKey: input.setupSessionKey, deliver: input.deliver === true, armedAt: now() };
+  }
   return {
     read,
-    begin(sessionKey     , retry = false, phone      = null) {
+
+    begin(sessionKey     , retry = false, phone      = null, relayRun      = null) {
+      const run = relayRun ? freshRelayRun(relayRun) : null;
       return change((r     ) => {
         if (r && (!retry || (r.status === "completed" && r.confirmation?.source !== "test-input"))) {
           if (sessionKey && sessionKey !== r.sessionKey) throw new Error("setup-session-mismatch");
+          let next = r;
           if (phone && !r.completionPolicy && r.status !== "completed") {
-            return { ...r, completionPolicyVersion: 2, completionPolicy: "reply-and-welcome", phone };
+            next = { ...next, completionPolicyVersion: 2, completionPolicy: "reply-and-welcome", phone };
           }
-          return r;
+          if (run && r.status !== "completed") next = { ...next, relayRun: run };
+          return next;
         }
         sessionKey = sessionKey || r?.sessionKey;
         if (typeof sessionKey !== "string" || !sessionKey.trim() || sessionKey.length > 512 || /[\x00-\x1f]/.test(sessionKey)) throw new Error("setup-session-required");
         return { schemaVersion: 1, backend: "openclaw", installationId: installation.id,
           ...(phone ? { completionPolicyVersion: 2, completionPolicy: "reply-and-welcome", phone } : {}),
-          attemptId: randomUUID(), sessionKey, startedAt: now(), status: "awaiting-reply" };
+          attemptId: randomUUID(), sessionKey, startedAt: now(), status: "awaiting-reply",
+          ...(run ? { relayRun: run } : {}) };
+      });
+    },
+
+    armRelayRun(attemptId     , relayRun     ) {
+      const run = freshRelayRun(relayRun);
+      return change((r     ) => {
+        if (!r || r.attemptId !== attemptId || r.status === "completed") return r;
+        return { ...r, relayRun: run };
+      });
+    },
+
+    endRelayRun(attemptId     , ending     ) {
+      return change((r     ) => {
+        if (!r?.relayRun || r.attemptId !== attemptId || r.relayRun.ending) return r;
+        if (!FIRST_USE_RELAY_ENDINGS.includes(ending?.outcome)) throw new Error("setup-relay-ending-invalid");
+        return { ...r, relayRun: { ...r.relayRun, ending: {
+          outcome: ending.outcome, at: now(),
+          ...(FIRST_USE_RELAY_STAGES.includes(ending.stage) ? { stage: ending.stage } : {}),
+        } } };
+      });
+    },
+    noteRelayWake(attemptId     , status     ) {
+      return change((r     ) => {
+        if (!r?.relayRun?.ending || r.attemptId !== attemptId || !["sent", "failed"].includes(status)) return r;
+        return { ...r, relayRun: { ...r.relayRun, wake: { status, at: now() } } };
       });
     },
     completeReply(candidate     ) {
@@ -171,6 +234,8 @@ function createFirstUseStore(stateDir     , options      = {}) {
         if (r.status === "awaiting-welcome") return r;
         if (r.status !== "awaiting-confirmation" && r.confirmation?.source !== "test-input") throw new Error("setup-reply-required");
 
+        if (firstUseReplyWasProviderError(r)) throw new Error("setup-reply-run-errored");
+
         return { ...r, status: r.completionPolicy === "reply-and-welcome" ? "awaiting-welcome" : "completed", confirmation: { at: now(),
           source: input.testInput === true ? "test-input" : "direct-wearer-terminal" } };
       });
@@ -181,9 +246,12 @@ function createFirstUseStore(stateDir     , options      = {}) {
           throw new Error("setup-confirmation-mismatch");
         }
         if (["completed", "awaiting-welcome"].includes(r.status)) return r;
+
         if (input.answer === "no") return r.observation?.answer === "no" ? r : { ...r, observation: { answer: "no", at: now(), source: input.testInput === true ? "test-input" : "host-setup-conversation" } };
         if (input.answer !== "yes") return r;
         if (r.status !== "awaiting-confirmation") throw new Error("setup-reply-required");
+
+        if (firstUseReplyWasProviderError(r)) throw new Error("setup-reply-run-errored");
         return { ...r, status: r.completionPolicy === "reply-and-welcome" ? "awaiting-welcome" : "completed", confirmation: { at: now(),
           source: input.testInput === true ? "test-input" : "host-setup-conversation",
           reportedVia: "host-setup-conversation" } };
@@ -195,6 +263,11 @@ function createFirstUseStore(stateDir     , options      = {}) {
             input.binding !== firstUseBinding(r)) throw new Error("setup-confirmation-mismatch");
         if (r.status === "completed") return r;
         if (r.status !== "awaiting-welcome" || !sameFirstUsePhone(r.phone, input.phone)) throw new Error("setup-welcome-mismatch");
+
+        if (input.auto === true && r.welcome && input.retry !== true) {
+          return { ...r, welcome: { id: randomUUID(), status: "in-progress",
+            attempts: r.welcome.attempts, startedAt: now() } };
+        }
         if (r.welcome && input.retry !== true) throw new Error("setup-welcome-retry-required");
         if (r.welcome?.attempts >= 2) throw new Error("setup-welcome-retry-exhausted");
         return { ...r, welcome: { id: randomUUID(), status: "in-progress",
@@ -229,7 +302,8 @@ function createFirstUseStore(stateDir     , options      = {}) {
 }
 
 function sameFirstUsePhone(expected     , actual     ) {
-  return !!expected && !!actual && expected.clientId === actual.clientId && expected.generation === actual.generation;
+  return !!expected && !!actual && typeof expected.generation === "string" && !!expected.generation &&
+    expected.generation === actual.generation;
 }
 
 function firstUseBinding(r     ) {
@@ -248,7 +322,7 @@ const FIRST_USE_TOOL_OPERATIONS = Object.freeze([
 
 const FIRST_USE_WAIT_MAX_MS = 60000;
 
-const FIRST_USE_RECEIPT_SETTLE_MAX_MS = 5000;
+const FIRST_USE_RECEIPT_SETTLE_MAX_MS = 30000;
 
 function validateFirstUseParams(params     ) {
   const allowed = params?.operation === "first_use_confirm" ? ["operation", "binding", "answer"]
@@ -274,10 +348,12 @@ function runFirstUseOperation(store     , operation     , input     , readPhoneS
       const sessionKey = readPhoneSession();
       const phone = readPhoneContext ? readPhoneContext() : null;
       if (r?.phone && operation !== "first_use_retry" && !sameFirstUsePhone(r.phone, phone)) throw new Error("setup-phone-binding-changed");
-      r = store.begin(sessionKey, operation === "first_use_retry", phone);
+      r = store.begin(sessionKey, operation === "first_use_retry", phone, input?.relayRun ?? null);
     }
   } else if (operation === "first_use_confirm") {
     if (!completed && r?.phone && !sameFirstUsePhone(r.phone, readPhoneContext?.())) throw new Error("setup-phone-binding-changed");
+
+    r = observeReplyEvidenceInto(store, r, observeReplyEvidence);
     r = store.confirmConversation({ ...input, sessionKey: completed ? r.sessionKey : readPhoneSession() });
   } else if (operation !== "first_use_wait") {
     throw new Error("setup-first-use-operation-invalid");
@@ -286,13 +362,17 @@ function runFirstUseOperation(store     , operation     , input     , readPhoneS
   if (!completed && operation === "first_use_wait" && readPhoneSession() !== r.sessionKey) throw new Error("setup-session-mismatch");
   if (!completed && operation === "first_use_wait" && r.phone && !sameFirstUsePhone(r.phone, readPhoneContext?.())) throw new Error("setup-phone-binding-changed");
 
-  if (operation === "first_use_wait" && typeof observeReplyEvidence === "function" &&
-      r.status === "awaiting-confirmation" && r.completionPolicy === "reply-and-welcome") {
-    let verdict      = null;
-    try { verdict = observeReplyEvidence(r); } catch (_) { verdict = null; }
-    if (verdict) r = store.applyReplyEvidence({ binding: firstUseBinding(r), ...verdict }) ?? r;
-  }
+  if (operation === "first_use_wait") r = observeReplyEvidenceInto(store, r, observeReplyEvidence);
   return firstUseResult(r);
+}
+
+function observeReplyEvidenceInto(store     , r     , observeReplyEvidence     ) {
+  if (typeof observeReplyEvidence !== "function" || !r ||
+      r.status !== "awaiting-confirmation" || r.completionPolicy !== "reply-and-welcome") return r;
+  let verdict      = null;
+  try { verdict = observeReplyEvidence(r); } catch (_) { verdict = null; }
+  if (!verdict) return r;
+  return store.applyReplyEvidence({ binding: firstUseBinding(r), ...verdict }) ?? r;
 }
 
 function firstUseResult(r     ) {
@@ -303,20 +383,35 @@ function firstUseResult(r     ) {
     replyCompletedAt: r.reply?.completedAt ?? null,
     confirmationSource: r.confirmation?.source ?? null,
 
-    replyEvidence: r.replyEvidence ?? "wearer_confirmed",
+    replyEvidence: r.replyEvidence ?? (r.confirmation || r.status === "completed" ? "wearer_confirmed" : null),
     replyEvidenceReason: r.replyEvidenceReason ?? null,
+
+    replyWasProviderError: firstUseReplyWasProviderError(r),
     observation: r.observation ?? null,
     acceptance: r.confirmation?.source === "test-input" ? "test-input-only" : r.confirmation ? "wearer-reported" : "not-confirmed",
     welcome: r.welcome ? { status: r.welcome.status, attempts: r.welcome.attempts,
       reason: r.welcome.reason ?? null, source: r.welcome.source ?? null } :
       { status: r.completionPolicy === "reply-and-welcome" ? "not-started" : "not-required-legacy" },
     nextOperations: r.status === "awaiting-reply" ? ["first_use_wait"]
-      : r.status === "awaiting-confirmation" ? r.observation?.answer === "no" ? ["first_use_retry"] : ["first_use_confirm"]
+
+      : r.status === "awaiting-confirmation" ? (r.observation?.answer === "no" || firstUseReplyWasProviderError(r)) ? ["first_use_retry"] : ["first_use_confirm"]
       : r.status === "awaiting-welcome" ? r.welcome ? (r.welcome.attempts < 2 ? ["first_use_welcome_retry"] : []) : ["first_use_welcome"]
 
-      : r.status === "completed" && r.confirmation?.source === "test-input" ? ["first_use_retry"] : [],
+      : r.status === "completed" && r.confirmation?.source === "test-input" ? ["first_use_retry"]
+
+      : r.status === "completed" ? ["wrap_feedback"] : [],
     ...(r.status === "awaiting-welcome" && (!r.welcome || r.welcome.attempts < 2)
       ? { action: welcomeAction(r) } : {}),
+
+    ...(r.status === "completed" && r.confirmation?.source !== "test-input"
+      ? { say: firstUseSuccessLines(r) } : {}),
+
+    relayRun: r.relayRun ? {
+      status: r.relayRun.ending ? "ended" : "running",
+      outcome: r.relayRun.ending?.outcome ?? null,
+      stage: r.relayRun.ending?.stage ?? null,
+      wake: r.relayRun.wake?.status ?? null,
+    } : null,
   };
 }
 
@@ -388,4 +483,4 @@ function createFirstUseObserver(store     , options      = {}) {
   };
 }
 
-module.exports = { createFirstUseStore, createFirstUseObserver, runFirstUseOperation, firstUseResult, sameFirstUsePhone, firstUseBinding, classifyFirstUseReplyEvidence, firstUseReplyEvidenceReason, FIRST_USE_REPLY_EVIDENCE, FIRST_USE_REPLY_EVIDENCE_REASONS, FIRST_USE_RECEIPT_SETTLE_MAX_MS };
+module.exports = { createFirstUseStore, createFirstUseObserver, runFirstUseOperation, firstUseResult, sameFirstUsePhone, firstUseBinding, classifyFirstUseReplyEvidence, firstUseReplyEvidenceReason, FIRST_USE_REPLY_EVIDENCE, FIRST_USE_REPLY_EVIDENCE_REASONS, FIRST_USE_RECEIPT_SETTLE_MAX_MS, FIRST_USE_ERRORED_RUN_REASONS, firstUseReplyWasProviderError, FIRST_USE_RELAY_ENDINGS, FIRST_USE_RELAY_STAGES, observeReplyEvidenceInto };

@@ -14,10 +14,11 @@ Three rules this module exists to keep:
 
 1. **The credential is read, never minted and never revealed.** The ladder asks
    only whether the name is present (``health.setup_secret_present``, which
-   answers a bool and never returns the value) and whether the gateway has
-   published its marker. It never calls ``bootstrap_relay_credential`` — that is
-   the *gateway's* job at plugin registration, and calling it from the CLI would
-   mint a credential in a process that is not the one that has to hold it.
+   answers a bool and never returns the value), whether its marker is
+   published, and whether the running gateway built an OcuClaw adapter. It never
+   calls ``bootstrap_relay_credential`` itself. The CLI's own plugin load does
+   (``register()`` runs in every process that loads the plugin), which is why
+   the marker alone never counts as "loaded" (#3480).
 2. **At most one restart per run, none when nothing is pending, and never
    without a yes.** The restart goes through the same bounded lifecycle plan the
    all-device reset uses (``pairing._prepare_gateway_restart`` and its
@@ -86,14 +87,20 @@ file — so it is never read as evidence of anything.
 
 On a real Cloudways managed Hermes container the restart planner returns no plan
 (#3097: ``manager='docker (foreground)'``, no systemd, the gateway is
-``hermes gateway run --no-supervise`` under ``/entrypoint.sh``). What happens
-there depends on WHY a restart is pending, and #3241 is the difference:
+``hermes gateway run --no-supervise`` under ``/entrypoint.sh``). The gateway
+exiting ends ``/entrypoint.sh`` and Cloudways restarts the whole container; since
+#3357 (Matty, 2026-09-23) the phone and ``optional-setup activate`` use exactly
+that bounce as the restart (see :data:`NOT_LOADED_MESSAGE`'s note). This ladder
+step does not. What happens here depends on WHY a restart is pending, and #3241
+is the difference:
 
-* **The plugin is not loaded** — no credential at all, no credential marker, or
-  no running gateway. Nothing after this step can work, so the step still stops
-  and asks for the restart (:data:`NOT_LOADED_LINES`, exit 2). The instruction
-  leads with the Cloudways dashboard rather than with ``hermes gateway restart``
-  for the reason spelled out at those lines.
+* **The plugin is not loaded** — no credential at all, no credential marker, a
+  running gateway that never built an OcuClaw adapter itself (#3480: the CLI
+  writes the marker too, so the marker alone is not proof), or no running
+  gateway. Nothing after this step can work, so the step still stops and asks
+  for the restart (:data:`NOT_LOADED_LINES`, exit 2). The instruction leads
+  with ``hermes gateway restart`` and ends with the exact command to type again,
+  for the reasons spelled out at those lines.
 * **Only settings are waiting** — step 2 wrote ``allow_admin_from``, or an
   earlier run did. That key is read at gateway start and is needed by exactly
   one feature, "Continue here" (``PROTOCOL.md``, ``adapter.py``,
@@ -108,6 +115,7 @@ there depends on WHY a restart is pending, and #3241 is the difference:
 from __future__ import annotations
 
 import os
+import textwrap
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -115,6 +123,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Tuple
 
 from . import health, receipts, relay_credential
+from .optional_setup import CLOUDWAYS_RESTART_WARNING
 
 # -- what this step reads -----------------------------------------------------
 
@@ -195,36 +204,56 @@ LOADED_MESSAGE = "OcuClaw is loaded and ready."
 
 #: What the user is told whenever the plugin has not loaded: no credential at
 #: all (the gateway mints it as the plugin registers — `adapter.py` ->
-#: `relay_credential.bootstrap_relay_credential`), no credential marker yet, or
-#: no running gateway to hold either.
+#: `relay_credential.bootstrap_relay_credential`), no credential marker yet, a
+#: running gateway that never built an OcuClaw adapter (#3480: it started
+#: before the install), or no running gateway at all.
 #:
-#: Why the dashboard comes first, and why the plugin's own reset wording is NOT
-#: reused here: that message ("not in a bounded restart lifecycle ... Install and
-#: start the Hermes gateway service") tells the user to install a gateway
-#: service, which is wrong on a host that has no service manager at all, where
-#: the account is unprivileged, and where ``/entrypoint.sh`` owns the gateway.
+#: Why the plugin's own reset wording is NOT reused here: that message ("not in
+#: a bounded restart lifecycle ... Install and start the Hermes gateway
+#: service") tells the user to install a gateway service, which is wrong on a
+#: host that has no service manager at all, where the account is unprivileged,
+#: and where ``/entrypoint.sh`` owns the gateway.
 #:
-#: Why `hermes gateway restart` is named second rather than first: at the 0.21.1
-#: floor, with no service manager installed, `_cmd_restart` falls through to
+#: Why the terminal command leads (#3480): the user is already in a terminal,
+#: and one typed line is the shortest way through. At the 0.21.1 floor, with no
+#: service manager installed, `_cmd_restart` falls through to
 #: ``stop_profile_gateway()`` and then runs ``run_gateway()`` in the foreground
 #: of the caller's own shell (`hermes_cli/gateway.py:6062-6066`). Stopping the
 #: gateway is what bounces the container here, so SSH drops and the foreground
 #: gateway that command was about to become dies with the session; PID 1 brings
-#: the real one back. That works, and the Hermes install block already describes
-#: it as "a container restart there", but it is a side effect rather than the
-#: host's own restart control, and #3097 deliberately did not execute it.
+#: the real one back. The warning printed with it is the one the activation
+#: restart already shows (`optional_setup.CLOUDWAYS_RESTART_WARNING`), imported
+#: rather than copied so the two can never drift. A container restart wipes
+#: shell history, so the lines end with the exact command to type again, never
+#: "press up". The dashboard stays as the one-line fallback.
+#:
+#: Ruling (Matty, 2026-09-23, #3357): the container bounce IS allowed as the
+#: Cloudways restart. The phone's Home card ("Restart Hermes") and
+#: `hermes ocuclaw optional-setup activate` now use it, after a warning that SSH
+#: drops: `restart_rpc._host_restart_mode` and
+#: `optional_setup._cloudways_container_restart`. This ladder step still does
+#: not execute it: it only names it, as before. Making the ladder restart on its
+#: own is a separate decision, not part of that ruling.
 NOT_LOADED_MESSAGE = "OcuClaw is installed but your agent has not loaded it yet."
 RESTART_AND_RERUN_MESSAGE = "Restart the agent, then run this command again."
 
+#: The command that restarts the agent, and the command to type after it.
+RESTART_COMMAND = "hermes gateway restart"
+RERUN_COMMAND = "hermes ocuclaw cloudways setup"
+
 NOT_LOADED_LINES = (
     f"  {NOT_LOADED_MESSAGE}",
+    "  One restart loads OcuClaw and the settings above. Type:",
+    f"    {RESTART_COMMAND}",
     "",
-    "  1. Restart the agent in your Cloudways dashboard.",
-    "  2. Reconnect with your SSH command.",
-    "  3. Run hermes ocuclaw cloudways setup again.",
+    # Wrapped like OpenClaw's two lines: one line of it wrapped mid-word in a
+    # 100-column terminal on the real box.
+    *(f"  {part}" for part in textwrap.wrap(CLOUDWAYS_RESTART_WARNING, width=86)),
     "",
-    "  Terminal alternative: hermes gateway restart",
-    "  This restarts the container and disconnects SSH.",
+    "  After you reconnect, type this again:",
+    f"    {RERUN_COMMAND}",
+    "",
+    "  Or restart the agent from your Cloudways dashboard.",
 )
 
 #: Printed when this command's own marker stands and nothing can answer it — an
@@ -265,7 +294,8 @@ PENDING_SETTINGS_WRITTEN_EARLIER = (
 )
 
 #: The dead end: this gateway booted AFTER the credential was written and still
-#: has not published a marker for it. Another restart has already been tried by
+#: has not loaded OcuClaw (no adapter of its own, or no credential marker).
+#: Another restart has already been tried by
 #: definition, so the ladder stops and points at the diagnosis instead of asking
 #: for the same bounce again.
 STILL_NOT_RUNNING_MESSAGE = "Your agent restarted but OcuClaw still is not running."
@@ -325,13 +355,18 @@ def credential_present() -> bool:
 
 
 def credential_adopted(home: Optional[Path]) -> bool:
-    """Whether a gateway has published this profile's credential marker.
+    """Whether this profile's credential marker has been published.
 
     Deliberately the marker, not `relay_credential.is_profile_established`: that
     predicate answers True on a readable credential alone, which is the question
-    already answered above. Only the gateway writes the marker, so its absence
-    is evidence that no gateway has registered the plugin against this
-    credential yet.
+    already answered above.
+
+    The marker is NOT gateway-only evidence (#3480). ``register()`` runs in
+    every process that loads the plugin, the ``hermes ocuclaw ...`` CLI
+    included, and it calls ``bootstrap_relay_credential``, which publishes the
+    marker. So a present marker says only that SOME process registered the
+    plugin. Whether the running gateway did is
+    :attr:`GatewayHealth.plugin_loaded`, and the step requires both.
     """
     return relay_credential.read_relay_credential_marker(home) is not None
 
@@ -392,6 +427,11 @@ class GatewayHealth:
     #: When the gateway PROCESS started, as UNIX seconds, or None when this host
     #: cannot say. Never derived from the receipt's ``updated_at``.
     started_at: Optional[float]
+    #: True only when the gateway process running NOW built an OcuClaw adapter:
+    #: see :func:`_plugin_loaded_by_this_process`. Any state counts, connected
+    #: or not. The question is whether the plugin loaded, not whether the relay
+    #: is up.
+    plugin_loaded: bool = False
 
     @property
     def healthy(self) -> bool:
@@ -406,7 +446,38 @@ def read_gateway_health(home: Optional[Path]) -> GatewayHealth:
         live=is_live,
         relay_connected=is_live and _relay_is_connected_now(record),
         started_at=_started_at(record) if is_live else None,
+        plugin_loaded=is_live and _plugin_loaded_by_this_process(record),
     )
+
+
+def _plugin_loaded_by_this_process(record: Optional[Mapping[str, Any]]) -> bool:
+    """Did the gateway running NOW load OcuClaw? Evidence only it can leave.
+
+    #3480. The credential marker cannot answer this: the CLI's own plugin load
+    (``hermes ocuclaw ...`` runs ``register()`` too) writes it. On a real box a
+    gateway that started twenty minutes before the install never loaded the
+    plugin, the CLI wrote the marker, and the ladder said "loaded".
+
+    Hermes itself leaves the evidence. At gateway start it writes a platform
+    entry ``state: connecting`` for every adapter it built
+    (``gateway/run_startup.py``, 0.21.1 floor commit ``2237be355906``), and it
+    builds one for ``ocuclaw`` only through the factory this plugin registers:
+    without the plugin it logs "No adapter for 'ocuclaw' -- is the plugin
+    installed?" and writes nothing. Each entry carries ``writer_pid`` /
+    ``writer_start_time``, so an entry left behind by an EARLIER gateway, one
+    that did load the plugin, does not count for this one. Only a gateway
+    process writes this receipt, never the CLI.
+
+    Any state counts: ``connecting``, ``connected``, ``retrying`` and ``fatal``
+    all mean an adapter exists in this process.
+    """
+    if not isinstance(record, Mapping):
+        return False
+    platforms = record.get("platforms")
+    entry = platforms.get(health.PLATFORM_NAME) if isinstance(platforms, Mapping) else None
+    if not isinstance(entry, Mapping):
+        return False
+    return _entry_written_by_this_process(record, entry)
 
 
 def _relay_is_connected_now(record: Optional[Mapping[str, Any]]) -> bool:
@@ -636,16 +707,19 @@ def assess_pending(
         # No running gateway means nothing has read anything, and the receipt's
         # start time is not this host's answer to anything either.
         return Pending(PENDING_GATEWAY_DOWN)
-    if bool(ctx.state.get("settings_changed")):
-        return Pending(PENDING_SETTINGS_CHANGED, blocking=False)
 
     written_at, marker_status = read_pending_marker(hermes_home)
     settled = marker_settled(written_at, marker_status, state.started_at)
     marker_stands = marker_status != MARKER_MISSING
 
+    # "Not loaded" is checked before "settings just changed" (#3480, real box
+    # 2026-09-23): a fresh run writes settings at [2/8], and that non-blocking
+    # deferral used to return first, so a gateway without OcuClaw skipped [3/8]
+    # silently and the ladder went on to Tailscale.
     if not adopted:
-        # The gateway is NEWER than the credential write and has still published
-        # no CREDENTIAL marker. A restart has effectively been tried already, so
+        # When the gateway is NEWER than the credential write and still has not
+        # loaded OcuClaw (no adapter of its own, or no credential marker), a
+        # restart has effectively been tried already, so
         # asking for another one is a loop with a friendly face. Unless the
         # ladder's own pending marker is still waiting: then the restart is owed
         # anyway, and after it the next run reaches this dead end with a clean
@@ -656,6 +730,8 @@ def assess_pending(
             return Pending(STILL_NOT_RUNNING_MESSAGE, dead_end=True)
         return Pending(PENDING_CREDENTIAL_NOT_ADOPTED)
 
+    if bool(ctx.state.get("settings_changed")):
+        return Pending(PENDING_SETTINGS_CHANGED, blocking=False)
     if settled is False:
         return Pending(PENDING_SETTINGS_WRITTEN_EARLIER, blocking=False)
     if settled is None and marker_stands:
@@ -713,8 +789,12 @@ def run_relay_credential(ctx: Any) -> Any:
             exit_code=ladder.SETUP_EXIT_STOPPED,
         )
 
-    adopted = credential_adopted(hermes_home)
     state = read_gateway_health(hermes_home)
+    # "Loaded" needs evidence from the gateway running NOW (#3480). The marker
+    # alone is not that: the CLI's own plugin load publishes it too, so a
+    # gateway that started before the install and never loaded OcuClaw still
+    # found one on disk.
+    adopted = credential_adopted(hermes_home) and state.plugin_loaded
     pending = assess_pending(ctx, state, adopted=adopted, hermes_home=hermes_home)
 
     if pending.dead_end:
@@ -729,8 +809,8 @@ def run_relay_credential(ctx: Any) -> Any:
             exit_code=ladder.SETUP_EXIT_PROBLEM,
         )
 
-    # The step's one line, and only where it is true: a gateway that is running
-    # and holding the credential is a gateway that has loaded OcuClaw.
+    # The step's one line, and only where it is true: the running gateway built
+    # an OcuClaw adapter itself, and the credential marker is published.
     if adopted and state.live:
         ctx.say(f"  {LOADED_MESSAGE}")
 
@@ -868,6 +948,8 @@ __all__ = [
     "SETTINGS_UNVERIFIABLE_MESSAGE",
     "STILL_NOT_RUNNING_MESSAGE",
     "Pending",
+    "RERUN_COMMAND",
+    "RESTART_COMMAND",
     "RESTART_CONSENT_LINES",
     "RESTART_FAILED_MESSAGE",
     "RESTART_HEALTHY_MESSAGE",

@@ -247,6 +247,10 @@ FACTS_KEYS_V1: Tuple[str, ...] = (
     # from doctor's active lane rather than from passive collection.
     "serveTlsCertAvailable",  # yes | no | unknown
     "serveFrontDoorTlsError",  # bool: this run's front-door probe hit a TLS alert
+    # F11 (#3348). A container or userspace node that does not take Tailscale's
+    # DNS cannot resolve its own MagicDNS name, so doctor's probe never leaves
+    # the host. That is a local fault, never a verdict on the route.
+    "serveFrontDoorUnresolved",  # bool: this run's probe could not resolve the node name
     # -- durable Hermes First-Run Proof ----------------------------------
     # The completion journey that WRITES this record is #1322; v1 carries the
     # key set now so the schema does not move when the writer lands.
@@ -417,7 +421,7 @@ _FINDINGS: Dict[str, Tuple[str, str, str, Optional[str]]] = {
         "setup",
         "error",
         "This Hermes host is outside the supported OcuClaw contract. "
-        "Use Hermes 0.21.x (recommended release v2026.9.14 / engine 0.21.3), "
+        "Use Hermes 0.21.x (recommended release v2026.9.24 / engine 0.21.5), "
         "then restart and run hermes ocuclaw doctor --json. "
         "Do not force-load this bundle on older or 0.22+ engines.",
         "install_supported_hermes",
@@ -476,6 +480,13 @@ _FINDINGS: Dict[str, Tuple[str, str, str, Optional[str]]] = {
         "error",
         "The configured tailnet route refused the TLS handshake.",
         "enable_tailnet_https_certs",
+    ),
+    "tailnet_name_unresolved": (
+        LEG_TAILNET_ROUTE,
+        "warning",
+        "This host cannot resolve its own tailnet name, so the route could "
+        "not be probed from here.",
+        "fix_host_dns",
     ),
     "phone_app_absent": (
         LEG_PHONE_APP,
@@ -667,6 +678,7 @@ def blank_facts(**overrides: Any) -> Dict[str, Any]:
         "serveReadCode": None,
         "serveTlsCertAvailable": TRISTATE_UNKNOWN,
         "serveFrontDoorTlsError": False,
+        "serveFrontDoorUnresolved": False,
         "firstRunProofRecord": None,
         "firstRunProofStatus": "missing",
     }
@@ -1219,6 +1231,7 @@ def _derive_tailnet_leg(
     application_ready = _tristate(facts["serveApplicationReady"])
     tls_certs = _tristate(facts["serveTlsCertAvailable"])
     tls_handshake_failed = facts["serveFrontDoorTlsError"] is True
+    name_unresolved = facts["serveFrontDoorUnresolved"] is True
 
     # Configuration shape is observed during collection, so its evidence is
     # fresh when it exists at all and absent otherwise — it carries no TTL.
@@ -1244,6 +1257,7 @@ def _derive_tailnet_leg(
         application_ready = TRISTATE_UNKNOWN
         tls_certs = TRISTATE_UNKNOWN
         tls_handshake_failed = False
+        name_unresolved = False
 
     evidence_ids = [
         out.evidence_entry(
@@ -1285,6 +1299,14 @@ def _derive_tailnet_leg(
         out.finding("tailnet_route_tls_error", evidence_ids)
     else:
         state = HEALTH_UNKNOWN
+
+    if name_unresolved:
+        # Deliberately NOT part of the state branch above. The probe never left
+        # this host, so it says nothing about the route and must not make the
+        # leg unhealthy. It is still a real local fault the user can fix, and
+        # silently folding it into "observed nothing" is what sent the #3348
+        # e2e looking at certificates for a missing DNS entry.
+        out.finding("tailnet_name_unresolved", evidence_ids)
 
     if tls_certs == TRISTATE_NO:
         # Independent of the state above: the route may not be configured at

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -30,6 +31,8 @@ from .tui_pairing import (
     _handler_for,
 )
 
+
+logger = logging.getLogger(__name__)
 
 PLUGIN_DIRNAME = "ocuclaw"
 PLUGIN_FILENAME = "plugin.js"
@@ -304,18 +307,54 @@ def _desktop_theme_request_from_host() -> str:
 
 
 def _safe_plugin_path(home: Path) -> Optional[Path]:
-    resolved_home = Path(home).expanduser().absolute()
-    root = resolved_home / "desktop-plugins"
-    directory = root / PLUGIN_DIRNAME
-    target = directory / PLUGIN_FILENAME
+    """The one path this bundle writes, with links followed to the real home.
+
+    Hermes Desktop resolves its home lexically and reads straight through any
+    link on the way down (`backend-env.ts` `normalizeHermesHomeRoot`), so a
+    linked ancestor — `/home -> /var/home` on Fedora Atomic, a dotfile-managed
+    `~/.hermes`, a moved home — names the very folder Desktop loads from.
+    Refusing those was a silent skip: no `plugin.js`, no error the user ever
+    sees, the Desktop icon simply never updates (#3367; helper sibling #3366).
+    So resolve the home once and operate on the real path.
+
+    Two links are still refused, and now each one is logged with the path:
+
+    * a linked `<root>/ocuclaw` plugin folder — Hermes Desktop does not load a
+      symlinked plugin directory, so writing through it produces a file that
+      nothing reads;
+    * a linked `plugin.js` — the final component is the file being replaced,
+      and following it would overwrite whatever it points at.
+    """
+
+    given = Path(home)
     try:
-        if any(path.is_symlink() for path in (resolved_home, root, directory, target)):
+        resolved_home = given.expanduser().resolve()
+        root = (resolved_home / "desktop-plugins").resolve()
+        directory = root / PLUGIN_DIRNAME
+        target = directory / PLUGIN_FILENAME
+        if directory.is_symlink():
+            logger.warning(
+                "OcuClaw Desktop plugin not regenerated: the plugin folder %s "
+                "is a symlink, and Hermes Desktop does not load a linked "
+                "plugin folder. Remove the link and retry.",
+                directory,
+            )
             return None
-        if target.resolve(strict=False) != target.absolute():
+        if target.is_symlink():
+            logger.warning(
+                "OcuClaw Desktop plugin not regenerated: %s is a symlink, and "
+                "this file is replaced in place rather than followed. Remove "
+                "the link and retry.",
+                target,
+            )
             return None
-        if directory.resolve(strict=False) != directory.absolute():
-            return None
-    except OSError:
+    except OSError as error:
+        logger.warning(
+            "OcuClaw Desktop plugin not regenerated: the plugin path under %s "
+            "could not be resolved (%s).",
+            given,
+            error,
+        )
         return None
     return target
 

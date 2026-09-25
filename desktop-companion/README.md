@@ -100,8 +100,14 @@ backend-managed contribution hidden.
 
 ## Safe refusals and interrupted updates
 
-- `unsafe_path`: use a direct absolute home path, without `..`, symbolic links
-  or Windows junctions. Do not replace a linked target automatically.
+- `unsafe_path`: use an absolute home path without `..`. The home is resolved
+  once, so linked ancestors, a linked home and a linked `desktop-plugins` root
+  are followed exactly as Hermes Desktop follows them; every receipt prints the
+  resolved `path` so a followed link stays visible. Only a linked
+  `desktop-plugins/ocuclaw` folder — which Desktop's directory-only enumeration
+  never loads — and a linked `plugin.js` are refused, and the message names the
+  exact link. Replace that link with a real folder or file yourself; this tool
+  does not replace a linked target automatically.
 - `foreign_plugin` / `presenter_invalid`: unrecognized local content is kept.
   Inspect the existing installation before deciding its disposition.
 - `duplicate_runtime`: another OcuClaw runtime exists in a profile, old package,

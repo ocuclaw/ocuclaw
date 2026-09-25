@@ -857,6 +857,10 @@ function createUpstreamRuntime(opts = {}) {
   const handler = opts.handler;
   const emitDebug = typeof opts.emitDebug === "function" ? opts.emitDebug : () => {};
   const operationRegistry = opts.operationRegistry || null;
+
+  const runtimeOpts = opts;
+  const noteRunOutcomeFrame =
+    typeof runtimeOpts.noteRunOutcomeFrame === "function" ? runtimeOpts.noteRunOutcomeFrame : null;
   const now = typeof opts.now === "function" ? opts.now : () => Date.now();
 
   function normalizeGatewaySessionEvent(data) {
@@ -2538,6 +2542,18 @@ function createUpstreamRuntime(opts = {}) {
     broadcast: (frame) => {
       const server = getServer();
       if (server) server.broadcast(JSON.stringify(frame));
+
+      emitDebug(
+        "relay.session",
+        "session_context_snapshot_broadcast",
+        "info",
+        { sessionKey: frame && frame.sessionKey ? frame.sessionKey : null },
+        () => ({
+          runActive: !!(frame && frame.runActive),
+          contextTokensKnown: !!(frame && frame.contextTokensKnown),
+          contextTokens: frame && Number.isFinite(frame.contextTokens) ? frame.contextTokens : null,
+        }),
+      );
     },
   });
 
@@ -2988,6 +3004,9 @@ function createUpstreamRuntime(opts = {}) {
         : data && data.sessionKey;
     if (data && typeof data.tool === "string") {
       observeTaskToolUse({ sessionKey: taskSessionKey, toolName: data.tool });
+    }
+    if (noteRunOutcomeFrame && data && data.runId) {
+      noteRunOutcomeFrame(data, data.phase || null, data.origin || null);
     }
     if (!sessionService.isCurrentSession(data.sessionKey)) return;
     const runId = data.runId || null;

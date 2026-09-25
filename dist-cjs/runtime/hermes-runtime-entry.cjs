@@ -9,6 +9,7 @@ const { createHermesPresencePush } = require("./hermes-presence-push.cjs");
 const { createHermesSetupHint, LINK_SETUP_HINT_METHOD } = require("./hermes-setup-hint.cjs");
 const { createHermesSttLane } = require("./hermes-stt-lane.cjs");
 const { createHermesPairingCompletionPush } = require("./hermes-pairing-completion-push.cjs");
+const { createHermesBoardMoments } = require("./hermes-board-moments.cjs");
 const { createHermesReplyDeliveryLink } = require("./hermes-reply-delivery-link.cjs");
 const { createHermesRuntimeReadiness } = require("./hermes-runtime-readiness.cjs");
 const { DEFAULT_HERMES_NAMESPACE, hermesDefaultSessionKeyPrefix, hermesSupportedSessionKeyPrefixes, parseHermesPublicKey } = require("./hermes-session-keys.cjs");
@@ -190,7 +191,12 @@ function bootRelay(ackPayload) {
       options,
     });
   };
+
+  let boardMoments = null;
   relay = createRelay({
+    onBoardMomentAck: (ack) => {
+      if (boardMoments) boardMoments.ack(ack);
+    },
     optionalSetupCommandsVersion: 1,
     optionalSetupEvenAiCommands: true,
       port,
@@ -245,7 +251,7 @@ function bootRelay(ackPayload) {
       evenAiDedupWindowMs: config.evenAiDedupWindowMs,
       inputPredictionTimeoutMs: config.inputPredictionTimeoutMs,
 
-      silentInputJev: resolveSilentInputJev(config.silentInputJev, {}, {}),
+      silentInputJev: resolveSilentInputJev(config.silentInputJev, {}, {}, config),
       evenAiRoutingMode:
         typeof config.evenAiRoutingMode === "string"
           ? config.evenAiRoutingMode
@@ -303,6 +309,9 @@ function bootRelay(ackPayload) {
       Object.assign(linkMethods, presence.methods);
       presence.push();
       createHermesPairingCompletionPush({ relay, link, logger });
+
+      boardMoments = createHermesBoardMoments({ relay, link, logger });
+      Object.assign(linkMethods, boardMoments.methods);
 
       Object.assign(linkMethods, createHermesReplyDeliveryLink({ relay, link, logger }).methods);
       return relay;

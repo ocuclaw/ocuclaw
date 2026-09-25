@@ -722,7 +722,8 @@ CHILD_ENV_ALLOWLIST: Tuple[str, ...] = (
 )
 
 # Deliberately NOT allowlisted, recorded so a future edit has to argue with it:
-#   OCUCLAW_RELAY_TOKEN / OCUCLAW_SONIOX_API_KEY / OCUCLAW_EVEN_AI_TOKEN —
+#   OCUCLAW_RELAY_TOKEN / OCUCLAW_SONIOX_API_KEY / OCUCLAW_EVEN_AI_TOKEN /
+#   OCUCLAW_TYPESAFE_API_KEY —
 #     credentials; they reach the child over `link.hello.ack`, never the env.
 #   NODE_OPTIONS / NODE_PATH — arbitrary-code-injection vectors into the child
 #     (`--require`, module resolution) from whatever the gateway inherited.

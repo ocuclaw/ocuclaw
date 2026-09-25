@@ -19,7 +19,9 @@ All eight are built. Steps 1, 4 and 5 live here (#3101), step 2 lives in
 :mod:`cloudways_settings` (#3102), step 3 lives in
 :mod:`cloudways_restart_step` (#3103), step 6 lives in
 :mod:`cloudways_serve_apply` (#3104) and steps 7 and 8 live in
-:mod:`cloudways_pair_steps` (#3105).
+:mod:`cloudways_pair_steps` (#3105). Step 1 ends with the model sign-in check
+(#3482, :mod:`cloudways_signin`), and step 5 draws its approval link as a QR
+code when the terminal can show one whole (#3483, :mod:`cloudways_qr`).
 """
 from __future__ import annotations
 
@@ -36,6 +38,7 @@ from . import (
     cloudways_restart_step,
     cloudways_serve_apply,
     cloudways_settings,
+    cloudways_signin,
     receipts,
     relay_credential,
 )
@@ -75,10 +78,11 @@ CONSENT_ANSWERS = frozenset({CONSENT_ANSWER})
 SHORT_YES_CONSENT_ANSWERS = frozenset({CONSENT_ANSWER, "y"})
 
 #: Step 6's question. It publishes a route, ADR-0026 has the user type the whole
-#: word for it, and its prompt says "the word" so a bare `y` that stops is not a
-#: surprise. Its answers are :data:`CONSENT_ANSWERS`, unchanged.
+#: word for it, and its prompt says "the full word" so a bare `y` that stops is
+#: not a surprise. Its answers are :data:`CONSENT_ANSWERS`, unchanged. Word for
+#: word the OpenClaw ladder's `CONSENT_QUESTION_STRICT`.
 WHOLE_WORD_CONSENT_QUESTION = (
-    f"Type the word {CONSENT_ANSWER} to continue, anything else stops: "
+    f"Apply route? Type the full word {CONSENT_ANSWER}; anything else stops: "
 )
 
 DEFAULT_ENROLL_WAIT_S = 600.0
@@ -178,6 +182,12 @@ CONTINUE_HERE_PENDING_MESSAGE = (
     "Continue here activates at the next agent restart."
 )
 
+#: The last line of a run that stopped because something went wrong: never on
+#: success, never on the planned restart stop (exit 2), never when the person
+#: stopped it themselves. Said once, at the ladder's exit, never by a step.
+#: Word for word the OpenClaw ladder's STUCK_HELP_MESSAGE.
+STUCK_HELP_MESSAGE = "Stuck? Ask us on Discord: https://discord.ocuclaw.com"
+
 
 # -- options ------------------------------------------------------------------
 
@@ -253,6 +263,10 @@ class StepRecord:
     status: str
     detail: Optional[str] = None
     exit_code: Optional[int] = None
+    #: Whether a stop with this record ends on :data:`STUCK_HELP_MESSAGE`.
+    #: ``None`` means "if it is a problem exit"; ``False`` marks a problem exit
+    #: the person chose themselves. Never part of the journal.
+    ask_for_help: Optional[bool] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {"id": self.id, "status": self.status, "detail": self.detail}
@@ -279,7 +293,11 @@ class StepContext:
 
     options: SetupOptions
     layout: cloudways.Layout
-    say: Callable[[str], None]
+    #: ``say(line)`` prints and records one line. ``say(line, role="prompt")``
+    #: styles it as an action prompt (yellow, as the OpenClaw ladder shows
+    #: them); :meth:`say_prompt` is the spelling that also works with a
+    #: one-argument stand-in.
+    say: Callable[..., None]
     #: Both take the consent lines, and optionally ``question`` / ``answers``
     #: when a step's consent is worded or parsed differently from the default.
     ask: Callable[..., bool]
@@ -315,6 +333,35 @@ class StepContext:
     #: themselves, which is the only reason they may have the streams.
     stream_in: Any = None
     stream_out: Any = None
+    #: The third door, for a numbered choice (#3482). Like :attr:`ask_human`,
+    #: ``--yes`` never answers it and it refuses without a real terminal; it
+    #: returns the stripped answer, or ``None`` when there is none. ``None``
+    #: here means the ladder was built without one, and a step treats that as
+    #: no terminal.
+    choose: Optional[Callable[..., Optional[str]]] = None
+    #: "Is a model signed in and selected?" for this layout's home (#3482).
+    #: ``None`` skips the check entirely.
+    signin_check_fn: Optional[Callable[[], Any]] = None
+    #: Runs ``hermes <args>`` with the terminal handed straight over and
+    #: returns its exit code. Output is never captured.
+    run_interactive_fn: Optional[Callable[[Sequence[str]], Optional[int]]] = None
+    #: ``qr_fn(text, prefix_lines)``: a terminal QR for ``text``, or ``None``
+    #: when this terminal cannot show one whole (#3483).
+    qr_fn: Optional[Callable[[str, Sequence[str]], Optional[str]]] = None
+    #: Prints a block to the terminal WITHOUT recording it in the result's
+    #: lines (a QR code has no place in `--json`). ``None`` falls back to say.
+    show: Optional[Callable[[str], None]] = None
+
+    def say_prompt(self, line: str) -> None:
+        """Print ``line`` as an action prompt: the "prompt" role, yellow.
+
+        Works with the ladder's own ``say`` and with a one-argument stand-in
+        (a test's ``lines.append``), which gets the plain line.
+        """
+        try:
+            self.say(line, role="prompt")
+        except TypeError:
+            self.say(line)
 
 
 @dataclass
@@ -368,11 +415,62 @@ def step_1_host_check(ctx: StepContext) -> StepRecord:
     # Only now may anything be written, the journal included.
     ctx.state["host_check_passed"] = True
     ctx.state["hostname"] = hostname
+    stopped = _model_sign_in(ctx)
+    if stopped is not None:
+        return stopped
     return StepRecord("host-check", STATUS_DONE, cloudways.DETECT_CLOUDWAYS)
 
 
 def _assume_cloudways(env: Mapping[str, str]) -> bool:
     return str(env.get(ASSUME_CLOUDWAYS_ENV, "")).strip() == "1"
+
+
+# -- step 1, continued · model sign-in (#3482) ---------------------------------
+
+
+def _model_sign_in(ctx: StepContext) -> Optional[StepRecord]:
+    """Is a model signed in? If not, offer the sign-in right here.
+
+    Part of step 1, not a numbered step: when a model is signed in it prints
+    nothing at all. The check and the chooser live in :mod:`cloudways_signin`.
+    Only three outcomes stop the ladder: the user chose to set it up
+    themselves, gave no answer, or a sign-in command did not finish.
+    """
+    if ctx.signin_check_fn is None:
+        return None
+    try:
+        state = ctx.signin_check_fn()
+    except Exception:  # noqa: BLE001 - a check that throws is "could not tell"
+        return None
+    verdict = getattr(state, "verdict", cloudways_signin.UNKNOWN)
+    if verdict in (cloudways_signin.SIGNED_IN, cloudways_signin.UNKNOWN):
+        return None
+    interactive = (
+        not ctx.options.assume_yes
+        and ctx.choose is not None
+        and ctx.run_interactive_fn is not None
+        and ctx.isatty()
+    )
+    run_command = ctx.run_interactive_fn or (lambda _args: None)
+    outcome = cloudways_signin.run_sign_in(
+        state,
+        say=ctx.say,
+        choose=ctx.choose,
+        interactive=interactive,
+        run_command=run_command,
+        recheck=ctx.signin_check_fn,
+    )
+    ctx.state["model_sign_in"] = outcome.outcome
+    if not outcome.stop:
+        return None
+    if outcome.failed:
+        return StepRecord(
+            "model-sign-in", STATUS_FAILED, outcome.outcome, exit_code=SETUP_EXIT_PROBLEM
+        )
+    # The manual lines already end "then run setup again".
+    return StepRecord(
+        "model-sign-in", STATUS_DECLINED, outcome.outcome, exit_code=SETUP_EXIT_STOPPED
+    )
 
 
 # -- step 2 · settings --------------------------------------------------------
@@ -424,17 +522,17 @@ def step_4_tailscale(ctx: StepContext) -> StepRecord:
     else:
         install_report = ctx.install_fn()
         if not install_report.get("ok"):
-            ctx.say(f"  {install_report.get('error') or 'the Tailscale install failed'}")
+            ctx.say(f"  {install_report.get('error') or 'The Tailscale install failed.'}")
             return StepRecord(
                 "tailscale", STATUS_FAILED, "install-failed", exit_code=SETUP_EXIT_PROBLEM
             )
-        ctx.say(f"  installed Tailscale {install_report.get('version') or cloudways.TAILSCALE_VERSION}.")
+        ctx.say(f"  Tailscale {install_report.get('version') or cloudways.TAILSCALE_VERSION} installed.")
         fired = install_report.get("fired") or {}
         # Only a REPORTED failure is one. A background dispatch or a next-tick
         # run reports no verdict, and the observed daemon state below is what
         # decides either way, so an unreported run gets no scary line.
         if str(fired.get("verdict") or "unreported") == "failed":
-            ctx.say("  the watchdog's immediate run failed; waiting for its next tick to start the daemon.")
+            ctx.say("  The watchdog's first run failed. Waiting for its next tick to start the daemon.")
 
     report = ctx.status_fn(wait_s=ctx.daemon_wait_s)
     daemon = _daemon_of(report)
@@ -453,7 +551,7 @@ def step_4_tailscale(ctx: StepContext) -> StepRecord:
         ctx.say("  Tailscale is running. Server approval is still needed.")
         return StepRecord("tailscale", status, state)
     ctx.say(
-        f"  the Tailscale daemon did not start (state {state}). The cron watchdog "
+        f"  The Tailscale daemon did not start (state {state}). The cron watchdog "
         "starts it within a minute; run the same command again."
     )
     return StepRecord("tailscale", STATUS_FAILED, str(state), exit_code=SETUP_EXIT_PROBLEM)
@@ -471,9 +569,49 @@ def _daemon_of(report: Mapping[str, Any]) -> Mapping[str, Any]:
 #: is on the same account by construction, which is what step 7 needs (#3177).
 #: Shared with the OpenClaw ladder word for word (#3177); the honest clause on
 #: the second line says a phone is wanted here, never required.
+#:
+#: Since #3483 these are the PLAIN-LINK lines: what prints when the terminal
+#: cannot show the QR code whole. They stay word for word what the shared copy
+#: fixture pins.
 STEP_5_PHONE_SIGN_IN_LINES = (
     "On your phone, sign in to Tailscale. Open this link to approve this server:",
 )
+
+#: #3483. First in step 5 either way: the app has to be on the phone before
+#: the code or the link can do anything.
+STEP_5_INSTALL_TAILSCALE_LINE = (
+    "No Tailscale on your phone? Install it from the App Store or Google Play "
+    "and sign in first."
+)
+#: #3483. Above the QR code, drawn with OcuClaw's own encoder (`cloudways_qr`).
+STEP_5_QR_LEAD_LINE = "Point your phone's camera at this code to approve this server:"
+#: #3483. Under the QR code, the same link as text.
+STEP_5_OR_OPEN_PREFIX = "Or open: "
+
+
+def _show_approval_link(ctx: StepContext, auth_url: str, header: str) -> None:
+    """The install line, then the link as a QR code, or as text when it won't fit."""
+    ctx.say(f"  {STEP_5_INSTALL_TAILSCALE_LINE}")
+    lead = f"  {STEP_5_QR_LEAD_LINE}"
+    or_open = f"  {STEP_5_OR_OPEN_PREFIX}{auth_url}"
+    code = None
+    if ctx.qr_fn is not None and ctx.isatty():
+        try:
+            # Every row the code shares the screen with, so it is drawn only
+            # when the header above it and the link below it still fit.
+            code = ctx.qr_fn(
+                auth_url, (header, f"  {STEP_5_INSTALL_TAILSCALE_LINE}", lead, or_open)
+            )
+        except Exception:  # noqa: BLE001 - no code; the link still works
+            code = None
+    if code:
+        ctx.say(lead)
+        (ctx.show or ctx.say)(code)
+        ctx.say(or_open)
+        return
+    for line in STEP_5_PHONE_SIGN_IN_LINES:
+        ctx.say(f"  {line}")
+    ctx.say(f"    {auth_url}")
 
 
 def step_5_enrollment(ctx: StepContext) -> StepRecord:
@@ -484,7 +622,7 @@ def step_5_enrollment(ctx: StepContext) -> StepRecord:
         ctx.say("  This server is already approved.")
         if ctx.state.get("stale_marker"):
             ctx.say(
-                "  a stale authorization marker is on disk; the next enable or install "
+                "  A stale authorization marker is on disk. The next enable or install "
                 "pass clears it, and nothing needs doing."
             )
         return StepRecord("enrollment", STATUS_SKIPPED, cloudways.STATE_RUNNING)
@@ -493,16 +631,20 @@ def step_5_enrollment(ctx: StepContext) -> StepRecord:
         ctx.say("  This server is already approved.")
         ctx.state["daemon_state"] = cloudways.STATE_RUNNING
         return StepRecord("enrollment", STATUS_SKIPPED, cloudways.STATE_RUNNING)
+    notice = enrolled.get("notice")
+    if isinstance(notice, str) and notice.strip():
+        # #3481: a restart left the last approval link dead and enroll()
+        # started a fresh login (`STALE_ENROLLMENT_NOTICE`). Said once, first,
+        # so the new link below is not mistaken for the old one.
+        ctx.say(f"  {notice.strip()}")
     auth_url = enrolled.get("authUrl")
     if not auth_url:
         ctx.say(f"  {enrolled.get('error') or 'no authorization link appeared'}")
         return StepRecord(
             "enrollment", STATUS_FAILED, "no-authorization-link", exit_code=SETUP_EXIT_PROBLEM
         )
-    for line in STEP_5_PHONE_SIGN_IN_LINES:
-        ctx.say(f"  {line}")
-    ctx.say(f"    {auth_url}")
-    deadline = ctx.clock() + max(0.0, float(ctx.options.wait_s))
+    _show_approval_link(ctx, str(auth_url), f"[5/{SETUP_STEP_COUNT}] Connect to Tailscale")
+    deadline =ctx.clock() + max(0.0, float(ctx.options.wait_s))
     last_notice = ctx.clock()
     approved = False
     while True:
@@ -608,6 +750,9 @@ def run_setup(
     poll_s: float = DEFAULT_POLL_S,
     notice_s: float = DEFAULT_NOTICE_S,
     daemon_wait_s: float = DEFAULT_DAEMON_WAIT_S,
+    signin_check_fn: Optional[Callable[[], Any]] = None,
+    interactive_runner: Optional[Callable[[Sequence[str]], Optional[int]]] = None,
+    qr_fn: Optional[Callable[[str, Sequence[str]], Optional[str]]] = None,
 ) -> SetupResult:
     """Run the ladder. Returns the exit code, every line shown, and the records.
 
@@ -624,16 +769,67 @@ def run_setup(
     lines: List[str] = []
     records: List[StepRecord] = []
 
-    def say(line: str) -> None:
+    def say(line: str, role: Optional[str] = None) -> None:
         lines.append(line)
         try:
-            stream_out.write(styled(line, stream_out, env) + "\n")
+            stream_out.write(styled(line, stream_out, env, role=role) + "\n")
+        except Exception:  # noqa: BLE001 - a closed stream never fails the ladder
+            pass
+
+    def show(block: str) -> None:
+        """To the terminal only: never in `lines`, so never in `--json`."""
+        try:
+            stream_out.write(block + "\n")
+            stream_out.flush()
         except Exception:  # noqa: BLE001 - a closed stream never fails the ladder
             pass
 
     confirm = _default_confirm(stream_in, stream_out, env=env)
+    read_choice = _default_choose(stream_in, stream_out, env=env)
 
     isatty = isatty_fn or _default_isatty(stream_in, stream_out)
+
+    def choose(
+        question_lines: Sequence[str], *, question: str, choices: Iterable[str]
+    ) -> Optional[str]:
+        """The numbered-choice door. --yes never answers it; no terminal, no answer."""
+        if not isatty():
+            for line in question_lines:
+                say(line)
+            say(f"  {HUMAN_ANSWER_REQUIRED_MESSAGE}")
+            return None
+        for line in question_lines:
+            lines.append(line)
+        return read_choice(question_lines, question=question)
+
+    def run_hermes_interactive(args: Sequence[str]) -> Optional[int]:
+        child_env = dict(env)
+        # The profile the ladder is setting up, as `cloudways_settings._hermes`
+        # pins it, never whatever the ambient environment points at.
+        child_env["HERMES_HOME"] = str(layout.hermes_home)
+        return cloudways_signin.run_interactive(
+            [cloudways.hermes_bin(), *args],
+            env=child_env,
+            stream_in=stream_in,
+            stream_out=stream_out,
+        )
+
+    def check_signin() -> Any:
+        return cloudways_signin.check_signed_in(
+            layout.hermes_home, env=env, hermes_bin=cloudways.hermes_bin(), runner=runner
+        )
+
+    def draw_qr(text: str, prefix_lines: Sequence[str]) -> Optional[str]:
+        from . import cloudways_qr
+
+        return cloudways_qr.terminal_qr(
+            text,
+            stream_out=stream_out,
+            stream_in=stream_in,
+            env=env,
+            light_terminal=options.light_terminal,
+            prefix_lines=prefix_lines,
+        )
 
     def ask(consent_lines: Sequence[str], **wording: Any) -> bool:
         if options.assume_yes:
@@ -688,6 +884,11 @@ def run_setup(
         daemon_wait_s=daemon_wait_s,
         stream_in=stream_in,
         stream_out=stream_out,
+        choose=choose,
+        signin_check_fn=signin_check_fn or check_signin,
+        run_interactive_fn=interactive_runner or run_hermes_interactive,
+        qr_fn=qr_fn or draw_qr,
+        show=show,
     )
 
     exit_code = SETUP_EXIT_OK
@@ -731,6 +932,8 @@ def run_setup(
         # run may have written the settings and left before any gateway
         # restarted, and that user is owed the same line.
         say(CONTINUE_HERE_PENDING_MESSAGE)
+    if _asks_for_help(exit_code, records):
+        say(f"  {STUCK_HELP_MESSAGE}")
 
     result = SetupResult(exit_code=exit_code, lines=lines, steps=records)
     # Nothing is written on a refusal, the journal included.
@@ -745,6 +948,19 @@ def run_setup(
             # own write failures and never raises them.
             pass
     return result
+
+
+def _asks_for_help(exit_code: int, records: Sequence[StepRecord]) -> bool:
+    """Does this run end on :data:`STUCK_HELP_MESSAGE`?
+
+    Only a problem exit does, and only when the step that stopped it did not
+    mark it as the person's own choice. Success, a decline, the planned restart
+    stop and Ctrl-C never do.
+    """
+    if exit_code != SETUP_EXIT_PROBLEM:
+        return False
+    last = records[-1] if records else None
+    return getattr(last, "ask_for_help", None) is not False
 
 
 def _restart_still_pending(layout: cloudways.Layout) -> bool:
@@ -809,6 +1025,30 @@ def _default_confirm(stream_in: Any, stream_out: Any, *, env=None) -> Callable[.
         return str(answer or "").strip().lower() in frozenset(answers)
 
     return confirm
+
+
+def _default_choose(stream_in: Any, stream_out: Any, *, env=None) -> Callable[..., Optional[str]]:
+    """Print the lines, ask in the prompt role, return the stripped answer.
+
+    ``None`` when there is no answer at all: end of input or a closed stream.
+    Ctrl-C is left to the ladder, which stops with exit 130 as it does at the
+    consent prompts.
+    """
+
+    def choose(question_lines: Sequence[str], *, question: str) -> Optional[str]:
+        try:
+            for line in question_lines:
+                stream_out.write(styled(line, stream_out, env) + "\n")
+            stream_out.write(styled(question, stream_out, env, role="prompt"))
+            stream_out.flush()
+            answer = stream_in.readline()
+        except Exception:  # noqa: BLE001 - an unanswerable prompt is no answer
+            return None
+        if not answer:
+            return None
+        return str(answer).strip()
+
+    return choose
 
 
 # -- the journal --------------------------------------------------------------
@@ -902,6 +1142,7 @@ JOURNAL_DETAILS = frozenset(
         cloudways.STATE_UNKNOWN,
         *cloudways_settings.JOURNAL_DETAILS,  # step 2
         *cloudways_restart_step.JOURNAL_DETAILS,  # step 3
+        *cloudways_signin.JOURNAL_DETAILS,  # step 1's model sign-in (#3482)
     }
     # Step 6's own words, owned by the module that emits them (#3104), so the
     # vocabulary and the step that uses it cannot drift apart.
@@ -926,6 +1167,7 @@ __all__ = [
     "SETUP_EXIT_STOPPED",
     "SETUP_STEPS",
     "SETUP_STEP_COUNT",
+    "STUCK_HELP_MESSAGE",
     "SetupOptions",
     "SetupResult",
     "StepContext",

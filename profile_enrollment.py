@@ -340,7 +340,7 @@ def _write_names(
             raise ValueError("Gateway configuration is invalid")
         gateway[ALLOWLIST_CONFIG_PATH[1]] = list(ordered)
 
-    atomic_config_write(path, config, sort_keys=False)
+    atomic_config_write(path, config)
 
 
 def mirror_is_required(capabilities: Optional[EngineCapabilities] = None) -> bool:

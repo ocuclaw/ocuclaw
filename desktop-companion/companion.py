@@ -43,14 +43,37 @@ def atomic_write(path, content):
             pass
 
 
-def safe_path(path):
-    # Check all ancestors, including broken links; Windows junctions resolve
-    # differently too. Never follow a link into somebody else's installation.
+def real_path(path):
+    """Resolve once and work on the real path, which every receipt then names.
+
+    Linked ancestors and a linked `desktop-plugins` root are normal layouts
+    (Fedora Atomic `/home -> var/home`, macOS `/private`, moved homes) and
+    Hermes Desktop follows them, so they are followed here too. The promise
+    not to follow a link into somebody else's installation is kept by showing
+    the resolved path instead of the given one.
+    """
+    path = Path(path)
     if not path.is_absolute() or ".." in path.parts:
-        raise CompanionError("Use an absolute home without parent traversal", "unsafe_path")
-    for part in [*reversed(path.parents), path]:
-        if part.is_symlink() or (part.exists() and part.resolve() != part):
-            raise CompanionError("Linked installation paths are not supported", "unsafe_path")
+        raise CompanionError(f"Use an absolute path without parent traversal: {path}", "unsafe_path")
+    return path.resolve()
+
+
+def check_plugin_folder(target):
+    """Refuse the two links Desktop cannot use, naming the exact path.
+
+    Desktop enumerates plugin folders with `readdir(withFileTypes)` and keeps
+    only directories, so a linked `<root>/ocuclaw` is never loaded and removal
+    treats it as a link. Writing through a linked `plugin.js` would edit a file
+    in another installation.
+    """
+    if target.parent.is_symlink():
+        raise CompanionError(
+            "Hermes Desktop does not load a linked plugin folder; "
+            f"replace the link at {target.parent} with a real folder", "unsafe_path")
+    if target.is_symlink():
+        raise CompanionError(
+            "A linked plugin file would write into another installation; "
+            f"replace the link at {target} with a real file", "unsafe_path")
 
 
 def build(output):
@@ -72,12 +95,12 @@ def build(output):
                             f"// OCUCLAW-DESKTOP-COMPANION version={version[1]}\n", 1)
     artifact = {"format": 2, "identity": IDENTITY, "version": version[1],
                 "sha256": digest(source), "sourceLines": source.splitlines(keepends=True)}
-    output = Path(output).absolute()
-    safe_path(output)
+    output = real_path(Path(output).absolute())
     # Keep every source line independently visible to reviewers and the bundle
     # scanner. A single escaped string falsely combines unrelated operations.
     atomic_write(output, json.dumps(artifact, ensure_ascii=True, indent=2) + "\n")
-    return {"status": "built", "version": version[1], "sha256": artifact["sha256"]}
+    return {"status": "built", "version": version[1], "sha256": artifact["sha256"],
+            "path": str(output)}
 
 
 def load_artifact(path):
@@ -107,20 +130,19 @@ def check_duplicates(home, target):
     # another profile's presenter or trusting which copy wins a migration.
     homes = [home]
     profiles = home / "profiles"
-    safe_path(profiles)
     if profiles.exists():
         homes.extend(profiles.iterdir())
     for local in homes:
-        safe_path(local)
         for root, entry in ((local / "desktop-plugins", "plugin.js"),
                             (local / "plugins", "desktop/plugin.js")):
-            safe_path(root)
             if not root.exists():
                 continue
             for directory in root.iterdir():
-                safe_path(directory)
+                # Desktop's readdir keeps only real directories, so a linked
+                # folder is not a runtime that could win a migration.
+                if directory.is_symlink():
+                    continue
                 candidate = directory / entry
-                safe_path(candidate)
                 if candidate == target or not candidate.is_file():
                     continue
                 if directory.name == "ocuclaw" or candidate.read_text(
@@ -140,7 +162,7 @@ def installed_source(target):
 def install(home, artifact_path):
     artifact = load_artifact(artifact_path)
     target = home / "desktop-plugins" / "ocuclaw" / "plugin.js"
-    safe_path(target)
+    check_plugin_folder(target)
     check_duplicates(home, target)
     homes = [home]
     profiles = home / "profiles"
@@ -148,7 +170,6 @@ def install(home, artifact_path):
         homes.extend(path for path in profiles.iterdir() if path.is_dir())
     for local in homes:
         backend = local / "plugins" / "ocuclaw" / "desktop_pairing.py"
-        safe_path(backend)
         if backend.exists() and not re.search(r"^COMPANION_VERSION_MARKER\s*=",
                                              backend.read_text(encoding="utf-8"), re.M):
             raise CompanionError(
@@ -178,12 +199,13 @@ def install(home, artifact_path):
         atomic_write(target, source)
         status = "updated" if current else "installed"
     return {"status": status, "version": artifact["version"], "sha256": artifact["sha256"],
+            "path": str(target),
             "next": "Reopen Hermes Desktop; enable OcuClaw in Desktop Plugins if desired"}
 
 
 def remove(home):
     target = home / "desktop-plugins" / "ocuclaw" / "plugin.js"
-    safe_path(target)
+    check_plugin_folder(target)
     if (target.parent / ".hermes-package.json").exists():
         raise CompanionError("Desktop manages this plugin from an agent package; remove it in Desktop instead", "package_managed")
     current = installed_source(target)
@@ -193,19 +215,19 @@ def remove(home):
             target.parent.rmdir()
         except OSError:
             pass  # Only the owned plugin file belongs to this operation.
-    return {"status": "removed" if current else "absent"}
+    return {"status": "removed" if current else "absent", "path": str(target)}
 
 
 def status(home):
     target = home / "desktop-plugins" / "ocuclaw" / "plugin.js"
-    safe_path(target)
+    check_plugin_folder(target)
     current = installed_source(target)
     if current is None:
-        return {"status": "absent"}
+        return {"status": "absent", "path": str(target)}
     check_duplicates(home, target)
     version = re.search(r"^// OCUCLAW-DESKTOP-COMPANION version=(\d+\.\d+\.\d+)$", current, re.M)
     return {"status": "installed", "version": version[1] if version else None,
-            "sha256": digest(current), "identity": IDENTITY}
+            "sha256": digest(current), "identity": IDENTITY, "path": str(target)}
 
 
 def main():
@@ -219,11 +241,14 @@ def main():
                              help="Absolute LOCAL app-level Hermes home (usually ~/.hermes)")
     args = parser.parse_args()
     try:
-        if args.command != "build" and Path(args.home).parent.name == "profiles":
-            raise CompanionError("Use the app-level Hermes home, not a profile home", "unsafe_path")
+        # Resolve the home once; every later path is built from the real one.
+        home = real_path(args.home) if args.command != "build" else None
+        if home is not None and home.parent.name == "profiles":
+            raise CompanionError(
+                f"Use the app-level Hermes home, not a profile home: {home}", "unsafe_path")
         result = (build(args.output) if args.command == "build" else
-                  install(Path(args.home), args.artifact) if args.command == "install" else
-                  remove(Path(args.home)) if args.command == "remove" else status(Path(args.home)))
+                  install(home, args.artifact) if args.command == "install" else
+                  remove(home) if args.command == "remove" else status(home))
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
         # No source, presenter values, OS exception paths or credentials in output.
         message = str(error) if isinstance(error, CompanionError) else "Companion operation failed; check artifact and filesystem permissions"

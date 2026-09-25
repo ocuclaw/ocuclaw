@@ -115,6 +115,54 @@ def capture_doctor(doctor, section, check):
         doctor.DOCTOR_CHECKS = tuple((title, titled(entry)) for title, entry in checks)
 
 
+def probe():
+    """The native surface capture_doctor and the audit path below rely on; a reason, or None.
+
+    Only used for a Hermes that is not one of the audited builds (#3346). It imports the
+    same modules a real run imports, under a throwaway HERMES_HOME, and reads their shape.
+    It patches nothing and runs no check.
+    """
+    import dataclasses
+    import inspect
+    import hermes_cli.doctor as doctor
+    report = sys.modules.get("hermes_cli.doctor_report")
+    if report is None:
+        return "doctor_report_missing"
+    if not all(callable(getattr(report, name, None)) for name in ("check_ok", "check_warn", "check_fail", "check_info", "_section")):
+        return "doctor_primitives_changed"
+    guard = getattr(getattr(report, "warn_on_error", None), "__wrapped__", None)
+    if guard is None or not guard.__defaults__ or guard.__defaults__[-1] is not report.check_warn:
+        return "doctor_warn_on_error_changed"
+    checks = getattr(doctor, "DOCTOR_CHECKS", None)
+    if not isinstance(checks, (tuple, list)) or not checks:
+        return "doctor_checks_changed"
+    for entry in checks:
+        if not (isinstance(entry, tuple) and len(entry) == 2 and (entry[0] is None or isinstance(entry[0], str))
+                and callable(entry[1]) and isinstance(getattr(entry[1], "__name__", None), str)):
+            return "doctor_checks_changed"
+    if not any(entry[1].__name__ in CHECKS for entry in checks):
+        return "doctor_checks_unrecognised"
+    try:
+        inspect.signature(doctor.run_doctor).bind(SimpleNamespace(fix=False, ack=None))
+    except (AttributeError, TypeError, ValueError):
+        return "doctor_entry_changed"
+    import hermes_cli.security_audit as native
+    single = callable(getattr(native, "_http_json", None))
+    if not single and not (callable(getattr(native, "_http_post_json", None)) and callable(getattr(native, "_http_get_json", None))):
+        return "audit_http_changed"
+    try:
+        inspect.signature(native._discover_components).bind(hermes_home=Path(os.environ["HERMES_HOME"]))
+        inspect.signature(native.run_audit).bind(components=[])
+    except (AttributeError, TypeError, ValueError):
+        return "audit_entry_changed"
+    def fields(name):
+        shape = getattr(native, name, None)
+        return {field.name for field in dataclasses.fields(shape)} if dataclasses.is_dataclass(shape) else set()
+    if "vuln" not in fields("Finding") or not {"osv_id", "severity"} <= fields("Vulnerability"):
+        return "audit_finding_changed"
+    return None
+
+
 def run(kind, output):
     data = {"state": "running", "phase": "starting", "checks": 0, "findings": [], "coverage": "unknown"}
     def emit():
@@ -232,6 +280,15 @@ The write descriptor is CLOEXEC and never inherited by native exec commands.
 
 if __name__ == "__main__":
     descriptor = watchdog(float(sys.argv[3]))
-    run(sys.argv[1], Path(sys.argv[2]))
+    if sys.argv[1] == "probe":
+        try:
+            reason = probe()
+        except BaseException:
+            reason = "import_failed"
+        verdict = {"state": "incompatible", "reason": reason} if reason else {"state": "compatible"}
+        with os.fdopen(os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "w") as file:
+            json.dump(verdict, file)
+    else:
+        run(sys.argv[1], Path(sys.argv[2]))
     # Exit atomically, closing the watchdog pipe only after native result write.
     os._exit(0)

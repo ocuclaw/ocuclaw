@@ -68,6 +68,8 @@ def read_management(rpc: Any, params: Any) -> dict:
     permission_operation = identity["operation"] in PERMISSION_OPERATIONS
     from .learning_management import OPERATIONS as LEARNING_OPERATIONS
     learning_operation = identity["operation"] in LEARNING_OPERATIONS
+    from .board_management import OPERATIONS as BOARD_OPERATIONS
+    board_operation = identity["operation"] in BOARD_OPERATIONS
     agent_operation = identity["operation"] in AGENT_OPERATIONS
     allowed = set(identity) | ({"memory"} if identity["operation"] in MEMORY_OPERATIONS else set()) | ({"jobs"} if job_operation else set()) | ({"approvals"} if approval_operation else set())
     allowed |= {"agents"} if agent_operation else set()
@@ -79,18 +81,22 @@ def read_management(rpc: Any, params: Any) -> dict:
     allowed |= {"tools"} if identity["operation"] in TOOLS_OPERATIONS else set()
     allowed |= {"connections"} if identity["operation"] in CONNECTION_OPERATIONS else set()
     allowed |= {"learning"} if learning_operation else set()
+    allowed |= {"board"} if board_operation else set()
     if set(p) - allowed or any(not identity[key] for key in identity):
         return fail("invalid_request", "A request identity and explicit profile scope are required.")
     if any(p[key] != identity[key] for key in identity):
         return fail("invalid_request", "Request identity is invalid.")
     if identity["scope"] not in ("profile", "gateway"):
         return fail("invalid_scope", "Choose profile or shared gateway scope.")
-    if identity["operation"] not in ("capabilities", "overview", *MEMORY_OPERATIONS, *SKILLS_OPERATIONS, *HEALTH_OPERATIONS, *SAVED_OPERATIONS, *TOOLS_OPERATIONS, *CONNECTION_OPERATIONS, *AGENT_OPERATIONS) and not job_operation and not approval_operation and not automation_operation and not permission_operation and not learning_operation:
+    if identity["operation"] not in ("capabilities", "overview", *MEMORY_OPERATIONS, *SKILLS_OPERATIONS, *HEALTH_OPERATIONS, *SAVED_OPERATIONS, *TOOLS_OPERATIONS, *CONNECTION_OPERATIONS, *AGENT_OPERATIONS) and not job_operation and not approval_operation and not automation_operation and not permission_operation and not learning_operation and not board_operation:
         return fail("unsupported", "This operation is not supported by the connected Hermes adapter.", "unsupported")
     if identity["operation"] == "overview" and identity["scope"] != "profile":
         return fail("invalid_scope", "Overview requires a selected profile.")
     if identity["operation"] in (*MEMORY_OPERATIONS, *SKILLS_OPERATIONS, *SAVED_OPERATIONS) and identity["scope"] != "profile":
         return fail("invalid_scope", "Memory requires a selected profile.")
+    if board_operation and identity["scope"] != "profile":
+        # Boards are shared across the root; the served profile authorizes the caller.
+        return fail("invalid_scope", "Board requires a selected profile.")
     if agent_operation and identity["scope"] != "gateway":
         # The enrollment set is one host-wide answer, not a property of any one
         # profile (#2940).
@@ -142,6 +148,9 @@ def read_management(rpc: Any, params: Any) -> dict:
         return handle_permissions(rpc, identity, p.get("permissions"))
     if identity["operation"] in SAVED_OPERATIONS:
         return handle_saved(rpc, identity, p.get("saved"))
+    if board_operation:
+        from .board_management import handle_board
+        return handle_board(identity, p.get("board"), rpc)
     capabilities = [
         {"operation": "capabilities", "scope": "gateway", "supported": True, "applyTiming": "read_only"},
         {"operation": "overview", "scope": "profile", "supported": True, "applyTiming": "read_only"},
@@ -163,6 +172,8 @@ def read_management(rpc: Any, params: Any) -> dict:
     result["capabilities"].extend(automations_capabilities(identity["profileId"]))
     from .permissions_management import permissions_capabilities
     result["capabilities"].extend(permissions_capabilities())
+    from .board_management import generic_capabilities as board_generic_capabilities
+    result["capabilities"].extend(board_generic_capabilities())
     if identity["operation"] == "overview":
         overview = {
             "profileName": _text(profile.get("displayName")) or identity["profileId"],

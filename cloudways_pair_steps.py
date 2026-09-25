@@ -182,32 +182,42 @@ STEP_7_PAIRING_FAILED_MESSAGE = (
     "Pairing did not finish. Run the same setup command to resume."
 )
 
-#: Said after a pairing code ran out with nothing ever claiming it (#3177). It
-#: names the one cause a non-technical person would never think of and cannot
-#: see from here: the app off, or signed in somewhere else. A refused or
-#: cancelled approval is a decision, not a missing phone, and never gets it.
+#: Said after the ceremony's own "Code expired before a phone joined." (#3177,
+#: #3483). It names the one cause a non-technical person would never think of
+#: and cannot see from here: the app off, or signed in somewhere else. A
+#: refused or cancelled approval is a decision, not a missing phone, and never
+#: gets it. Worded once and shared with the OpenClaw ladder.
 #:
-#: ONLY when the phone check that opens step 7 did not see a phone. When it did,
-#: Tailscale is demonstrably not the problem and saying so would send the user
-#: to fix something that is already working.
-STEP_7_NO_PHONE_CAUSE_MESSAGE = (
-    "Most often this means Tailscale is switched off, or signed in to a "
-    "different account, on your phone."
+#: Said whether or not the phone check that opens step 7 saw a phone. On a real
+#: box (R1) the check printed "Phone found on your Tailscale network." and the
+#: code still ran out with Tailscale off on the phone, so a phone seen on the
+#: tailnet does not rule Tailscale out.
+#:
+#: Two lines, broken after "switched off,": as one line it ran to 102 columns
+#: with its indent and wrapped mid-word in a 100-column terminal.
+STEP_7_NO_PHONE_CAUSE_LINES = (
+    "Most often this means Tailscale is switched off,",
+    "or signed in to a different account, on your phone.",
 )
 
-#: The same moment, on a host where a phone IS on the private network. Nothing
-#: is diagnosed, because there is nothing to diagnose: the code simply was not
-#: entered.
-STEP_7_NOBODY_ENTERED_MESSAGE = "Nobody entered the code in time."
+#: The same moment, whether or not a phone was seen. The other usual cause on a
+#: real box: the person was not on the pair screen yet when the two minutes
+#: started (#3483). Shared word for word with the OpenClaw ladder.
+STEP_7_OPEN_PAIR_SCREEN_MESSAGE = "If the pair screen wasn't open yet, open it first."
+
+#: The ceremony's own phase for "no phone ever joined this code".
+PAIRING_WAITING_FOR_PHONE_PHASE = "waiting-for-phone"
 
 #: Printed once, on a real terminal, immediately before the FIRST code is
 #: minted. The code lives two minutes, so a user who walks away to find their
 #: phone comes back to a code that has already gone. Worded once and shared with
-#: the OpenClaw ladder, which prints it exactly as written.
+#: the OpenClaw ladder, which prints it exactly as written. The first line names
+#: the pair screen and the keypress together, so no separate "Press Enter" line
+#: is needed (#3483). Printed yellow, as an action, like OpenClaw.
 STEP_7_READY_LINES = (
-    "Open Even > OcuClaw on your phone.",
+    "Open Even > OcuClaw > Pair with your computer on your phone, then press "
+    "Enter to show the code.",
     "The next pairing code expires in 2 minutes.",
-    "Press Enter to show the code.",
 )
 
 #: What a code that ran out costs: one keypress, not the whole eight steps. The
@@ -220,6 +230,19 @@ STEP_7_NEW_CODE_PROMPT = (
 #: The one word that ends the retry loop. Compared stripped and lower-cased;
 #: everything else, Enter included, means "give me another code".
 STEP_7_STOP_WORD = "stop"
+
+#: Nobody answered :data:`STEP_7_NEW_CODE_PROMPT` before its wait ran out. On a
+#: real box the OpenClaw ladder went back to the shell with nothing said there.
+#: Word for word the OpenClaw ladder's PAIR_RETRY_NO_ANSWER_MESSAGE.
+STEP_7_NO_ANSWER_MESSAGE = (
+    "No answer, so setup stopped here. Run the same command again to get a new code."
+)
+
+#: What :func:`new_code_answer` can answer.
+NEW_CODE_AGAIN = "again"
+NEW_CODE_STOP = "stop"
+NEW_CODE_NO_TERMINAL = "no-terminal"
+NEW_CODE_NO_ANSWER = "no-answer"
 
 #: How long either step 7 keypress waits before carrying on without one. A
 #: terminal with nobody at it is ordinary on a managed host, so neither the
@@ -262,19 +285,22 @@ PHONE_WALKTHROUGH_LINES = (
 
 PHONE_APPEARED_MESSAGE = "Phone found on your Tailscale network."
 
-PHONE_CARRY_ON_MESSAGE = "Carrying on without a phone on your private network."
+#: The next three are word for word the OpenClaw ladder's (#3344 reworded them
+#: there and not here). The two-line ones print each line under the step
+#: indent; as single lines they ran past 100 columns.
+PHONE_CARRY_ON_MESSAGE = "Phone check skipped. No phone was found on your Tailscale network."
 
 PHONE_WAIT_TIMEOUT_MESSAGE = (
-    "No phone appeared on your private network. Switch on Tailscale on your "
-    "phone, then run the same command again; it picks up here."
+    "No phone found before the check timed out.\n"
+    "Turn on Tailscale on your phone, then run setup again."
 )
 
 #: No terminal, so nobody can press Enter and nobody is watching the wait run
 #: down. The walkthrough would be printed into a log nobody reads, so the run
 #: says the one honest line and goes straight on to the ceremony.
 PHONE_NO_TERMINAL_MESSAGE = (
-    "No phone is on your private network yet. Carrying on, because this is not "
-    "an interactive terminal."
+    "No phone found on your Tailscale network.\n"
+    "Phone check skipped: this terminal is not interactive."
 )
 
 #: How long the wait runs, and how often it re-reads the tailnet. Both are
@@ -298,10 +324,11 @@ PHONE_TIMEOUT = "timeout"
 PHONE_UNREADABLE = "unreadable"
 PHONE_NO_TERMINAL = "no-terminal"
 
-#: The two endings that mean a phone really is on the private network. Only
-#: these rule Tailscale out as the reason a pairing code was never claimed; the
-#: rest are "not seen", which includes "could not be read".
-PHONE_SEEN_STATES = frozenset({PHONE_FOUND, PHONE_APPEARED})
+
+def _say_lines(ctx: StepContext, message: str) -> None:
+    """Say a message of one or more lines, every line under the step indent."""
+    for line in message.split("\n"):
+        ctx.say(f"  {line}")
 
 
 def _default_phone_present(ctx: StepContext) -> Optional[bool]:
@@ -413,6 +440,28 @@ def _default_read_line(
     return _take_line(stream)
 
 
+def _say_action(ctx: StepContext, text: str) -> None:
+    """One line the person must act on, in the prompt colour (yellow).
+
+    `ctx.say` styles only step headings, so the ready gate and the new-code
+    offer would print plain here while OpenClaw prints them yellow. Written
+    straight to the ladder's terminal through `styled`, like step 8's prompt,
+    which keeps colour off pipes, dumb terminals and NO_COLOR. With no stream
+    to write to, `ctx.say` still carries the words.
+    """
+    stream = getattr(ctx, "stream_out", None)
+    if stream is None:
+        ctx.say(text)
+        return
+    from .terminal_output import styled
+
+    try:
+        stream.write(styled(text, stream, getattr(ctx, "env", None), role="prompt") + "\n")
+        stream.flush()
+    except Exception:  # noqa: BLE001 - a closed stream never fails the step
+        pass
+
+
 def hold_until_ready(
     ctx: StepContext, *, read_line_fn: Optional[Callable[[], Optional[str]]] = None
 ) -> bool:
@@ -427,7 +476,7 @@ def hold_until_ready(
     if ctx.options.assume_yes or not ctx.isatty():
         return False
     for line in STEP_7_READY_LINES:
-        ctx.say(line)
+        _say_action(ctx, line)
     (read_line_fn or (lambda: _default_read_line(ctx)))()
     return True
 
@@ -441,13 +490,26 @@ def ask_for_a_new_code(
     ends exactly as it did before the loop existed. A wait that runs out is the
     same answer: nobody is there.
     """
+    return new_code_answer(ctx, read_line_fn=read_line_fn) == NEW_CODE_AGAIN
+
+
+def new_code_answer(
+    ctx: StepContext, *, read_line_fn: Optional[Callable[[], Optional[str]]] = None
+) -> str:
+    """:func:`ask_for_a_new_code`, telling apart the three ways it says no.
+
+    No terminal is the old ending, the stop word is the person's own choice,
+    and a wait that ran out is nobody there, which gets its own line.
+    """
     if not ctx.isatty():
-        return False
-    ctx.say(STEP_7_NEW_CODE_PROMPT)
+        return NEW_CODE_NO_TERMINAL
+    _say_action(ctx, STEP_7_NEW_CODE_PROMPT)
     answer = (read_line_fn or (lambda: _default_read_line(ctx)))()
     if answer is None:
-        return False
-    return answer.strip().lower() != STEP_7_STOP_WORD
+        return NEW_CODE_NO_ANSWER
+    if answer.strip().lower() == STEP_7_STOP_WORD:
+        return NEW_CODE_STOP
+    return NEW_CODE_AGAIN
 
 
 def wait_for_a_phone(
@@ -473,7 +535,7 @@ def wait_for_a_phone(
         # evidence about the person's phone.
         return PHONE_UNREADABLE
     if not ctx.isatty():
-        ctx.say(f"  {PHONE_NO_TERMINAL_MESSAGE}")
+        _say_lines(ctx, PHONE_NO_TERMINAL_MESSAGE)
         return PHONE_NO_TERMINAL
 
     for line in PHONE_WALKTHROUGH_LINES:
@@ -486,7 +548,7 @@ def wait_for_a_phone(
             ctx.say(f"  {PHONE_CARRY_ON_MESSAGE}")
             return PHONE_CARRIED_ON
         if ctx.clock() >= deadline:
-            ctx.say(f"  {PHONE_WAIT_TIMEOUT_MESSAGE}")
+            _say_lines(ctx, PHONE_WAIT_TIMEOUT_MESSAGE)
             return PHONE_TIMEOUT
         ctx.sleep(min(poll_s, max(0.0, deadline - ctx.clock())))
         # A poll that cannot be read is transient, not an answer: the opening
@@ -771,7 +833,6 @@ def step_7_pair(
     # they are ready rather than while they are still looking for it.
     hold_until_ready(ctx, read_line_fn=read_line_fn)
 
-    phone_seen = phone in PHONE_SEEN_STATES
     new_codes = 0
 
     while True:
@@ -799,22 +860,47 @@ def step_7_pair(
                 "pair", STATUS_REFUSED, DETAIL_PAIRING_REFUSED, exit_code=SETUP_EXIT_STOPPED
             )
         if str(ending.get("reason") or "") == PAIRING_EXPIRED_REASON:
-            # The code ran out with nothing claiming it. Name the cause the
-            # person cannot see from this terminal, and only the cause the phone
-            # check actually leaves open (#3177).
-            # The ceremony reports the exchange phase. Tailnet presence cannot
-            # tell whether this particular code was entered or words appeared.
-            if not ending.get("phase"):
+            # The code ran out with nothing claiming it. Name the causes the
+            # person cannot see from this terminal (#3177). The ceremony reports
+            # the exchange phase and already said which one ran out. Only "no
+            # phone ever joined" gets the hint (#3483), and always both lines:
+            # a phone the check saw on the tailnet still failed with Tailscale
+            # off on a real box, so the check cannot rule Tailscale out.
+            phase = ending.get("phase")
+            if not phase:
                 ctx.say("  Pairing did not finish before the code expired.")
+            elif phase == PAIRING_WAITING_FOR_PHONE_PHASE:
+                for line in STEP_7_NO_PHONE_CAUSE_LINES:
+                    ctx.say(f"  {line}")
+                ctx.say(f"  {STEP_7_OPEN_PAIR_SCREEN_MESSAGE}")
             # A code that ran out is a minute of slowness, not a broken setup,
             # so it costs one keypress and not the other seven steps. Bounded:
             # after three fresh codes something else is wrong, and a rerun
             # picks up here anyway.
-            if new_codes < STEP_7_MAX_NEW_CODES and ask_for_a_new_code(
-                ctx, read_line_fn=read_line_fn
-            ):
-                new_codes += 1
-                continue
+            if new_codes < STEP_7_MAX_NEW_CODES:
+                answer = new_code_answer(ctx, read_line_fn=read_line_fn)
+                if answer == NEW_CODE_AGAIN:
+                    new_codes += 1
+                    continue
+                if answer == NEW_CODE_NO_ANSWER:
+                    ctx.say(f"  {STEP_7_NO_ANSWER_MESSAGE}")
+                    return StepRecord(
+                        "pair",
+                        STATUS_FAILED,
+                        DETAIL_PAIRING_FAILED,
+                        exit_code=SETUP_EXIT_PROBLEM,
+                    )
+                if answer == NEW_CODE_STOP:
+                    # The person's own stop: the ladder's Discord line is not
+                    # for them.
+                    ctx.say(f"  {STEP_7_PAIRING_FAILED_MESSAGE}")
+                    return StepRecord(
+                        "pair",
+                        STATUS_FAILED,
+                        DETAIL_PAIRING_FAILED,
+                        exit_code=SETUP_EXIT_PROBLEM,
+                        ask_for_help=False,
+                    )
         ctx.say(f"  {STEP_7_PAIRING_FAILED_MESSAGE}")
         return StepRecord(
             "pair", STATUS_FAILED, DETAIL_PAIRING_FAILED, exit_code=SETUP_EXIT_PROBLEM
@@ -845,8 +931,9 @@ STEP_8_LEAVE_TAILSCALE_ON_MESSAGE = (
 #: doctor` reports it the moment the run finishes, and without it the phone's
 #: "+" button stays grey with nothing on screen saying why. Said once, at the
 #: end, and only while the choice is still open.
+#: Two lines: as one it ran to 113 columns with its indent.
 STEP_8_AGENT_MODE_CHOICE_MESSAGE = (
-    "Optional: choose agent mode with /ocuclaw-setup in a Hermes chat. "
+    "Optional: choose agent mode with /ocuclaw-setup in a Hermes chat.\n"
     'Until then the phone\'s "+" button stays grey.'
 )
 
@@ -855,11 +942,14 @@ STEP_8_AGENT_MODE_CHOICE_MESSAGE = (
 #: to error the moment it was copied (#3234c, the same fix `pairing.py` took for
 #: its own ending). What is named instead is a diagnosis they can run and the
 #: command they are already in.
+#:
+#: Four lines, broken by hand so the command is never split: as one line it
+#: ran to 257 columns.
 STEP_8_STALE_PAIRING_MESSAGE = (
-    "this run skipped pairing because a previous pairing is recorded here. If "
-    "that phone is gone, or this host has been reset since it was paired, it "
-    "can no longer connect: run `hermes ocuclaw doctor` to see what this host "
-    "has, then run the same command again."
+    "this run skipped pairing because a previous pairing is recorded here.\n"
+    "If that phone is gone, or this host has been reset since it was paired,\n"
+    "it can no longer connect: run `hermes ocuclaw doctor` to see what this host has,\n"
+    "then run the same command again."
 )
 
 #: Outcome and evidence in one journal word, so a later reader can never mistake
@@ -955,9 +1045,12 @@ def _default_agent_mode_chosen() -> bool:
     block = platforms.get("ocuclaw") if isinstance(platforms, Mapping) else None
     extra = block.get("extra") if isinstance(block, Mapping) else None
     agent_mode = extra.get("agent_mode") if isinstance(extra, Mapping) else None
-    return isinstance(multiplex, bool) and (
-        (agent_mode == "multiple" and multiplex is True)
-        or (agent_mode == "single" and multiplex is False)
+    from .setup_profiles import agent_mode_recorded, multiplex_opt_out_retired
+
+    return agent_mode_recorded(
+        agent_mode,
+        multiplex,
+        opt_out_retired=multiplex_opt_out_retired(),
     )
 
 
@@ -990,7 +1083,7 @@ def step_8_first_use(
             # Relay Credential. So when no message ever arrives after a skipped
             # pairing, name the one thing the user would otherwise never think
             # to check.
-            ctx.say(f"  {STEP_8_STALE_PAIRING_MESSAGE}")
+            _say_lines(ctx, STEP_8_STALE_PAIRING_MESSAGE)
 
     if code == SETUP_EXIT_OK:
         # Committed or cleanly handed off to the welcome double-tap. Either way
@@ -1001,7 +1094,7 @@ def step_8_first_use(
         # this line on exactly the run it was written for. `outcome` and the
         # `DETAIL_*` journal words are two vocabularies; never compare them.
         if not agent_mode_chosen_fn():
-            ctx.say(f"  {STEP_8_AGENT_MODE_CHOICE_MESSAGE}")
+            _say_lines(ctx, STEP_8_AGENT_MODE_CHOICE_MESSAGE)
         return StepRecord("first-use", STATUS_DONE, detail)
     status = STATUS_REFUSED if code == SETUP_EXIT_STOPPED else STATUS_FAILED
     return StepRecord("first-use", status, detail, exit_code=code)
@@ -1016,12 +1109,12 @@ __all__ = [
     "HEALTH_HEALTHY",
     "PAIRING_DENIED_REASON",
     "PAIRING_EXPIRED_REASON",
+    "PAIRING_WAITING_FOR_PHONE_PHASE",
     "PHONE_APPEARED",
     "PHONE_CARRIED_ON",
     "PHONE_FOUND",
     "PHONE_NO_TERMINAL",
     "PHONE_POLL_S",
-    "PHONE_SEEN_STATES",
     "PHONE_TIMEOUT",
     "PHONE_TURN_TIMEOUT_STATE",
     "PHONE_UNREADABLE",
@@ -1033,12 +1126,14 @@ __all__ = [
     "STEP_7_INPUT_WAIT_S",
     "STEP_7_MAX_NEW_CODES",
     "STEP_7_NEW_CODE_PROMPT",
-    "STEP_7_NOBODY_ENTERED_MESSAGE",
-    "STEP_7_NO_PHONE_CAUSE_MESSAGE",
+    "STEP_7_NO_ANSWER_MESSAGE",
+    "STEP_7_NO_PHONE_CAUSE_LINES",
+    "STEP_7_OPEN_PAIR_SCREEN_MESSAGE",
     "STEP_7_READY_LINES",
     "STEP_8_AGENT_MODE_CHOICE_MESSAGE",
     "STEP_DETAILS",
     "ask_for_a_new_code",
+    "new_code_answer",
     "collect_route_evidence",
     "first_use_detail",
     "hold_until_ready",

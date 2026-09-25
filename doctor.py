@@ -28,7 +28,9 @@ explicitly disproved #1275 path.
 A third check runs on the other side of that fork. :func:`plan_cert_precheck`
 fires only on a run with no route to probe and a Serve command about to be
 proposed, and asks whether this tailnet can issue the TLS certificate that
-command needs at all (#2672).
+command needs at all (#2672). It asks by reading ``tailscale status --json``
+and never by running ``tailscale cert``: an issued certificate puts the
+node's tailnet name in the public Certificate Transparency logs (#3648).
 """
 
 from __future__ import annotations
@@ -40,13 +42,20 @@ import shutil
 import socket
 import ssl
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
 from . import tailnet_dial
 from .relay_verifier import RelayVerifyOutcome, verify_relay_credential
-from .serve import phone_address, serve_port, tailscale_argv
+from .serve import (
+    normalize_dns_name,
+    phone_address,
+    read_status_document,
+    serve_port,
+    tailscale_argv,
+)
 from .snapshot import (
     OBSERVATION_ACTIVE,
     SERVE_CLASSIFICATIONS,
@@ -95,6 +104,11 @@ OUTCOME_RELAY_NO_CREDENTIAL = "relay_verifier_skipped_no_credential"
 #: which is a fact worth a finding. A tailnet without HTTPS certificates
 #: enabled produces exactly this on a route the classifier calls ready (#2672).
 OUTCOME_TLS_HANDSHAKE_FAILED = "probe_tls_handshake_failed"
+#: F11 (#3348). The node's own tailnet name did not resolve, so the probe never
+#: reached the network. Told apart from `probe_failed` because it is a specific,
+#: fixable local condition — a container or userspace node without MagicDNS —
+#: and reporting it as "observed nothing" sends the user to look at the route.
+OUTCOME_UNRESOLVED = "probe_name_unresolved"
 OUTCOME_CERT_AVAILABLE = "tls_cert_available"
 OUTCOME_CERT_UNAVAILABLE = "tls_cert_unavailable"
 OUTCOME_CERT_UNKNOWN = "tls_cert_unknown"
@@ -105,6 +119,7 @@ PROBE_OUTCOME_CODES = (
     OUTCOME_TIMEOUT,
     OUTCOME_FAILED,
     OUTCOME_TLS_HANDSHAKE_FAILED,
+    OUTCOME_UNRESOLVED,
     OUTCOME_CERT_AVAILABLE,
     OUTCOME_CERT_UNAVAILABLE,
     OUTCOME_CERT_UNKNOWN,
@@ -304,8 +319,10 @@ def _front_door_handshake(
         return OUTCOME_TLS_HANDSHAKE_FAILED
     except socket.gaierror:
         # The node name did not resolve. Tailscale DNS being unavailable is a
-        # local condition, not a verdict on the route.
-        return OUTCOME_FAILED
+        # local condition, not a verdict on the route — but it is a named,
+        # fixable one, so it gets its own code instead of disappearing into
+        # "observed nothing" (F11, #3348).
+        return OUTCOME_UNRESOLVED
     except OSError as exc:
         # Only errors that are genuinely the network answering "no" become a
         # negative claim. Everything else — a local file-descriptor limit, a
@@ -350,23 +367,94 @@ def _run_cert_command(args: List[str], timeout_s: float) -> Optional[Tuple[int, 
     )
 
 
-def tailnet_tls_cert_check(
+def _read_status_document(
+    timeout_s: float, runner: Optional[Callable[..., Any]] = None
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """One bounded, read-only ``tailscale status --json`` (a test seam)."""
+    return read_status_document(timeout_s=timeout_s, runner=runner)
+
+
+def cert_domains_outcome(document: Any, dns_name: str) -> str:
+    """Read a ``tailscale status --json`` document: can this node get a cert?
+
+    ``CertDomains`` is the list of names the tailnet's control plane will help
+    certify, and it is the same list ``tailscale cert`` checks before it
+    starts an ACME order. With HTTPS Certificates off in the admin console it
+    is empty (``null``), and ``tailscale cert`` then refuses for every name.
+
+    Three outcomes, as for :func:`tailnet_tls_cert_check`. Only a document
+    that carries the key with no names in it is :data:`OUTCOME_CERT_UNAVAILABLE`.
+    A document without the key at all (an older Tailscale, or not a status
+    document), or a list without this node's own name, is
+    :data:`OUTCOME_CERT_UNKNOWN`: withholds nothing and claims nothing.
+    """
+    if not isinstance(document, Mapping) or "CertDomains" not in document:
+        return OUTCOME_CERT_UNKNOWN
+    domains = document.get("CertDomains")
+    if domains is None or domains == []:
+        return OUTCOME_CERT_UNAVAILABLE
+    if not isinstance(domains, list):
+        return OUTCOME_CERT_UNKNOWN
+    wanted = (normalize_dns_name(dns_name) or "").lower()
+    names = {(normalize_dns_name(name) or "").lower() for name in domains}
+    if wanted and wanted in names:
+        return OUTCOME_CERT_AVAILABLE
+    return OUTCOME_CERT_UNKNOWN
+
+
+def tailnet_cert_domains_check(
     dns_name: str,
     timeout_s: float,
     *,
-    runner: Optional[Callable[[List[str], float], Optional[Tuple[int, str]]]] = None,
+    runner: Optional[Callable[..., Any]] = None,
 ) -> str:
     """Can this tailnet issue a TLS certificate for this node's own name?
 
     `tailscale serve --tls-terminated-tcp` needs one, and a tailnet with
     HTTPS Certificates turned off in the admin console silently cannot supply
     it: the route applies, `serve status` classifies it ``ready``, and every
-    connection through it then dies in a TLS alert. That is #2672, and the
-    whole cost of finding it out is this one bounded call.
+    connection through it then dies in a TLS alert. That is #2672.
 
-    The certificate is written to the null device rather than to stdout. A
-    private key must never enter a captured buffer, and this check wants only
-    the exit status.
+    This is the check doctor and the Cloudways ladder's consent run BEFORE
+    anyone agreed to a route, so it must change nothing (#3648). It reads
+    ``tailscale status --json`` and nothing else (:func:`cert_domains_outcome`).
+    It never runs ``tailscale cert``: an issued certificate is logged in the
+    public Certificate Transparency logs under the node's tailnet name, and a
+    person who then answers no would still have had that name published.
+
+    ``runner`` is a ``subprocess.run``-shaped callable, as for
+    :func:`serve.read_status_document`. Any read failure is
+    :data:`OUTCOME_CERT_UNKNOWN`.
+    """
+    try:
+        document, code = _read_status_document(timeout_s, runner)
+    except Exception:  # noqa: BLE001 - a substituted runner may raise anything
+        return OUTCOME_CERT_UNKNOWN
+    if document is None:
+        return OUTCOME_CERT_UNKNOWN
+    return cert_domains_outcome(document, dns_name)
+
+
+def tailnet_tls_cert_check(
+    dns_name: str,
+    timeout_s: float,
+    *,
+    runner: Optional[Callable[[List[str], float], Optional[Tuple[int, str]]]] = None,
+) -> str:
+    """Ask Tailscale for this node's TLS certificate, and read the answer.
+
+    This ISSUES the certificate when Tailscale does not hold one yet, and an
+    issued certificate is logged publicly under the node's tailnet name. It
+    is therefore never a precheck (#3648): it runs only after the person typed
+    ``yes`` to the route (the Cloudways ladder's certificate wait). Anything
+    that must change nothing uses :func:`tailnet_cert_domains_check`.
+
+    The certificate is written into a private temporary directory that is
+    deleted straight after the call (:func:`private_cert_dir`), never to
+    stdout: a private key must never enter a captured buffer, and this check
+    wants only the exit status. It used to go to the null device, which
+    Tailscale 1.102.x refuses, so the check could never say "available"
+    (#3593).
 
     Three outcomes, and the third is the important one. Only Tailscale's own
     "this tailnet cannot issue certs" refusal produces
@@ -375,25 +463,54 @@ def tailnet_tls_cert_check(
     nothing and claims nothing.
     """
     runner = _run_cert_command if runner is None else runner
-    null_device = os.devnull
     try:
-        answer = runner(
-            [
-                *tailscale_argv(),
-                "cert",
-                "--cert-file",
-                null_device,
-                "--key-file",
-                null_device,
-                dns_name,
-            ],
-            timeout_s,
-        )
+        cert_dir = private_cert_dir()
+    except OSError:
+        return OUTCOME_CERT_UNKNOWN
+    try:
+        answer = runner(cert_command(dns_name, cert_dir), timeout_s)
     except Exception:  # noqa: BLE001 - a substituted runner may raise anything
         return OUTCOME_CERT_UNKNOWN
+    finally:
+        remove_cert_dir(cert_dir)
     if answer is None:
         return OUTCOME_CERT_UNKNOWN
     returncode, message = answer
+    return cert_outcome(returncode, message)
+
+
+def private_cert_dir() -> str:
+    """A fresh directory only this user can read, for one ``tailscale cert``.
+
+    Tailscale 1.102.x refuses any output that is not a regular file ("/dev/null
+    already exists and is not a regular file", #3593). The files land here
+    instead, under a mode 700 directory, and :func:`remove_cert_dir` deletes
+    them as soon as the call is over.
+    """
+    return tempfile.mkdtemp(prefix="ocuclaw-cert-")
+
+
+def remove_cert_dir(path: Optional[str]) -> None:
+    """Delete a :func:`private_cert_dir` and everything in it. Never raises."""
+    if path:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def cert_command(dns_name: str, cert_dir: str) -> List[str]:
+    """The one ``tailscale cert`` argv, writing into ``cert_dir``."""
+    return [
+        *tailscale_argv(),
+        "cert",
+        "--cert-file",
+        os.path.join(cert_dir, "cert.pem"),
+        "--key-file",
+        os.path.join(cert_dir, "key.pem"),
+        dns_name,
+    ]
+
+
+def cert_outcome(returncode: int, message: str) -> str:
+    """Read one finished ``tailscale cert``: available, unavailable or unknown."""
     if returncode == 0:
         return OUTCOME_CERT_AVAILABLE
     lowered = str(message or "").lower()
@@ -416,6 +533,9 @@ def plan_cert_precheck(facts: Mapping[str, Any]) -> Optional[ProbeCheck]:
     is a run whose route is ``absent`` or ``wrong`` and whose route probes
     were therefore all skipped. Nothing is planned on a ``ready`` route, where
     the front-door check already reports a TLS refusal directly.
+
+    Side-effect free (#3648): it reads ``tailscale status --json`` and never
+    issues a certificate (:func:`tailnet_cert_domains_check`).
     """
     if facts.get("serveClassification") not in {"absent", "wrong"}:
         return None
@@ -425,7 +545,7 @@ def plan_cert_precheck(facts: Mapping[str, Any]) -> Optional[ProbeCheck]:
     return ProbeCheck(
         name=CHECK_TAILNET_TLS_CERT,
         timeout_s=PROBE_DEFAULT_TIMEOUT_S,
-        run=lambda allowance: tailnet_tls_cert_check(dns_name, allowance),
+        run=lambda allowance: tailnet_cert_domains_check(dns_name, allowance),
     )
 
 
@@ -691,6 +811,7 @@ def _clear_probe_facts(facts: Mapping[str, Any]) -> Dict[str, Any]:
     updated["serveProbedAt"] = None
     updated["serveTlsCertAvailable"] = TRISTATE_UNKNOWN
     updated["serveFrontDoorTlsError"] = False
+    updated["serveFrontDoorUnresolved"] = False
     return updated
 
 
@@ -750,6 +871,13 @@ def apply_probe_outcomes(
             # that the front door refuses TLS, which the deriver turns into a
             # finding instead of silence.
             updated["serveFrontDoorTlsError"] = True
+            observed = True
+        elif reachability.result_code == OUTCOME_UNRESOLVED:
+            # Reachability stays unknown on purpose: nothing left this host, so
+            # nothing was learned about the route. What IS established is that
+            # this node cannot resolve its own tailnet name, which the deriver
+            # turns into its own finding (F11, #3348).
+            updated["serveFrontDoorUnresolved"] = True
             observed = True
 
     if certificate is not None:

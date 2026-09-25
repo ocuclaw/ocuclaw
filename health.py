@@ -38,9 +38,9 @@ PLATFORM_NAME = "ocuclaw"
 BUNDLE_DIR = Path(__file__).resolve().parent
 DEFAULT_RUNTIME_ENTRY = BUNDLE_DIR / "dist-cjs" / "runtime" / "hermes-runtime-entry.cjs"
 
-CERTIFIED_HERMES_VERSION = "0.21.3"
-CERTIFIED_HERMES_TAG = "v2026.9.14"
-CERTIFIED_HERMES_COMMIT = "345cd2b057a452236de401d3534b8502a7465e8d"
+CERTIFIED_HERMES_VERSION = "0.21.5"
+CERTIFIED_HERMES_TAG = "v2026.9.24"
+CERTIFIED_HERMES_COMMIT = "f97608f178d1ffeca59860195ab7da295f7c8e5f"
 SUPPORTED_HERMES_MIN = (0, 21, 1)
 SUPPORTED_HERMES_MAX_EXCLUSIVE = (0, 22, 0)
 
@@ -52,11 +52,14 @@ OCUCLAW_WEARER_USER_ID = "ocuclaw-wearer"
 OCUCLAW_RELAY_TOKEN_ENV = "OCUCLAW_RELAY_TOKEN"
 OCUCLAW_SONIOX_API_KEY_ENV = "OCUCLAW_SONIOX_API_KEY"
 OCUCLAW_EVEN_AI_TOKEN_ENV = "OCUCLAW_EVEN_AI_TOKEN"
+# Silent input's TypeSafe key (#3359); the same `.env` contract as the others.
+OCUCLAW_TYPESAFE_API_KEY_ENV = "OCUCLAW_TYPESAFE_API_KEY"
 
 _SECRET_ENV_TO_KEY = {
     OCUCLAW_RELAY_TOKEN_ENV: "relayToken",
     OCUCLAW_SONIOX_API_KEY_ENV: "sonioxApiKey",
     OCUCLAW_EVEN_AI_TOKEN_ENV: "evenAiToken",
+    OCUCLAW_TYPESAFE_API_KEY_ENV: "typesafeApiKey",
 }
 
 # Non-secret platform settings that may also come from the Hermes env file
@@ -320,13 +323,84 @@ def supported_hermes_range() -> str:
     return f">={minimum},<{maximum}"
 
 
-def hermes_version() -> str:
-    try:
-        from hermes_cli import __version__
+# ``hermes_cli.__release_date__`` of each release in the supported range. A
+# checkout with no install stamp and no release tags (an old ``--depth 1``
+# install that pulled newer main) still carries the date of the release it
+# descends from. Only a date listed here identifies a version, so an unknown or
+# newer date stays unidentified and is refused.
+HERMES_RELEASE_DATES = {
+    "2026.9.7": "0.21.1",
+    "2026.9.11": "0.21.2",
+    "2026.9.14": "0.21.3",
+    "2026.9.21": "0.21.4",
+    "2026.9.24": "0.21.5",
+}
 
-        return str(__version__ or "")
-    except Exception:  # noqa: BLE001 - diagnostics stay available on ABI drift
+HERMES_VERSION_UNKNOWN_HINT = (
+    "OcuClaw could not identify the Hermes version (no install stamp, no "
+    "release tag and no known release date). Update Hermes with "
+    "`hermes update` or re-run the Hermes installer, then restart the gateway"
+)
+
+
+def _identified_version(raw: Any) -> str:
+    """``raw`` as a version string, or "" for missing/placeholder values."""
+    text = str(raw or "").strip()
+    parsed = parse_version(text)
+    if parsed is None or parsed == (0, 0, 0):
         return ""
+    return text
+
+
+def _version_from_attribute() -> str:
+    # A literal through 0.21.x. Since 2026-09-24 main serves it lazily from
+    # install-stamp.json and returns the "0.0.0" placeholder without a stamp.
+    from hermes_cli import __version__
+
+    return _identified_version(__version__)
+
+
+def _version_from_version_info() -> str:
+    # Hermes's canonical identity on main: install stamp, then live git (the
+    # nearest release tag). "unknown" when neither exists.
+    from hermes_cli.version_info import get_version_info
+
+    return _identified_version(get_version_info().base_version)
+
+
+def _version_from_release_date() -> str:
+    from hermes_cli import __release_date__
+
+    date = str(__release_date__ or "").strip()
+    return HERMES_RELEASE_DATES.get(date, "")
+
+
+_HERMES_VERSION_SOURCES = (
+    _version_from_attribute,
+    _version_from_version_info,
+    _version_from_release_date,
+)
+
+
+def hermes_version() -> str:
+    """The running Hermes release version, or "" when nothing identifies it.
+
+    The ONE place the plugin reads the Hermes version. First usable source wins:
+    1. ``hermes_cli.__version__`` (skipping main's "0.0.0" placeholder);
+    2. ``hermes_cli.version_info.get_version_info().base_version``
+       (install stamp, then git release tags);
+    3. ``hermes_cli.__release_date__`` looked up in ``HERMES_RELEASE_DATES``.
+    Package metadata and pyproject are not used: main ships them as "0.0.0",
+    and an editable install's metadata keeps the version it was installed at.
+    """
+    for source in _HERMES_VERSION_SOURCES:
+        try:
+            version = source()
+        except Exception:  # noqa: BLE001 - diagnostics stay available on ABI drift
+            continue
+        if version:
+            return version
+    return ""
 
 
 def find_node() -> Optional[str]:

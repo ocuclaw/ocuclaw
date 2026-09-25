@@ -13,7 +13,47 @@ const INPUT_PREDICTION_METHODS = Object.freeze({
   test: "input.prediction.test",
 
   open: "input.prediction.open",
+
+  modelAllow: "input.prediction.model.allow",
 });
+
+const INPUT_PREDICTION_MODEL_LIST_CAP = 20;
+
+const INPUT_PREDICTION_MODEL_CHOICE_RE = /^[A-Za-z0-9._:@/-]{1,128}$/;
+
+const REPLY_MODEL_FAST_OUTPUT_COST_MAX = 6;
+
+const REPLY_MODEL_PRIORITY_TIER_RE = /-fast(?=$|[-_.:@/])/i;
+
+function replyModelSpeedFacts(modelId, costOutPerM = null, recommended = false) {
+  const out = {};
+  const id = typeof modelId === "string" ? modelId : "";
+  const cost = typeof costOutPerM === "number" && Number.isFinite(costOutPerM) && costOutPerM >= 0 ? costOutPerM : null;
+  if (cost !== null) out.costOutPerM = Math.round(cost * 1000) / 1000;
+  if (REPLY_MODEL_PRIORITY_TIER_RE.test(id)) {
+    out.fast = false;
+  } else if (recommended === true) {
+    out.fast = true;
+  } else if (cost !== null && cost > 0) {
+    out.fast = cost <= REPLY_MODEL_FAST_OUTPUT_COST_MAX;
+  }
+  return out;
+}
+
+const INPUT_PREDICTION_MODEL_ALLOW_STATUSES = Object.freeze(["saved", "policy-denied", "error"]);
+
+const INPUT_PREDICTION_MODEL_ALLOW_MODES = Object.freeze(["none", "hot_reload", "restart", "manual"]);
+
+function modelAllowResult(requestId, status, activation = null) {
+  const s = INPUT_PREDICTION_MODEL_ALLOW_STATUSES.includes(status) ? status : "error";
+  const a = activation && typeof activation === "object" ? activation : {};
+  const mode = INPUT_PREDICTION_MODEL_ALLOW_MODES.includes(a.mode) ? a.mode : (s === "saved" ? "manual" : "none");
+  return {
+    requestId: typeof requestId === "string" && INPUT_PREDICTION_MODEL_CHOICE_RE.test(requestId) ? requestId : "",
+    status: s,
+    activation: { required: s === "saved" ? a.required !== false : false, mode: s === "saved" ? mode : "none" },
+  };
+}
 
 const INPUT_PREDICTION_LIMITS = Object.freeze({
   maxContextChars: 512,
@@ -87,6 +127,40 @@ const INPUT_PREDICTION_PHONE_FORBIDDEN_KEYS = Object.freeze([
 
 const LETTER_RE = /^[A-Za-z]{1,31}$/;
 
+const INPUT_PREDICTION_CANDIDATE_SCHEMA_ALPHA = "alpha-v1";
+const INPUT_PREDICTION_CANDIDATE_SCHEMA_APOSTROPHE = "local-apostrophe-v1";
+const INPUT_PREDICTION_CANDIDATE_SCHEMAS = Object.freeze([
+  INPUT_PREDICTION_CANDIDATE_SCHEMA_ALPHA,
+  INPUT_PREDICTION_CANDIDATE_SCHEMA_APOSTROPHE,
+]);
+
+const INPUT_PREDICTION_UNSUPPORTED_SCHEMA_REASON = "invalid-request: unsupported candidateSchema";
+
+const APOSTROPHE_CANDIDATE_RE = /^[A-Za-z]+(?:'[A-Za-z]+)*$/;
+
+function normalizeCandidateSchema(params) {
+  const p = params && typeof params === "object" ? params : {};
+  if (p.candidateSchema === undefined || p.candidateSchema === null) {
+    return { ok: true, schema: INPUT_PREDICTION_CANDIDATE_SCHEMA_ALPHA, named: false };
+  }
+  const raw = p.candidateSchema;
+  if (typeof raw !== "string" || !INPUT_PREDICTION_CANDIDATE_SCHEMAS.includes(raw)) {
+    return { ok: false, schema: "", named: true };
+  }
+  return { ok: true, schema: raw, named: true };
+}
+
+function isCandidateUnderSchema(text, schema) {
+  if (typeof text !== "string" || text.length < 1 || text.length > INPUT_PREDICTION_LIMITS.maxPatternLength) return false;
+  if (schema === INPUT_PREDICTION_CANDIDATE_SCHEMA_ALPHA) return LETTER_RE.test(text);
+  if (schema === INPUT_PREDICTION_CANDIDATE_SCHEMA_APOSTROPHE) return APOSTROPHE_CANDIDATE_RE.test(text);
+  return false;
+}
+
+function candidateMatchKey(text) {
+  return String(text || "").toLowerCase().replace(/'/g, "");
+}
+
 function letterGroup(ch, ways) {
   const code = String(ch || "").toLowerCase().charCodeAt(0);
   if (!(code >= 97 && code <= 122)) return -1;
@@ -123,16 +197,19 @@ function patternCompatible(word, pattern, ways) {
   return true;
 }
 
-function normalizeCandidateWord(raw) {
+function normalizeCandidateWord(raw, schema = INPUT_PREDICTION_CANDIDATE_SCHEMA_ALPHA) {
   if (typeof raw !== "string") return null;
   const display = raw.trim();
-  if (!LETTER_RE.test(display)) return null;
-  return { display, key: display.toLowerCase() };
+  if (!isCandidateUnderSchema(display, schema)) return null;
+  return { display, key: display.toLowerCase(), matchKey: candidateMatchKey(display) };
 }
 
 function validateCandidates(list, opts) {
   const pattern = opts && typeof opts.pattern === "string" ? opts.pattern : "";
   const ways = normalizeWays(opts && opts.ways);
+  const schema = opts && typeof opts.candidateSchema === "string"
+    ? opts.candidateSchema
+    : INPUT_PREDICTION_CANDIDATE_SCHEMA_ALPHA;
   const cap = clampInt(opts && opts.maxCandidates, 1, INPUT_PREDICTION_LIMITS.maxCandidates, INPUT_PREDICTION_LIMITS.maxCandidates);
   const hidden = new Set(
     Array.isArray(opts && opts.hiddenKeys) ? opts.hiddenKeys.map((k) => String(k).toLowerCase()) : [],
@@ -142,11 +219,11 @@ function validateCandidates(list, opts) {
   let rejected = 0;
   const source = Array.isArray(list) ? list : [];
   for (const raw of source) {
-    const word = normalizeCandidateWord(raw);
+    const word = normalizeCandidateWord(raw, schema);
     if (!word) { rejected += 1; continue; }
     if (seen.has(word.key)) { rejected += 1; continue; }
     if (hidden.has(word.key)) { rejected += 1; continue; }
-    if (!patternCompatible(word.display, pattern, ways)) { rejected += 1; continue; }
+    if (!patternCompatible(word.matchKey, pattern, ways)) { rejected += 1; continue; }
     seen.add(word.key);
     candidates.push(word.display);
     if (candidates.length >= cap) break;
@@ -290,4 +367,4 @@ function policyRevisionOf(policy) {
   return `p${h.toString(16)}`;
 }
 
-module.exports = { INPUT_PREDICTION_PROTOCOL_VERSION, INPUT_PREDICTION_PURPOSE, INPUT_PREDICTION_PER_WORD_RETIRED_REASON, INPUT_PREDICTION_PROMPT_VERSION, INPUT_PREDICTION_METHODS, INPUT_PREDICTION_LIMITS, INPUT_PREDICTION_STATUSES, INPUT_PREDICTION_SPELLING_MODES, INPUT_PREDICTION_TEST_EXAMPLE, INPUT_PREDICTION_FORBIDDEN_KEYS, INPUT_PREDICTION_PHONE_FORBIDDEN_KEYS, letterGroup, normalizeWays, isPatternDigits, patternCompatible, normalizeCandidateWord, validateCandidates, findForbiddenKey, normalizePredictionRequest, predictionResult, normalizeUsage, predictionTelemetry, policyRevisionOf, INPUT_PREDICTION_JEV_LIMITS, normalizeJevContext };
+module.exports = { INPUT_PREDICTION_PROTOCOL_VERSION, INPUT_PREDICTION_PURPOSE, INPUT_PREDICTION_PER_WORD_RETIRED_REASON, INPUT_PREDICTION_PROMPT_VERSION, INPUT_PREDICTION_METHODS, INPUT_PREDICTION_LIMITS, INPUT_PREDICTION_STATUSES, INPUT_PREDICTION_SPELLING_MODES, INPUT_PREDICTION_TEST_EXAMPLE, INPUT_PREDICTION_FORBIDDEN_KEYS, INPUT_PREDICTION_PHONE_FORBIDDEN_KEYS, letterGroup, normalizeWays, isPatternDigits, patternCompatible, normalizeCandidateWord, validateCandidates, findForbiddenKey, normalizePredictionRequest, predictionResult, normalizeUsage, predictionTelemetry, policyRevisionOf, INPUT_PREDICTION_JEV_LIMITS, normalizeJevContext, INPUT_PREDICTION_MODEL_LIST_CAP, INPUT_PREDICTION_MODEL_CHOICE_RE, INPUT_PREDICTION_MODEL_ALLOW_STATUSES, INPUT_PREDICTION_MODEL_ALLOW_MODES, modelAllowResult, REPLY_MODEL_FAST_OUTPUT_COST_MAX, replyModelSpeedFacts, INPUT_PREDICTION_CANDIDATE_SCHEMA_ALPHA, INPUT_PREDICTION_CANDIDATE_SCHEMA_APOSTROPHE, INPUT_PREDICTION_CANDIDATE_SCHEMAS, INPUT_PREDICTION_UNSUPPORTED_SCHEMA_REASON, normalizeCandidateSchema, isCandidateUnderSchema, candidateMatchKey };

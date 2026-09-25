@@ -64,15 +64,83 @@ let controlSecret = ''
 let pollTimer = null
 let decisionStarted = false
 let sizeCancellationStarted = false
+let resultNotified = false
 let cancelRequested = false
 let activationProbeRunning = false
 let pairingActive = false
+// The reducer gets no window size. The last render records whether the QR
+// view fits, so `m` can refuse to switch to a QR that would not fit.
+let qrFitsWindow = false
+
+// #3521. A result code the setup tool maps to "make the Hermes window bigger".
+const WINDOW_TOO_SMALL = 'tui_window_too_small'
+// Hermes ui-tui Dialog (components/overlay.tsx): a round border (2 rows),
+// paddingY 1 (2 rows), the title and its margin (2 rows), the hint and its
+// margin (2 rows).
+const DIALOG_CHROME_ROWS = 8
+// Border and paddingX 2 take six columns. Two more spare cells keep Ink from
+// soft-wrapping a row that is exactly as wide as the inner box.
+const DIALOG_CHROME_COLUMNS = 8
+// The dialog keeps this many columns clear of the window edge.
+const WINDOW_MARGIN_COLUMNS = 4
 
 const clean = value => String(value ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').slice(0, 240)
-const requiredColumns = block => Math.max(0, ...String(block).split('\n').map(line => [...line].length))
-// Dialog adds two border rows, two vertical-padding rows, two title rows,
-// two hint rows, plus the blank and two instruction rows below the QR.
-const requiredRows = block => String(block).split('\n').length + 11
+const textRows = lines => lines.flatMap(line => String(line ?? '').split('\n'))
+const requiredColumns = block => Math.max(0, ...textRows([block]).map(line => [...line].length))
+// The window size a dialog needs to show these exact lines (plus its title
+// and hint) with no wrapped or clipped row.
+const viewSize = ({ title = '', hint = '', lines }) => ({
+  cols: requiredColumns(textRows([title, hint, ...lines]).join('\n')) + DIALOG_CHROME_COLUMNS + WINDOW_MARGIN_COLUMNS,
+  rows: textRows(lines).length + DIALOG_CHROME_ROWS,
+})
+const fitsWindow = (size, cols, rows) => cols >= size.cols && rows >= size.rows
+const largerSize = (...sizes) => ({
+  cols: Math.max(...sizes.map(size => size.cols)),
+  rows: Math.max(...sizes.map(size => size.rows)),
+})
+const PAIRING_TITLE = 'Pair OcuClaw phone'
+const QR_HINT = 'm shows Manual · Esc/q cancels'
+const MANUAL_HINT = 'm shows QR · Esc/q cancels'
+const MANUAL_ONLY_HINT = 'Esc/q cancels · a bigger window shows the QR'
+const WORDS_HINT = '↑/↓ choose · Enter confirms · Esc/q refuses'
+const qrLines = state => [
+  state.qrBlock,
+  '',
+  // F17 (#3348). "Take a photo of the QR code" is the phone control.
+  'In Even Hub open OcuClaw, tap Pair with your computer,',
+  'then Take a photo of the QR code.',
+  'The screen advances automatically when the phone connects.',
+]
+const manualLines = state => [
+  // F17 (#3348). Only the controls the phone app actually shows:
+  // "Pair with your computer", "Enter the pairing code instead".
+  'In Even Hub open OcuClaw, tap Pair with your computer,',
+  'then Enter the pairing code instead:',
+  '',
+  String(state.addressLine ?? ''),
+  String(state.codeLine ?? ''),
+  '',
+  'This is the same one-time encrypted exchange.',
+  'The screen advances automatically when the phone connects.',
+]
+const wordsLines = state => [
+  `Phone: ${state.phoneLabel ?? ''}`,
+  '',
+  `    ${state.phrase ?? ''}`,
+  '',
+  'Approve only if all four words match in order on the phone.',
+  '',
+  `${state.selection === 'yes' ? '›' : ' '} Yes — all four words match`,
+  `${state.selection === 'no' ? '›' : ' '} No — refuse this phone`,
+]
+// The smallest window the whole ceremony fits in without the QR: the manual
+// view now, then the four-word check (its phrase is not known yet, so this
+// counts the fixed lines; the four short words fit well inside them).
+const manualMinimumSize = state => largerSize(
+  viewSize({ title: PAIRING_TITLE, hint: MANUAL_ONLY_HINT, lines: manualLines(state) }),
+  viewSize({ title: PAIRING_TITLE, hint: WORDS_HINT, lines: wordsLines({}) }),
+)
+const qrViewSize = state => viewSize({ title: PAIRING_TITLE, hint: QR_HINT, lines: qrLines(state) })
 const blendWithWhite = (value, opacity = QR_WATERMARK_OPACITY) => {
   const source = String(value ?? '').trim()
   const short = /^#([0-9a-f]{3})$/i.exec(source)
@@ -121,19 +189,46 @@ const qrWatermarkRuns = (block, watermarkColor) => {
     return runs
   })
 }
+// BEGIN pairing-bootstrap-parser
+// Keep this block byte-identical in tui-widgets/ocuclaw-pair.mjs and
+// desktop-template/plugin.js. tests/hermes-pairing-bootstrap-contract.test.js
+// feeds both copies the text the relay presenter really prints.
+// The parts are found by shape, not by the words around them: the QR is the
+// longest run of equal-width half-block rows, and the manual details are the
+// "Address:" and "Pairing code:" lines at any indent. The 2.0.9 rewording broke
+// a wording-based parser; a shape-based one survives the next rewording.
+const PAIRING_QR_ROW = /^[ ▀▄█]+$/
+const parsePairingBootstrap = block => {
+  const lines = String(block ?? '').split('\n').map(line => line.replace(/\r$/, ''))
+  const labelled = label => {
+    const line = lines.find(candidate => candidate.trimStart().startsWith(label))
+    const value = line ? line.trim().slice(label.length).trim() : ''
+    return value ? `${label} ${value}` : ''
+  }
+  let qrLines = []
+  let run = []
+  for (const line of [...lines, '']) {
+    const isRow = PAIRING_QR_ROW.test(line)
+    if (isRow && (run.length === 0 || [...run[0]].length === [...line].length)) {
+      run.push(line)
+      continue
+    }
+    if (run.length > qrLines.length) qrLines = run
+    run = isRow ? [line] : []
+  }
+  const width = qrLines.length ? [...qrLines[0]].length : 0
+  const address = labelled('Address:')
+  const code = labelled('Pairing code:')
+  if (qrLines.length < 10 || width < 10 || !qrLines.some(line => line.trim()) || !address || !code) return null
+  return { qrLines, address, code }
+}
+// END pairing-bootstrap-parser
 const splitBootstrap = block => {
-  const lines = String(block).split('\n')
-  const scanIndex = lines.indexOf('  Scan this code with the Even app:')
-  const manualIndex = lines.indexOf('  Or pair manually — in the Even app, choose "Enter manually":')
-  const addressLine = lines.find(line => line.startsWith('    Address:'))
-  const codeLine = lines.find(line => line.startsWith('    Pairing code:'))
-  const qrLines = scanIndex >= 0 && manualIndex > scanIndex ? lines.slice(scanIndex + 2, manualIndex - 1) : []
-  const qrWidth = requiredColumns(qrLines.join('\n'))
-  if (qrLines.length < 10 || qrWidth < 10 || qrLines.some(line => [...line].length !== qrWidth) || !addressLine || !codeLine) return null
-  return {
-    qrBlock: qrLines.join('\n'),
-    addressLine: clean(addressLine.trim()),
-    codeLine: clean(codeLine.trim()),
+  const parsed = parsePairingBootstrap(block)
+  return parsed && {
+    qrBlock: parsed.qrLines.join('\n'),
+    addressLine: clean(parsed.address),
+    codeLine: clean(parsed.code),
   }
 }
 const terminalCode = body => {
@@ -207,6 +302,8 @@ export default function register(sdk) {
   }
 
   const outcome = body => {
+    // A window-size cancel already owns the panel and the result (#3521).
+    if (sizeCancellationStarted) return
     clearTimeout(pollTimer)
     controlSecret = ''
     const state = clean(body?.state) || 'failed'
@@ -233,6 +330,7 @@ export default function register(sdk) {
   const poll = async () => {
     try {
       const { status, body } = await control('state')
+      if (sizeCancellationStarted) return
       if (status !== 200) return fail('state_refused', `The relay refused the pairing status check (${status}).`)
       if (TERMINAL_PAIRING_STATES.has(body.state)) return outcome(body)
       if (body.prompt?.safetyPhraseText) {
@@ -279,6 +377,8 @@ export default function register(sdk) {
       if (!body.controlSecret || !bootstrap) return fail('invalid_create_response', 'The relay returned an unusable pairing request.')
       controlSecret = String(body.controlSecret)
       if (cancelRequested) return void decide('cancel')
+      // The QR is the preferred view. PairingView opens the manual view
+      // instead whenever the QR does not fit this window (#3521).
       setState({
         phase: 'qr',
         view: 'qr',
@@ -286,7 +386,6 @@ export default function register(sdk) {
         addressLine: bootstrap.addressLine,
         codeLine: bootstrap.codeLine,
         blockColumns: requiredColumns(bootstrap.qrBlock),
-        blockRows: requiredRows(bootstrap.qrBlock),
       })
       schedulePoll()
     } catch {
@@ -294,10 +393,34 @@ export default function register(sdk) {
     }
   }
 
-  const cancelForSize = () => {
+  // #3521. Below the manual/four-word minimum the ceremony cannot be shown at
+  // all. Cancel the relay exchange, keep the reason on screen, and hand the
+  // setup tool the result now: the person must not have to press Enter before
+  // the assistant can say "make the window bigger".
+  const cancelForSize = window => {
     if (sizeCancellationStarted) return
     sizeCancellationStarted = true
-    void decide('cancel')
+    decisionStarted = true
+    resultNotified = true
+    clearTimeout(pollTimer)
+    const current = config
+    const result = { outcomeState: 'cancelled', code: WINDOW_TOO_SMALL, window }
+    setState({
+      ...result,
+      phase: 'outcome',
+      title: 'Make this Hermes window bigger',
+      message: [
+        `Pairing needs at least ${window.minCols} columns × ${window.minRows} rows.`,
+        `This window is ${window.cols} columns × ${window.rows} rows.`,
+        'Nothing was paired. Make the window bigger,',
+        'then retry pairing from the setup assistant.',
+      ].join('\n'),
+    })
+    void (async () => {
+      try { if (controlSecret) await control('cancel') } catch {}
+      controlSecret = ''
+      await notify(current, result)
+    })()
   }
 
   const requestCancel = () => {
@@ -308,7 +431,19 @@ export default function register(sdk) {
 
   const notify = async (current, state) => {
     if (!current) return
-    const payload = JSON.stringify({ v: 1, runId: current.runId, state: state.outcomeState, code: state.code })
+    const payload = JSON.stringify({
+      v: 1,
+      runId: current.runId,
+      state: state.outcomeState,
+      code: state.code,
+      // Window dimensions only: they let the tool name the size to reach.
+      ...(state.code === WINDOW_TOO_SMALL && state.window ? {
+        cols: state.window.cols,
+        rows: state.window.rows,
+        minCols: state.window.minCols,
+        minRows: state.window.minRows,
+      } : {}),
+    })
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
         const response = await fetch(current.callbackUrl, {
@@ -330,25 +465,42 @@ export default function register(sdk) {
     controlSecret = ''
     decisionStarted = false
     sizeCancellationStarted = false
+    resultNotified = false
+    qrFitsWindow = false
     cancelRequested = false
   }
 
   const closeOutcome = state => {
     const current = config
+    const alreadyNotified = resultNotified
     resetPairingSession()
-    void notify(current, state)
+    if (!alreadyNotified) void notify(current, state)
     return null
   }
 
   const PairingView = ({ cols, rows, state, t }) => {
-    const tooNarrow = state.phase === 'qr' && state.blockColumns > Math.max(0, cols - 12)
-    const tooShort = state.phase === 'qr' && state.blockRows > rows
-    const tooSmall = tooNarrow || tooShort
+    // #3521. The QR (about 43 rows) is the preferred view, but only when it
+    // fits. Otherwise the manual view (address + code for the same exchange)
+    // opens instead. Cancel only when even the manual and four-word views do
+    // not fit. Every size is measured from the lines this view renders.
+    const inQr = state.phase === 'qr'
+    const qrSize = inQr ? qrViewSize(state) : null
+    const minimum = inQr ? manualMinimumSize(state) : null
+    const qrFits = inQr && fitsWindow(qrSize, cols, rows)
+    const tooSmall = inQr && !fitsWindow(minimum, cols, rows)
+    const showQr = inQr && qrFits && state.view !== 'manual'
+    if (inQr) qrFitsWindow = qrFits
     sdk.React.useEffect(() => {
-      if (tooSmall) cancelForSize()
-    }, [tooSmall])
+      if (tooSmall) {
+        cancelForSize({ cols, rows, minCols: minimum.cols, minRows: minimum.rows })
+      } else if (inQr && !qrFits && state.view !== 'manual') {
+        // Stay on the manual view: growing the window later must not swap
+        // the view under someone typing the code; `m` offers the QR then.
+        setState({ view: 'manual' })
+      }
+    }, [tooSmall, qrFits, inQr, state.view])
 
-    let title = state.title || 'Pair OcuClaw phone'
+    let title = state.title || PAIRING_TITLE
     let hint = 'Esc/q cancels'
     let width = Math.min(76, Math.max(48, cols - 6))
     let lines = []
@@ -358,45 +510,31 @@ export default function register(sdk) {
       hint = 'Enter/Esc closes'
       lines = ['Pairing opens automatically from the host-owned /ocuclaw-setup flow.']
     } else if (tooSmall) {
-      title = 'Widen this Hermes window'
+      // One frame until the effect above moves the panel to its outcome.
+      title = 'Make this Hermes window bigger'
       lines = [
-        `Pairing needs at least ${state.blockColumns + 12} columns × ${state.blockRows} rows.`,
+        `Pairing needs at least ${minimum.cols} columns × ${minimum.rows} rows.`,
         `This window is ${cols} columns × ${rows} rows.`,
-        'The exchange is being cancelled safely. Enlarge the window and continue setup.',
       ]
     } else if (state.phase === 'loading') {
       lines = ['Opening a one-time encrypted pairing exchange…']
-    } else if (state.phase === 'qr') {
-      // Dialog/Text reserve four inner cells beyond the visible border. Give
-      // every canonical QR row that exact space so Ink never soft-wraps it.
-      width = Math.min(cols - 4, Math.max(68, state.blockColumns + 8))
-      if (state.view === 'manual') {
-        hint = 'm shows QR · Esc/q cancels'
-        lines = [
-          'In the OcuClaw phone app, choose Enter manually:',
-          '',
-          state.addressLine,
-          state.codeLine,
-          '',
-          'This is the same one-time encrypted exchange.',
-          'The screen advances automatically when the phone connects.',
-        ]
+    } else if (inQr) {
+      // Give every canonical QR row its exact space so Ink never soft-wraps
+      // it; the manual view keeps the same width when the QR fits.
+      width = Math.min(
+        cols - WINDOW_MARGIN_COLUMNS,
+        Math.max(68, (qrFits ? qrSize : minimum).cols - WINDOW_MARGIN_COLUMNS),
+      )
+      if (showQr) {
+        hint = QR_HINT
+        lines = qrLines(state)
       } else {
-        hint = 'm shows Manual · Esc/q cancels'
-        lines = [state.qrBlock, '', 'Scan this QR in the OcuClaw phone app.', 'The screen advances automatically when the phone connects.']
+        hint = qrFits ? MANUAL_HINT : MANUAL_ONLY_HINT
+        lines = manualLines(state)
       }
     } else if (state.phase === 'words') {
-      hint = '↑/↓ choose · Enter confirms · Esc/q refuses'
-      lines = [
-        `Phone: ${state.phoneLabel}`,
-        '',
-        `    ${state.phrase}`,
-        '',
-        'Approve only if all four words match in order on the phone.',
-        '',
-        `${state.selection === 'yes' ? '›' : ' '} Yes — all four words match`,
-        `${state.selection === 'no' ? '›' : ' '} No — refuse this phone`,
-      ]
+      hint = WORDS_HINT
+      lines = wordsLines(state)
     } else if (state.phase === 'deciding') {
       lines = [state.message]
     } else if (state.phase === 'outcome') {
@@ -406,7 +544,7 @@ export default function register(sdk) {
 
     return h(Overlay, { backdrop: true, zone: 'center' },
       h(Dialog, { title, hint, width }, ...lines.map((line, index) => {
-        const isQrBlock = state.phase === 'qr' && state.view !== 'manual' && index === 0
+        const isQrBlock = showQr && index === 0
         if (isQrBlock) {
           const children = []
           const rows = qrWatermarkRuns(line, blendWithWhite(t.color.accent))
@@ -462,7 +600,9 @@ export default function register(sdk) {
         return state
       }
       if (state.phase === 'qr' && ch === 'm') {
-        return { ...state, view: state.view === 'manual' ? 'qr' : 'manual' }
+        // #3521: `m` offers the QR only when the QR fits this window.
+        if (state.view === 'manual') return qrFitsWindow ? { ...state, view: 'qr' } : state
+        return { ...state, view: 'manual' }
       }
       if (cancelKey && (state.phase === 'loading' || state.phase === 'qr')) {
         requestCancel()
@@ -520,6 +660,8 @@ export default function register(sdk) {
       controlSecret = ''
       decisionStarted = false
       sizeCancellationStarted = false
+      resultNotified = false
+      qrFitsWindow = false
       cancelRequested = false
       pairingActive = true
       defineWidgetApp(app)

@@ -25,17 +25,17 @@ This installable repository is generated from the OcuClaw monorepo. Published
 copies include the generated-artifact provenance notice and are updated only by
 the bundle publisher; do not hand-edit an installed checkout.
 
-The human-facing baseline is Hermes release `v2026.9.14`. Its package version
-`0.21.3` and certified commit
-`345cd2b057a452236de401d3534b8502a7465e8d` are separate identities. The
-current bundle, shared plugin, and client train is 2.0.9; the bundled setup
-guide has its own `1.3.22-hermes` version. The bidirectional client/plugin
+The human-facing baseline is Hermes release `v2026.9.24`. Its package version
+`0.21.5` and certified commit
+`f97608f178d1ffeca59860195ab7da295f7c8e5f` are separate identities. The
+current bundle, shared plugin, and client train is 2.1.0; the bundled setup
+guide has its own `1.3.24-hermes` version. The bidirectional client/plugin
 compatibility floors are `2.0.2`. This beta bundle ships from the GitHub
 repository only; it has no npm or ClawHub publication leg.
 
 ## Requirements
 
-- Hermes `>=0.21.1,<0.22.0` (Hermes 0.21.1 and later 0.21.x; certified baseline `0.21.3`).
+- Hermes `>=0.21.1,<0.22.0` (Hermes 0.21.1 and later 0.21.x; certified baseline `0.21.5`).
 - Tailscale on the Hermes host and the phone for the authenticated external
   relay route.
 - The OcuClaw app installed through Even Hub on the phone and Even G2.
@@ -80,7 +80,7 @@ profiles as a repair.
 
 <!-- ocuclaw:install-block:start -->
 OcuClaw needs Hermes `>=0.21.1,<0.22.0`; the certified baseline is Hermes
-`0.21.3`. Install it once, in the default Hermes profile: that profile owns the
+`0.21.5`. Install it once, in the default Hermes profile: that profile owns the
 relay the glasses pair to, and a second copy in another profile is never the
 answer.
 
@@ -94,11 +94,10 @@ invitation, and the software itself is still beta.
 **Terminal first.** This is the supported path and the one every beta build is
 tested on:
 
-**Cloudways managed Hermes: install, restart once, then one command.**
+**Cloudways managed Hermes: install, then one command. Do not restart yet.**
 
 ```bash
 hermes plugins install ocuclaw/ocuclaw --enable
-hermes gateway restart
 hermes ocuclaw cloudways setup
 ```
 
@@ -109,10 +108,16 @@ already done. It asks twice, showing exactly what changes and defaulting to no.
 There is no retry flag: run the same command again and it continues where it
 stopped.
 
-**One restart, one run.** The restart above is the only one this install needs.
-If anything interrupts the run, including a restart that closes SSH, Hermes and
-tmux, reconnect with the Cloudways SSH command and run the same command again:
-it skips what is done and carries on from there.
+**One restart, asked for at step 3.** Ignore the restart line
+`hermes plugins install` prints. Setup saves its settings at step 2, then step 3
+checks whether your agent has loaded OcuClaw. On a fresh install it has not, so
+step 3 stops and asks for the one gateway restart that loads OcuClaw and applies
+those settings together: type `hermes gateway restart`. On Cloudways that
+restarts the whole container and closes SSH, Hermes and tmux, so reconnect with
+the Cloudways SSH command and run `hermes ocuclaw cloudways setup` again: it
+skips what is done and carries on from there. A host whose service manager owns
+the gateway asks first at step 3, restarts it for you, and carries on in the
+same run. If anything else interrupts the run, run the same command again.
 
 **The command looks for your phone before it pairs it.** Step 5 asks you to
 install Tailscale on the phone and approve the link there. Step 7 then checks
@@ -144,15 +149,14 @@ and requests one planned activation restart. Resume that setup session by its
 ID; do not blindly reopen the latest chat. Saved configuration is not gateway
 activation: the assistant must verify the new gateway and relay.
 
-For other hosts, the direct install/restart sequence is:
+For other hosts in a terminal, install, then go straight to setup:
 
 ```bash
 hermes plugins install ocuclaw/ocuclaw --enable
 hermes config set display.interface tui   # the pairing panel lives in the TUI
-hermes gateway restart
 ```
 
-Then, in bare `hermes` or in Hermes Desktop:
+Then, in a fresh `hermes --tui`:
 
 ```text
 /ocuclaw-setup
@@ -161,7 +165,9 @@ Then, in bare `hermes` or in Hermes Desktop:
 `hermes plugins install` prints that restart instruction and stops there — it
 never restarts the gateway for you. Until the gateway restarts, OcuClaw is
 installed but not loaded by that managed gateway, and nothing about the glasses
-works through it yet. A fresh TUI can prepare setup before that activation.
+works through it yet. A fresh TUI can prepare setup before that activation, so
+do not restart yet: `/ocuclaw-setup` saves its settings first and then asks for
+one gateway restart, which loads OcuClaw and applies those settings together.
 
 **Run `hermes` in a real terminal.** The TUI boots only when stdin *and*
 stdout are a TTY, so a piped or captured run — `hermes | tee log`, a CI

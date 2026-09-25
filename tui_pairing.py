@@ -55,6 +55,50 @@ RECEIPT_WAIT_SECONDS = 5.0
 _ALLOWED_STATES = frozenset({"completed", "failed", "cancelled", "refused"})
 _SAFE_CODE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,79}$")
 _SAFE_CHALLENGE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+# #3521. The panel reports this when even its manual view does not fit the
+# Hermes window. Only this code may carry the window size, and only as four
+# small integers: the actual size and the size the panel needs.
+WINDOW_TOO_SMALL_CODE = "tui_window_too_small"
+_WINDOW_KEYS = ("cols", "rows", "minCols", "minRows")
+_CALLBACK_KEYS = frozenset({"v", "runId", "state", "code"})
+# A Python launcher between the TUI and this worker: the Windows venv
+# python.exe (a uv trampoline or the stdlib venv launcher) that starts the real
+# interpreter as its child. Only these are skipped when finding the TUI.
+_PYTHON_LAUNCHER_NAME = re.compile(r"^pythonw?(\d+(\.\d+)*)?(\.exe)?$", re.IGNORECASE)
+_MAX_LAUNCHER_HOPS = 2
+
+
+def resolve_owner_tui_pid(parents: Optional[Callable[[], Any]] = None) -> int:
+    """Return the pid of the Hermes TUI that owns this setup turn.
+
+    The widget reports its own Node pid. On Linux and macOS the TUI spawns the
+    gateway Python directly, so the direct parent is the TUI. On Windows the
+    venv ``python.exe`` is a launcher that starts the real interpreter as a
+    child, so the direct parent is that launcher and the claim never matched
+    (#3375). Skip only Python launchers, then stop at the first other process:
+    a farther Node process (an editor terminal, say) is never picked. With no
+    psutil, or an ancestry that cannot be read, the direct parent is kept.
+    """
+    direct_parent = os.getppid()
+    try:
+        if parents is None:
+            import psutil  # A Hermes core dependency, still optional here.
+
+            parents = psutil.Process().parents
+        chain = list(parents())
+    except Exception:  # noqa: BLE001 - unreadable ancestry keeps the old owner
+        return direct_parent
+    for hop, process in enumerate(chain[: _MAX_LAUNCHER_HOPS + 1]):
+        try:
+            name = str(process.name())
+            pid = int(process.pid)
+        except Exception:  # noqa: BLE001 - a vanished or denied ancestor
+            return direct_parent
+        if hop == 0 and pid != direct_parent:
+            return direct_parent
+        if _PYTHON_LAUNCHER_NAME.fullmatch(name) is None:
+            return pid
+    return direct_parent
 
 
 def widget_path(home: Path) -> Path:
@@ -282,7 +326,11 @@ class _ActivationState:
     def accept(self, token: str, payload: Any) -> bool:
         if not hmac.compare_digest(str(token), self.token):
             return False
-        if not isinstance(payload, Mapping) or set(payload) != {"v", "runId", "state", "code"}:
+        if not isinstance(payload, Mapping):
+            return False
+        keys = set(payload)
+        with_window = keys == _CALLBACK_KEYS | set(_WINDOW_KEYS)
+        if keys != _CALLBACK_KEYS and not with_window:
             return False
         if payload.get("v") != 1 or payload.get("runId") != self.run_id:
             return False
@@ -290,9 +338,17 @@ class _ActivationState:
         code = str(payload.get("code") or "")
         if state not in _ALLOWED_STATES or _SAFE_CODE.fullmatch(code) is None:
             return False
+        result: Dict[str, Any] = {"state": state, "code": code}
+        if with_window:
+            window = {key: payload.get(key) for key in _WINDOW_KEYS}
+            if code != WINDOW_TOO_SMALL_CODE or not all(
+                type(value) is int and 0 < value < 10000 for value in window.values()
+            ):
+                return False
+            result["window"] = window
         with self.lock:
             if self.result is None:
-                self.result = {"state": state, "code": code}
+                self.result = result
                 self.event.set()
         return True
 
@@ -386,6 +442,32 @@ def _completion_id(record: Any) -> Optional[str]:
     return str(record.get("completionId")) if isinstance(record, Mapping) else None
 
 
+def _window_too_small_result(result: Mapping[str, Any]) -> Dict[str, Any]:
+    """#3521. Name the window as the cause, never the phone or the G2."""
+
+    window = result.get("window")
+    if isinstance(window, Mapping):
+        size = (
+            f"It is {window['cols']} columns × {window['rows']} rows; pairing "
+            f"needs at least {window['minCols']} columns × {window['minRows']} rows. "
+        )
+    else:
+        size = ""
+    response: Dict[str, Any] = {
+        "ok": False,
+        "state": str(result.get("state") or "cancelled"),
+        "code": WINDOW_TOO_SMALL_CODE,
+        "message": (
+            "The Hermes window is too small to show the pairing panel. "
+            f"{size}Nothing was paired. Make the Hermes window bigger, then "
+            "retry pairing."
+        ),
+    }
+    if isinstance(window, Mapping):
+        response["window"] = dict(window)
+    return response
+
+
 def run_tui_pairing(
     address: str,
     *,
@@ -400,7 +482,9 @@ def run_tui_pairing(
 ) -> Dict[str, Any]:
     """Activate the preloaded widget and return its verified secret-free result."""
 
-    resolved_owner_tui_pid = os.getppid() if owner_tui_pid is None else owner_tui_pid
+    resolved_owner_tui_pid = (
+        resolve_owner_tui_pid() if owner_tui_pid is None else owner_tui_pid
+    )
     if not isinstance(resolved_owner_tui_pid, int) or resolved_owner_tui_pid <= 0:
         return {
             "ok": False,
@@ -561,6 +645,8 @@ def run_tui_pairing(
                     "record a new pairing receipt. Pairing is not confirmed."
                 ),
             }
+        if result["code"] == WINDOW_TOO_SMALL_CODE:
+            return _window_too_small_result(result)
         return {
             "ok": False,
             "state": result["state"],

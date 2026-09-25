@@ -176,7 +176,7 @@ def read_profile_config(home: Path) -> Tuple[Dict[str, Any], bool]:
     except Exception:  # noqa: BLE001 - absent/older Hermes falls through
         pass
     try:
-        import yaml
+        from .yaml_compat import yaml
 
         if not path.exists():
             return {}, False
@@ -535,6 +535,7 @@ def collect(
             "configuredFromFile": configured_file,
             "envOverride": override,
             "agentMode": agent_mode,
+            "optOutRetired": _opt_out_retired(),
         },
         "served": {"state": served_state, "profiles": served_profiles},
         "enrolled": enrolled,
@@ -710,6 +711,16 @@ def _migrate_fix(hermes_version: Optional[str], profiles: Sequence[str]) -> str:
     )
 
 
+def _opt_out_retired() -> bool:
+    """Does this engine ignore `gateway.multiplex_profiles: false` (#3618)?"""
+    try:
+        from .setup_profiles import multiplex_opt_out_retired
+
+        return multiplex_opt_out_retired()
+    except Exception:  # noqa: BLE001 - only changes a fix line
+        return False
+
+
 def derive_faults(inventory: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """Every named fault this inventory proves. Pure; no host access."""
     if not inventory.get("observed"):
@@ -853,7 +864,14 @@ def derive_faults(inventory: Mapping[str, Any]) -> List[Dict[str, Any]]:
                 MODE_MULTIPLEX if mode["envOverride"] else MODE_STANDALONE,
             )
         )
-    if mode.get("agentMode") in ("multiple", "single"):
+    # #3618: on Hermes 0.21.4+ OcuClaw no longer offers "single agent",
+    # whatever the profile count. A saved "single" there is outgrown, not a
+    # disagreement: the next setup pass records "multiple" without asking.
+    # Leave the stale word out of the agreement check so the doctor does not
+    # raise an error the person cannot act on.
+    opt_out_retired = bool(mode.get("optOutRetired"))
+    single_outgrown = opt_out_retired and mode.get("agentMode") == "single"
+    if mode.get("agentMode") in ("multiple", "single") and not single_outgrown:
         known.append(
             (
                 "platforms.ocuclaw.extra.agent_mode",
@@ -861,6 +879,29 @@ def derive_faults(inventory: Mapping[str, Any]) -> List[Dict[str, Any]]:
             )
         )
     if len({value for _label, value in known}) > 1:
+        if opt_out_retired:
+            # #3618: on 0.21.4+ "false" and "single" are not fixes. This
+            # Hermes ignores `multiplex_profiles: false` once the host has two
+            # profiles (0.21.5 rewrites it), and OcuClaw does not offer
+            # single agent there at all. Only the multiplex side can agree.
+            fix = (
+                "OcuClaw does not offer single agent on Hermes 0.21.4 and "
+                "later, which ignores `gateway.multiplex_profiles: false` "
+                "once the host has two profiles. Agree on "
+                "multiple agents: `hermes config set "
+                "gateway.multiplex_profiles true` and `hermes config set "
+                "--force platforms.ocuclaw.extra.agent_mode multiple`, unset "
+                f"any {MULTIPLEX_ENV} override, then restart the gateway (or "
+                "re-run `/ocuclaw-setup`, which does this)."
+            )
+        else:
+            fix = (
+                "Pick one mode and make all three agree: "
+                "`hermes config set gateway.multiplex_profiles true|false`, "
+                f"unset any {MULTIPLEX_ENV} override, and re-run "
+                "`/ocuclaw-setup` so platforms.ocuclaw.extra.agent_mode "
+                "matches."
+            )
         faults.append(
             _fault(
                 FAULT_MODE_DISAGREEMENT,
@@ -869,11 +910,7 @@ def derive_faults(inventory: Mapping[str, Any]) -> List[Dict[str, Any]]:
                 "The gateway mode is not agreed: "
                 + ", ".join(f"{label} says {value}" for label, value in known)
                 + ".",
-                "Pick one mode and make all three agree: "
-                "`hermes config set gateway.multiplex_profiles true|false`, "
-                f"unset any {MULTIPLEX_ENV} override, and re-run "
-                "`/ocuclaw-setup` so platforms.ocuclaw.extra.agent_mode "
-                "matches.",
+                fix,
             )
         )
 

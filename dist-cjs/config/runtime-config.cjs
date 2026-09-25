@@ -276,13 +276,17 @@ const MIN_SILENT_INPUT_JEV_BUDGET_MS = 200;
 const MAX_SILENT_INPUT_JEV_BUDGET_MS = 5000;
 const DEFAULT_SILENT_INPUT_JEV_BUDGET_MS = 2500;
 
-function resolveSilentInputJev(value, openclawConfig, env) {
+function resolveSilentInputJev(value, openclawConfig, env, pluginConfig = {}) {
   const raw = isObject(value) ? value : {};
   const { configEnv, processEnv } = gatewayEnvSources(openclawConfig, env);
+
+  const stored = pickString(isObject(pluginConfig) ? pluginConfig.typesafeApiKey : "");
+  const explicitKey = pickString(raw.apiKey);
+  const explicitEnabled = raw.enabled !== undefined && raw.enabled !== null && raw.enabled !== "";
   return {
 
-    enabled: raw.enabled === true || raw.enabled === "true",
-    apiKey: pickString(raw.apiKey, configEnv.TYPESAFE_API_KEY, processEnv.TYPESAFE_API_KEY),
+    enabled: explicitEnabled ? (raw.enabled === true || raw.enabled === "true") : !!stored,
+    apiKey: pickString(explicitKey, stored, configEnv.TYPESAFE_API_KEY, processEnv.TYPESAFE_API_KEY),
 
     budgetMs: clampInt(
       raw.budgetMs == null ? undefined : raw.budgetMs,
@@ -399,7 +403,7 @@ function createRuntimeConfig(opts = {}) {
       openclawConfig,
       Reflect.get(opts, "logger"),
     ),
-    silentInputJev: resolveSilentInputJev(pluginConfig.silentInputJev, openclawConfig, env),
+    silentInputJev: resolveSilentInputJev(pluginConfig.silentInputJev, openclawConfig, env, pluginConfig),
     freshnessWindowMs: parseIntOrDefault(pluginConfig.freshnessWindowMs, 5000),
   };
 }

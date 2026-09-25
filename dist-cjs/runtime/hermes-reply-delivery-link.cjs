@@ -18,6 +18,9 @@ const HERMES_REASONS = {
   ambiguous_recipient: "attribution_unavailable",
   reply_entry_not_found: "attribution_unavailable",
   reply_not_text: "unsupported_reply_shape",
+
+  reply_run_errored: "reply_run_errored",
+  reply_run_rate_limited: "reply_run_rate_limited",
 };
 const hermesReason = (reason) =>
   reason === null || reason === undefined ? null : HERMES_REASONS[reason] || "unspecified";

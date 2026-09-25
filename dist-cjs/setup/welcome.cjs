@@ -2,8 +2,13 @@ const { isCloudwaysManagedHost } = require("./cloudways-host.cjs");
 const { firstUseResult, sameFirstUsePhone } = require("./first-use.cjs");
 const { openClawWelcomeSurface } = require("./welcome-surface.cjs");
 
+const SETUP_WELCOME_DISCONNECT_GRACE_MS = 15000;
+const PHONE_GONE_REASONS = ["setup-phone-session-ambiguous-or-disconnected", "setup-phone-session-unavailable"];
+
 function createSetupWelcome(store     , readPhone     , getRenderer     ,
-  isCloudways      = isCloudwaysManagedHost, awaitReplySettled      = null) {
+  isCloudways      = isCloudwaysManagedHost, awaitReplySettled      = null, options      = {}) {
+  const now = typeof options.now === "function" ? options.now : Date.now;
+  const graceMs = Number.isFinite(options.disconnectGraceMs) ? options.disconnectGraceMs : SETUP_WELCOME_DISCONNECT_GRACE_MS;
   let active      = null;
 
   let waiting      = null;
@@ -23,14 +28,18 @@ function createSetupWelcome(store     , readPhone     , getRenderer     ,
       if (!active || frame?.surfaceId !== active.surfaceId) return true;
 
       if (!active.renderer.isCurrentDeclaration(active.surfaceId, active.declarationId)) return true;
-      if (frame.clientId !== active.phone.clientId || frame.phoneClient !== true ||
+
+      let current      = null;
+      try { current = checkPhone(active.record); } catch (_) { return false; }
+      if (frame.clientId !== current.clientId || frame.phoneClient !== true ||
           !["dismissed", "back"].includes(frame.outcome?.result) ||
           (frame.outcome.origin !== undefined && frame.outcome.origin !== "gesture") ||
           (frame.outcome.actor !== undefined && frame.outcome.actor !== "wearer")) return false;
-      try { checkPhone(active.record); } catch (_) { return false; }
       active.gesture = frame.outcome.result;
       return true;
     },
+
+    busy() { return !!(active || waiting); },
 
     cancel(reason      = "runtime-unavailable") {
 
@@ -70,10 +79,17 @@ function createSetupWelcome(store     , readPhone     , getRenderer     ,
       active = pending;
       const cancel = () => { pending.reason = "cancelled"; pending.abort.abort(); };
       signal?.addEventListener("abort", cancel, { once: true });
+      let goneSince      = null;
       const monitor = setInterval(() => {
-        try { checkPhone(record); }
+        try { checkPhone(record); goneSince = null; }
         catch (error) {
-          pending.reason = error instanceof Error ? error.message : "runtime-unavailable";
+          const reason = error instanceof Error ? error.message : "runtime-unavailable";
+
+          if (PHONE_GONE_REASONS.includes(reason) && graceMs > 0) {
+            if (goneSince === null) goneSince = now();
+            if (now() - goneSince < graceMs) return;
+          }
+          pending.reason = reason;
           pending.abort.abort();
         }
       }, 100);
@@ -92,7 +108,9 @@ function createSetupWelcome(store     , readPhone     , getRenderer     ,
             catch (_) { pending.reason = "setup-state-locked"; pending.abort.abort(); }
           },
         });
-        checkPhone(record);
+
+        try { checkPhone(record); }
+        catch (error) { if (!(error instanceof Error) || !PHONE_GONE_REASONS.includes(error.message)) throw error; }
         const dismissed = pending.gesture && outcome?.result === pending.gesture && !pending.reason;
         const reason = pending.reason ?? (dismissed ? null : outcome?.reason === "superseded" ? "render-replaced"
           : outcome?.result === "window_expired" ? "timed-out"
@@ -117,4 +135,4 @@ function createSetupWelcome(store     , readPhone     , getRenderer     ,
   };
 }
 
-module.exports = { createSetupWelcome };
+module.exports = { createSetupWelcome, SETUP_WELCOME_DISCONNECT_GRACE_MS };

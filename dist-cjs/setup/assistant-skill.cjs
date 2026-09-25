@@ -12,7 +12,7 @@ const BUNDLED_SKILL_SOURCE = "openclaw-extra";
 const BUNDLED_SKILL_FROM_MODULE = "../../skills/ocuclaw-assist/SKILL.md";
 
 const ASSISTANT_SHADOW_ACTION =
-  "A separately installed copy of the OcuClaw Setup Assistant is shadowing the one this plugin ships, so this conversation is running an older guide than the installed plugin carries. Tell the user in plain words and name both guide versions. Then have them clear it in their own terminal: `openclaw skills remove ocuclaw-assist` on hosts that have that verb, and on hosts that do not (OpenClaw 2026.7.x has no `skills remove`), delete the folder holding the SKILL.md that `openclaw skills info ocuclaw-assist --json` reports as `filePath`. Re-read journey afterwards. The assistant ships only inside the plugin now and is updated with `openclaw plugins update ocuclaw`. This is a named condition, not a halt: setup continues either way.";
+  "A separately installed copy of the OcuClaw Setup Assistant is shadowing the one this plugin ships, so this conversation is running an older guide than the installed plugin carries. Tell the user in plain words and name both guide versions. Then have them clear it in their own terminal: `openclaw skills remove ocuclaw-assist` on hosts that have that verb, and on hosts that do not (OpenClaw 2026.7.x has no `skills remove`), delete the folder holding the SKILL.md that `openclaw skills info ocuclaw-assist --json` reports as `filePath`. Re-read journey afterwards. The assistant ships only inside the plugin now and is updated with the plugin: `openclaw plugins update ocuclaw@latest` when it came from npm, `openclaw plugins update ocuclaw` when it came from ClawHub. This is a named condition, not a halt: setup continues either way.";
 
 const DEFAULT_TIMEOUT_MS = 15000;
 

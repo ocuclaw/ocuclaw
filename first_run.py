@@ -60,7 +60,19 @@ FIRST_RUN_PROOF_METHOD = "phone-origin-g2-wearer-confirmed"
 #: evidence a committed proof rests on, and the two must never be conflated.
 FIRST_RUN_PROOF_METHOD_SDK_RECEIPT = "phone-origin-g2-sdk-receipt"
 PHONE_ORIGIN_WAIT_SECONDS = 165.0
-WELCOME_ROUND_TRIP_WAIT_SECONDS = 150.0
+#: #3523. A slow hello gets one quiet re-wait inside the same tool call, so the
+#: assistant never improvises chat between two waits.
+PHONE_ORIGIN_REWAITS = 1
+#: #3523. Hermes ends any one tool call at this many seconds. Every blocking
+#: setup wait below must finish, with margin, inside it.
+HERMES_TOOL_CALL_LIMIT_SECONDS = 420.0
+#: #3523. The welcome wait covers the worst honest case: the gateway may hold
+#: the welcome up to 30 s for the reply run (adapter
+#: ``FIRST_RUN_WELCOME_REPLY_WAIT_SECONDS``), each card lasts 60 s
+#: (``WELCOME_SURFACE["timeoutMs"]``) and the gateway re-renders it once. That
+#: is 150 s of cards and hold alone, so a 150 s wait missed a tap on the second
+#: card; 210 s leaves a minute for render and watcher latency.
+WELCOME_ROUND_TRIP_WAIT_SECONDS = 210.0
 FIRST_RUN_WAIT_POLL_SECONDS = 0.1
 PHONE_TURN_CANDIDATE_GATE_TTL_SECONDS = 60.0
 
@@ -223,6 +235,18 @@ _PHONE_CANDIDATE_KEYS = frozenset(
         "turnFingerprint",
     }
 )
+#: #3392. Only on a candidate whose run the adapter closed as a provider error:
+#: the run-outcome code, so the separate CLI process can name the failure and
+#: its fix. A closed vocabulary; anything else is never written or read back.
+_PHONE_CANDIDATE_OPTIONAL_KEYS = frozenset({"runErrorCode"})
+PHONE_CANDIDATE_RUN_ERROR_CODES = frozenset(
+    {
+        "provider_auth_invalid",
+        "provider_error",
+        "provider_quota_exhausted",
+        "provider_rate_limited",
+    }
+)
 
 
 class PhoneTurnCandidateGate:
@@ -255,6 +279,19 @@ class PhoneTurnCandidateGate:
     ) -> bool:
         return self._note(session_key, run_id, succeeded=bool(succeeded))
 
+    def note_errored(self, session_key: str, run_id: str) -> bool:
+        """H11 (#3348). A non-retryable provider error still has a phone turn.
+
+        The run failed, so it must never become a *successful* candidate, and
+        the ``succeeded=False`` tombstone below still guarantees that. But the
+        model's error text did reach the glasses, and the only surface that
+        can tell the user "your message got through, the model did not answer"
+        is this candidate's reply-delivery observation, which refuses it with
+        ``reply_run_errored``. Publishing nothing would instead time the setup
+        wait out as if the phone had never spoken.
+        """
+        return self._note(session_key, run_id, committed=True, errored=True)
+
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
@@ -266,6 +303,7 @@ class PhoneTurnCandidateGate:
         *,
         committed: bool = False,
         succeeded: Optional[bool] = None,
+        errored: bool = False,
     ) -> bool:
         session_key = str(session_key or "").strip()
         run_id = str(run_id or "").strip()
@@ -299,6 +337,15 @@ class PhoneTurnCandidateGate:
                 # Failure is terminal for this run. A contradictory late or
                 # duplicate callback must never reopen it.
                 entry["succeeded"] = succeeded
+            if errored:
+                # H11: the run is terminal and failed. Tombstone it so no
+                # later callback can publish it as a success, then publish it
+                # once as the errored candidate the setup wait is waiting for.
+                entry["succeeded"] = False
+                if entry["committed"] and not entry["published"]:
+                    entry["published"] = True
+                    return True
+                return False
             if (
                 entry["committed"]
                 and entry["succeeded"] is True
@@ -422,6 +469,7 @@ def record_phone_turn_candidate(
     now: Optional[datetime] = None,
     session_key: Optional[str],
     turn_id: Optional[str],
+    run_error_code: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Publish the latest delivered phone turn for a separate host CLI.
 
@@ -450,6 +498,10 @@ def record_phone_turn_candidate(
         "sessionFingerprint": session_fingerprint,
         "turnFingerprint": turn_fingerprint,
     }
+    if run_error_code in PHONE_CANDIDATE_RUN_ERROR_CODES:
+        # #3392. Not part of the candidate id: the binding stays the same
+        # whatever the run's outcome was.
+        body["runErrorCode"] = run_error_code
     with receipt_state_lock(state_dir(resolved), FIRST_RUN_LOCK_FILENAME) as acquired:
         if not acquired:
             return {"state": "lock_unavailable", "recorded": False}
@@ -485,7 +537,12 @@ def _read_phone_turn_candidate(
         return {"state": "unreadable"}
     if (
         not isinstance(record, dict)
-        or set(record) != _PHONE_CANDIDATE_KEYS
+        or not _PHONE_CANDIDATE_KEYS <= set(record)
+        or not set(record) <= _PHONE_CANDIDATE_KEYS | _PHONE_CANDIDATE_OPTIONAL_KEYS
+        or (
+            "runErrorCode" in record
+            and record["runErrorCode"] not in PHONE_CANDIDATE_RUN_ERROR_CODES
+        )
         or record.get("schemaVersion")
         != FIRST_RUN_PHONE_CANDIDATE_SCHEMA_VERSION
     ):
@@ -511,6 +568,7 @@ def _read_phone_turn_candidate(
         "sessionFingerprint": record["sessionFingerprint"],
         "turnFingerprint": record["turnFingerprint"],
         "candidateId": _phone_candidate_id(record),
+        **({"runErrorCode": record["runErrorCode"]} if "runErrorCode" in record else {}),
     }
 
 
@@ -535,12 +593,54 @@ def wait_for_phone_turn_candidate(
                 "received": True,
                 "completedAt": candidate["completedAt"],
                 "candidateId": candidate["candidateId"],
+                # #3392. Present only when the adapter closed this run as errored.
+                **({"runErrorCode": candidate["runErrorCode"]} if candidate.get("runErrorCode") else {}),
             }
         if state in {"unavailable", "unreadable", "malformed", "wrong_profile"}:
             return {"state": state, "received": False}
         if time.monotonic() >= deadline:
             return {"state": "timeout", "received": False}
         time.sleep(max(0.001, min(float(poll_seconds), deadline - time.monotonic())))
+
+
+def wait_for_phone_origin(
+    *,
+    home: Optional[Path] = None,
+    timeout_seconds: float = PHONE_ORIGIN_WAIT_SECONDS,
+    poll_seconds: float = FIRST_RUN_WAIT_POLL_SECONDS,
+    rewaits: int = PHONE_ORIGIN_REWAITS,
+    on_rewait: Optional[Callable[[], Any]] = None,
+) -> Dict[str, Any]:
+    """The setup tool's hello wait: one bounded wait, then quiet re-waits (#3523).
+
+    Only a plain ``timeout`` earns a re-wait; every other answer (a turn, or a
+    receipt that cannot be read) returns at once. Every wait shares the first
+    wait's start as its threshold, so a hello sent just before the first wait
+    ended still counts. ``on_rewait`` runs before each re-wait (the adapter
+    refreshes the phone's "send a message" hint there, whose TTL covers one
+    wait). A result that needed a re-wait says ``rewaited: true``.
+    """
+
+    threshold = _utc_now()
+    result = wait_for_phone_turn_candidate(
+        home=home,
+        not_before=threshold,
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+    )
+    for _ in range(max(0, int(rewaits))):
+        if result.get("state") != "timeout":
+            break
+        if on_rewait is not None:
+            on_rewait()
+        result = wait_for_phone_turn_candidate(
+            home=home,
+            not_before=threshold,
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
+        result["rewaited"] = True
+    return result
 
 
 def reply_delivery_path(home: Optional[Path] = None) -> Optional[Path]:
@@ -1467,6 +1567,50 @@ def arm_first_run_proof(
         )
 
 
+def _errored_run_refusal(
+    *,
+    home: Optional[Path],
+    candidate: Mapping[str, Any],
+    candidate_id: str,
+) -> Optional[Dict[str, Any]]:
+    """The #3468 refusal when this candidate's run errored, else ``None``.
+
+    Either signal is enough: the adapter's ``runErrorCode`` on the candidate,
+    or the phone's delivery observation naming an errored run.
+    """
+
+    run_error_code = candidate.get("runErrorCode") or None
+    reason = _project_reply_delivery(home=home, candidate_id=candidate_id).get(
+        "reason"
+    )
+    errored_reason = reason if reason in REPLY_DELIVERY_ERRORED_RUN_REASONS else None
+    if run_error_code is None and errored_reason is None:
+        return None
+    return {
+        "state": "reply_run_errored",
+        "armed": False,
+        "committed": False,
+        "replyWasProviderError": True,
+        "runErrorCode": run_error_code,
+        "reason": errored_reason or "reply_run_errored",
+    }
+
+
+def phone_turn_run_error_code(
+    candidate_id: str,
+    *,
+    home: Optional[Path] = None,
+) -> Optional[str]:
+    """The adapter's error code for this exact candidate's run, if any."""
+
+    candidate = _read_phone_turn_candidate(home=home)
+    if candidate.get("state") != "ready" or not hmac.compare_digest(
+        str(candidate_id or ""), str(candidate.get("candidateId") or "")
+    ):
+        return None
+    return candidate.get("runErrorCode") or None
+
+
 def arm_first_run_proof_from_candidate(
     *,
     home: Optional[Path] = None,
@@ -1482,7 +1626,9 @@ def arm_first_run_proof_from_candidate(
     ``reply_evidence`` names which path the caller is claiming. The wearer
     path is unchanged. ``client_sdk_receipt`` is refused unless this exact
     candidate already has an eligible ``sdk_accepted`` observation, so a
-    caller can never assert machine evidence it does not have.
+    caller can never assert machine evidence it does not have. A candidate
+    whose run errored is refused on BOTH paths (#3468): state
+    ``reply_run_errored``, ``replyWasProviderError: True``, nothing written.
     """
 
     resolved = home if home is not None else resolve_receipt_home()
@@ -1508,6 +1654,17 @@ def arm_first_run_proof_from_candidate(
                 "armed": False,
                 "committed": False,
             }
+        # #3468. A provider-error reply never proves setup, whatever evidence
+        # the caller claims: the wearer saw the model's error text, and an
+        # errored run has no receipt worth the name. Checked before either
+        # evidence path, so nothing is written for this turn.
+        errored = _errored_run_refusal(
+            home=resolved,
+            candidate=candidate,
+            candidate_id=expected_candidate_id,
+        )
+        if errored is not None:
+            return errored
         if reply_evidence == REPLY_EVIDENCE_CLIENT_SDK_RECEIPT:
             projection = _project_reply_delivery(
                 home=resolved, candidate_id=expected_candidate_id
@@ -1592,11 +1749,13 @@ __all__ = [
     "first_run_attempt_path",
     "inspect_attempt",
     "is_welcome_surface",
+    "phone_turn_run_error_code",
     "record_reply_delivery",
     "record_welcome_outcome",
     "reply_delivery_path",
     "validate_reply_delivery_report",
     "wait_for_first_run_terminal",
+    "wait_for_phone_origin",
     "wait_for_phone_turn_candidate",
     "wait_for_reply_delivery",
     "welcome_surface",

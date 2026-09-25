@@ -73,15 +73,25 @@ function renderPairingBootstrap(view                      )         {
       ? `${Math.max(0, Math.round(expiresInSeconds))} seconds`
       : `${minutes} minute${minutes === 1 ? "" : "s"}`;
 
-  const prefix = [
-    `Scan with Even. Expires in ${window}.`,
-    "Or choose Enter manually:",
+  const instructions = [
+    "In OcuClaw tap Pair with your computer > Take a photo of the QR code.",
+    `Expires in ${window}. Or tap Enter the pairing code instead and type:`,
+  ];
+  const manualDetails = [
     `Address: ${qrPayload.address}`,
     `Pairing code: ${pairingCode}`,
   ];
+  const prefix = [...instructions, ...manualDetails];
   const section = renderCodeSection(qrPayload, lightTerminal, terminal, prefix);
   if (section.length === 1 && section[0].startsWith("QR ")) {
-    return [`In Even, choose Enter manually. Expires in ${window}.`, section[0], ...prefix.slice(2), ""].join("\n");
+
+    return [
+      "In the OcuClaw app on your phone, tap Pair with your computer, then",
+      `Enter the pairing code instead. Expires in ${window}.`,
+      section[0],
+      ...manualDetails,
+      "",
+    ].join("\n");
   }
   return [...prefix, ...section, ""].join("\n");
 }

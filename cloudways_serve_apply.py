@@ -44,6 +44,10 @@ The rules this seam keeps
 * **The certificate precheck is a hard gate** (#2672). A tailnet that cannot
   issue the node's TLS certificate produces a route that classifies ``ready``
   and fails every connection, so the consent is never even offered there.
+  The precheck only reads ``tailscale status --json`` (#3648). The one
+  ``tailscale cert`` call starts after the yes and the apply: an issued
+  certificate publishes the node's tailnet name in public Certificate
+  Transparency logs, so a "no" must never have started one.
 * **Configured is not working** (#1275). :func:`serve.observe` decides the
   route's *shape* and nothing else. Health is the front-door TLS handshake in
   :mod:`doctor`, and it is the only thing that lets this step finish.
@@ -71,7 +75,9 @@ The rules this seam keeps
 """
 from __future__ import annotations
 
+import os
 import shlex
+import shutil
 import subprocess
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
@@ -86,16 +92,42 @@ from . import doctor, receipts, serve
 #: certificate the tailnet is still minting for a node that was authorized
 #: seconds ago, which routinely takes tens of seconds. Borrowing the probe
 #: budget here would report a perfectly good route as broken.
-ROUTE_WAIT_S = 120.0
+#: Five minutes, matched by the OpenClaw ladder (DEFAULT_CERTIFICATE_WAIT_MS):
+#: two minutes sent people back to rerun setup several times.
+ROUTE_WAIT_S = 300.0
 
 #: One health probe's own allowance, and the poll and notice cadence of the
-#: wait around it.
+#: wait around it. One progress line about every 30 seconds, never one per
+#: poll.
 ROUTE_PROBE_TIMEOUT_S = doctor.PROBE_DEFAULT_TIMEOUT_S
 ROUTE_POLL_S = 5.0
-ROUTE_NOTICE_S = 20.0
+ROUTE_NOTICE_S = 30.0
 
 #: The apply itself is one short local command; it is not a wait.
 APPLY_TIMEOUT_S = 20.0
+
+#: How long ONE ``tailscale cert`` call may run (#3593). It covers the whole
+#: certificate wait, because killing the call cancels the issuance Tailscale
+#: started for it: a real box whose ``set-dns`` call took over 30 seconds never
+#: got its certificate while each call was killed after 2 seconds, and one call
+#: left alone got it in 37 seconds.
+CERT_ISSUE_BUDGET_S = ROUTE_WAIT_S
+
+#: A call that ended without the certificate is started again, one at a time,
+#: and never sooner than this after the last start.
+CERT_RETRY_S = ROUTE_NOTICE_S
+
+#: How long a fresh call is watched for a quick answer before the ladder moves
+#: on and lets it run: a certificate Tailscale already holds comes back at
+#: once, and so does a tailnet that cannot issue certificates at all.
+CERT_GLANCE_S = ROUTE_PROBE_TIMEOUT_S
+CERT_GLANCE_POLL_S = 0.25
+
+#: At most this many calls in one wait. The precheck makes none (#3648). A call that
+#: ends without the certificate is usually a failed ACME order, and Let's
+#: Encrypt allows only five failed validations per host name per hour. After
+#: the last one the wait goes on with the route probe alone.
+CERT_MAX_CALLS = 3
 
 # -- journal vocabulary -------------------------------------------------------
 
@@ -169,6 +201,19 @@ CERT_UNKNOWN_MESSAGE = (
     'Setup will continue and check that the route answers.'
 )
 
+#: Said once the route is applied, word for word the OpenClaw ladder's own
+#: cold-certificate line, and then its "ready" line once the route answers.
+COLD_CERTIFICATE_MESSAGE = (
+    'Waiting for the certificate. This usually takes a minute or two.'
+)
+CERTIFICATE_READY_MESSAGE = 'Certificate ready.'
+
+#: The step's own reading of a certificate check that ran out of time. On a
+#: node authorized minutes ago that is the certificate still being issued, not
+#: a check that could not run, so it is waited on rather than apologised for.
+#: Never written to the journal; doctor's three outcomes are untouched.
+CERT_PENDING = 'tls_cert_pending'
+
 APPLY_FAILED_MESSAGE = (
     'No route was applied.\n'
     'Run setup again, or run the command above to see the full error.'
@@ -191,9 +236,18 @@ OVERRIDE_CONSENT_LINE = (
     "on a real machine."
 )
 
-WAIT_TIMEOUT_MESSAGE = (
-    'The route was applied but has not answered yet.\n'
-    'Its certificate may still be pending. Run setup again to recheck it.'
+#: The certificate wait ran out. Everything before it is kept, so a rerun picks
+#: up at this step. Word for word the OpenClaw ladder's
+#: CERTIFICATE_TIMEOUT_MESSAGE.
+CERTIFICATE_TIMEOUT_MESSAGE = (
+    'The certificate is not ready yet. Run the same command again; setup picks up here.'
+)
+
+#: A route that was already published, and never failed on its certificate,
+#: still did not answer by the end of the wait.
+ROUTE_TIMEOUT_MESSAGE = (
+    'The private route has not answered yet. Run the same command again; setup picks up '
+    'here.'
 )
 
 UNSETTLED_OWNERSHIP_MESSAGE = (
@@ -206,12 +260,32 @@ NOT_READY_AFTER_APPLY_MESSAGE = (
     'Route ownership was not recorded. Run hermes ocuclaw doctor to check the port.'
 )
 
-TLS_WAIT_LINE = (
-    "the node's TLS certificate is not ready yet. That is normal on a node "
-    "this new; still waiting."
-)
+def waited_for(elapsed_s: float) -> str:
+    """``30 seconds``, ``1 minute``, ``1 minute 30 seconds``, ``2 minutes``...
 
-WAIT_LINE = "still waiting for the route to answer."
+    Word for word the OpenClaw ladder's ``waitedFor``.
+    """
+    total = max(0, int(elapsed_s))
+    minutes, seconds = divmod(total, 60)
+    parts = []
+    if minutes > 0:
+        parts.append(f"{minutes} {'minute' if minutes == 1 else 'minutes'}")
+    if seconds > 0 or minutes == 0:
+        parts.append(f"{seconds} seconds")
+    return " ".join(parts)
+
+
+def certificate_progress_message(elapsed_s: float) -> str:
+    """Said about every 30 seconds while the certificate wait goes on.
+
+    Word for word the OpenClaw ladder's ``certificateProgressMessage``.
+    """
+    return f"Still waiting for the certificate ({waited_for(elapsed_s)} so far)."
+
+
+def route_progress_message(elapsed_s: float) -> str:
+    """The same cadence, for a published route that is not failing on TLS."""
+    return f"Still waiting for the route to answer ({waited_for(elapsed_s)} so far)."
 
 
 def consent_lines(
@@ -234,7 +308,7 @@ def consent_lines(
             "  Allow access from your tailnet only. Never public; never Tailscale Funnel.",
             "  If you say yes, setup will run:",
             f"    {command}",
-            "  Answer anything but yes and nothing is changed.",
+            "  Anything but yes leaves this route unchanged.",
         )
     return override + (
         "  If you say yes, setup will run:",
@@ -294,7 +368,7 @@ def run_private_route(
     *,
     probe_fn: Optional[Callable[[str, int, float], str]] = None,
     observe_fn: Optional[Callable[..., Any]] = None,
-    cert_fn: Optional[Callable[..., str]] = None,
+    issue_fn: Optional[Callable[..., Any]] = None,
     record_fn: Optional[Callable[..., str]] = None,
 ) -> Any:
     """Publish the private route on a decisive Cloudways host, after consent.
@@ -302,11 +376,14 @@ def run_private_route(
     The seams are resolved here rather than bound as defaults so a test can
     substitute the network probe on the module and still drive the whole step
     through ``run_setup``, the way a user drives it.
+
+    ``issue_fn(ctx, dns_name, budget_s)`` starts one ``tailscale cert`` call
+    and returns its handle (see :class:`_ProcessIssuance`).
     """
     setup = _setup()
     probe = probe_fn or _default_probe
     observe = observe_fn or _default_observe
-    cert = cert_fn or _default_cert
+    issue = issue_fn or _default_issue
     record = record_fn or doctor.record_route_ownership
 
     def record_for(status: str, detail: str, exit_code: Optional[int] = None) -> Any:
@@ -317,7 +394,7 @@ def run_private_route(
     # reason this seam is allowed to exist; a caller that reorders or trims the
     # ladder gets a refusal, not an apply.
     if not _decisive_cloudways(ctx):
-        ctx.say(f"  {NOT_DECISIVE_MESSAGE}")
+        _say_block(ctx, NOT_DECISIVE_MESSAGE)
         return record_for(
             setup.STATUS_REFUSED, DETAIL_NOT_DECISIVE, setup.SETUP_EXIT_STOPPED
         )
@@ -329,13 +406,13 @@ def run_private_route(
     if classification == serve.CLASSIFY_UNKNOWN:
         # Never read is never "absent": applying over a route we could not see
         # is exactly the replacement this lane refuses to make.
-        ctx.say(f"  {UNREADABLE_ROUTE_MESSAGE}")
+        _say_block(ctx, UNREADABLE_ROUTE_MESSAGE)
         return record_for(
             setup.STATUS_FAILED, DETAIL_UNREADABLE, setup.SETUP_EXIT_PROBLEM
         )
 
     if classification == serve.CLASSIFY_WRONG:
-        ctx.say(f"  {FOREIGN_ROUTE_MESSAGE}")
+        _say_block(ctx, FOREIGN_ROUTE_MESSAGE)
         return record_for(
             setup.STATUS_REFUSED, DETAIL_FOREIGN, setup.SETUP_EXIT_STOPPED
         )
@@ -345,14 +422,14 @@ def run_private_route(
     # Whatever comes next, it is not going to be a fight with a sibling install
     # over the one host-global port.
     if _claim_conflict(facts) is not None:
-        ctx.say(f"  {FOREIGN_OWNER_MESSAGE}")
+        _say_block(ctx, FOREIGN_OWNER_MESSAGE)
         return record_for(
             setup.STATUS_REFUSED, DETAIL_FOREIGN, setup.SETUP_EXIT_STOPPED
         )
 
     dns_name = getattr(observation, "dns_name", None)
     if not dns_name:
-        ctx.say(f"  {NO_TAILNET_NAME_MESSAGE}")
+        _say_block(ctx, NO_TAILNET_NAME_MESSAGE)
         return record_for(
             setup.STATUS_FAILED, DETAIL_NO_TAILNET_NAME, setup.SETUP_EXIT_PROBLEM
         )
@@ -371,6 +448,7 @@ def run_private_route(
             record=record,
             port=port,
             applied=False,
+            issue=issue,
         )
 
     # -- absent: the apply path ----------------------------------------------
@@ -378,18 +456,57 @@ def run_private_route(
     # #2672's precheck, before the consent rather than after it: a route this
     # tailnet cannot certify would apply cleanly, classify `ready`, and fail
     # every connection, so the question is never asked there.
-    verdict = cert(ctx, dns_name)
+    #
+    # It only READS (#3648): `tailscale status --json`, whose CertDomains is
+    # empty on a tailnet with HTTPS Certificates off. It never runs
+    # `tailscale cert`, because an issued certificate puts this node's tailnet
+    # name in the public Certificate Transparency logs, and a person who then
+    # answers no must have published nothing. The ONE issuance call (#3593)
+    # starts only after the yes and the apply, in the certificate wait.
+    verdict = _cert_precheck(ctx, dns_name)
     if verdict == doctor.OUTCOME_CERT_UNAVAILABLE:
-        ctx.say(f"  {CERT_UNAVAILABLE_MESSAGE}")
+        _say_block(ctx, CERT_UNAVAILABLE_MESSAGE)
         return record_for(
             setup.STATUS_FAILED, DETAIL_CERT_UNAVAILABLE, setup.SETUP_EXIT_PROBLEM
         )
-    if verdict != doctor.OUTCOME_CERT_AVAILABLE:
+    if verdict == doctor.OUTCOME_CERT_UNKNOWN:
+        # The status could not be read, or does not say (an older Tailscale).
         # Unknown withholds nothing and claims nothing, exactly as it does in
-        # doctor: a missing binary or a timeout is not evidence against the
-        # tailnet, and the health wait below is the real gate either way.
-        ctx.say(f"  {CERT_UNKNOWN_MESSAGE}")
+        # doctor; the certificate wait after the apply is the real gate
+        # either way.
+        _say_block(ctx, CERT_UNKNOWN_MESSAGE)
+    return _consent_and_apply(
+        ctx,
+        setup,
+        record_for=record_for,
+        facts=facts,
+        dns_name=dns_name,
+        port=port,
+        probe=probe,
+        observe=observe,
+        record=record,
+        issue=issue,
+    )
 
+
+def _consent_and_apply(
+    ctx: Any,
+    setup: Any,
+    *,
+    record_for: Callable[..., Any],
+    facts: Mapping[str, Any],
+    dns_name: str,
+    port: int,
+    probe: Callable[[str, int, float], str],
+    observe: Callable[..., Any],
+    record: Callable[..., str],
+    issue: Optional[Callable[..., Any]],
+) -> Any:
+    """The consent, the apply and the wait, once the precheck let it ask.
+
+    Nothing before the typed yes runs anything but reads. The certificate is
+    first asked for by the wait in :func:`_finish`, after the apply.
+    """
     # Resolved once, here: this exact tuple is what is printed and what is run.
     argv = serve_apply_argv(relay_port=port)
     command = shlex.join(argv)
@@ -419,7 +536,7 @@ def run_private_route(
         getattr(fresh, "classification", None) != serve.CLASSIFY_ABSENT
         or getattr(fresh, "dns_name", None) != dns_name
     ):
-        ctx.say(f"  {TOOK_THE_PORT_MESSAGE}")
+        _say_block(ctx, TOOK_THE_PORT_MESSAGE)
         return record_for(
             setup.STATUS_REFUSED, DETAIL_FOREIGN, setup.SETUP_EXIT_STOPPED
         )
@@ -432,10 +549,11 @@ def run_private_route(
     # the teardown gate.
     proposal = record(facts)
     if proposal != doctor.RECORD_PROPOSED:
-        ctx.say(
-            f"  {FOREIGN_OWNER_MESSAGE}"
+        _say_block(
+            ctx,
+            FOREIGN_OWNER_MESSAGE
             if proposal in (doctor.RECORD_FOREIGN_OWNER, doctor.RECORD_UNREADABLE_CLAIM)
-            else f"  {UNSETTLED_OWNERSHIP_MESSAGE}"
+            else UNSETTLED_OWNERSHIP_MESSAGE,
         )
         return record_for(
             setup.STATUS_REFUSED, DETAIL_FOREIGN, setup.SETUP_EXIT_STOPPED
@@ -445,12 +563,19 @@ def run_private_route(
     if returncode != 0:
         if message:
             ctx.say(f"  {message}")
-        ctx.say(f"  {APPLY_FAILED_MESSAGE}")
+        _say_block(ctx, APPLY_FAILED_MESSAGE)
         return record_for(
             setup.STATUS_FAILED, DETAIL_APPLY_FAILED, setup.SETUP_EXIT_PROBLEM
         )
-    ctx.say("  the route is applied. Waiting for it to answer.")
+    ctx.say("  Private route configured.")
+    # The cold-certificate window, said the way the OpenClaw ladder says it:
+    # everything is in place and the one missing piece is the certificate
+    # Tailscale issues for this node's name. A phone that dials before it
+    # exists stalls on its first connection, so the ladder waits here.
+    ctx.say(f"  {COLD_CERTIFICATE_MESSAGE}")
 
+    # The wait starts the ONE `tailscale cert` call now, after the yes and
+    # the apply (#3593, #3648), and stops it when the step ends.
     return _finish(
         ctx,
         setup,
@@ -461,6 +586,7 @@ def run_private_route(
         record=record,
         port=port,
         applied=True,
+        issue=issue,
     )
 
 
@@ -475,14 +601,27 @@ def _finish(
     record: Callable[..., str],
     port: int,
     applied: bool,
+    issue: Optional[Callable[..., Any]] = None,
 ) -> Any:
     """Wait for the route to answer, then record what was observed."""
-    healthy, _last_outcome = _wait_for_route(ctx, dns_name=dns_name, probe=probe)
+    healthy, _last_outcome, waited_on_cert = _wait_for_route(
+        ctx,
+        dns_name=dns_name,
+        probe=probe,
+        issue=issue,
+        announced=applied,
+    )
+    if healthy and waited_on_cert:
+        # The handshake that ended the wait verified this node's certificate
+        # against its own name, so this is observed, not assumed.
+        ctx.say(f"  {CERTIFICATE_READY_MESSAGE}")
     if not healthy:
         # A bounded wait that ran out is a wait, not a broken route, and it
         # costs the user nothing: the next run picks up exactly here. No
         # observed receipt is written, because nothing was observed.
-        ctx.say(f"  {WAIT_TIMEOUT_MESSAGE}")
+        _say_block(
+            ctx, CERTIFICATE_TIMEOUT_MESSAGE if waited_on_cert else ROUTE_TIMEOUT_MESSAGE
+        )
         return setup.StepRecord(
             "private-route",
             setup.STATUS_FAILED,
@@ -495,7 +634,7 @@ def _finish(
     # taken after the apply, never the one taken before it.
     observation = observe(ctx, port)
     if getattr(observation, "classification", None) != serve.CLASSIFY_READY:
-        ctx.say(f"  {NOT_READY_AFTER_APPLY_MESSAGE}")
+        _say_block(ctx, NOT_READY_AFTER_APPLY_MESSAGE)
         return setup.StepRecord(
             "private-route",
             setup.STATUS_FAILED,
@@ -511,9 +650,9 @@ def _finish(
         pass
 
     if applied:
-        ctx.say("  the private route is published and answering.")
+        ctx.say("  The private route is published and answering.")
         return setup.StepRecord("private-route", setup.STATUS_DONE, DETAIL_PUBLISHED)
-    ctx.say("  the private route is already published and answering.")
+    ctx.say("  The private route is already published and answering.")
     return setup.StepRecord("private-route", setup.STATUS_SKIPPED, DETAIL_PRESENT)
 
 
@@ -522,37 +661,122 @@ def _wait_for_route(
     *,
     dns_name: str,
     probe: Callable[[str, int, float], str],
-) -> Tuple[bool, str]:
+    issue: Optional[Callable[..., Any]] = None,
+    announced: bool = False,
+) -> Tuple[bool, str, bool]:
     """Bounded wait on the front-door TLS handshake. Never the classifier.
+
+    Returns whether the route answered, the last probe outcome, and whether
+    this wait was about the certificate. ``announced`` says the caller already
+    printed :data:`COLD_CERTIFICATE_MESSAGE` (right after an apply). A rerun on
+    a route that is published but whose certificate is still being issued says
+    it here, once, so the rerun reads as the same certificate wait it picks up.
+
+    Read-only, and quiet between notices: one progress line about every
+    :data:`ROUTE_NOTICE_S`, never one per poll.
 
     ``serve status`` answers whether the route is *configured*, which #1275
     proved says nothing about whether it works. The only thing allowed to end
     this wait is the route itself answering a TLS handshake on its own
     certificate.
+
+    The certificate comes first (#3593). It is asked for with ONE
+    ``tailscale cert`` call at a time, left to finish: ``issue`` starts the
+    first one as the wait begins, which is always after the typed yes
+    (#3648), and another only when none is running and the certificate is
+    not issued yet, no sooner than :data:`CERT_RETRY_S` after the last start
+    and at most :data:`CERT_MAX_CALLS` in all. ``issue`` is ``None`` when the
+    certificate cannot be asked for. The route is not probed until the
+    certificate is issued or cannot be asked for: a handshake on a route with
+    no certificate makes Tailscale start a competing issuance with a short
+    deadline of its own, and on a real box those left ACME orders ``invalid``.
     """
     port = serve.serve_port()
-    deadline = ctx.clock() + ROUTE_WAIT_S
-    last_notice = ctx.clock()
-    while True:
-        try:
-            outcome = probe(dns_name, port, ROUTE_PROBE_TIMEOUT_S)
-        except Exception:  # noqa: BLE001 - a failed probe observed nothing
-            outcome = doctor.OUTCOME_FAILED
-        if outcome == doctor.OUTCOME_REACHABLE:
-            return True, outcome
-        if ctx.clock() >= deadline:
-            return False, outcome
-        if ctx.clock() - last_notice >= ROUTE_NOTICE_S:
-            last_notice = ctx.clock()
-            ctx.say(
-                f"  {TLS_WAIT_LINE}"
-                if outcome == doctor.OUTCOME_TLS_HANDSHAKE_FAILED
-                else f"  {WAIT_LINE}"
-            )
-        ctx.sleep(min(ROUTE_POLL_S, max(0.0, deadline - ctx.clock())))
+    started = ctx.clock()
+    deadline = started + ROUTE_WAIT_S
+    next_notice = started + ROUTE_NOTICE_S
+    issuance: Optional[Any] = None
+    issued = False
+    calls = 0
+    last_start: Optional[float] = None
+    outcome = doctor.OUTCOME_FAILED
+    try:
+        while True:
+            if issuance is not None:
+                try:
+                    finished = issuance.poll()
+                except Exception:  # noqa: BLE001 - a failed call observed nothing
+                    finished = doctor.OUTCOME_CERT_UNKNOWN
+                if finished is not None:
+                    issuance.close()
+                    issuance = None
+                    if finished == doctor.OUTCOME_CERT_AVAILABLE:
+                        issued = True
+                    elif finished == doctor.OUTCOME_CERT_UNAVAILABLE:
+                        issue = None
+            if (
+                not issued
+                and issue is not None
+                and issuance is None
+                and calls >= CERT_MAX_CALLS
+            ):
+                # Out of calls: the probe alone decides from here.
+                issue = None
+            if (
+                not issued
+                and issue is not None
+                and issuance is None
+                and (last_start is None or ctx.clock() - last_start >= CERT_RETRY_S)
+            ):
+                last_start = ctx.clock()
+                calls += 1
+                budget = min(CERT_ISSUE_BUDGET_S, max(CERT_GLANCE_S, deadline - last_start))
+                finished, issuance = _begin_certificate(ctx, dns_name, issue, budget)
+                if finished == doctor.OUTCOME_CERT_AVAILABLE:
+                    issued = True
+                elif finished in (doctor.OUTCOME_CERT_UNAVAILABLE, doctor.OUTCOME_CERT_UNKNOWN):
+                    # Refused, or could not run: the probe alone decides.
+                    issue = None
+                if issuance is not None and not announced:
+                    # Still being issued: this is the certificate wait, and
+                    # it says so in the same words as the first run.
+                    ctx.say(f"  {COLD_CERTIFICATE_MESSAGE}")
+                    announced = True
+            if issued or issue is None:
+                try:
+                    outcome = probe(dns_name, port, ROUTE_PROBE_TIMEOUT_S)
+                except Exception:  # noqa: BLE001 - a failed probe observed nothing
+                    outcome = doctor.OUTCOME_FAILED
+                if outcome == doctor.OUTCOME_REACHABLE:
+                    return True, outcome, announced
+                if not announced and outcome == doctor.OUTCOME_TLS_HANDSHAKE_FAILED:
+                    ctx.say(f"  {COLD_CERTIFICATE_MESSAGE}")
+                    announced = True
+            now = ctx.clock()
+            if now >= deadline:
+                return False, outcome, announced
+            if now >= next_notice:
+                periods = int((now - started) // ROUTE_NOTICE_S)
+                elapsed = periods * ROUTE_NOTICE_S
+                ctx.say(
+                    f"  {certificate_progress_message(elapsed)}"
+                    if announced
+                    else f"  {route_progress_message(elapsed)}"
+                )
+                next_notice = started + (periods + 1) * ROUTE_NOTICE_S
+            ctx.sleep(min(ROUTE_POLL_S, max(0.0, deadline - ctx.clock())))
+    finally:
+        if issuance is not None:
+            issuance.close()
 
 
 # -- the pieces ---------------------------------------------------------------
+
+
+def _say_block(ctx: Any, message: str) -> None:
+    """Say a message of one or more lines, every line under the step's indent."""
+    for line in message.split("\n"):
+        ctx.say(f"  {line}")
 
 
 def _setup() -> Any:
@@ -615,29 +839,200 @@ def _default_observe(ctx: Any, port: int) -> Any:
     )
 
 
-def _default_cert(ctx: Any, dns_name: str) -> str:
-    """#2672's certificate precheck, through the ladder's injected runner."""
-    return doctor.tailnet_tls_cert_check(
-        dns_name, ROUTE_PROBE_TIMEOUT_S, runner=_cert_runner(ctx)
+def _cert_precheck(ctx: Any, dns_name: str) -> str:
+    """#2672's precheck, read-only: can this tailnet certify this node?
+
+    One bounded ``tailscale status --json`` through the ladder's runner, read
+    by :func:`doctor.tailnet_cert_domains_check`. It never runs
+    ``tailscale cert`` (#3648), so it is safe before the consent.
+    """
+    return doctor.tailnet_cert_domains_check(
+        dns_name, serve.READ_TIMEOUT_S, runner=ctx.runner
     )
 
 
-def _cert_runner(
+def _begin_certificate(
     ctx: Any,
-) -> Optional[Callable[[Sequence[str], float], Optional[Tuple[int, str]]]]:
-    """Adapt ``ctx.runner`` to the shape doctor's cert check expects."""
-    if ctx.runner is None:
+    dns_name: str,
+    issue: Optional[Callable[..., Any]],
+    budget_s: float,
+) -> Tuple[str, Optional[Any]]:
+    """Start one ``tailscale cert`` call and give it a short look.
+
+    Only ever called from the certificate wait, after the typed yes (#3648).
+    Returns doctor's verdict and ``None`` when the call answered within
+    :data:`CERT_GLANCE_S`, or :data:`CERT_PENDING` and the still-running call,
+    which the caller owns and must :meth:`close`. A call that could not start
+    at all is :data:`doctor.OUTCOME_CERT_UNKNOWN`.
+    """
+    if issue is None:
+        return doctor.OUTCOME_CERT_UNKNOWN, None
+    try:
+        issuance = issue(ctx, dns_name, budget_s)
+    except Exception:  # noqa: BLE001 - a call that never started observed nothing
+        return doctor.OUTCOME_CERT_UNKNOWN, None
+    look_until = ctx.clock() + CERT_GLANCE_S
+    while True:
+        try:
+            finished = issuance.poll()
+        except Exception:  # noqa: BLE001 - a failed call observed nothing
+            finished = doctor.OUTCOME_CERT_UNKNOWN
+        if finished is not None:
+            issuance.close()
+            return finished, None
+        if ctx.clock() >= look_until:
+            return CERT_PENDING, issuance
+        ctx.sleep(CERT_GLANCE_POLL_S)
+
+
+def _default_issue(ctx: Any, dns_name: str, budget_s: float) -> Any:
+    """Start the one ``tailscale cert`` call for this node.
+
+    A real run starts the CLI in the background. An exercise that injected a
+    process runner gets that runner, called once with the whole budget.
+    """
+    if ctx.runner is not None:
+        return _RunnerIssuance(ctx, dns_name, budget_s)
+    return _ProcessIssuance(dns_name, budget_s, ctx.clock)
+
+
+class _ProcessIssuance:
+    """ONE ``tailscale cert`` for this node, left running until it answers.
+
+    Never killed round by round (#3593): stopping the CLI cancels the issuance
+    Tailscale started for it, and on a tailnet whose ``set-dns`` call is slow
+    that cancelled every attempt. It writes into a private temporary
+    directory, because Tailscale 1.102.x refuses the null device, and
+    :meth:`close` deletes that directory with the key in it. The CLI's own
+    output goes to a file there too, so nothing ever waits on a full pipe.
+
+    :meth:`poll` is ``None`` while the call runs, then one of doctor's three
+    certificate outcomes, or :data:`CERT_PENDING` when the call ran out of
+    ``budget_s`` or was stopped.
+    """
+
+    def __init__(self, dns_name: str, budget_s: float, clock: Callable[[], float]):
+        self._clock = clock
+        self._deadline = clock() + max(0.0, float(budget_s))
+        self._outcome: Optional[str] = None
+        self._proc: Optional[subprocess.Popen] = None
+        self._output: Any = None
+        self._dir: Optional[str] = doctor.private_cert_dir()
+        try:
+            argv = doctor.cert_command(dns_name, self._dir)
+            if shutil.which(argv[0]) is None:
+                raise FileNotFoundError(argv[0])
+            self._output = open(
+                os.path.join(self._dir, "output.txt"), "w+", encoding="utf-8"
+            )
+            self._proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=self._output,
+                stderr=subprocess.STDOUT,
+            )
+        except BaseException:
+            self.close()
+            raise
+
+    def poll(self) -> Optional[str]:
+        if self._outcome is not None:
+            return self._outcome
+        if self._proc is None:
+            self._outcome = CERT_PENDING
+            return self._outcome
+        returncode = self._proc.poll()
+        if returncode is None:
+            if self._clock() < self._deadline:
+                return None
+            self._outcome = CERT_PENDING
+        else:
+            self._outcome = doctor.cert_outcome(returncode, self._read_output())
+        self.close()
+        return self._outcome
+
+    def _read_output(self) -> str:
+        try:
+            self._output.flush()
+            self._output.seek(0)
+            return str(self._output.read(4096))
+        except Exception:  # noqa: BLE001 - unreadable output reads as unknown
+            return ""
+
+    def close(self) -> None:
+        """Stop the call if it is still running and delete its files. Idempotent."""
+        proc, self._proc = self._proc, None
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        output, self._output = self._output, None
+        if output is not None:
+            try:
+                output.close()
+            except OSError:
+                pass
+        cert_dir, self._dir = self._dir, None
+        doctor.remove_cert_dir(cert_dir)
+
+
+class _RunnerIssuance:
+    """The same call through an injected process runner, answered at once.
+
+    The runner is given the whole budget as its timeout. A runner that runs
+    out of time is a certificate still being issued (:data:`CERT_PENDING`).
+    """
+
+    def __init__(self, ctx: Any, dns_name: str, budget_s: float):
+        timed_out: list = []
+        verdict = doctor.tailnet_tls_cert_check(
+            dns_name, budget_s, runner=_cert_runner(ctx, timed_out)
+        )
+        if verdict == doctor.OUTCOME_CERT_UNKNOWN and timed_out:
+            verdict = CERT_PENDING
+        self._outcome = verdict
+
+    def poll(self) -> Optional[str]:
+        return self._outcome
+
+    def close(self) -> None:
         return None
+
+
+def _cert_runner(
+    ctx: Any, timed_out: list
+) -> Callable[[Sequence[str], float], Optional[Tuple[int, str]]]:
+    """Adapt ``ctx.runner`` (or a plain subprocess) to doctor's cert check.
+
+    Notes a timeout in ``timed_out``; every other failure observed nothing.
+    """
 
     def run(args: Sequence[str], timeout_s: float) -> Optional[Tuple[int, str]]:
         try:
-            completed = ctx.runner(
-                list(args),
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-                check=False,
-            )
+            if ctx.runner is None:
+                if shutil.which(args[0]) is None:
+                    return None
+                completed = subprocess.run(
+                    list(args),
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s,
+                    check=False,
+                )
+            else:
+                completed = ctx.runner(
+                    list(args),
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s,
+                    check=False,
+                )
+        except subprocess.TimeoutExpired:
+            timed_out.append(True)
+            return None
         except Exception:  # noqa: BLE001 - a substituted runner may raise anything
             return None
         return (
@@ -697,6 +1092,7 @@ __all__ = [
     "ROUTE_POLL_S",
     "ROUTE_PROBE_TIMEOUT_S",
     "ROUTE_WAIT_S",
+    "certificate_progress_message",
     "consent_lines",
     "relay_port",
     "run_private_route",

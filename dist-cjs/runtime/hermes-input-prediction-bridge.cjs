@@ -1,5 +1,5 @@
 const { METHOD_NOT_FOUND_CODE } = require("../gateway/backend-contract.cjs");
-const { INPUT_PREDICTION_LIMITS, INPUT_PREDICTION_METHODS, INPUT_PREDICTION_PROTOCOL_VERSION, INPUT_PREDICTION_STATUSES, normalizeCandidateWord, normalizePredictionRequest, normalizeUsage, predictionResult, validateCandidates } = require("./input-prediction-shared.cjs");
+const { INPUT_PREDICTION_LIMITS, INPUT_PREDICTION_METHODS, INPUT_PREDICTION_PROTOCOL_VERSION, INPUT_PREDICTION_STATUSES, modelAllowResult, normalizeCandidateWord, normalizePredictionRequest, normalizeUsage, predictionResult, validateCandidates } = require("./input-prediction-shared.cjs");
 const { SILENT_INPUT_OPEN_LIMITS, normalizeOpenRequest, normalizeWholeReply, openReplyResult } = require("./silent-input-open-reply.cjs");
 
 const LINK_INPUT_PREDICTION_METHODS = Object.freeze({
@@ -8,6 +8,7 @@ const LINK_INPUT_PREDICTION_METHODS = Object.freeze({
   cancel: INPUT_PREDICTION_METHODS.cancel,
   test: INPUT_PREDICTION_METHODS.test,
   open: INPUT_PREDICTION_METHODS.open,
+  modelAllow: INPUT_PREDICTION_METHODS.modelAllow,
 });
 
 const LINK_INPUT_PREDICTION_GRACE_MS = 500;
@@ -309,12 +310,32 @@ function createHermesInputPredictionTranslators(opts) {
     }
   }
 
+  async function modelAllow(params) {
+    const p = params && typeof params === "object" ? params : {};
+    const payload = {
+      requestId: cleanString(p.requestId),
+      modelChoice: cleanString(p.modelChoice),
+      clientId: cleanString(p.clientId),
+      connectionId: cleanString(p.connectionId),
+      profileId: cleanString(p.profileId),
+    };
+    try {
+      const raw = await link.request(LINK_INPUT_PREDICTION_METHODS.modelAllow, payload);
+      const r = raw && typeof raw === "object" ? raw : {};
+      return modelAllowResult(payload.requestId, r.status, r.activation);
+    } catch (err) {
+      if (isMethodNotFound(err)) return modelAllowResult(payload.requestId, "policy-denied");
+      return modelAllowResult(payload.requestId, "error");
+    }
+  }
+
   return {
     [LINK_INPUT_PREDICTION_METHODS.capabilities]: capabilities,
     [LINK_INPUT_PREDICTION_METHODS.request]: request,
     [LINK_INPUT_PREDICTION_METHODS.cancel]: cancel,
     [LINK_INPUT_PREDICTION_METHODS.test]: test,
     [LINK_INPUT_PREDICTION_METHODS.open]: open,
+    [LINK_INPUT_PREDICTION_METHODS.modelAllow]: modelAllow,
   };
 }
 

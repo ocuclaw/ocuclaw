@@ -16,13 +16,15 @@ const operations      = {
   "evenai.test.cancel": [],
 };
 const id = (value     ) => typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+
+const OPTIONAL_SETUP_CAPABILITIES = Object.freeze(["soniox", "even_ai", "typesafe"]);
 function parseOptionalSetupRequest(value     ) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || !id(value.requestId) || !Object.prototype.hasOwnProperty.call(operations, value.operation)) return null;
   const keys = ["type", "requestId", "operation", ...operations[value.operation]];
   if (Object.keys(value).some(key => !keys.includes(key))
       || (value.type !== undefined && value.type !== "ocuclaw.optional.setup.request")) return null;
-  if (value.operation === "credential.begin" && (!["soniox", "even_ai"].includes(value.capability) || !["create", "replace"].includes(value.intent))) return null;
+  if (value.operation === "credential.begin" && (!OPTIONAL_SETUP_CAPABILITIES.includes(value.capability) || !["create", "replace"].includes(value.intent))) return null;
   if (value.operation.startsWith("credential.") && value.operation !== "credential.begin" && !id(value.transactionId)) return null;
   if (value.operation === "credential.save" && (typeof value.credential !== "string" || !/^[\x21-\x7e]{1,4096}$/.test(value.credential))) return null;
   if (["activation.apply", "activation.status", "diagnostics.apply", "route.apply", "route.status"].includes(value.operation) && !id(value.operationId)) return null;
@@ -48,7 +50,7 @@ function optionalSetupResult(request     , result     ) {
   const snapshot = result.snapshot;
   if (snapshot && ["openclaw", "hermes"].includes(snapshot.runtime) && id(snapshot.generation)) {
     const capabilities      = {};
-    for (const key of ["soniox", "even_ai"]) {
+    for (const key of OPTIONAL_SETUP_CAPABILITIES) {
       const row = snapshot.capabilities?.[key];
       capabilities[key] = { present: row?.present === true, state: states.includes(row?.state) ? row.state : "unknown" };
     }
@@ -63,10 +65,15 @@ function optionalSetupResult(request     , result     ) {
         activeAccess: typeof d.activeAccess === "boolean" ? d.activeAccess : null,
         activeHandoff: typeof d.activeHandoff === "boolean" ? d.activeHandoff : null };
     }
+
+    const hostContext = snapshot.hostContext;
+    if (hostContext && typeof hostContext === "object" && !Array.isArray(hostContext)) {
+      out.snapshot.hostContext = { cloudways: hostContext.cloudways === true };
+    }
   }
   const transaction = result.transaction;
   if (transaction && id(transaction.id) && Number.isFinite(transaction.expiresAtMs)
-      && ["soniox", "even_ai"].includes(transaction.capability) && ["create", "replace"].includes(transaction.intent)) {
+      && OPTIONAL_SETUP_CAPABILITIES.includes(transaction.capability) && ["create", "replace"].includes(transaction.intent)) {
     out.transaction = { id: transaction.id, expiresAtMs: transaction.expiresAtMs, capability: transaction.capability, intent: transaction.intent };
   }
   const activation = result.activation;
@@ -99,4 +106,4 @@ function optionalSetupResult(request     , result     ) {
   return out;
 }
 
-module.exports = { parseOptionalSetupRequest, optionalSetupFailure, optionalSetupResult };
+module.exports = { OPTIONAL_SETUP_CAPABILITIES, parseOptionalSetupRequest, optionalSetupFailure, optionalSetupResult };

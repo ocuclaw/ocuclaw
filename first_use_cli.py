@@ -66,6 +66,48 @@ WELCOME_HANDOFF_MESSAGE = (
     "Double-tap the welcome on your glasses to finish."
 )
 
+#: Said once setup is complete. Three lines, one sentence each, so none wraps
+#: mid-word in a 100-column terminal. Byte for byte the OpenClaw first-use
+#: verb's OPTIONAL_SETUP_HANDOFF_LINES.
+OPTIONAL_SETUP_HANDOFF_LINES = (
+    "Optional: on your phone, the Optional setup card on Home offers voice and Even AI.",
+    "You can also reach them later under Settings > Voice and Settings > Defaults > Even AI.",
+    "Choose what you want, or leave it for later.",
+)
+
+#: The one fixed "setup complete" line (#3524). The terminal verb prints it and
+#: the host setup tool returns it as the first `say` line of a committed
+#: Welcome Round Trip, so no skill text carries a competing version.
+SETUP_COMPLETE_LINE = "OcuClaw setup is complete for this Hermes profile."
+
+#: One sentence per reply-evidence kind. An SDK receipt is never worded as the
+#: wearer seeing the reply.
+REPLY_EVIDENCE_SAY_LINES: Dict[str, str] = {
+    REPLY_EVIDENCE_WEARER_CONFIRMED: (
+        "You confirmed the reply appeared on your glasses, and your welcome "
+        "double-tap came back."
+    ),
+    REPLY_EVIDENCE_CLIENT_SDK_RECEIPT: (
+        "Your phone reported SDK acceptance of the reply, and your welcome "
+        "double-tap came back."
+    ),
+}
+
+
+def setup_complete_say_lines(reply_evidence: Optional[str] = None) -> List[str]:
+    """The lines a committed setup says, in order (#3524).
+
+    The fixed complete line, one evidence sentence when the evidence kind is
+    known, then the shared optional-setup handoff. Byte for byte the same
+    handoff the OpenClaw first-use result carries.
+    """
+    lines = [SETUP_COMPLETE_LINE]
+    evidence = REPLY_EVIDENCE_SAY_LINES.get(str(reply_evidence or ""))
+    if evidence:
+        lines.append(evidence)
+    lines.extend(OPTIONAL_SETUP_HANDOFF_LINES)
+    return lines
+
 # -- one line per attempt state -----------------------------------------------
 #
 # Total by construction: `_attempt_line` falls back to a state-naming line, so
@@ -75,7 +117,7 @@ WELCOME_HANDOFF_MESSAGE = (
 
 ATTEMPT_STATE_LINES: Dict[str, str] = {
     "committed": (
-        "OcuClaw setup is complete for this Hermes profile.\n"
+        SETUP_COMPLETE_LINE + "\n"
         "First message and welcome double-tap confirmed."
     ),
     "armed": (
@@ -168,19 +210,80 @@ REPLY_DELIVERY_REASON_LINES: Dict[str, str] = {
 #: error text, not a reply. Nothing here is a glasses problem, an OcuClaw
 #: problem or something a wearer can confirm, so the attempt is neither armed
 #: nor completed: the user fixes the model and runs the same command again.
-ERRORED_RUN_FIRST_LINES: Dict[str, str] = {
-    "reply_run_rate_limited": (
-        "Your agent's model is rate-limiting this account, so it returned an "
-        "error instead of a reply to your message."
-    ),
-    "reply_run_errored": (
-        "Your agent's model returned an error instead of a reply to your "
-        "message."
-    ),
-}
-ERRORED_RUN_TAIL_LINES = (
-    "Check your model with `hermes -z hello`, fix it, then run the same setup command again.",
+#: F21 (#3348). The verdict, and it is a verdict about TWO things at once.
+#: Everything OcuClaw installs was proven by this attempt — the phone reached
+#: the agent and the agent's text reached the glasses — and the one thing that
+#: failed is the model. Saying only "your model errored" left the #3348 run
+#: unable to tell whether the install had worked at all.
+ERRORED_RUN_VERDICT = (
+    "Your message reached your agent and its reply reached your glasses, but "
+    "the model returned an error instead of an answer. OcuClaw is installed; "
+    "setup is not complete."
 )
+
+#: #3392. The verdict names WHICH failure it was and its fix, in one line after
+#: the lead above. The same lines as the OpenClaw lane (first-use-wait.ts),
+#: with this engine's own commands. The login command is provider-neutral:
+#: nothing here knows which provider the model config names.
+ERRORED_RUN_RETRY_COMMAND = "hermes ocuclaw first-use"
+MODEL_LOGIN_COMMAND = "hermes model"
+MODEL_CHECK_COMMAND = "hermes -z hello"
+
+#: A closed vocabulary, shared with the OpenClaw lane and the phone's labels.
+PROVIDER_ERROR_CLASSES = ("auth", "quota", "rate_limit", "overloaded", "model_error")
+_PROVIDER_ERROR_CODE_CLASSES: Dict[str, str] = {
+    "provider_auth_invalid": "auth",
+    "provider_quota_exhausted": "quota",
+    "provider_rate_limited": "rate_limit",
+    "provider_unavailable": "overloaded",
+    "provider_overloaded": "overloaded",
+    "provider_timeout": "overloaded",
+    # The narrowed delivery reason, for a candidate that carries no code.
+    "reply_run_rate_limited": "rate_limit",
+}
+
+
+def provider_error_class(code: Optional[str], reason: Optional[str] = None) -> str:
+    """The failure class from the run's code, else the delivery reason."""
+
+    for value in (code, reason):
+        known = _PROVIDER_ERROR_CODE_CLASSES.get(str(value or ""))
+        if known is not None:
+            return known
+    return "model_error"
+
+
+def provider_error_class_line(error_class: str) -> str:
+    retry = ERRORED_RUN_RETRY_COMMAND
+    if error_class == "auth":
+        return (
+            "The model provider rejected the sign-in. Sign in to the model "
+            f"again (`{MODEL_LOGIN_COMMAND}`), then run {retry} and send a "
+            "fresh message."
+        )
+    if error_class == "quota":
+        return (
+            "The model account is out of quota or has a billing problem. "
+            "Check the plan or billing for this model, then run "
+            f"{retry} and send a fresh message."
+        )
+    if error_class == "rate_limit":
+        return (
+            "The model is rate limiting this account. Wait for the limit to "
+            f"reset or choose another model, then run {retry} and send a "
+            "fresh message."
+        )
+    return (
+        "The model provider failed or is busy. Try again in a minute, or "
+        f"check the model itself (`{MODEL_CHECK_COMMAND}`), then run {retry}."
+    )
+
+
+def errored_run_verdict(code: Optional[str], reason: Optional[str] = None) -> str:
+    """The lead plus the one class line: printed as one line."""
+
+    line = provider_error_class_line(provider_error_class(code, reason))
+    return f"{ERRORED_RUN_VERDICT} {line}"
 
 GATEWAY_NOT_RUNNING_LINES = (
     "No running Hermes gateway could be confirmed for this profile, so nothing "
@@ -327,6 +430,11 @@ def run_first_use(
         "replyEvidence": None,
         "replyDelivery": None,
         "wearerAsked": False,
+        # F21 (#3348). Always present, so a reader never has to tell "no
+        # provider error" apart from "this build does not report one".
+        "replyWasProviderError": False,
+        # #3392. One of PROVIDER_ERROR_CLASSES when the model failed, else None.
+        "providerErrorClass": None,
     }
 
     def say(text: str = "") -> None:
@@ -364,8 +472,8 @@ def run_first_use(
 
     def done(code: int, outcome: str) -> Dict[str, Any]:
         if code == EXIT_OK and outcome == "committed":
-            say("Optional: on your phone, open OcuClaw > Settings > Optional setup. "
-                "Choose what you want, or leave it for later.")
+            for line in OPTIONAL_SETUP_HANDOFF_LINES:
+                say(line)
         record["outcome"] = outcome
         return {"exitCode": code, "lines": lines, "record": record}
 
@@ -406,6 +514,9 @@ def run_first_use(
 
     # 3. Ask for the message, and hold the phone's hint for exactly this wait.
     say("")
+    # #3348 H9 turned out to be a stale busy flag on the phone (fixed in the
+    # relay and app), not the conversation choice, so the plain OpenClaw wording
+    # stands: asking for a new conversation only confused people.
     say(f"In the paired conversation on your phone, send {FIRST_USE_SEND_TEXT}.")
     say("Waiting for the reply on your glasses…")
 
@@ -446,17 +557,27 @@ def run_first_use(
         "lane": delivery.get("lane"),
     }
     delivery_reason = str(delivery.get("reason") or "")
-    if delivery_reason in REPLY_DELIVERY_ERRORED_RUN_REASONS:
+    # #3468. The adapter's code on the candidate is enough on its own: the
+    # arm refuses it anyway, so asking the wearer first would be a lie.
+    if delivery_reason in REPLY_DELIVERY_ERRORED_RUN_REASONS or candidate.get(
+        "runErrorCode"
+    ):
         # Checked BEFORE the accepted branch on purpose: an errored run still
         # paints its error text, so a receipt for it must never read as the
         # first message going through. Nothing is armed and nothing is
         # recorded, so a later rerun is a clean first message.
         record["attemptState"] = "reply_run_errored"
+        # F21 (#3348). The chain is proven; the model is not. Derived here
+        # rather than stored, exactly like the OpenClaw lane's field.
+        record["replyWasProviderError"] = True
+        # #3392. The adapter's code for this run rides on the candidate; the
+        # delivery reason is the fallback when it does not.
+        run_error_code = candidate.get("runErrorCode")
+        record["providerErrorClass"] = provider_error_class(
+            run_error_code, delivery_reason
+        )
         return problem(
-            ERRORED_RUN_FIRST_LINES.get(
-                delivery_reason, ERRORED_RUN_FIRST_LINES["reply_run_errored"]
-            ),
-            *ERRORED_RUN_TAIL_LINES,
+            errored_run_verdict(run_error_code, delivery_reason),
             outcome="refused",
         )
     if delivery.get("status") == REPLY_DELIVERY_SDK_ACCEPTED:
@@ -502,6 +623,17 @@ def run_first_use(
         return done(EXIT_OK, "committed")
     if armed.get("armed") is not True:
         record["attemptState"] = armed_state
+        if armed_state == "reply_run_errored":
+            # #3468. The arm's own guard: the delivery reason landed after the
+            # wait above ended. Same verdict, nothing recorded.
+            record["replyWasProviderError"] = True
+            record["providerErrorClass"] = provider_error_class(
+                armed.get("runErrorCode"), armed.get("reason")
+            )
+            return problem(
+                errored_run_verdict(armed.get("runErrorCode"), armed.get("reason")),
+                outcome="refused",
+            )
         if armed_state == "reply_evidence_unavailable":
             return problem(
                 "The glasses SDK receipt for that reply is no longer usable, "
@@ -577,9 +709,7 @@ def _await_welcome(
         record["replyEvidence"] = terminal.get("replyEvidence") or record.get(
             "replyEvidence"
         )
-        say(
-            "OcuClaw setup is complete for this Hermes profile."
-        )
+        say(SETUP_COMPLETE_LINE)
         return done(EXIT_OK, "committed")
     if state == "timeout":
         say(_attempt_line("timeout"))
@@ -599,7 +729,11 @@ __all__ = [
     "EXIT_PROBLEM",
     "EXIT_USAGE",
     "FIRST_USE_SEND_TEXT",
+    "OPTIONAL_SETUP_HANDOFF_LINES",
     "PROMPT_TEXT",
+    "REPLY_EVIDENCE_SAY_LINES",
+    "SETUP_COMPLETE_LINE",
     "gateway_running",
     "run_first_use",
+    "setup_complete_say_lines",
 ]

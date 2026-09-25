@@ -22,10 +22,14 @@ import types
 import urllib.error
 import urllib.parse
 import urllib.request
-import yaml
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
+
+try:  # Same rule as ../yaml_compat.py: Hermes main ships hermes_yaml, not PyYAML.
+    import yaml
+except ImportError:
+    import hermes_yaml as yaml
 
 try:
     from fastapi import APIRouter, Body, Header, HTTPException, Response, WebSocket, status as http_status
@@ -44,7 +48,7 @@ GLASSES_STATE_STALE_AFTER_MS = 30_000
 DEVICE_STATE_STALE_AFTER_MS = 120_000
 DEVICE_STATE_CLOCK_SKEW_MS = 60_000
 PLATFORM_RECEIPT_EMPIRICAL_TTL_S = 300.0
-SETUP_GUIDE_VERSION = "2026-09-21 (1.3.22-hermes)"
+SETUP_GUIDE_VERSION = "2026-09-25 (1.3.24-hermes)"
 
 _LEG_ORDER = (
     ("hermesGateway", "Hermes gateway"),

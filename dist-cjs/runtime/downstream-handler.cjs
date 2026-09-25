@@ -2,6 +2,7 @@ const { normalizeEvenAiRoutingMode, normalizeEvenAiDefaultAgent } = require("../
 const { activeBackendDisplayName } = require("../gateway/backend-contract.cjs");
 const { projectSessionDriverFields } = require("./session-driver-projection.cjs");
 const { managementRequest, validManagementRequest, managementResult, managementFailure } = require("./hermes-management.cjs");
+const { boardMomentAck } = require("./hermes-board-moments.cjs");
 const { normalizeOcuClawDefaultModel, normalizeOcuClawDefaultThinking, normalizeOcuClawAgentProgressNotes, normalizeOcuClawSystemPrompt, normalizeOcuClawDefaultAgent, normalizeOcuClawEvenAiSection, normalizeOcuClawEvenAiPeer, normalizeOcuClawPathwayBinding, normalizeOcuClawPathways } = require("./ocuclaw-settings-store.cjs");
 const { formatMainOperationReceived, formatSendAck } = require("./relay-worker-protocol.cjs");
 const { CAPABILITY_SNAPSHOT_TYPE, PUSH_MESSAGE_TYPE } = require("./capability-snapshot.cjs");
@@ -56,6 +57,33 @@ function sanitizeProtocolFrame(value, seen = new WeakSet(), depth = 0) {
       : sanitizeProtocolFrame(entry, seen, depth + 1);
   }
   return clean;
+}
+
+const CODEX_APP_SERVER_APPROVAL_PLUGIN_ID = "openclaw-codex-app-server";
+const CODEX_APP_SERVER_APPROVAL_TITLE_PREFIX = "Codex app-server ";
+const CHAT_ESCAPE_ENTITIES = new Map([
+  ["&amp;", "&"],
+  ["&lt;", "<"],
+  ["&gt;", ">"],
+  ["&quot;", "\""],
+  ["&#39;", "'"],
+  ["&#x27;", "'"],
+  ["&apos;", "'"],
+]);
+const CHAT_ESCAPE_ENTITY_RE = /&(?:amp|lt|gt|quot|apos|#39|#x27);/g;
+
+function isChatEscapedApprovalRequest(request) {
+  if (!request || typeof request !== "object") return false;
+  if (request.pluginId === CODEX_APP_SERVER_APPROVAL_PLUGIN_ID) return true;
+  return (
+    typeof request.title === "string" &&
+    request.title.startsWith(CODEX_APP_SERVER_APPROVAL_TITLE_PREFIX)
+  );
+}
+
+function decodeChatEscapedText(value) {
+  if (typeof value !== "string" || value.indexOf("&") < 0) return value;
+  return value.replace(CHAT_ESCAPE_ENTITY_RE, (entity) => CHAT_ESCAPE_ENTITIES.get(entity) ?? entity);
 }
 
 function hasOwn(obj, key) {
@@ -149,6 +177,7 @@ function createDownstreamHandler(opts) {
   const onCreateOpenClawAgent = opts.onCreateOpenClawAgent || null;
   const onCreateHermesProfile = opts.onCreateHermesProfile || null;
   const onHermesManagement = opts.onHermesManagement || null;
+  const onBoardMomentAck = opts.onBoardMomentAck || null;
   const onSetAgentEmoji = opts.onSetAgentEmoji || null;
   const onGetAgentSettings = opts.onGetAgentSettings || null;
   const onSetAgentSettings = opts.onSetAgentSettings || null;
@@ -303,6 +332,9 @@ function createDownstreamHandler(opts) {
     inputPredictionCancel: "ocuclaw.input.prediction.cancel",
     inputPredictionTest: "ocuclaw.input.prediction.test",
     inputPredictionTestResult: "ocuclaw.input.prediction.test.result",
+
+    inputPredictionModelAllow: "ocuclaw.input.prediction.model.allow",
+    inputPredictionModelAllowResult: "ocuclaw.input.prediction.model.allow.result",
     providerUsageGet: "ocuclaw.provider.usage.get",
     providerUsageSnapshot: "ocuclaw.provider.usage.snapshot",
     skillsCatalogGet: "ocuclaw.skills.catalog.get",
@@ -346,6 +378,9 @@ function createDownstreamHandler(opts) {
     openclawAgentCreateResult: "ocuclaw.agent.openclaw.create.result",
     hermesProfileCreate: "ocuclaw.profile.hermes.create",
     hermesManagement: "ocuclaw.hermes.management",
+
+    boardMoment: "ocuclaw.board.moment",
+    boardMomentAck: "ocuclaw.board.moment.ack",
     hermesProfileCreateResult: "ocuclaw.profile.hermes.create.result",
     agentEmojiSet: "ocuclaw.agent.emoji.set",
     agentEmojiSetResult: "ocuclaw.agent.emoji.set.result",
@@ -1654,16 +1689,21 @@ function createDownstreamHandler(opts) {
         ? "plugin"
         : "exec";
     const isPluginApproval = approvalKind === "plugin";
-    const commandText =
+    const decodeText =
+      isPluginApproval && isChatEscapedApprovalRequest(request)
+        ? decodeChatEscapedText
+        : (value) => value;
+    const commandText = decodeText(
       request.command ||
       (request.host === "node" && request.systemRunPlan && typeof request.systemRunPlan.commandText === "string"
         ? request.systemRunPlan.commandText
         : "") ||
       (isPluginApproval && typeof request.title === "string" ? request.title : "") ||
-      "";
+      "",
+    );
     const pluginDescription =
       isPluginApproval && typeof request.description === "string" && request.description.length > 0
-        ? request.description
+        ? decodeText(request.description)
         : null;
     return JSON.stringify({
       type: APP_PROTOCOL.approvalRequest,
@@ -3110,7 +3150,11 @@ function createDownstreamHandler(opts) {
         "open", "open-words", "back", "search", "draft", "submit", "edit", "edit-draft", "save", "cancel", "remove-row", "star", "undo", "dismiss", "replace-stored",
         "hide-row", "restore-row", "find", "hide-found", "favourite-found", "restore-hidden",
 
+        "row-menu",
+
         "storage-fault",
+
+        "forget-spelled",
       ];
       if (!operation || (!storeOps.includes(operation) && !sectionOps.includes(operation))) {
         throw new Error("remote-control webui-silent-input-word requires a supported operation");
@@ -3127,6 +3171,27 @@ function createDownstreamHandler(opts) {
         throw new Error("remote-control webui-silent-input-word requires a single line of at most 200 chars");
       }
       return { ...payload, value: operation, text };
+    }
+    if (action === "webui-silent-input-suggestions") {
+
+      const operation = parseOptionalTrimmedString(msg.value);
+      const ops = [
+        "check:ranking", "check:replies", "off:ranking", "off:replies",
+        "add-key-open", "add-key-paste", "add-key-save", "add-key-cancel",
+      ];
+
+      const modelPick = /^model:[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$/.test(operation || "");
+      if (!operation || (!ops.includes(operation) && !modelPick)) {
+        throw new Error("remote-control webui-silent-input-suggestions requires a supported operation");
+      }
+      if (operation === "add-key-paste") {
+        const key = typeof msg.text === "string" ? msg.text.trim() : "";
+        if (!key || !/^[\x21-\x7e]{1,4096}$/.test(key)) {
+          throw new Error("remote-control webui-silent-input-suggestions add-key-paste requires text: one printable line of at most 4096 chars");
+        }
+        return { ...payload, value: operation, text: key };
+      }
+      return { ...payload, value: operation, text: "" };
     }
     if (action === "webui-temple-editor") {
 
@@ -3212,6 +3277,9 @@ function createDownstreamHandler(opts) {
     }
 
     if (
+
+      action === "webui-setup-help-open" ||
+      action === "webui-setup-help-dismiss" ||
       action === "webui-agent-create-open" ||
       action === "webui-agent-create-tap" ||
       action === "webui-agent-create-next" ||
@@ -3321,6 +3389,13 @@ function createDownstreamHandler(opts) {
     if (action === "webui-hermes-try-again") {
 
       return payload;
+    }
+    if (action === "webui-hermes-board") {
+
+      const text = typeof msg.text === "string" ? msg.text : "";
+
+      if (!/^(?:settings|open-board|default:[a-z0-9][a-z0-9_-]{0,63}|lane:[a-z][a-z_]{0,31}=(?:on|off)|initial:[a-z][a-z_]{0,31}|watch:(?:off|notify|notify_wake)|watch-(?:bell|cancel)|new-card|create-(?:save|check|retry|close|more|open|done|voice)|create-title:[A-Za-z0-9][A-Za-z0-9 .,'!?-]{0,79}|create-lane:(?:triage|ready)|create-watch:(?:off|notify)|create-priority:[0-2]|create-worker:(?:[a-z0-9][a-z0-9_-]{0,63})?|verdict:(?:approve|request_changes)|verdict-(?:send|cancel|check)|verdict-reason:[A-Za-z0-9][A-Za-z0-9 .,'!?-]{0,79}|moment|moment-dismiss|moments:(?:on|off)|done:(?:on|off)|quiet:(?:off|(?:[01][0-9]|2[0-3]):[0-5][0-9]-(?:[01][0-9]|2[0-3]):[0-5][0-9])|quiet-zone:phone|board:[a-z0-9][a-z0-9_-]{0,63}|filter:[a-z][a-z_]{0,31}|list-more|refresh|card:[A-Za-z0-9_.:-]{1,64}|home|stat:(?:needs_you|running|failed|total)|queue:[A-Za-z0-9_.:-]{1,64}|say-card|picker|comment|comment-(?:send|cancel|check)|comment-text:[A-Za-z0-9][A-Za-z0-9 .,'!?-]{0,79}|answer|tools-enable|tools-confirm|tools-cancel|reason-lab|more|card-action:(?:make_ready|reassign|set_model|retry|split|archive)|card-worker:(?:[a-z0-9][a-z0-9_-]{0,63})?|card-model:(?:[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,63})?|card-(?:confirm|cancel|check)|create-parent:[A-Za-z0-9_.:-]{1,64}|create-split|create-split-check|maint|maint-(?:refresh|export|confirm|cancel|check)|maint-reclaim:[A-Za-z0-9_.:-]{1,64}|maint-attachments:(?:on|off)|maint-logs:(?:on|off)|artifact:[0-9]{1,15}|artifact-(?:save|close|source|scripts(?:-(?:run|cancel|stop))?))$/.test(text)) throw new Error("Invalid Hermes board action");
+      return { ...payload, text };
     }
     if (action === "webui-hermes-learning") {
       const text = typeof msg.text === "string" ? msg.text : "";
@@ -3441,6 +3516,7 @@ function createDownstreamHandler(opts) {
         ["voice-test", /^start$/],
         ["voice-test-hint", /^dismiss$/],
         ["optional-home", /^(voice|even-ai|dismiss)$/],
+        ["voice-activation-home", /^(activate|cancel|later|dismiss|status|fixture:(due|confirm|progress|reconnecting|ready|clear))$/],
         ["display-debug", /^(expand|collapse|diagnostics)$/],
         ["manual-even-ai", /^(open|dismiss|unlock-agent-configuration|store-private-secret|enable-runtime|verify-private-route|configure-even-realities-app|exercise-glasses-request)?$/],
         ["agent-filter", /^(open|dismiss)?$/],
@@ -3987,6 +4063,18 @@ function createDownstreamHandler(opts) {
       };
     }
 
+    if (isForeignHermesSessionKey(sessionKey)) {
+      return {
+        unicast: formatSessionAbortAck({
+          requestId,
+          sessionKey,
+          status: "rejected",
+          error: "Foreign sessions are read-only; nothing to stop here.",
+          errorCode: "unsupported_session_key",
+        }),
+      };
+    }
+
     if (!onAbortSession) {
       return {
         unicast: formatSessionAbortAck({
@@ -4045,6 +4133,17 @@ function createDownstreamHandler(opts) {
           requestId,
           "rejected",
           "Missing required field: sessionKey",
+        ),
+      };
+    }
+    if (isForeignHermesSessionKey(sessionKey)) {
+      return {
+        unicast: formatSendAckCompat(
+          requestId,
+          "rejected",
+          "Foreign sessions are read-only; copy to OcuClaw before sending.",
+          "unsupported_session_key",
+          undefined,
         ),
       };
     }
@@ -4117,6 +4216,7 @@ function createDownstreamHandler(opts) {
     const pages = onSimulate(
       msg.sender || "Simulator",
       msg.text || "",
+      parseOptionalTrimmedString(msg.id) || undefined,
     );
     return { broadcast: formatPages(pages) };
   }
@@ -5070,13 +5170,21 @@ function createDownstreamHandler(opts) {
             ? `${APP_PROTOCOL.inputPredictionCancel}.ack`
             : op === "open"
               ? APP_PROTOCOL.inputPredictionOpenResult
-              : APP_PROTOCOL.inputPredictionResult;
+              : op === "modelAllow"
+                ? APP_PROTOCOL.inputPredictionModelAllowResult
+                : APP_PROTOCOL.inputPredictionResult;
+
+    const modelAllowFailure = (status) => ({
+      requestId: testRequestId,
+      status,
+      activation: { required: false, mode: "none" },
+    });
 
     const noIdentity = { agentId: "", profileId: "", sessionKey: "" };
     const frame = (body) => ({
       unicast: JSON.stringify({
         type: resultType,
-        ...(op === "cancel" ? {} : noIdentity),
+        ...(op === "cancel" || op === "modelAllow" ? {} : noIdentity),
         ...body,
       }),
     });
@@ -5095,6 +5203,7 @@ function createDownstreamHandler(opts) {
         });
       }
       if (op === "cancel") return frame({ requestId, accepted: false, abort: false });
+      if (op === "modelAllow") return frame(modelAllowFailure("error"));
 
       if (op === "open") {
         return frame({ requestId, status: "unavailable", replies: [], words: [], provider: "", model: "", elapsedMs: 0, usage: null, reason: "input prediction service not wired on this host" });
@@ -5111,6 +5220,7 @@ function createDownstreamHandler(opts) {
           return frame({ protocolVersion: 1, supported: false, unsupportedReason: "input prediction failed", structuredOutput: false, abort: false, policyRevision: "", limits: null, models: [], connectionDefault: null });
         }
         if (op === "cancel") return frame({ requestId, accepted: false, abort: false });
+        if (op === "modelAllow") return frame(modelAllowFailure("error"));
         if (op === "open") {
           return frame({ requestId, status: "error", replies: [], words: [], provider: "", model: "", elapsedMs: 0, usage: null, reason: "input prediction failed" });
         }
@@ -5952,6 +6062,18 @@ function createDownstreamHandler(opts) {
     } catch (error) {
       return reply(managementFailure(identity, "management_unavailable", error?.code === -32601 || error?.code === "capability_unavailable"));
     }
+  }
+
+  function handleBoardMomentAck(clientId, msg) {
+    if (!isPhoneClient(clientId)) return null;
+    const ack = boardMomentAck(msg);
+    if (!ack || typeof onBoardMomentAck !== "function") return null;
+    try {
+      onBoardMomentAck(ack);
+    } catch (err) {
+      logger.warn(`[downstream] board moment ack failed: ${err && err.message ? err.message : err}`);
+    }
+    return null;
   }
 
   function handleCreateHermesProfile(clientId, msg) {
@@ -7517,6 +7639,19 @@ function createDownstreamHandler(opts) {
           return handleInputPrediction(clientId, "cancel", msg);
         case APP_PROTOCOL.inputPredictionTest:
           return handleInputPrediction(clientId, "test", msg);
+        case APP_PROTOCOL.inputPredictionModelAllow:
+
+          if (typeof opts.isPhoneClient !== "function" || opts.isPhoneClient(clientId) !== true) {
+            return {
+              unicast: JSON.stringify({
+                type: APP_PROTOCOL.inputPredictionModelAllowResult,
+                requestId: msg && typeof msg.requestId === "string" && /^[A-Za-z0-9._:@/-]{1,128}$/.test(msg.requestId) ? msg.requestId : "",
+                status: "policy-denied",
+                activation: { required: false, mode: "none" },
+              }),
+            };
+          }
+          return handleInputPrediction(clientId, "modelAllow", msg);
         case APP_PROTOCOL.skillsCatalogGet:
         case "getSkills":
           return handleGetSkillsCatalog(clientId);
@@ -7566,6 +7701,8 @@ function createDownstreamHandler(opts) {
           return handleCreateHermesProfile(clientId, msg);
         case APP_PROTOCOL.hermesManagement:
           return handleHermesManagement(clientId, msg);
+        case APP_PROTOCOL.boardMomentAck:
+          return handleBoardMomentAck(clientId, msg);
         case APP_PROTOCOL.agentEmojiSet:
           return handleSetAgentEmoji(clientId, msg);
         case APP_PROTOCOL.agentSettingsGet:

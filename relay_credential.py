@@ -3,6 +3,13 @@
 The reusable credential itself lives only in Hermes's managed ``.env``.  This
 module owns the separate, secret-free generation marker that distinguishes a
 provably fresh profile from an established profile whose credential is gone.
+
+Marker provenance (#3480): the marker says only that SOME process registered
+the plugin against this profile. ``register()`` runs in every process that
+loads the plugin, the ``hermes ocuclaw ...`` CLI included, and it calls
+:func:`bootstrap_relay_credential`, which publishes the marker. It is never
+proof that the running gateway loaded OcuClaw; ask the gateway's own runtime
+receipt for that (``cloudways_restart_step._plugin_loaded_by_this_process``).
 """
 
 from __future__ import annotations
@@ -105,7 +112,11 @@ def _valid_marker(record: Any, *, home: Optional[Path]) -> bool:
 
 
 def read_relay_credential_marker(home: Optional[Path] = None) -> Optional[dict]:
-    """Read the exact-profile v1 marker; reject every unqualified shape."""
+    """Read the exact-profile v1 marker; reject every unqualified shape.
+
+    Any process that loads the plugin may have written it, the CLI included,
+    so a marker is not evidence that a gateway loaded OcuClaw (#3480).
+    """
     resolved = home if home is not None else receipts.resolve_receipt_home()
     if resolved is None:
         return None

@@ -103,7 +103,7 @@ def bootstrap_profile(source: Path, target: Path) -> None:
     content += "".join(f"{key}={json.dumps(env[key], ensure_ascii=False)}\n" for key in sorted(allowed) if key in env)
     write_private(target / ".env", content)
     # No auth.json copy: single-use OAuth refresh state must retain one owner.
-    atomic_config_write(target / "config.yaml", target_cfg, sort_keys=False)
+    atomic_config_write(target / "config.yaml", target_cfg)
 
 
 def admit_profile(source: Path, name: str) -> None:

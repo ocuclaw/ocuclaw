@@ -7,7 +7,7 @@ metadata: {"hermes": {"emoji": "glasses"}}
 
 # OcuClaw Setup Assistant for Hermes
 
-**Guide version:** 2026-09-21 (1.3.22-hermes)
+**Guide version:** 2026-09-25 (1.3.24-hermes)
 
 **Provenance:** deliberately forked from the OcuClaw Setup Assistant guide
 1.0.41 at commit `fffbb2154`. That is the source guide version, not an
@@ -36,7 +36,8 @@ This gate runs after the phone-session entry gate and before the Opening move,
 on every setup, update and troubleshooting entry. One wearer is one pairing and
 one relay credential, and it lives in the **default** Hermes profile.
 
-Run the read-only preflight first and obey its verdict:
+Run the read-only preflight first, as one `terminal` call (never
+`execute_code`), and obey its verdict:
 
 ```bash
 hermes ocuclaw setup-preflight --json
@@ -196,9 +197,16 @@ calibration question again afterward.
 
 Use Hermes' `clarify` question tool for every bounded question when the tool is
 available: calibration, command approval (including Cloudways installation and
-Tailscale Serve), checkpoint OK, device choice, wearer yes/no evidence,
-and optional yes/skip decisions. Ask one question per call with two or three
-concrete choices.
+Tailscale Serve), checkpoint OK, and optional yes/skip decisions. Ask one
+question per call with two or three concrete choices.
+Wearer yes/no evidence is the exception, and so is any question whose honest
+answer you cannot guess (the Cloudways `likely` check). Hermes marks the first
+choice of any list "(Recommended)", and that steers the answer. Ask these
+open-ended: call `clarify` with no choices and end the question with "Type yes
+or no." Only a clear yes counts as yes. For a vague answer, ask once more the
+same way; if it is still not a clear yes, treat it as no and diagnose. A
+`clarify` timeout reply of either kind (one says no answer came, the classic
+CLI one says to use your best judgement) is no answer. It is never yes.
 `clarify.question` is a plain-text surface in Hermes Desktop and TUI. Never put
 Markdown delimiters, backticks, or fenced code blocks in it. When a checkpoint
 question needs to show a command, include the exact command as an indented
@@ -221,6 +229,11 @@ tailnet.
 ## Reference router
 
 Use the registered `ocuclaw_setup` tool for setup state and focused guidance.
+If it is not in your tool list, Hermes has deferred it. Load it by its exact
+name: call `tool_describe` with `{"names":["ocuclaw_setup"]}`, then invoke it
+through `tool_call`. To search instead, use the one-word query `ocuclaw`.
+Hermes' tool search returns nothing when a query has a word no tool carries,
+so an empty search never means the tool is missing.
 Never resolve a bundled reference by a relative path. Begin a resumed or new
 conversation with `{"operation":"status"}`; use `{"operation":"doctor"}` when
 the state is invalid or unavailable.
@@ -274,9 +287,14 @@ when the local relay is already healthy. A durable pairing/completion receipt
 or the lane card's recorded G2 answer satisfies this question. Resume uses that
 answer; updates, recovery, and Even AI activation do not re-ask it.
 
-`{"operation":"pair_phone"}` is the direct local pairing action. Use it only
-at `journey.nextCheckpoint: secure-phone-pairing`, after `doctor` has verified
-the current private route and the user has confirmed the phone is ready. It
+`{"operation":"pair_phone"}` is the direct local pairing action. During setup,
+use it at `journey.nextCheckpoint: secure-phone-pairing`, after `doctor` has
+verified the current private route and the user has confirmed the phone is
+ready. After setup (any later checkpoint, including core completion), use it
+when the person asks to re-pair their phone after setup: the same phone, never
+a second one. Say plainly that setup and its proof stay done; re-pairing never
+reopens the journey, and `paired` there ends the request instead of
+continuing to `wait_phone_origin`. It
 opens a model-bypassing panel on the live Hermes TUI or Desktop surface, waits
 while that panel advances from QR to four words to the explicit human decision,
 and returns only after the controller reaches a terminal result. Never repeat,
@@ -284,10 +302,31 @@ summarize, re-render, or answer the panel through prose or another tool. In
 classic CLI the action returns `tui_required` immediately. Give its one-time
 TUI/Desktop handoff and resume the same saved checkpoint there; do not call the
 pairing action again in classic CLI.
-For `desktop_pairing_timeout` or `tui_pairing_timeout`, use the returned timeout
-message verbatim: "Pairing timed out. Ensure OcuClaw is running on your Even
-G2, then retry pairing." Do not replace it with Even Hub or generic phone-ready
-wording.
+The TUI panel shows the QR when it fits the window and the address and pairing
+code (manual entry) when it does not; both are the same exchange. Act on the
+returned `code`, never on a guess:
+
+| `code` | Action |
+|---|---|
+| `paired` | Continue with `wait_phone_origin`. |
+| `tui_window_too_small` | The Hermes window is too small even for the manual view. Nothing was paired and the phone is not at fault. Use the returned message: it names the window's size and the size needed. Ask the person to make this Hermes window bigger (drag its edge or maximise it; do not quit Hermes), then call `pair_phone` again. |
+| `desktop_pairing_timeout`, `tui_pairing_timeout` | The phone did not connect in time; use the returned timeout message verbatim: "Pairing timed out. Ensure OcuClaw is running on your Even G2, then retry pairing." Do not replace it with Even Hub or generic phone-ready wording. |
+| `cancelled`, `refused` | The person cancelled or refused in the panel. Ask whether to retry; call `pair_phone` again only on yes. |
+| `tui_required` | The classic-CLI handoff above. |
+| `tui_relaunch_required` | The widget was repaired after this TUI started. Relaunch Hermes once only when a service manager runs the gateway; otherwise use the fallback below. |
+| `desktop_plugin_unavailable` | Keep Desktop open, reload Desktop plugins once, and retry. |
+| `phone_already_connected` | The phone is connected now, so nothing was opened. Use the returned message: to re-pair, the person closes OcuClaw on the phone or disconnects it there first, then says so; call `pair_phone` again. Never offer this as a way to add a second phone. |
+| `profile_unresolved`, `setup_not_configured`, `gateway_not_healthy`, `relay_not_healthy`, `tailnet_route_not_verified`, `tailnet_route_not_owned`, `tailnet_identity_unavailable`, `address_unavailable`, `verification_failed` | A pre-pairing check failed and nothing was opened. Each code has its own returned message naming the cause and next step; use it, fix that one cause, then call `pair_phone` again. Only `tailnet_route_not_verified` means the private route is unverified. |
+| any other code, or the same failure twice | Deterministic: the panel will fail the same way again. Hand off the fallback below. |
+
+Fallback for a deterministic pairing failure: ask the person to run
+`hermes ocuclaw pair --address <verified-phoneAddress>` in their own terminal,
+a separate window they open themselves. Never run it through your Terminal or
+any other tool, pipe it, or ask for its output: its QR and pairing code must
+never reach you. Wait for them to say the phone paired, then continue with
+`wait_phone_origin`. Never suggest quitting, closing or relaunching the Hermes
+TUI to retry pairing while the gateway may be this TUI's child (it was started
+from here, or no service manager runs it): quitting the TUI stops the gateway.
 
 `{"operation":"wait_phone_origin"}` is the direct observation after pairing.
 Announce the phone message request and call it immediately; it blocks for a
@@ -305,7 +344,11 @@ or that it was displayed, and continue. On `unconfirmed`, `unsupported` or
 `pending`, give reconnect guidance first when a disconnect is known, then ask
 one `clarify` yes/no question confirming whether the reply appeared on the
 physical Even G2, with neither answer recommended. A “No” is diagnosed, never
-armed.
+armed. Check for a model error before any of that: when either result carries
+`replyWasProviderError: true`, `runErrorCode`, or the reason
+`reply_run_errored`, the chain works and the model is unreachable. Give the
+result's `action` line (the class fix) and stop; never ask whether the reply
+appeared, and never arm. The arm refuses that turn with `reply_run_errored`.
 
 `{"operation":"welcome_round_trip"}` is the other mutating private-tool action.
 Use it only once you hold reply evidence. Tell the wearer to double-tap the
@@ -342,8 +385,11 @@ If the tool returns a structured guidance error or its Guide version differs,
 the bundled plugin is broken. Report that receipt; do not improvise from an
 older OpenClaw guide.
 
-If `ocuclaw_setup` itself is unavailable, stop and report that the supported
-Hermes plugin contract is broken. Do not guess a relative reference path or
+Only when that exact-name lookup fails (`tool_describe` lists `ocuclaw_setup`
+under `not_found`, or neither tool exists) is `ocuclaw_setup` unavailable. Then
+stop and report that the supported Hermes plugin contract is broken; ask the
+user to check that `hermes plugins list` shows ocuclaw enabled and that the
+gateway has been restarted once since the install. Do not guess a relative reference path or
 continue with remembered setup commands.
 
 ### Status-state vocabulary
@@ -377,6 +423,12 @@ receipt.
 2. **Run commands exactly as printed.** Substitute only marked placeholders.
    Never wrap a command in `read`, a loop, a pipe, or extra flags. If a command
    is unsafe or incompatible, stop that phase and diagnose read-only.
+   Run shell only through the `terminal` tool, one printed command per call.
+   Never use `execute_code` for setup work, not even a read-only check: a
+   script that calls `terminal` makes Hermes stop for a "script can spawn
+   subprocesses" approval the user should never see. For setup state, call
+   `ocuclaw_setup` with `{"operation":"status"}` or `{"operation":"doctor"}`
+   instead of composing a shell check; both are typed and read-only.
    For TS-NOT-INSTALLED, each OS branch prints one complete private staged
    download/install block; run that whole block as one Terminal command so its
    quoted temporary-path variable remains in scope. Its `&&` chain or
@@ -398,7 +450,11 @@ receipt.
    profile; there is no user-entry lane. If an established profile is missing
    it, stop normal setup and load the credential-reset branch.
    On a matching bundle advertising private phone setup, lead with Home's
-   Optional setup card or Settings re-entry. The dedicated page's masked field
+   Optional setup card, whose two buttons are **Set up voice** and
+   **Set up Even AI**; later re-entry is **Settings > Voice** and
+   **Settings > Defaults > Even AI**. The card has no other buttons, and
+   Settings has no separate optional-setup row.
+   The dedicated page's masked field
    and explicit replacement confirmation own private entry. Save privately does
    not restart Hermes; Review activation and its separate confirmation handle
    the supported host lifecycle. Unsupported activation stays pending. Refresh
@@ -424,15 +480,29 @@ receipt.
    and ask for OK. In ordinary assistant prose, use a fenced block. In a
    `clarify.question`, use an indented plain-text command line with no Markdown
    delimiters. The direct-panel `pair_phone` exception has no
-   shell command: the user's Step 8 phone-ready confirmation authorizes opening
+   shell command: Step 8's fresh online-phone check authorizes opening
    its local modal, and the modal itself owns the explicit Yes/No gate. The pause message opens with the
    previous phase's result. If a pause message has no exact command line,
    discard and rewrite it. Resolve `Skip if` checks before proposing a mutation.
 5. **One restart per phase.** Warn: "Hermes may go quiet briefly while its
    gateway restarts. If I do not return, say 'continue OcuClaw setup'." After
-   any config change, state that it is saved but not applied until
-   `hermes gateway restart` succeeds. Never repeat a restart without a new
-   finding. Optional Soniox/Even AI saves use fresh-install's grouped
+   any config change, state that it is saved but not applied until the
+   gateway restarts. Never repeat a restart without a new finding.
+   **A local fresh install restarts once (#3541):** the person arrives from
+   the after-install card without restarting, so the gateway may not have
+   loaded OcuClaw yet. That is expected; this TUI already holds the plugin and
+   its Relay Credential. Do Steps 1-4b first, then fresh-install Step 5's one
+   restart loads OcuClaw and applies them together. Never ask for an earlier
+   restart.
+   **Who restarts it:** run `hermes gateway restart` yourself only when fresh
+   status reports `gatewaySupervision: service`. For `unsupervised`,
+   `unknown` or an absent field, never run `hermes gateway restart` or
+   `hermes gateway run` from a tool: hand the restart to the person with the
+   exact words in `quick_reference` → `Restarting the gateway` (Ctrl+C in
+   their gateway terminal, `hermes gateway run` again there, then
+   "continue"), then re-check status. This covers every restart in this
+   skill, including the ownership move lane above. **Never start the gateway
+   or `tailscaled` as a tool or background child.** Optional Soniox/Even AI saves use fresh-install's grouped
    `optional-setup activate` barrier and fresh loaded-runtime status instead
    of a second generic restart; an uncertain activation remains pending.
 6. **Official Hermes CLI only.** Use `hermes config set|get|unset` and
@@ -560,7 +630,10 @@ hermes profile list
 ```
 
 During fresh setup, call `{"operation":"agent_mode"}` before
-the restart. Multiple agents is recommended, single agent remains a choice.
+the restart. Multiple agents is recommended; single agent remains a choice
+wherever status reports `singleAgentAvailable: true`. When it is false (Hermes
+0.21.4 and later, whatever the profile count), skip the question and say
+nothing about it, then apply multiple agents.
 Require `status.mandatoryConfiguration.agentModeChosen: true`; verify the
 served list after restart. The same operation applies to an EXISTING install
 whose status reports `agentModeChosen: false` (#2515): the phone's grey "+"
@@ -590,7 +663,7 @@ secondary-profile rejection, not merely because multiple profiles exist.
 ## Shipping posture that must remain truthful
 
 - Supported Hermes is exactly `>=0.21.1,<0.22.0` (Hermes 0.21.1 and later 0.21.x);
-  the certified baseline is `0.21.3`.
+  the certified baseline is `0.21.5`.
 - Install and update use the private GitHub bundle `ocuclaw/ocuclaw`.
   Beta testers need repository access and Git HTTPS authentication on this host.
 - The relay defaults to `wsBind` `127.0.0.1` and `wsPort` `47801`, loopback

@@ -10,6 +10,8 @@ const DETECT_CLOUDWAYS = "cloudways";
 const DETECT_LIKELY = "likely";
 const DETECT_NO = "no";
 
+const CLOUDWAYS_SPECIFIC_SIGNALS = ["openclaw_log_in_home_logs"];
+
 function onPath(name     , env     ) {
   const raw = env && typeof env.PATH === "string" ? env.PATH : "";
   for (const entry of raw.split(path.delimiter)) {
@@ -30,14 +32,23 @@ function readProc1Cmdline() {
   }
 }
 
+function homeOf(options     , env     ) {
+  if (typeof options.home === "string" && options.home) return options.home;
+  const envHome = env && typeof env.HOME === "string" ? env.HOME.trim() : "";
+  if (envHome) return envHome;
+  try { return os.homedir(); } catch (_) { return ""; }
+}
+
 function detectionSignals(options     , hostname     , proc1     ) {
   const env = options.env || process.env;
   const exists = typeof options.pathExists === "function"
     ? options.pathExists
     : (target     ) => { try { fs.accessSync(target); return true; } catch (_) { return false; } };
   const has = typeof options.which === "function" ? options.which : (name     ) => onPath(name, env);
+  const home = homeOf(options, env);
   return {
     hostname_cloudwaysagents: String(hostname || "").toLowerCase().endsWith(CLOUDWAYS_HOSTNAME_SUFFIX),
+    openclaw_log_in_home_logs: Boolean(home) && exists(path.join(home, "logs", "openclaw.log")),
     pid1_entrypoint_sh: proc1.includes("entrypoint.sh"),
     no_systemctl: !has("systemctl"),
     no_crontab: !has("crontab"),
@@ -50,7 +61,8 @@ function detectionVerdict(signals     ) {
   if (signals.hostname_cloudwaysagents) return DETECT_CLOUDWAYS;
   const supporting = Object.keys(signals)
     .filter((key) => key !== "hostname_cloudwaysagents" && signals[key]).length;
-  return supporting >= 3 ? DETECT_LIKELY : DETECT_NO;
+  const specific = CLOUDWAYS_SPECIFIC_SIGNALS.some((key) => signals[key]);
+  return specific && supporting >= 3 ? DETECT_LIKELY : DETECT_NO;
 }
 
 function resolveHostname(options     ) {

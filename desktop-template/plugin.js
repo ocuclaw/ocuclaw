@@ -2498,16 +2498,43 @@ const clean = value => [...String(value ?? '')]
   .join('')
   .slice(0, 240)
 
+// BEGIN pairing-bootstrap-parser
+// Keep this block byte-identical in tui-widgets/ocuclaw-pair.mjs and
+// desktop-template/plugin.js. tests/hermes-pairing-bootstrap-contract.test.js
+// feeds both copies the text the relay presenter really prints.
+// The parts are found by shape, not by the words around them: the QR is the
+// longest run of equal-width half-block rows, and the manual details are the
+// "Address:" and "Pairing code:" lines at any indent. The 2.0.9 rewording broke
+// a wording-based parser; a shape-based one survives the next rewording.
+const PAIRING_QR_ROW = /^[ ▀▄█]+$/
+const parsePairingBootstrap = block => {
+  const lines = String(block ?? '').split('\n').map(line => line.replace(/\r$/, ''))
+  const labelled = label => {
+    const line = lines.find(candidate => candidate.trimStart().startsWith(label))
+    const value = line ? line.trim().slice(label.length).trim() : ''
+    return value ? `${label} ${value}` : ''
+  }
+  let qrLines = []
+  let run = []
+  for (const line of [...lines, '']) {
+    const isRow = PAIRING_QR_ROW.test(line)
+    if (isRow && (run.length === 0 || [...run[0]].length === [...line].length)) {
+      run.push(line)
+      continue
+    }
+    if (run.length > qrLines.length) qrLines = run
+    run = isRow ? [line] : []
+  }
+  const width = qrLines.length ? [...qrLines[0]].length : 0
+  const address = labelled('Address:')
+  const code = labelled('Pairing code:')
+  if (qrLines.length < 10 || width < 10 || !qrLines.some(line => line.trim()) || !address || !code) return null
+  return { qrLines, address, code }
+}
+// END pairing-bootstrap-parser
 const splitBootstrap = block => {
-  const lines = String(block ?? '').split('\n')
-  const scanIndex = lines.indexOf('  Scan this code with the Even app:')
-  const manualIndex = lines.indexOf('  Or pair manually — in the Even app, choose "Enter manually":')
-  const addressLine = lines.find(line => line.startsWith('    Address:'))
-  const codeLine = lines.find(line => line.startsWith('    Pairing code:'))
-  const qrLines = scanIndex >= 0 && manualIndex > scanIndex ? lines.slice(scanIndex + 2, manualIndex - 1) : []
-  const width = Math.max(0, ...qrLines.map(line => [...line].length))
-  if (qrLines.length < 10 || width < 10 || qrLines.some(line => [...line].length !== width) || !addressLine || !codeLine) return null
-  return { qrLines, addressLine: clean(addressLine.trim()), codeLine: clean(codeLine.trim()) }
+  const parsed = parsePairingBootstrap(block)
+  return parsed && { qrLines: parsed.qrLines, addressLine: clean(parsed.address), codeLine: clean(parsed.code) }
 }
 
 const paintPixelLogoWatermark = (context, cols, rows, scale) => {
@@ -2615,14 +2642,16 @@ function PairingDialog({ api }) {
   if (ceremony?.phase === 'qr') {
     body = view === 'manual'
       ? jsxs('div', { style: { display: 'grid', gap: 10 }, children: [
-          jsx('p', { children: 'In the OcuClaw phone app, choose Enter manually:' }),
+          // F17 (#3348). Real phone controls only: "Pair with your computer",
+          // then "Enter the pairing code instead".
+          jsx('p', { children: 'In Even Hub open OcuClaw, tap Pair with your computer, then Enter the pairing code instead:' }),
           jsx('code', { style: { overflowWrap: 'anywhere' }, children: ceremony.addressLine }),
           jsx('code', { children: ceremony.codeLine }),
           jsx('p', { style: { color: 'var(--ui-text-tertiary)' }, children: 'This is the same one-time encrypted exchange. The screen advances automatically.' }),
         ] })
       : jsxs('div', { style: { display: 'grid', gap: 10 }, children: [
           jsx(QrCanvas, { lines: ceremony.qrLines }),
-          jsx('p', { style: { textAlign: 'center' }, children: 'Scan this QR in the OcuClaw phone app. The screen advances automatically.' }),
+          jsx('p', { style: { textAlign: 'center' }, children: 'In Even Hub open OcuClaw, tap Pair with your computer, then Take a photo of the QR code. The screen advances automatically.' }),
         ] })
   } else if (ceremony?.phase === 'words') {
     body = jsxs('div', { style: { display: 'grid', gap: 14 }, children: [
@@ -2664,7 +2693,7 @@ function PairingDialog({ api }) {
         ceremony.phase === 'qr' ? jsxs(DialogFooter, { children: [
           jsx(Button, { variant: 'outline', onClick: () => void command('cancel'), children: 'Stop pairing' }),
           jsx(Button, { variant: 'outline', onClick: hide, children: 'Hide' }),
-          jsx(Button, { variant: 'secondary', onClick: () => viewStore.set(current => current === 'qr' ? 'manual' : 'qr'), children: view === 'qr' ? 'Enter manually' : 'Show QR' }),
+          jsx(Button, { variant: 'secondary', onClick: () => viewStore.set(current => current === 'qr' ? 'manual' : 'qr'), children: view === 'qr' ? 'Show pairing code' : 'Show QR' }),
         ] }) : null,
         ceremony.phase === 'words' ? jsxs(DialogFooter, { children: [
           jsx(Button, { variant: 'outline', onClick: () => void command('deny'), children: 'No — refuse this phone' }),
@@ -3357,10 +3386,12 @@ function expressionFor(def,age,variant=0){
  else beats=[[.9,'curious'],[4.8,'focused'],[6,'delighted'],[8,'focused']];
  const t=age%beats[beats.length-1][0];return beats.find(([end])=>t<end)[1];
 }
-// Ten idle variations, including edge exercise and small lens/prop routines.
+// Twelve idle variations, including edge exercise and small lens/prop routines.
 // Each is a 10 s loop; the rotation advances every loop and on
 // every wake from a held still frame. Paths live in props.js.
-const IDLE_VARIATIONS=10;
+// The drum (11) needs the settled name row under him: without it the
+// rotation skips it, and a pinned drum plays the hang (10) instead.
+const IDLE_VARIATIONS=12,HANG=10,DRUM=11,WITHOUT_DRUM=11;
 const IDLE_BEATS=[
  [[1,'curious'],[6.5,'playful'],[10,'delighted']],
  [[1,'curious'],[2.2,'focused'],[3.5,'curious'],[5.5,'delighted'],[7.2,'curious'],[7.6,'surprised'],[8.4,'delighted'],[10,'playful']],
@@ -3371,16 +3402,103 @@ const IDLE_BEATS=[
  [[2,'sleepy'],[5.5,'focused'],[7,'sleepy'],[7.6,'surprised'],[10,'curious']],
  [[2,'focused'],[4.5,'curious'],[6.8,'skeptical'],[8,'focused'],[10,'delighted']],
  [[2,'curious'],[5,'focused'],[6.4,'playful'],[7.2,'surprised'],[8.5,'curious'],[10,'playful']],
- [[2,'curious'],[4,'skeptical'],[6,'focused'],[8.5,'delighted'],[10,'skeptical']]];
-const IDLE_REST_EMOTION=['playful','curious','sleepy','neutral','curious','playful','neutral','delighted','neutral','neutral'];
+ [[2,'curious'],[4,'skeptical'],[6,'focused'],[8.5,'delighted'],[10,'skeptical']],
+ [[2.2,'focused'],[4.4,'playful'],[6.4,'delighted'],[7.4,'surprised'],[10,'delighted']],
+ // The live drum face follows its planned beats (drumBeat); this is the fallback.
+ [[.88,'playful'],[4,'focused'],[10,'delighted']]];
+const IDLE_REST_EMOTION=['playful','curious','sleepy','neutral','curious','playful','neutral','delighted','neutral','neutral','delighted','delighted'];
 const idlePaths=()=>(typeof module!=='undefined'?require('./props.js'):root.WatchProps).idle;
 const look=(q,ax,ay)=>{q.gazeX=clamp((ax-q.x)/24,-2,2);q.gazeY=clamp((ay-q.y)/9,-1.5,1.5);return q;};
 // Resting hands per variation, so he is not arms-folded between beats.
 const IDLE_HANDS=[{lx:20,rx:76,ly:27,ry:27,lrot:.15,rrot:-.15},{lx:26,rx:70,ly:25,ry:25,lrot:.55,rrot:-.55},{lx:38,rx:58,ly:27,ry:27,lrot:.08,rrot:-.08},{lx:20,rx:76,ly:27,ry:27,lrot:.15,rrot:-.15},{lx:38,rx:58,ly:27,ry:27,lrot:.08,rrot:-.08}];
 IDLE_HANDS.push({lx:12,rx:84,ly:-1,ry:-1,lrot:0,rrot:0});
 for(let i=0;i<4;i++)IDLE_HANDS.push({lx:16,rx:82,ly:26,ry:26,lrot:0,rrot:0});
+IDLE_HANDS.push({lx:20,rx:76,ly:27,ry:27,lrot:.15,rrot:-.15},{lx:20,rx:76,ly:27,ry:27,lrot:0,rrot:0});
+const smooth=u=>{u=clamp(u,0,1);return u*u*(3-2*u);},win=(t,a,b)=>smooth((t-a)/(b-a)),mix=(a,b,u)=>a+(b-a)*u;
+// One-hand hang: grips sit OUTSIDE the lenses (head x +-31; the face spans
+// +-26), or the face mask swallows the mittens and he reads as a floating head.
+const GRIP=31;
+// Arms at full stretch keep his whole face on the image: brows clear the top
+// edge at head y 14 level and y 16 when tilted two steps (each step lifts a lens).
+function hangBeat(t,q){const up=win(t,.6,1.8);
+ Object.assign(q,{x:48,lx:48-GRIP,rx:48+GRIP,ly:0,ry:0,lopen:0,ropen:0,lrot:0,rrot:0,y:18-4*up,gazeX:.6,gazeY:.8-2*up});
+ // One hand lets go and he leans into the grip, the way a one-arm hang pulls the
+ // shoulder up. The lean never levels out and breathes with a 0.5 Hz swing, so
+ // each 220 ms G2 frame is a clearly different pose.
+ if(t>=2.2&&t<6.4){const u=win(t,2.2,2.8),s=Math.sin((t-2.2)*3.2),x=48-5*u+3*s;
+  Object.assign(q,{x,y:15+u,tilt:u*(.13+.05*s),lx:48-GRIP+s,rx:x+29,ry:26,ropen:.6,rrot:-.3,gazeX:.6+.6*s,gazeY:-.3});}
+ if(t>=6.4){const d=win(t,6.4,6.9),bounce=t>6.9&&t<7.4?Math.abs(Math.sin((t-6.9)*7))*3*(1-win(t,6.9,7.4)):0;
+  Object.assign(q,{x:48,tilt:0,lopen:.5,ropen:.5,lx:mix(48-GRIP,20,d),rx:mix(72,76,d),ly:27*d,ry:mix(26,27,d),y:mix(16,13,d)+bounce,gazeX:.6,gazeY:mix(-1.2,-.4,d)});}
+ return q;}
+// Roll, rimshot, bow on his own name. The controller measures the settled name
+// row with pretext and sends letter centres in image x: letters only, never the
+// colon or a space. Measured on renderer.js: a mitten is 7 px wide and is drawn
+// whole only while its centre is at x<=96; ry 27 puts its bottom row on the
+// floor; the waiting mitten hovers at 23, any higher and the lens rim hides it.
+const DRUM_GEOMETRY={maxX:96,minX:3,strikeY:27,hoverY:23,headMin:26,headMax:72,slot:.22,start:.88};
+// Plan the whole roll before it starts. Hits alternate L, R along the letters,
+// one per 220 ms frame; a mitten is down for its hit's frame and otherwise
+// hovers over its own NEXT letter, so no hand ever jumps in from rest.
+function drumPlan(glyphs){
+ if(!Array.isArray(glyphs))return null;
+ const G=DRUM_GEOMETRY,letters=glyphs.map(Number).filter(Number.isFinite),beats=[];let blocked=null;
+ // Letters run left to right, so the first one out of reach is the only one he
+ // stretches for. At most 20 hits keeps the stretch, crash and bow inside the 10 s loop.
+ for(const x of letters){if(x<=G.maxX&&beats.length<20)beats.push(Math.max(G.minX,x));else if(blocked===null)blocked=Math.min(x,G.maxX+8);}
+ if(!beats.length)return null;
+ const hits=beats.map((x,i)=>({t:G.start+i*G.slot,x,hand:i%2?'r':'l'}));
+ const rollEnd=G.start+(beats.length+1)*G.slot,stretchEnd=rollEnd+(blocked===null?0:1.32),rimEnd=stretchEnd+.88,crashEnd=rimEnd+.66;
+ return {key:letters.join(','),beats,blocked,hits,rollEnd,stretchEnd,rimEnd,crashEnd};}
+function drumHand(P,hand,t){const G=DRUM_GEOMETRY,own=P.hits.filter(h=>h.hand===hand);
+ for(const h of own)if(t>=h.t&&t<h.t+G.slot)return {x:h.x,y:G.strikeY,open:.1,down:true};
+ const next=own.find(h=>h.t>t)||own[own.length-1];return next?{x:next.x,y:G.hoverY,open:.4,down:false}:null;}
+// Point at himself: rotation pi turns the finger back at the face, placed just
+// outside the right temple arm so the face mask does not swallow it. Gaze and
+// tilt stay clear of the renderer's .5 rounding edge, so the still frame is exact.
+function pointAtSelf(q,u){const poke=u>.44&&u<.88?1:0;
+ Object.assign(q,{x:48,rx:48+37-poke,ry:18,rpoint:1,rrot:Math.PI,ropen:.2,lx:20,ly:27,gazeX:.6,gazeY:-.4,y:13+poke,tilt:.05});return q;}
+// One frame of the drum routine: pose into q; returns the face and which mittens strike.
+function drumBeat(t,P,q){
+ const G=DRUM_GEOMETRY,strike={l:false,r:false},first=P.beats[0],last=P.beats[P.beats.length-1];let emotion='focused';
+ const home=x=>{q.x=x;q.lx=x-28;q.rx=x+28;q.ly=27;q.ry=27;};
+ Object.assign(q,{y:13,tilt:0,lrot:0,rrot:0,lopen:.5,ropen:.5,lpoint:0,rpoint:0});
+ if(t<G.start){home(48);q.ly=q.ry=22;q.lx=P.hits[0].x;const r=P.hits.find(h=>h.hand==='r');if(r)q.rx=r.x;look(q,48,-20);emotion='playful';}
+ else if(t<P.rollEnd){
+  const k=Math.max(0,P.hits.findIndex((h,i)=>t>=h.t&&(i===P.hits.length-1||t<P.hits[i+1].t))),h=P.hits[k],next=P.hits[Math.min(P.hits.length-1,k+1)];
+  // The head drifts between the current and next letter, so the body follows the roll.
+  const u=clamp((t-h.t)/Math.max(.01,next.t-h.t),0,1);home(clamp(mix(h.x,next.x,u)*.7+48*.3,G.headMin,G.headMax));
+  for(const hand of ['l','r']){const a=drumHand(P,hand,t);if(!a)continue;q[hand+'x']=a.x;q[hand+'y']=a.y;q[hand+'open']=a.open;strike[hand]=a.down;}
+  q.tilt=strike.l?-.04:strike.r?.04:0;look(q,next.x,42);
+ }
+ else if(t<P.stretchEnd){
+  // Out of reach: lean with the head at x<=60 (further right his own lens hides
+  // the reaching mitten), stretch to the reach limit, fall short, shrug.
+  if(t<P.rollEnd+.66){const u=win(t,P.rollEnd,P.rollEnd+.5);home(60);Object.assign(q,{rx:mix(84,G.maxX,u),ry:mix(20,G.strikeY,u),ropen:1,rrot:-.5,tilt:.14*u,y:13+u,eye:.6});look(q,P.blocked,42);}
+  else{home(60);Object.assign(q,{lx:34,rx:86,ly:21,ry:21,lopen:1,ropen:1,lrot:.6,rrot:-.6});look(q,48,20);emotion='skeptical';}
+ }
+ else if(t<P.rimEnd){
+  // Both sticks held high outside the lenses, then ba-dum on the last letter.
+  const u=t-P.stretchEnd,R=Math.min(G.maxX,last+5);home(clamp(last-16,G.headMin,60));q.lopen=q.ropen=.4;
+  if(u<.44){Object.assign(q,{lx:q.x-31,rx:q.x+31,ly:11,ry:11,lrot:.5,rrot:-.5,y:12});look(q,48,-20);emotion='playful';}
+  else{const left=u<.66;Object.assign(q,{lx:R-10,rx:R,ly:left?G.strikeY:G.hoverY,ry:left?G.hoverY:G.strikeY});strike[left?'l':'r']=true;look(q,last,42);}
+ }
+ else if(t<P.crashEnd){
+  // Tss: one wind-up frame, then both mittens crash onto the first and last
+  // letters, at least 10 px apart so a short name still reads as two hits.
+  const up=t<P.rimEnd+.22,wide=last-first>=10,L=Math.max(G.minX,wide?first:(first+last)/2-5),R=Math.min(G.maxX,wide?last:(first+last)/2+5);
+  home(clamp((L+R)/2,G.headMin,G.headMax));
+  Object.assign(q,up?{lx:Math.max(G.minX,q.x-31),rx:Math.min(G.maxX,q.x+31),ly:11,ry:11,lopen:1,ropen:1,lrot:.5,rrot:-.5,y:11}:{lx:L,rx:R,ly:G.strikeY,ry:G.strikeY,lopen:.1,ropen:.1,y:14});
+  if(!up)strike.l=strike.r=true;look(q,q.x,up?-20:42);emotion='delighted';
+ }
+ else{const u=t-P.crashEnd;emotion='delighted';
+  // A small bow with closed eyes, then he points at himself.
+  if(u<.44){home(48);Object.assign(q,{y:15,eye:.08,lx:34,rx:62,ly:26,ry:26});}else pointAtSelf(q,u-.44);
+ }
+ return {emotion,strike};}
 // One beat of a variation: head, hands and where he looks. Emotion comes from IDLE_BEATS.
-function idleBeat(v,t,q){const P=idlePaths();Object.assign(q,IDLE_HANDS[v],{gazeX:.6,gazeY:.6,tilt:0,y:13});
+function idleBeat(v,t,q,drum=null){const P=idlePaths();if(v===DRUM&&!drum)v=HANG;Object.assign(q,IDLE_HANDS[v],{gazeX:.6,gazeY:.6,tilt:0,y:13});
+ if(v===HANG)hangBeat(t,q);
+ if(v===DRUM)drumBeat(t,drum,q);
  if(v===0){const y=P.yoyoY(t);Object.assign(q,{rx:80,ry:15,rrot:-.3,tilt:.05,gazeX:1.3,gazeY:clamp((y-23.5)/5,-1,1)});}
  if(v===1){if(t<1)Object.assign(q,{gazeX:.6,gazeY:-.6});else if(t<3.5){Object.assign(q,{y:13.4,lx:40,rx:56,ly:26,ry:26,lrot:.3,rrot:-.3});look(q,48,25);}
   else if(t<7.2){q.tilt=.05;const b=P.bubble(t);look(q,b.x,b.y);}else if(t<7.6)Object.assign(q,{gazeX:1.5,gazeY:-.8,x:49});else Object.assign(q,{gazeX:1.2,gazeY:-.6});}
@@ -3434,6 +3552,8 @@ function idleRest(v,q){Object.assign(q,IDLE_HANDS[v],{gazeX:.6,gazeY:.6,tilt:0,y
  if(v===7)Object.assign(q,{gazeX:1.2,gazeY:-.7,tilt:-.04});
  if(v===8)Object.assign(q,{x:48,lx:20,rx:76,ly:27,ry:27,gazeX:.6,gazeY:.6});
  if(v===9)Object.assign(q,{tilt:0,gazeX:.6,gazeY:.6});
+ if(v===HANG)Object.assign(q,{gazeX:.6,gazeY:-.4});
+ if(v===DRUM)Object.assign(pointAtSelf(q,0),{lopen:.5});
  return q;}
 const actions={};
 const SIDE_BY_GROUP={Conversation:1,Work:1,Mind:1,Results:1,Web:1,Agents:1,Connection:1,Presence:1};
@@ -3643,7 +3763,7 @@ actions.reply.prop='mic';actions.reply.staticExpression='curious';
 actions.reply.description='Grips a handheld microphone and brings its rounded head below the outer corner of his glasses before holding still.';
 actions.git.prop='gitcards';
 Object.assign(actions.idle.pose,{y:13,lx:38,ly:27,rx:58,ry:27,lrot:.08,rrot:-.08});
-actions.idle.description='Ten idle routines: yo-yo, bubble, nap, fly, chin tuck, pull ups, heavy eyelids, window cleaning, pixel juggling and frame straightening.';
+actions.idle.description='Twelve idle routines: yo-yo, bubble, nap, fly, chin tuck, pull ups, heavy eyelids, window cleaning, pixel juggling, frame straightening, a one-hand hang and a drum roll on his own name.';
 Object.assign(actions.listening.pose,{x:50,y:14,tilt:-.08,lx:20,ly:14,lrot:.08,lopen:1,rx:82,ry:26,listenCue:0,gazeX:-1.3});
 actions.listening.description='Tilts into the cupped hand, lifts the listening-side brow and gives a little attentive nod.';
 Object.assign(actions.thinking.pose,{x:45,y:13,tilt:0,lx:35,ly:27,rx:57,ry:27,rpoint:-.6});
@@ -3850,6 +3970,7 @@ function create(initial='idle',options={}){
  let prop={kind:byId[id].prop,reveal:byId[id].prop?1:0,velocity:0,layout:byId[id].layout||null},icon={kind:byId[id].icon,reveal:byId[id].icon?1:0,velocity:0};
  let response=1,motion=1,expression='auto',view='auto',entryPose={...p},emotion='neutral',micro=MICRO_DEFAULT;
  const visits={idle:0};let entryVariant=0,pinnedIdle=null,pinnedThinking=null,resting=false,restAge=0,restFreeze=null,restVariant=null,restPending=false,restStarted=0;
+ let drum=null,drumStrike=null;
  let transit=null;
  // The approved Soft and elastic presence handoffs. Work props, authored
  // performances and held poses keep their existing choreography.
@@ -3893,7 +4014,7 @@ function create(initial='idle',options={}){
  const typing={glyph:'_',count:0,hand:null,downAt:-1};let typingSeed=8146;
  const tapArmed={l:false,r:false};
  const firstAction=byId[id].action;if(firstAction in visits)visits[firstAction]=1;
- const variation=()=>{const a=byId[id].action;if(a==='idle')return pinnedIdle!==null?pinnedIdle:restVariant!==null?restVariant:(entryVariant+Math.floor(age/10))%IDLE_VARIATIONS;return a==='thinking'?thinkingVariant:0;};
+ const variation=()=>{const a=byId[id].action;if(a==='idle'){const v=pinnedIdle!==null?pinnedIdle:restVariant!==null?restVariant:(entryVariant+Math.floor(age/10))%(drum?IDLE_VARIATIONS:WITHOUT_DRUM);return v===DRUM&&!drum?HANG:v;}return a==='thinking'?thinkingVariant:0;};
  function carrier(c,desired,dt,stiffness=18){
    if(c.kind!==desired&&c.reveal<.005&&Math.abs(c.velocity)<.08){c.kind=desired;}
    const goal=c.kind===desired&&desired?1:0;
@@ -3928,6 +4049,10 @@ function create(initial='idle',options={}){
    if(def.magic)magicPose(q,def.magic);
    const magicTarget=def.magic?{...q}:null;
    emotion=expression==='auto'?(def.magic?'focused':def.static?(def.staticExpression||'curious'):resting&&def.action==='idle'?IDLE_REST_EMOTION[variation()]:expressionFor(def,def.action==='thinking'?thinkingAge:age,variation())):expression;
+   // The drum's beats depend on the planned roll, so its face comes from the plan.
+   const drumNow=def.action==='idle'&&!resting&&variation()===DRUM?drumBeat(age%10,drum,{...q}):null;
+   drumStrike=drumNow&&drumNow.strike;
+   if(drumNow&&expression==='auto')emotion=drumNow.emotion;
    if(transit&&age<.75&&expression==='auto')emotion='curious';
    if(cue||attending||wakeBeat)emotion='curious';
    for(const name of expressions.slice(1))q[name]=Number(name===emotion);
@@ -3972,7 +4097,7 @@ function create(initial='idle',options={}){
     }
     q.turn=view==='auto'?0:view;
    }
-   if((def.action||def.id)==='idle'){if(resting)idleRest(variation(),q);else idleBeat(variation(),age%10,q);}
+   if((def.action||def.id)==='idle'){if(resting)idleRest(variation(),q);else idleBeat(variation(),age%10,q,drum);}
    if((def.action||def.id)==='listening'){
     const nod=Math.max(0,Math.sin(age*1.1));q.x=49;q.tilt=-.085-.055*nod*motion;q.gazeX=-1.3;q.gazeY=-.2;q.turn=view==='auto'?-1:view;
     q.browLiftL=-1.2;q.browL=-.14;q.browR=.08;q.lx=19;q.lrot=.1;q.rx=62;q.ry=27;
@@ -4097,7 +4222,9 @@ function create(initial='idle',options={}){
     let goal=age<delay?entryPose[k]:q[k];
     const weighted=(microMove||(softTransition&&age<1.4))&&['x','y','tilt'].includes(k);
     if(weighted&&age<delay)goal-=Math.sign(q[k]-entryPose[k])*(k==='tilt'?.04:1.5);
-    const w=(restFreeze?32:facial||micHand?30:brow?23:head?12:k==='tempo'?5:def.loop==='code'&&/^[lr][xyrotpoint]+$/.test(k)?30:16)*response;
+    // Drum strikes must land on their letters inside one 220 ms frame.
+    const drumBody=drumNow&&(head||/^[lr](x|y|rot|open|point)$/.test(k));
+    const w=(restFreeze?32:facial||micHand||drumBody?30:brow?23:head?12:k==='tempo'?5:def.loop==='code'&&/^[lr][xyrotpoint]+$/.test(k)?30:16)*response;
     [p[k],v[k]]=(weighted?springZ:spring)(p[k],v[k],goal,w,dt);
     if(weighted&&age>=delay){const allowance=k==='tilt'?.04:1;p[k]=clamp(p[k],Math.min(entryPose[k],q[k])-allowance,Math.max(entryPose[k],q[k])+allowance);}
    }
@@ -4132,7 +4259,7 @@ function create(initial='idle',options={}){
    }
  }
  function step(seconds){carry+=clamp(Number.isFinite(seconds)?seconds:0,0,.25);while(carry>=1/120){tick(1/120);carry-=1/120;}return snapshot();}
- function snapshot(){const drawn={...p},d=byId[id],beat=time%4.8,microBreath=micro&&age>=2&&!resting&&!d.static&&d.action!=='idle'&&['Work','Mind','Web','Agents'].includes(d.group)&&beat>=2.4&&beat<3.8?1:0;if(microBreath){drawn.y=Math.round(Math.max(13,drawn.y))+1;drawn.ly=Math.round(drawn.ly)+1;drawn.ry=Math.round(drawn.ry)+1;}if(transit&&age<.75&&!resting&&!flowing(d)){drawn.delighted=0;drawn.surprised=0;if(Math.abs(drawn.gazeX)<.5&&Math.abs(drawn.gazeY)<.5)drawn.gazeY=-.6;}return {id,action:attending?'attend':d.action,p:drawn,v:{...v},time,phase,age,thinkingAge,emotion,switches,interruptions,variant:variation(),thinking:thinkingDetail?{...thinkingDetail}:null,resting,attending,stowing:!!stow,static:isStill(),microBreath,prop:{...prop},icon:{...icon},typing:{...typing}};}
+ function snapshot(){const drawn={...p},d=byId[id],beat=time%4.8,microBreath=micro&&age>=2&&!resting&&!d.static&&d.action!=='idle'&&['Work','Mind','Web','Agents'].includes(d.group)&&beat>=2.4&&beat<3.8?1:0;if(microBreath){drawn.y=Math.round(Math.max(13,drawn.y))+1;drawn.ly=Math.round(drawn.ly)+1;drawn.ry=Math.round(drawn.ry)+1;}if(transit&&age<.75&&!resting&&!flowing(d)){drawn.delighted=0;drawn.surprised=0;if(Math.abs(drawn.gazeX)<.5&&Math.abs(drawn.gazeY)<.5)drawn.gazeY=-.6;}return {id,action:attending?'attend':d.action,p:drawn,v:{...v},time,phase,age,thinkingAge,emotion,switches,interruptions,variant:variation(),drum:drumStrike&&!resting?{...drumStrike}:null,thinking:thinkingDetail?{...thinkingDetail}:null,resting,attending,stowing:!!stow,static:isStill(),microBreath,prop:{...prop},icon:{...icon},typing:{...typing}};}
  // Snapshot carries choice metadata, never a live engine reference. The adapter only
  // retains it after display acceptance, including before a study prop has risen.
  const rawSnapshot=()=>({...snapshot(),thoughtChoice:thinkingChoice?{...thinkingChoice}:null});
@@ -4165,6 +4292,8 @@ function create(initial='idle',options={}){
    // Director pin: fixes WHICH thinking gesture plays (3 = the cogs). The route/idea
    // draw below it is untouched, and a pinned variant never drains the shuffled bag.
    if(opts.idleVariation!==undefined)restVariant=null;
+   // Name-row letter centres (image x) for the drum. A new list drops what a pin change drops.
+   if(opts.nameGlyphs!==undefined){const next=drumPlan(opts.nameGlyphs);if((next&&next.key)!==(drum&&drum.key)){drum=next;restVariant=null;}}
    if(opts.thinkingVariation===null)pinnedThinking=null;else if(Number.isInteger(opts.thinkingVariation))pinnedThinking=((opts.thinkingVariation%THINKING_VARIATIONS)+THINKING_VARIATIONS)%THINKING_VARIATIONS;
    if(opts.thinkingVariation!==undefined&&byId[id].action==='thinking')nextThinking();
   if(opts.response!==undefined)response=clamp(opts.response,.35,2);
@@ -4181,7 +4310,7 @@ function restPoseFor(def,variant=0){
  Object.assign(p,{browL:0,browR:0,browY:0,browLiftL:0,browLiftR:0,gazeX:.6,gazeY:-.3,eye:1,eyeL:1,eyeR:1,turn:0,lopen:.5,ropen:.5,lpoint:0,rpoint:0,ly:Math.max(25,p.ly),ry:Math.max(25,p.ry),listenCue:0,errorCue:0,effect:0,[emotion]:1},def.rest||{});
  return {p,emotion};
 }
-const api={create,catalogue,actions,byId,originals,BASE,spring,springZ,targetFor,restPoseFor,attentionFor,expressions,expressionFor,IDLE_VARIATIONS,idleBeat,idleRest,SIDE_BY_GROUP,transitions,MICRO_DEFAULT,CUES,ATTEND_POSE,THINKING_VARIATIONS,THINKING_IDEAS,thinkingDuration};
+const api={create,catalogue,actions,byId,originals,BASE,spring,springZ,targetFor,restPoseFor,attentionFor,expressions,expressionFor,IDLE_VARIATIONS,HANG,DRUM,DRUM_GEOMETRY,drumPlan,drumBeat,idleBeat,idleRest,SIDE_BY_GROUP,transitions,MICRO_DEFAULT,CUES,ATTEND_POSE,THINKING_VARIATIONS,THINKING_IDEAS,thinkingDuration};
 Object.assign(api,{magicStudyPose,MAGIC_REVEAL_END});
 if(typeof module!=='undefined')module.exports=api;else root.WatchEngine=api;
 })(typeof window!=='undefined'?window:globalThis);
@@ -4507,7 +4636,8 @@ function render(s,options={}){
   if(v===3&&!still){if(t<7){const f=P.fly(t);flyAt(f.x,f.y,Math.floor(t*20)%2);}else if(t>=8.5&&t<9.5){const f=P.flyEscape(t);flyAt(f.x,f.y,Math.floor(t*20)%2);}}
   if(v===7){
    if(!still&&t>=1&&t<3.5){const fade=t<2?1:(3.5-t)/1.5;for(let y=hy-5;y<hy+5;y+=2)for(let x=hx+6;x<hx+20;x+=2)if(!handMask[y*W+x])dot(x,y,Math.round(6*fade));}
-   if(!still&&t>=4.5&&t<7.5)sp(hx+16,hy-3,['11','11']);
+   // The stubborn speck sits on the lens, behind the scrubbing mitten and its outline.
+   if(!still&&t>=4.5&&t<7.5){const x0=hx+16,y0=hy-3;for(let y=y0-1;y<=y0+2;y++)for(let x=x0-1;x<=x0+2;x++){const i=y*W+x;if(x>=0&&x<W&&y>=0&&y<H&&!handMask[i]&&!gripMask[i])dot(x,y,x>=x0&&x<=x0+1&&y>=y0&&y<=y0+1?ink:0);}}
    if(still||t>=8){const cx=hx+24,cy=hy-9;thin(cx-3,cy,cx+3,cy);thin(cx,cy-3,cx,cy+3);}
   }
   if(v===8&&!still&&t>=1&&t<9.5){for(let k=0;k<3;k++){
@@ -4517,6 +4647,12 @@ function render(s,options={}){
    else {x=k?90:74;y=t<8.5?24:24+(t-8.5)*12;}
    sp(x,y,['11','11']);
   }}
+  // Drum strikes: the letters never move, so two short diagonal strokes either
+  // side of a striking mitten, on the two rows above the floor, show the hit.
+  if(v===11&&!still&&s.drum)for(const h of ['l','r'])if(s.drum[h]){
+   const x=Math.round(h==='l'?p.lx:p.rx);
+   for(const [dx,y] of [[-6,30],[-7,29],[6,30],[7,29]])dot(x+dx,y);
+  }
  }
  // Small helpers grow in from a dock; no new face appears at full size.
  function helper(cx,cy,scale){if(scale<.04)return;const h=local(cx,cy,0,scale);for(const x of [-7,1]){h.rect(x,-3,6,6);h.rect(x+2,-1,2,2,0);}h.rect(-1,-2,2,2);h.rect(-7,-6,6,2);h.rect(1,-6,6,2);}
@@ -4527,8 +4663,8 @@ function render(s,options={}){
  const facing=Math.max(-2,Math.min(2,Math.round(p.turn||0)));
  const tilt=Math.max(-2,Math.min(2,Math.round(p.tilt/.08)));
  const depth=Math.abs(facing),direction=Math.sign(facing),slant=depth===2?direction:0;
- // Pull ups intentionally cross the canvas edge; all other poses retain clearance.
- const edgeGrip=s.action==='idle'&&s.variant===5&&!s.resting;
+ // Pull ups and the one-hand hang cross the canvas edge; all other poses retain clearance.
+ const edgeGrip=s.action==='idle'&&(s.variant===5||s.variant===10)&&!s.resting;
  const hx=Math.round(p.x),hy=edgeGrip?Math.round(p.y):Math.max(13+Math.abs(tilt),Math.round(p.y));
  const left={x:hx-12,y:hy-tilt+(facing===2?1:0),w:facing<0?20:22,h:16,slant};
  const right={x:hx+12,y:hy+tilt+(facing===-2?1:0),w:facing>0?20:22,h:16,slant};
@@ -4723,7 +4859,13 @@ function render(s,options={}){
  const object=pixels.slice();pixels.set(face);blocked=new Uint8Array(W*H);
  for(let i=0;i<W*H;i++)if(face[i])for(const j of [i,i-1,i+1,i-W,i+W])if(j>=0&&j<W*H)blocked[j]=1;
  // Also reserve the dark lens interiors, which are part of the face silhouette.
- for(let y=Math.max(0,hy-12-Math.abs(tilt));y<=Math.min(31,hy+9+Math.abs(tilt));y++)for(let x=Math.max(0,hx-28);x<=Math.min(99,hx+28);x++)blocked[y*W+x]=1;
+ // The one-hand hang grips the top edge beside a brow and dangles the free
+ // mitten beside a temple, inside this padded box. Until he rests it
+ // reserves only the rasterised lens box (columns hx-23..hx+22, rows hy+-8), so
+ // the padding cannot cut chunks out of either mitten. Face pixels and their
+ // one-pixel halo stay blocked, so brows, rims and temples keep their ink.
+ const hangGrip=edgeGrip&&s.variant===10,x0=hx-(hangGrip?23:28),x1=hx+(hangGrip?22:28),y0=hy-(hangGrip?8:12)-Math.abs(tilt),y1=hy+(hangGrip?8:9)+Math.abs(tilt);
+ for(let y=Math.max(0,y0);y<=Math.min(31,y1);y++)for(let x=Math.max(0,x0);x<=Math.min(99,x1);x++)blocked[y*W+x]=1;
  // These two authored gestures touch the lenses deliberately. Keep their
  // narrow contact areas separate from ordinary hand/frame collision rules.
  if(s.action==='idle'&&(s.variant===6||s.variant===7)){

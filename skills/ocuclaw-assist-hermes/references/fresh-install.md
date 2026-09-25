@@ -1,6 +1,6 @@
 # OcuClaw fresh install on Hermes — Steps 1–12 (plus Step 4b)
 
-**Guide version:** 2026-09-21 (1.3.22-hermes)
+**Guide version:** 2026-09-25 (1.3.24-hermes)
 
 Keep using the loaded setup skill for guardrails, the lane card, and the
 internal completion checklist.
@@ -111,7 +111,7 @@ or present it as an outstanding requirement in Desktop.
 
 <!-- ocuclaw:install-block:start -->
 OcuClaw needs Hermes `>=0.21.1,<0.22.0`; the certified baseline is Hermes
-`0.21.3`. Install it once, in the default Hermes profile: that profile owns the
+`0.21.5`. Install it once, in the default Hermes profile: that profile owns the
 relay the glasses pair to, and a second copy in another profile is never the
 answer.
 
@@ -125,11 +125,10 @@ invitation, and the software itself is still beta.
 **Terminal first.** This is the supported path and the one every beta build is
 tested on:
 
-**Cloudways managed Hermes: install, restart once, then one command.**
+**Cloudways managed Hermes: install, then one command. Do not restart yet.**
 
 ```bash
 hermes plugins install ocuclaw/ocuclaw --enable
-hermes gateway restart
 hermes ocuclaw cloudways setup
 ```
 
@@ -140,10 +139,16 @@ already done. It asks twice, showing exactly what changes and defaulting to no.
 There is no retry flag: run the same command again and it continues where it
 stopped.
 
-**One restart, one run.** The restart above is the only one this install needs.
-If anything interrupts the run, including a restart that closes SSH, Hermes and
-tmux, reconnect with the Cloudways SSH command and run the same command again:
-it skips what is done and carries on from there.
+**One restart, asked for at step 3.** Ignore the restart line
+`hermes plugins install` prints. Setup saves its settings at step 2, then step 3
+checks whether your agent has loaded OcuClaw. On a fresh install it has not, so
+step 3 stops and asks for the one gateway restart that loads OcuClaw and applies
+those settings together: type `hermes gateway restart`. On Cloudways that
+restarts the whole container and closes SSH, Hermes and tmux, so reconnect with
+the Cloudways SSH command and run `hermes ocuclaw cloudways setup` again: it
+skips what is done and carries on from there. A host whose service manager owns
+the gateway asks first at step 3, restarts it for you, and carries on in the
+same run. If anything else interrupts the run, run the same command again.
 
 **The command looks for your phone before it pairs it.** Step 5 asks you to
 install Tailscale on the phone and approve the link there. Step 7 then checks
@@ -175,15 +180,14 @@ and requests one planned activation restart. Resume that setup session by its
 ID; do not blindly reopen the latest chat. Saved configuration is not gateway
 activation: the assistant must verify the new gateway and relay.
 
-For other hosts, the direct install/restart sequence is:
+For other hosts in a terminal, install, then go straight to setup:
 
 ```bash
 hermes plugins install ocuclaw/ocuclaw --enable
 hermes config set display.interface tui   # the pairing panel lives in the TUI
-hermes gateway restart
 ```
 
-Then, in bare `hermes` or in Hermes Desktop:
+Then, in a fresh `hermes --tui`:
 
 ```text
 /ocuclaw-setup
@@ -192,7 +196,9 @@ Then, in bare `hermes` or in Hermes Desktop:
 `hermes plugins install` prints that restart instruction and stops there — it
 never restarts the gateway for you. Until the gateway restarts, OcuClaw is
 installed but not loaded by that managed gateway, and nothing about the glasses
-works through it yet. A fresh TUI can prepare setup before that activation.
+works through it yet. A fresh TUI can prepare setup before that activation, so
+do not restart yet: `/ocuclaw-setup` saves its settings first and then asks for
+one gateway restart, which loads OcuClaw and applies those settings together.
 
 **Run `hermes` in a real terminal.** The TUI boots only when stdin *and*
 stdout are a TTY, so a piped or captured run — `hermes | tee log`, a CI
@@ -342,7 +348,8 @@ routing either through the model. For a terminal install only, inspect
 surface. For Desktop installs, leave the terminal default alone: it is not a
 completion requirement and must not appear as an unresolved setup check.
 Classic `hermes --cli` hands the pairing checkpoint to TUI or Desktop. Configuration
-changes require a gateway restart.
+changes require a gateway restart; Step 5's single restart applies them. Do
+not ask for one here.
 
 VERIFY the non-secret gate without reading any secret:
 
@@ -403,10 +410,26 @@ receipt and continue to Step 5 without retrying.
 
 ## Step 5 · Restart and verify the loopback relay
 
+On a local install this is the only gateway restart setup asks for (#3541).
+The after-install card sends the person straight to `/ocuclaw-setup` with no
+restart, so the gateway may not have loaded OcuClaw yet. That is expected, not
+a finding: Steps 1-4 run in this TUI, which loads the plugin and holds the
+Relay Credential, and none of them needs the gateway. This one restart loads
+OcuClaw into the gateway and applies every Step 4 and 4b setting together.
+Never ask for an extra restart before this step. The one exception is not a
+request: the agent-choice migration (`agent-mode.md` step 3c) restarts the
+gateway by itself, and this step still applies the settings saved after it.
+
 Warn about the brief restart, then CHECKPOINT:
 
 Call `{"operation":"quick_reference"}` and follow `Restarting the gateway`,
-including its supervisor-specific command and wizard rule.
+including its supervisor-specific command and wizard rule. Read
+`status.gatewaySupervision` first. Only `service` lets you run
+`hermes gateway restart`. For `unsupervised`, `unknown` or an absent field,
+never run `hermes gateway restart` or `hermes gateway run` from a tool: give
+the person the exact hand-off (Ctrl+C in their gateway terminal,
+`hermes gateway run` again there, then "continue") and wait for "continue".
+This is the normal case for a gateway started by hand in a terminal.
 
 On Cloudways, all required settings and agent choice must already be saved.
 Use the exact reconnect/session handoff in `quick_reference` before activation.
@@ -453,7 +476,10 @@ hermes ocuclaw cloudways detect
 If it reports `cloudways`, or `likely` and the user confirms a Cloudways
 Managed AI Agents host, call `{"operation":"cloudways"}`. The system
 `tailscale` does not exist there, and `TS-NOT-INSTALLED` must not be entered.
-Otherwise continue with the rest of this step.
+Otherwise continue with the rest of this step. A `likely` verdict is not
+decisive, so ask it open-ended with `clarify` and no choices: "Is this Hermes
+running on Cloudways Managed AI Agents? Type yes or no." Only a clear yes
+counts; a timeout reply is no answer.
 
 On a Cloudways host, offer the one command:
 
@@ -557,6 +583,14 @@ symptom is `probe_failed` plus `relay_verifier_protocol_error` on a route
 classified `ready`. `doctor` prechecks this and withholds the apply command
 when the certificate is unavailable, printing the admin-console fix instead.
 
+The second cause of `probe_failed` is DNS on this node, not the certificate:
+containers and userspace-networking nodes often cannot resolve their own
+MagicDNS name, so the probe never reaches the front door. Fix it where the
+gateway runs -- `tailscale set --accept-dns=true`, a
+`nameserver 100.100.100.100` line in that node's resolver, or an `/etc/hosts`
+line for `<node>.<tailnet>.ts.net` -- then run `doctor` again. See
+`TS-DNS-SELF` in troubleshooting.
+
 Continue only when the route is `ready` and the bounded reachability and relay
 checks succeed. Configuration shape alone is advisory. An `unknown` result is
 not a negative claim; follow the printed reason. Never use Funnel, a public
@@ -566,33 +600,34 @@ Hermes profiles.
 
 ## Step 8 · Phone Tailscale
 
-Refresh the tailnet immediately before asking about the phone:
+Refresh the tailnet immediately before pairing:
 
 ```bash
 tailscale status --json
 ```
 
 This is a read-only agent Terminal check. From `Peer`, select only entries with
-`Online: true` whose `OS`, case-insensitively, is `android` or `ios`. Use each
-candidate's current `HostName`; a remembered device name is not evidence.
+`Online: true` whose `OS`, case-insensitively, is `android` or `ios` (the same
+rule as the Cloudways ladder's phone check). Use each phone's current
+`HostName`; a remembered device name is not evidence.
 
-- One candidate: use `clarify` to ask whether that named phone is the one being
-  paired, with Yes and No choices.
-- Two or three candidates: use one `clarify` device-choice question naming each.
-- More than three candidates: walk the current names with one `clarify` yes/no
-  question at a time until the user confirms one.
-- No candidates, or the user rejects every candidate: ask them to open Tailscale
-  on the intended phone. Use `clarify` for Connected / Not yet, then rerun the
-  JSON check. Continue only after the chosen phone appears online.
+Do not ask which phone is being paired. The pairing itself proves which phone
+connects, and the hostname only feeds the lane card.
 
-Record the confirmed current hostname in the lane card. The completion criterion
-is one user-confirmed phone candidate that the fresh JSON reports online.
+- One or more online phones: say which are online in one line, for example
+  "Tailscale sees `<HostName>` online." Record them as `Tailscale phone:
+  online` in the lane card and go straight to Step 9.
+- No online phone: ask them to open Tailscale on the phone they will pair and
+  turn it on, then rerun the JSON check. Continue once a phone appears online.
+
+The completion criterion is at least one phone that the fresh JSON reports
+online.
 
 ## Step 9 · Securely pair the phone
 
 Continue only from a current successful `doctor` receipt whose
-`journey.nextCheckpoint` is `secure-phone-pairing`. The Step 8 confirmation
-that Tailscale is Connected means the phone is ready, so announce that the
+`journey.nextCheckpoint` is `secure-phone-pairing`. Step 8's fresh check
+that a phone is online on Tailscale means the phone is ready, so announce that the
 secure in-window pairing panel is opening and immediately call:
 
 ```json
@@ -602,31 +637,42 @@ secure in-window pairing panel is opening and immediately call:
 Do not run a shell command, ask for another OK, or reproduce the QR in chat.
 The supported Hermes TUI widget or Desktop runtime presenter obtains the
 verified private address itself, renders the relay's canonical QR directly,
-and advances automatically when the phone connects. TUI uses `m`; Desktop uses
-**Enter manually** to show the address/code for the same exchange. The user
+and advances automatically when the phone connects. The TUI panel opens on the
+address/code (manual) view when the QR does not fit the window, and `m` offers
+the QR only when it fits; the Desktop panel's manual toggle shows the
+address/code for the same exchange. On the
+phone, the user opens OcuClaw in Even Hub, taps **Pair with your computer**,
+then **Take a photo of the QR code**, or **Enter the pairing code instead** to
+type the address and code.
+The user
 compares the four-word safety phrase on both devices. TUI defaults to **No**;
 Desktop has separate explicit refuse/approve buttons and Enter alone never
 approves. The tool returns only after the relay reaches a terminal state.
 
-If the phone camera cannot read the QR, use Manual in the phone app with the
-private address and short-lived code visible in that same panel. The QR
+If the phone camera cannot read the QR, the user taps **Enter the pairing code
+instead** in the phone app and types the private address and short-lived code
+visible in that same panel. The QR
 contains only the private address, one-time exchange ID, and host ephemeral
 public key. Neither initiation reveals or asks the user to enter the Relay
 Credential.
 
 `tui_required` is the compatibility code for classic CLI or another unsupported
 host surface. Use the one-time TUI/Desktop handoff from Step 5 and resume here;
-do not repeat completed checks. `tui_relaunch_required`
-means the owned widget was repaired after this TUI started: relaunch Hermes
-once and continue this checkpoint. For `tui_widget_unavailable` or
-`tui_activation_port_unavailable`, retry once after confirming the relaunched
-window is TUI and no other local setup owns the pairing panel. For
-`desktop_plugin_unavailable`, keep Desktop open, reload Desktop plugins once,
-and retry the checkpoint. Only if the supported presenter still cannot load may troubleshooting fall
-back to the exact verified
-`hermes ocuclaw pair --address <phoneAddress>` command in a separate direct
-terminal. Never run that interactive fallback through an agent tool, pipe its
-output, or relay its QR through the model.
+do not repeat completed checks. `tui_window_too_small` means even the manual
+view does not fit this Hermes window: nothing was paired and the phone is not
+at fault. Use the returned message (it names the window's size and the size
+needed), ask the person to make this window bigger without quitting Hermes,
+and call `pair_phone` again. `tui_relaunch_required` means the owned widget was
+repaired after this TUI started: relaunch Hermes once and continue this
+checkpoint, but only when a service manager runs the gateway. Never suggest
+quitting or relaunching the TUI while the gateway may be its child; quitting
+stops the gateway. For `desktop_plugin_unavailable`, keep Desktop open, reload
+Desktop plugins once, and retry the checkpoint. Any other failure code, or the
+same failure twice, is deterministic: ask the person to run the exact verified
+`hermes ocuclaw pair --address <phoneAddress>` command in their own terminal,
+a separate window they open themselves. Never run that interactive fallback
+through your Terminal or any other agent tool, pipe its output, or relay its QR
+or pairing code through the model.
 
 ## Step 10 · Phone-origin hello
 
@@ -647,8 +693,31 @@ bounded wait expires. Do not replace this with a host-originated CLI message.
 Retain `phoneOriginAction.candidateId` for the next private tool calls. It is an
 opaque, secret-free race binding; never print or explain it to the user.
 
-After `phoneOriginAction.received: true`, call the delivery check for that same
-candidate:
+**No hello yet.** The call already re-waits once, quietly, inside the same
+call: a slow hello is still caught, and `rewaited: true` only says so. When it
+returns `state: "timeout"` (`received: false`), no phone message came in about
+five and a half minutes. Say that plainly, ask the wearer to check that
+OcuClaw on the phone shows connected and to send the message again, then call
+`wait_phone_origin` once more. Never fill the wait with chat, never ask them to
+report sending it, and never call `wait_reply_delivery` or
+`welcome_round_trip` without `received: true`. Any other `state`
+(`unavailable`, `unreadable`, `malformed`, `wrong_profile`) is not a slow
+phone: call `{"operation":"status"}` and follow troubleshooting.
+
+**Model-error branch, checked first.** When `phoneOriginAction` carries
+`runErrorCode` or `replyWasProviderError: true`, the model returned an error
+instead of an answer, and the glasses showed that error text. The chain works;
+the model is unreachable. Give the tool's `action` line as the verdict: it
+names the failure class (`providerErrorClass`) and its fix, such as
+`hermes model` to sign in again or `hermes -z hello` to check the model. Then
+stop. Never ask whether the reply appeared, never arm, and never call
+`welcome_round_trip` for this turn: a model error never proves setup, and the
+arm refuses it with `reply_run_errored` whatever evidence is claimed. Once the
+wearer has fixed the provider, retry with `hermes ocuclaw first-use` in a
+terminal, or run this step again with a fresh phone message.
+
+After `phoneOriginAction.received: true` with no model error, call the
+delivery check for that same candidate:
 
 ```json
 {"operation":"wait_reply_delivery","phoneCandidateId":"<candidateId returned by wait_phone_origin>"}
@@ -657,6 +726,11 @@ candidate:
 This is one bounded check, about 40 seconds. It never asks for a new phone
 message and never restarts `wait_phone_origin`. Read `replyDelivery.status`:
 
+- Model error, before anything else: `replyDelivery.replyWasProviderError:
+  true`, or `replyDelivery.reason` is `reply_run_errored` or
+  `reply_run_rate_limited`. Take the model-error branch above: give
+  `replyDelivery.action` as the verdict and stop. Never ask whether the reply
+  appeared.
 - `sdk_accepted`: the phone app reported that the glasses SDK accepted the
   reply. Say plainly what that is:
 
@@ -670,12 +744,14 @@ message and never restarts `wait_phone_origin`. Read `replyDelivery.status`:
   confirm the write. If `replyDelivery.reason` is `client_disconnected`, or the
   phone leg is unhealthy in the same receipt, give reconnect guidance first:
   ask the wearer to reopen the OcuClaw phone app and wait for it to reconnect,
-  then repeat the delivery check once. Otherwise use `clarify` once: “Did the
-  reply appear on your Even G2?” Offer exactly “Yes, the reply appeared” and
-  “No, nothing appeared,” with neither answer recommended. The selected answer
-  is the wearer evidence; advance on Yes with
-  `"replyEvidence":"wearer_confirmed"` and diagnose on No. Never arm after a
-  “No”, and never treat a missing answer as approval.
+  then repeat the delivery check once. Otherwise ask with `clarify` and no
+  choices (open-ended, so Hermes adds no “(Recommended)” answer): “Did the
+  reply appear on your Even G2? Type yes or no.” Only a clear yes is wearer
+  evidence; advance on it with `"replyEvidence":"wearer_confirmed"`. A no means
+  diagnose. For a vague answer, ask once more the same way; if it is still not
+  a clear yes, diagnose. A `clarify` timeout reply of either kind is no
+  answer, never yes. Never arm after a “No”, and never treat a missing answer
+  as approval.
 
 Check the newest gateway log only when diagnosis is needed:
 
@@ -732,21 +808,27 @@ Hermes × OcuClaw × Cloudways on a Cloudways managed host. You never supply it.
 Do not call `render_glasses_ui` from either the host or phone conversation; its
 live control link belongs to the managed gateway process. If the welcome screen
 appears a second time, the wearer double-taps it once more: the one automatic retry
-is already covered by the blocking tool call. The deterministic
+is already covered by the blocking tool call, which waits about three and a
+half minutes, long enough for the reply hold and both cards. The deterministic
 gateway handler, not assistant prose, consumes the live result. Only
 `firstRunProofAction.welcomeDelivery.committed: true`, confirmed by
 `firstRunProofAttempt.committed: true` and snapshot `firstRunProof.state:
-proven`, permits this announcement:
+proven`, permits the completion announcement.
 
-> Got it! OcuClaw on Hermes is set up. I saw your message reach the glasses and felt
-> your double-tap come back—the connection works in both directions.
+The committed `welcome_round_trip` result carries the announcement itself: its
+`say` array holds the fixed setup-complete line, one sentence naming the reply
+evidence actually obtained, and the optional-setup pointers. Say those lines
+verbatim, in order, once, one per line. Do not add, reword, merge or drop any
+of them, and do not write a success sentence of your own. Its `nextOperations`
+names `wrap_feedback`, the finish that follows once the optional choices
+resolve.
 
 Say only what the evidence supports. With SDK-only reply evidence, the reply
 leg is “your phone app confirmed the glasses accepted the reply”, never “you
 confirmed seeing the reply”. The double-tap proves the welcome surface, not
 that the earlier reply was read.
 
-Record `First-Run Proof: committed`, make the announcement once, and then
+Record `First-Run Proof: committed`, say the `say` lines once, and then
 continue to Step 11. Do not announce merely because the image rendered, the
 Attempt exists, or the wearer says they tapped.
 
@@ -780,9 +862,11 @@ never erases a previously committed First-Run Proof or reopens completion.
 
 ## Step 11 · Optional voice and Even AI setup
 
-After recorded core completion, give one short handoff: **on your phone, open
-the Optional setup card above your agents > Choose what to add**. Settings >
-Optional setup always provides re-entry. Dismissing Home's invitation is separate
+The optional-setup handoff is already in the `say` lines you repeated at
+Step 10; do not give it a second time. The card's two buttons are
+**Set up voice** and **Set up Even AI**. The card has no other buttons, and Settings
+has no separate optional-setup row. Use the names above and nothing else.
+Dismissing Home's invitation is separate
 from skipping Voice or Even AI. They can stop, skip each choice or return
 later. This is not a ninth Cloudways stage. Keep a pending welcome warning visible
 if they chose to continue without that proof; optional work never clears it.
@@ -837,7 +921,7 @@ billing setup blocks key creation, stay at that step or let them skip Soniox;
 do not mark it configured. The API console is distinct from the Soniox
 transcription app. These steps follow https://soniox.com/docs/stt/get-started.
 
-Once the Soniox key is ready, the supported phone path is **Optional setup >
+Once the Soniox key is ready, the supported phone path is **Set up voice** on Home's **Optional setup** card (later **Settings > Voice**) >
 Voice > Soniox > Save**. Enter it privately, confirm a replacement if needed,
 and choose **Save privately**. Fresh readback must confirm the save. Activation
 and the selected spoken test remain separate checkpoints.
@@ -871,7 +955,7 @@ Never solicit or display either value in the guided conversation. Never use
 `clarify` or a chat text box for secrets. Continue only when a fresh status
 receipt reports a confirmed save. Presence alone does not establish activation.
 Keep the save pending while another chosen optional capability is being prepared;
-then use the activation barrier. Return to **Settings > Optional setup > Voice**,
+then use the activation barrier. Return to **Settings > Voice**,
 start the selected spoken test and speak a short phrase. Only its matching final
 transcription establishes speech proof; typed chat and old transcripts do not.
 A stale configuration, reconnect, unavailable provider or failed test needs a
@@ -922,7 +1006,7 @@ false, explain that this Token is a shared private secret chosen by the user,
 not a key issued by the Hub website. Have them create a strong random secret in
 their password manager and keep it for Hermes and the phone's Token field.
 Never generate it in an assistant response or ask them to paste it into chat.
-On the advertised phone interface, use **Optional setup > Even AI > Connect**.
+On the advertised phone interface, tap **Set up Even AI** on Home's **Optional setup** card (later **Settings > Defaults > Even AI**), then **Connect**.
 Enter the user-chosen secret in the masked field and choose **Save privately**;
 confirm replacement before entering a new value over an existing one.
 Keep the same secret for the Even app. Refresh readback before activation.
@@ -956,6 +1040,23 @@ restart Hermes. Preserve reconnect details first. After reconnecting, refresh
 the current loaded state; never replay an uncertain apply operation automatically.
 If activation is unavailable, use the host's supported handoff and retain pending
 state. An applied operation receipt is for status checks only.
+
+The restart is required: a saved key stays invisible to the relay until the
+next gateway start, and every listen shows `Soniox key missing` until then.
+Status detects a saved but unloaded key for every save path, including the
+`hermes gateway setup` masked prompts and a hand-edited `.env`, and the phone
+offers **Restart Hermes** on its Home screen; an Even AI token counts only once
+`platforms.ocuclaw.extra.evenAiEnabled` is true (otherwise `unknown`, reason
+`even_ai_not_enabled`). On Cloudways still decline the wizard's own restart
+offer (it closes SSH and Hermes mid-setup), then activate from the phone or the
+terminal command below. On Cloudways both restart the whole container (Matty,
+2026-09-23, #3357): the Home card offers **Restart Hermes** there too, and
+`hermes ocuclaw optional-setup activate` warns first, then does the same. SSH
+disconnects; reconnect in about a minute. The phone reconnects on its own in
+1 to 5 minutes. If status stays `unknown` with reason
+`loaded_value_differs_after_restart`, the gateway restarted and still loaded a
+different value than `.env` (process env, systemd unit or managed override):
+say so and check that environment instead of offering another restart.
 
 <details><summary>Advanced: terminal activation or unsupported phone lifecycle</summary>
 
@@ -1045,7 +1146,7 @@ Do not claim `g2-validated` without wearer-confirmed real G2 evidence.
 
 ### Optional diagnostics
 
-Return to **Settings > Optional setup > Diagnostics** only if the current backend
+Return to **Settings > Display > debug section > Diagnostics** only if the current backend
 advertises support. Unsupported controls stay unavailable; do not borrow OpenClaw
 commands for Hermes. Diagnostic access and full-bundle phone handoff are distinct
 permissions. Handoff permits review on the phone, while **Send** is a separate

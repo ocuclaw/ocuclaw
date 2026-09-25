@@ -240,6 +240,13 @@ REPAIR_TEXT: Dict[str, str] = {
         "this node's own certificate, and a tailnet that cannot issue one "
         "accepts the route and then fails every connection through it."
     ),
+    "fix_host_dns": (
+        "Fix DNS on this host: this node cannot resolve its own MagicDNS name. "
+        "Turn on Tailscale's accept-dns, or set nameserver 100.100.100.100, or "
+        "add an /etc/hosts line for <node>.<tailnet>.ts.net, then run "
+        "`hermes ocuclaw doctor` again. Containers and userspace nodes that "
+        "keep their own resolver hit this; the route itself is not implicated."
+    ),
     "pair_phone_app": (
         "Pair the OcuClaw phone app with this host from the Setup Assistant."
     ),
@@ -300,6 +307,10 @@ _PROBE_OUTCOME_GLOSS = {
     doctor_lane.OUTCOME_TLS_HANDSHAKE_FAILED: (
         "the route answered but refused the TLS handshake, which is what a "
         "tailnet without HTTPS Certificates does"
+    ),
+    doctor_lane.OUTCOME_UNRESOLVED: (
+        "this node cannot resolve its own MagicDNS name, so the probe never "
+        "left this host and says nothing about the route"
     ),
     doctor_lane.OUTCOME_CERT_AVAILABLE: (
         "this tailnet can issue the TLS certificate the Serve route needs"
@@ -588,13 +599,24 @@ AGENT_CHOICE_MULTIPLE = "multiple"
 AGENT_CHOICE_SINGLE = "single"
 AGENT_CHOICE_MISMATCH = "mismatch"
 AGENT_CHOICE_UNKNOWN = "unknown"
+#: #3618: "single" was chosen, but this Hermes is 0.21.4+, where OcuClaw no
+#: longer offers it (whatever the profile count). The next setup pass records
+#: "multiple" without asking.
+AGENT_CHOICE_SINGLE_OUTGROWN = "single_outgrown"
+AGENT_CHOICE_OUTGROWN_HINT = (
+    "run /ocuclaw-setup in a Hermes chat; it records multiple agents"
+)
 
 # Same wording the phone shows when the grey "+" is tapped (#2515), so a
 # tester reading either surface recognises the other.
 AGENT_CHOICE_SETUP_HINT = "run /ocuclaw-setup in a Hermes chat to choose"
 
 
-def agent_choice_state(facts: Mapping[str, Any]) -> str:
+def agent_choice_state(
+    facts: Mapping[str, Any],
+    *,
+    opt_out_retired: Optional[bool] = None,
+) -> str:
     """Classify the agent choice from the raw config leaves (#2515).
 
     Mirrors `_setup_status`'s `agentModeChosen` rule — a choice counts only
@@ -607,6 +629,9 @@ def agent_choice_state(facts: Mapping[str, Any]) -> str:
     - ``single``    switch off, answer ``single``: "+" is grey by choice.
     - ``mismatch``  answer and switch disagree — an interrupted write or a
                     hand edit; the choice must be re-run, not guessed.
+    - ``single_outgrown``  answer ``single`` on Hermes 0.21.4+, where
+                    OcuClaw no longer offers it, whatever the profile count;
+                    setup records ``multiple`` without asking (#3618).
     - ``unknown``   the config could not be read.
     """
     if not facts.get("configReadable"):
@@ -619,8 +644,18 @@ def agent_choice_state(facts: Mapping[str, Any]) -> str:
         return AGENT_CHOICE_UNCHOSEN
     if mode == "multiple" and multiplex is True:
         return AGENT_CHOICE_MULTIPLE
-    if mode == "single" and multiplex is not True:
-        return AGENT_CHOICE_SINGLE
+    if mode == "single":
+        # #3618: on Hermes 0.21.4+ OcuClaw no longer offers "single", whatever
+        # the profile count, so a saved "single" is outgrown: setup records
+        # "multiple" without asking. Not a disagreement to fix by hand.
+        if opt_out_retired is None:
+            from .setup_profiles import multiplex_opt_out_retired
+
+            opt_out_retired = multiplex_opt_out_retired()
+        if opt_out_retired:
+            return AGENT_CHOICE_SINGLE_OUTGROWN
+        if multiplex is not True:
+            return AGENT_CHOICE_SINGLE
     return AGENT_CHOICE_MISMATCH
 
 
@@ -645,11 +680,26 @@ def _render_agent_choice(facts: Mapping[str, Any], *, prescribe: bool) -> List[s
             f"{switch}  but agent mode is recorded as {facts.get('agentMode')!r} — "
             "the choice and the switch disagree"
         )
+    elif state == AGENT_CHOICE_SINGLE_OUTGROWN:
+        text = (
+            f"{switch}  · agent mode 'single' was chosen, but OcuClaw does not "
+            "offer single agent on Hermes 0.21.4 and later"
+        )
     else:
         text = f"{switch}  · agent mode not chosen yet — the phone's \"+\" is grey"
     lines = [f"  multiple agents           {text}"]
-    if prescribe and state in (AGENT_CHOICE_UNCHOSEN, AGENT_CHOICE_MISMATCH):
-        lines.append(f"    → {AGENT_CHOICE_SETUP_HINT} (multiple agents is recommended)")
+    if prescribe and state == AGENT_CHOICE_SINGLE_OUTGROWN:
+        lines.append(f"    → {AGENT_CHOICE_OUTGROWN_HINT}")
+    elif prescribe and state in (AGENT_CHOICE_UNCHOSEN, AGENT_CHOICE_MISMATCH):
+        from .setup_profiles import multiplex_opt_out_retired
+
+        # #3618: on Hermes 0.21.4+ setup does not ask; it records multiple.
+        if multiplex_opt_out_retired():
+            lines.append(f"    → {AGENT_CHOICE_OUTGROWN_HINT}")
+        else:
+            lines.append(
+                f"    → {AGENT_CHOICE_SETUP_HINT} (multiple agents is recommended)"
+            )
     return lines
 
 

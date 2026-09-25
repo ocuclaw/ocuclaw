@@ -34,6 +34,8 @@ const BRIDGE_REQUEST_METHODS = Object.freeze([
   "input.prediction.cancel",
   "input.prediction.capabilities",
 
+  "input.prediction.model.allow",
+
   "input.prediction.open",
   "input.prediction.request",
   "input.prediction.test",

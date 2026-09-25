@@ -85,6 +85,13 @@ DETECT_CLOUDWAYS = "cloudways"
 DETECT_LIKELY = "likely"
 DETECT_NO = "no"
 
+#: Signals only a Cloudways Managed AI Agents box shows. The others (an
+#: exported HERMES_HOME, an entrypoint.sh PID 1, no systemctl, no crontab) are
+#: true of any plain Docker container, so they can support a "likely" but never
+#: make one: a plain lab container scored four of them and read as "likely"
+#: (#3348 Hermes finding 1).
+CLOUDWAYS_SPECIFIC_SIGNALS = ("hermes_venv_on_path",)
+
 STATE_ABSENT = "absent"  # no binaries installed
 STATE_STOPPED = "stopped"  # binaries present, daemon not answering
 STATE_STARTING = "starting"
@@ -137,6 +144,11 @@ class Layout:
     @property
     def needs_auth_marker(self) -> Path:
         return self.state_dir / "needs-authorization"
+
+    @property
+    def enrollment_daemon(self) -> Path:
+        """Which tailscaled an in-flight enrollment was started against."""
+        return self.state_dir / "enrollment-daemon"
 
     @property
     def watchdog_state(self) -> Path:
@@ -259,8 +271,10 @@ def detect(
     """Is this a Cloudways Managed AI Agents container?
 
     Measured on a real box on 2026-09-16. The hostname suffix alone is
-    decisive; without it, three of the five supporting signals make it
-    "likely", which the Setup Assistant turns into one question to the user.
+    decisive. Without it, "likely" needs a Cloudways-specific signal (the
+    Cloudways Hermes venv) plus at least three supporting signals in all; the
+    Setup Assistant turns "likely" into one question to the user. Generic
+    container facts alone always read "no".
     """
     env = os.environ if env is None else env
     path_exists = os.path.exists if path_exists is None else path_exists
@@ -290,7 +304,8 @@ def detect(
         verdict = DETECT_CLOUDWAYS
     else:
         supporting = sum(1 for key, hit in signals.items() if hit and key != "hostname_cloudwaysagents")
-        verdict = DETECT_LIKELY if supporting >= 3 else DETECT_NO
+        specific = any(signals[key] for key in CLOUDWAYS_SPECIFIC_SIGNALS)
+        verdict = DETECT_LIKELY if specific and supporting >= 3 else DETECT_NO
     return Detection(verdict=verdict, signals=signals, hostname=hostname)
 
 
@@ -802,6 +817,79 @@ def install(
 
 # -- enroll / retry -----------------------------------------------------------
 
+ENROLLMENT_STARTED = "enrollment-started\n"
+STALE_ENROLLMENT_NOTICE = (
+    "The last approval link stopped working when the container restarted. Starting a fresh one."
+)
+
+
+def _daemon_identity(layout: Layout) -> str:
+    """Names this tailscaled instance: its socket's inode and creation mtime.
+
+    tailscaled recreates the socket on every start, so a container restart
+    (or any daemon restart) changes this even when the pid is reused.
+    """
+    try:
+        info = layout.socket_path.stat()
+    except OSError:
+        return "none"
+    return f"{info.st_ino} {info.st_mtime_ns}"
+
+
+def _record_enrollment_daemon(layout: Layout) -> None:
+    try:
+        layout.enrollment_daemon.write_text(_daemon_identity(layout) + "\n")
+    except OSError:
+        pass
+
+
+def _clear_enrollment(layout: Layout) -> None:
+    layout.needs_auth_marker.unlink(missing_ok=True)
+    layout.enrollment_daemon.unlink(missing_ok=True)
+
+
+def enrollment_up_running(layout: Layout, *, proc_root: Path = Path("/proc")) -> bool:
+    """True while a `tailscale up` against our socket is alive (any caller)."""
+    tailscale = str(layout.tailscale)
+    socket_arg = f"--socket={layout.socket_path}"
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        words = [part.decode("utf-8", "replace") for part in argv if part]
+        if words and words[0] == tailscale and socket_arg in words and "up" in words:
+            return True
+    return False
+
+
+def _enrollment_is_stale(
+    layout: Layout, before: "DaemonState", up_running: Callable[[Layout], bool]
+) -> bool:
+    """An "enrollment-started" marker whose login can no longer produce a link.
+
+    After a container restart tailscaled comes back as NeedsLogin with no
+    AuthURL: the login the marker points at died with the old daemon, so
+    waiting on it never ends. A live `up`, a pending AuthURL, or the same
+    daemon that the enrollment started against all mean the login may still
+    be in flight, and a second `up` would only replace it.
+    """
+    if before.backend != "NeedsLogin" or before.auth_url:
+        return False
+    if up_running(layout):
+        return False
+    try:
+        recorded = layout.enrollment_daemon.read_text().strip()
+    except OSError:
+        return True  # written before daemon identities were recorded
+    return recorded != _daemon_identity(layout)
+
 
 def enroll(
     layout: Layout,
@@ -814,6 +902,7 @@ def enroll(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     progress: Optional[Callable[[str], None]] = None,
+    up_running: Optional[Callable[[Layout], bool]] = None,
 ) -> Dict[str, Any]:
     """`tailscale up`, bounded; returns the authorization URL when one is needed.
 
@@ -821,6 +910,8 @@ def enroll(
     The existing auth-needed marker also records an in-flight enrollment so
     interrupted observations can resume without another login. The watchdog
     clears that marker when authorized; nothing here waits for a human.
+    A marker left by a daemon that has since restarted is stale: it is
+    cleared and a fresh login starts (``staleEnrollmentCleared`` + ``notice``).
     """
     deadline = clock() + max(1.0, min(float(wait_s), 90.0))
     before = daemon_state(layout, runner=runner, timeout_s=min(8.0, max(0.1, deadline - clock())))
@@ -849,13 +940,23 @@ def enroll(
     out, err = "", ""
     command_failed = False
     try:
-        enrollment_started = layout.needs_auth_marker.read_text() == "enrollment-started\n"
+        enrollment_started = layout.needs_auth_marker.read_text() == ENROLLMENT_STARTED
     except OSError:
         enrollment_started = False
+    stale_cleared = False
+    if enrollment_started and _enrollment_is_stale(layout, before, up_running or enrollment_up_running):
+        # Real box 2026-09-23: a container restart mid-approval left this
+        # marker behind and every retry waited on a login that no longer exists.
+        _clear_enrollment(layout)
+        enrollment_started = False
+        stale_cleared = True
+        if progress:
+            progress(STALE_ENROLLMENT_NOTICE)
     if not before.auth_url and not enrollment_started:
         # Persist before invoking up: interruption must not start another login.
         layout.needs_auth_marker.parent.mkdir(parents=True, exist_ok=True)
-        layout.needs_auth_marker.write_text("enrollment-started\n")
+        layout.needs_auth_marker.write_text(ENROLLMENT_STARTED)
+        _record_enrollment_daemon(layout)
         if progress:
             progress("Starting Tailscale registration; waiting up to 90 seconds for its authorization link.")
         try:
@@ -864,7 +965,7 @@ def enroll(
                 raise_spawn_error=True,
             )
         except (OSError, ValueError):
-            layout.needs_auth_marker.unlink(missing_ok=True)
+            _clear_enrollment(layout)
             return {"ok": False, "state": before.state, "pending": False, "commandFailed": True,
                     "error": "Tailscale registration command could not start; check cloudways status, then retry."}
         # Tailscale's own --timeout also exits nonzero. An uncertain timeout or
@@ -900,12 +1001,16 @@ def enroll(
     }
     if qr and match:
         result["qr"] = out
+    if stale_cleared:
+        # Callers without a progress sink (the setup ladder) print this line.
+        result["staleEnrollmentCleared"] = True
+        result["notice"] = STALE_ENROLLMENT_NOTICE
     if not result["ok"]:
         result["pending"] = after.state == STATE_NEEDS_AUTH and not command_failed
         if command_failed:
             # We still observed the daemon for the full budget before declaring
             # rejection. A corrected command may now be retried on this identity.
-            layout.needs_auth_marker.unlink(missing_ok=True)
+            _clear_enrollment(layout)
             result["commandFailed"] = True
         result["error"] = (
             "Tailscale registration command failed and no authorization link appeared; check cloudways status, then retry."
@@ -1208,6 +1313,7 @@ __all__ = [
     "DETECT_NO",
     "Layout",
     "SOCKS5_LISTEN",
+    "STALE_ENROLLMENT_NOTICE",
     "STATE_ABSENT",
     "STATE_NEEDS_AUTH",
     "STATE_RUNNING",
@@ -1225,6 +1331,7 @@ __all__ = [
     "disable",
     "enable",
     "enroll",
+    "enrollment_up_running",
     "ensure_watchdog_job",
     "install",
     "install_binaries",

@@ -755,7 +755,7 @@ class GwRpc:
         # try that turns failures into `status: "partial"`, and an unimportable
         # yaml must still raise BEFORE the irreversible native create, as it did
         # when this import sat at the top of this method.
-        import yaml  # noqa: F401 - import-time check; the writer re-imports it
+        from .yaml_compat import yaml  # noqa: F401 - import-time check; the writer re-imports it
 
         setup = params["setup"]
         fields, folder, blocked = _validated_setup(setup)
@@ -833,7 +833,7 @@ class GwRpc:
         attempt left half-built. Raises on any failure; the caller decides what
         a failure means to its wearer.
         """
-        import yaml
+        from .yaml_compat import yaml
 
         bootstrap_profile(default_home, profile_dir)
         if fields["instructions"]:
@@ -1130,7 +1130,7 @@ class GwRpc:
         else:
             extra["emoji"] = emoji
 
-        atomic_config_write(config_path, raw_cfg, sort_keys=False)
+        atomic_config_write(config_path, raw_cfg)
         return {
             "status": "updated",
             "profile": {"id": profile_id, "name": profile_id},
@@ -1329,7 +1329,7 @@ class GwRpc:
             raise ValueError("emoji is too long")
 
         _profile, home = self._settings_profile(profile_id)
-        import yaml
+        from .yaml_compat import yaml
         from hermes_cli.config import atomic_config_write, read_user_config_raw
 
         config_path = home / "config.yaml"
@@ -1414,7 +1414,7 @@ class GwRpc:
         soul_tmp.write_text(fields["instructions"], encoding="utf-8")
         os.replace(soul_tmp, home / "SOUL.md")
         try:
-            atomic_config_write(config_path, cfg, sort_keys=False)
+            atomic_config_write(config_path, cfg)
         except Exception as exc:
             raise RuntimeError(
                 "Instructions were saved, but the other settings were not. Reload before trying again."

@@ -1,6 +1,6 @@
 # Cloudways managed Hermes — userspace Tailscale kept alive by Hermes cron
 
-**Guide version:** 2026-09-21 (1.3.22-hermes)
+**Guide version:** 2026-09-25 (1.3.24-hermes)
 
 Use this branch in place of fresh-install Steps 6 and 7 when the host is a
 Cloudways **Managed AI Agents** container. Everything else in the fresh-install
@@ -93,8 +93,16 @@ Six facts to state plainly when you offer it:
 - **The first message.** It is step 8 of the same command, in the same
   terminal. Nobody types a second command for it. Step 8 sends a real message
   through the user's agent, so check that the agent's model answers first with
-  `hermes -z hello`; if the model returns an error, step 8 says so, records
-  nothing and asks for a rerun once the model is fixed. When the phone reports that
+  `hermes -z hello`; if the model returns an error, step 8 prints the verdict
+  plainly -- the chain works, the model is unreachable: the message reached the
+  agent and its reply reached the glasses, but the model answered with an error
+  instead of an answer. The next line names the failure and its one fix: a
+  rejected sign-in (sign in again with `hermes model`), out of quota or
+  billing (check the plan), rate limited (wait for the limit or choose another
+  model), or a busy or failing provider (try again in a minute, or check with
+  `hermes -z hello`). The outcome is refused, nothing is recorded, and the
+  step asks for a rerun once the model is fixed. It never asks the wearer
+  whether the reply appeared. When the phone reports that
   the glasses SDK accepted that exact reply, the step says so and asks nothing;
   otherwise it asks the wearer, on a real terminal, exactly as this skill asks
   today. `--yes` never answers that and never approves a pairing. The wearer's
@@ -217,7 +225,8 @@ Approval remains pending until the phone authenticates back.
 
 Tell the user once when entering this branch: OcuClaw is partnered with
 Cloudways. Cloudways staff are available in the Cloudways channel in the
-[OcuClaw Discord](https://discord.ocuclaw.com/).
+OcuClaw Discord: https://discord.ocuclaw.com/ (write the URL bare, never as a
+Markdown link; the Hermes TUI hides a link's address).
 
 Hermes runs as a non-root user inside a container: no privilege elevation of
 any kind, no systemd, no cron binary, no TUN device, and the system
@@ -279,8 +288,10 @@ hermes ocuclaw cloudways detect
 ```
 
 - `cloudways`: continue with C2.
-- `likely`: ask the user one `clarify` yes/no question, "Is this Hermes running
-  on Cloudways Managed AI Agents?" Continue only on yes.
+- `likely`: ask the user one open-ended `clarify` question with no choices,
+  "Is this Hermes running on Cloudways Managed AI Agents? Type yes or no."
+  Continue only on a clear yes. `likely` is not decisive, and a choice list
+  would get "(Recommended)" on its first option. A timeout reply is no answer.
 - `no`: leave this branch; use fresh-install Steps 6 and 7 with the system
   Tailscale.
 
@@ -410,6 +421,18 @@ starts about 30 s later and its first tick about a minute after that; the
 watchdog then starts `tailscaled`. Measured on the test host: node `running`
 again 18–100 s after the container came back. After any restart, run
 `hermes ocuclaw cloudways status --wait 120` before probing the route.
+
+**Activating saved optional choices restarts the container too** (Matty,
+2026-09-23, #3357). When a saved Soniox key or Even AI token waits for a restart,
+the phone's Home card offers **Restart Hermes** on Cloudways, and
+`hermes ocuclaw optional-setup activate` works here. In both, the gateway exits
+and Cloudways restarts the whole container. The phone path first waits for
+active work; the CLI path does not. The CLI warns first: `This restarts the
+whole container. SSH will disconnect; reconnect in about a minute. Your phone
+reconnects in 1–5 minutes. Active replies are stopped, not finished.` It still asks for
+`ACTIVATE`. Follow the reconnect and resume steps above before either. The
+`cloudways setup` ladder does not restart by itself; it still names the
+dashboard restart when OcuClaw is not loaded.
 
 One slower case, seen once: the container bounced a second time while the
 watchdog's first tick was running. Hermes cron then holds that tick's fire

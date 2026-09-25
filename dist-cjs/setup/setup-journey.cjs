@@ -1,18 +1,90 @@
 const { createHash } = require("node:crypto");
 const { hostname } = require("node:os");
 const { resolve } = require("node:path");
+const { PLUGIN_VERSION } = require("../version.cjs");
 const FIRST_USE_SUCCESS = "OcuClaw setup is complete. Optional integrations can wait.";
-const OPTIONAL_SETUP_HANDOFF = "Optional: on your phone, open OcuClaw > Settings > Optional setup. Choose what you want, or leave it for later.";
 
-function firstUseSuccess(record) {
+const OPTIONAL_SETUP_HANDOFF_LINES = Object.freeze([
+  "Optional: on your phone, the Optional setup card on Home offers voice and Even AI.",
+  "You can also reach them later under Settings > Voice and Settings > Defaults > Even AI.",
+  "Choose what you want, or leave it for later.",
+]);
+const OPTIONAL_SETUP_HANDOFF = OPTIONAL_SETUP_HANDOFF_LINES.join(" ");
+
+function firstUseSuccessLines(record) {
   const evidence = record?.confirmation && record.confirmation.source !== "test-input"
     ? "You confirmed the reply appeared on your glasses."
     : record?.replyEvidence === "client_sdk_receipt"
       ? "Your phone reported SDK acceptance of the reply."
       : "";
-  return [FIRST_USE_SUCCESS, evidence, OPTIONAL_SETUP_HANDOFF].filter(Boolean).join(" ");
+  return [FIRST_USE_SUCCESS, evidence, ...OPTIONAL_SETUP_HANDOFF_LINES].filter(Boolean);
+}
+
+function firstUseSuccess(record) {
+  return firstUseSuccessLines(record).join(" ");
 }
 const FIRST_USE_RETRY = "Send a new message from the phone in this OpenClaw session, wait for its reply, then run openclaw ocuclaw first-use again.";
+
+const FIRST_USE_TERMINAL_ARMED = "A first-message check is armed for this phone session. Run openclaw ocuclaw first-use in your own terminal; it waits for your phone message and continues on its own.";
+
+const FIRST_USE_PROVIDER_ERROR_ACTION = "The chain works; the model is unreachable. Fix the provider, then offer first_use_retry; do not ask whether the reply appeared.";
+
+const FIRST_USE_ERRORED_RUN_REASONS = Object.freeze([
+  "reply_run_errored",
+  "reply_run_rate_limited",
+]);
+
+const FIRST_USE_PROVIDER_ERROR_CLASSES = Object.freeze([
+  "auth",
+  "quota",
+  "rate_limit",
+  "overloaded",
+  "model_error",
+]);
+const PROVIDER_ERROR_CODE_CLASSES = Object.freeze({
+  provider_auth_invalid: "auth",
+  provider_quota_exhausted: "quota",
+  provider_rate_limited: "rate_limit",
+  provider_unavailable: "overloaded",
+  provider_overloaded: "overloaded",
+  provider_timeout: "overloaded",
+
+  reply_run_rate_limited: "rate_limit",
+});
+
+function firstUseProviderErrorClass(value) {
+  if (value && typeof value === "object") {
+    if (FIRST_USE_PROVIDER_ERROR_CLASSES.includes(value.class)) return value.class;
+    return firstUseProviderErrorClass(value.code);
+  }
+  return typeof value === "string" && PROVIDER_ERROR_CODE_CLASSES[value] ? PROVIDER_ERROR_CODE_CLASSES[value] : "model_error";
+}
+
+function firstUseRunErrored(code) {
+  const known = typeof code === "string" && code ? code : null;
+  return { code: known, class: firstUseProviderErrorClass(known) };
+}
+
+function firstUseWithRunErrored(result, errored) {
+  if (!result || !errored) return result;
+  const open = result.status === "awaiting-reply" ||
+    (result.status === "awaiting-confirmation" && result.replyWasProviderError === true);
+  if (!open || !Array.isArray(result.nextOperations)) return { ...result, replyRunErrored: errored };
+  return { ...result, replyRunErrored: errored, nextOperations: ["first_use_retry"], action: FIRST_USE_PROVIDER_ERROR_ACTION };
+}
+
+const TOOL_POLICY_ALSO_ALLOW_APPLY_COMMAND =
+  `openclaw config set tools.alsoAllow '["ocuclaw"]' --strict-json`;
+
+function toolPolicyWarnings(toolPolicy) {
+  if (toolPolicy?.exposure !== "hidden-by-profile") return [];
+  return [{
+    id: "tool-policy-hides-ocuclaw",
+    evidence: `tools.profile=${toolPolicy.profile ?? "unknown"}`,
+    detail: "This host's tool profile hides plugin tools, so ocuclaw_setup is not in the model's inventory. This is the quickstart default, not a deliberate policy: naming the plugin in alsoAllow admits it without weakening anything else.",
+    applyCommand: TOOL_POLICY_ALSO_ALLOW_APPLY_COMMAND,
+  }];
+}
 
 function setupInstallation(stateDir) {
   return {
@@ -46,9 +118,19 @@ function cloudwaysRouteBlocked(route, daemon, host) {
   return route?.route?.readCode === "serve_cli_absent" || route?.evidence === "serve_cli_absent";
 }
 
+const SERVE_CLI_ABSENT_ACTION =
+  "The tailscale CLI is not on the gateway process's PATH (macOS App Store build: expose the CLI), or Tailscale runs in a different container/VM than the gateway; move one of them.";
+
+function serveCliAbsent(route) {
+  if (!route || typeof route !== "object") return false;
+  return route.route?.readCode === "serve_cli_absent" || route.evidence === "serve_cli_absent";
+}
+
 function privateRouteAction(route, daemon = null, host = null) {
 
   if (cloudwaysRouteBlocked(route, daemon, host)) return CLOUDWAYS_INSTALL_ACTION;
+
+  if (serveCliAbsent(route)) return SERVE_CLI_ABSENT_ACTION;
   if (!route || typeof route !== "object" || !route.route) {
     return host?.managed === "cloudways"
       ? CLOUDWAYS_INSTALL_ACTION
@@ -83,6 +165,10 @@ function privateRouteAction(route, daemon = null, host = null) {
       if (coldCertificateWindow(route, daemon)) {
         return `The :${port} route is applied and this installation owns it, the relay is listening, and the only thing missing is the TLS certificate Tailscale issues on the first connection. That first secure connection can take up to a minute. Do the wait inside this same turn: sleep 60 seconds in your own terminal, or re-read journey up to 3 times about 30 seconds apart, and only then answer. Never say you will re-check later and end the turn, because nothing wakes you; if you must stop, ask the user to say "check the route again" in a minute. Only a repeat timeout after that wait points at MagicDNS, HTTPS Certificates in the tailnet admin console, or the relay itself. Change nothing in the meantime.`;
       }
+
+      if (route.evidence === "front_door_unresolved") {
+        return `The :${port} route is configured but this node cannot resolve its own MagicDNS name (normal in containers and on userspace nodes). This is DNS on this host, not certificates. Read this node's tailnet name from your own tailscale status, then do one of: run tailscale set --accept-dns=true, or add nameserver 100.100.100.100 to this host's resolver, or add an /etc/hosts line mapping that name to this node's tailnet IP, ${reobserve}`;
+      }
       return `The :${port} route is configured for this relay but did not prove reachable (${route.evidence}). Check that the relay is listening on its loopback port and that HTTPS certificates are enabled for this tailnet, ${reobserve}`;
     case "offline":
       return "Tailscale on this host is not running and online; sign in and bring it up, then re-read journey.";
@@ -115,7 +201,7 @@ function tailnetDaemonAction(daemon) {
   return "The Cloudways Tailscale daemon state could not be read. Run `openclaw ocuclaw cloudways status --json` and follow references/cloudways.md. Do not start tailscaled by hand.";
 }
 
-function setupJourney(state, installation, route = null, firstUse = null, tailnetDaemon = null) {
+function setupJourney(state, installation, route = null, firstUse = null, tailnetDaemon = null, runErrored = null) {
   const daemon = tailnetDaemonBlock(tailnetDaemon);
 
   const host = state.host && typeof state.host === "object" ? state.host : null;
@@ -128,7 +214,17 @@ function setupJourney(state, installation, route = null, firstUse = null, tailne
   const replyConfirmed = !!firstUse?.confirmation && !testComplete;
 
   const receiptEvidenced = firstUse?.replyEvidence === "client_sdk_receipt";
+
+  const replyWasProviderError = FIRST_USE_ERRORED_RUN_REASONS.includes(firstUse?.replyEvidenceReason);
   const firstUseStatus = testComplete && firstUse?.status === "completed" ? "awaiting-confirmation" : firstUse?.status ?? "awaiting-reply";
+
+  const preReplyRunErrored = !!firstUse && firstUse.status === "awaiting-reply" &&
+    !!runErrored && typeof runErrored === "object";
+  const replyRunErrored = preReplyRunErrored || (replyWasProviderError && runErrored && typeof runErrored === "object")
+    ? { code: typeof runErrored.code === "string" ? runErrored.code : null, class: firstUseProviderErrorClass(runErrored) }
+    : replyWasProviderError ? { code: null, class: firstUseProviderErrorClass(firstUse.replyEvidenceReason) }
+    : null;
+  const modelFailed = replyWasProviderError || preReplyRunErrored;
   const awaitingWelcome = firstUseStatus === "awaiting-welcome";
   const welcomeAction = coreComplete ? "Welcome dismissed. No action needed."
     : state.capabilities.welcome !== "available"
@@ -141,6 +237,8 @@ function setupJourney(state, installation, route = null, firstUse = null, tailne
   const firstUseAction = coreComplete ? firstUseSuccess(firstUse)
     : firstUseStatus === "unavailable" ? "Have the installation owner check setup state access and ownership. Preserve the existing record; do not claim completion."
     : awaitingWelcome ? welcomeAction
+
+    : modelFailed ? FIRST_USE_PROVIDER_ERROR_ACTION
     : firstUse?.observation?.answer === "no" ? "The wearer reported that the reply did not appear. Preserve that observation, diagnose the glasses path, then offer an explicit fresh first_use_retry; do not ask the same visibility question again or show welcome."
     : state.capabilities.toolFirstUse === "unknown" ? "The owning runtime could not be reached. Check its health before choosing the supported first-use flow; preserve the checkpoint."
     : state.capabilities.toolFirstUse === "available"
@@ -149,7 +247,7 @@ function setupJourney(state, installation, route = null, firstUse = null, tailne
         : "Call first_use_begin to arm or resume the intended phone session before asking for a fresh phone message; then first_use_wait. Preserve the binding on normal resume."
     : firstUseStatus === "awaiting-confirmation"
       ? "A completed phone reply is recorded. In your own terminal run openclaw ocuclaw first-use and confirm only if that reply appeared on G2. If it never appeared, run openclaw ocuclaw first-use --retry before a fresh phone send. The assistant must not answer for you."
-      : firstUse ? FIRST_USE_RETRY
+      : firstUse ? FIRST_USE_TERMINAL_ARMED
       : "Open the intended OpenClaw conversation on the phone, then run openclaw ocuclaw first-use in your own terminal to begin this installation's first-reply checkpoint.";
   const configured = state.configuration.issueIds.length === 0 &&
     state.secrets.relayToken.presence === "present" &&
@@ -227,13 +325,15 @@ function setupJourney(state, installation, route = null, firstUse = null, tailne
       reason: pairingAvailable ? "direct-terminal-pairing" : "pairing-operation-unavailable",
       action: pairingAvailable
         ? "In your own interactive terminal run openclaw ocuclaw pair. Scan QR or use its short-lived Manual code, compare all four words on the phone and terminal, then explicitly approve or refuse. The assistant must not run or capture this ceremony. Re-read journey afterwards to resume this installation; an already connected phone is current health, not durable pairing or first-use proof."
-        : "This host cannot offer the production terminal ceremony: it is outside the plugin's declared OpenClaw compatibility window (2026.6.9 or newer) or lacks the runtime APIs the ceremony uses. Move to a supported host (recommended OpenClaw 2026.9.4) and re-read journey; preserve existing credentials.",
+        : "This host cannot offer the production terminal ceremony: it is outside the plugin's declared OpenClaw compatibility window (2026.7.1-2 or newer) or lacks the runtime APIs the ceremony uses. Move to a supported host (recommended OpenClaw 2026.9.4) and re-read journey; preserve existing credentials.",
     },
     {
 
       id: "phone-origin-proof", status: replyConfirmed || receiptEvidenced ? "complete" : awaitingWelcome ? "awaiting-confirmation" : firstUseStatus,
       reason: replyConfirmed ? "wearer-confirmed-phone-reply"
         : receiptEvidenced ? "client-sdk-receipt-phone-reply"
+
+        : modelFailed ? "reply-run-errored"
         : awaitingWelcome ? "awaiting-confirmation" : firstUseStatus,
       action: firstUseAction,
     },
@@ -253,8 +353,19 @@ function setupJourney(state, installation, route = null, firstUse = null, tailne
     ...(host ? { host } : {}),
     ...(assistantSkill ? { assistantSkill } : {}),
     installation,
+
+    runtimePlugin: state.plugin && state.plugin.status === "loaded" &&
+      state.runtime && state.runtime.status !== "unknown"
+      ? { version: typeof PLUGIN_VERSION === "string" && PLUGIN_VERSION ? PLUGIN_VERSION : null,
+        evidence: "owning-runtime-code" }
+      : null,
+
+    compatibility: state.compatibility ?? null,
+    environment: state.environment ?? null,
     capabilities: state.capabilities,
     toolPolicy: state.toolPolicy,
+
+    warnings: toolPolicyWarnings(state.toolPolicy),
     durableFacts: {
       requiredConfiguration: {
         status: configured ? "complete" : "incomplete",
@@ -291,8 +402,13 @@ function setupJourney(state, installation, route = null, firstUse = null, tailne
       wearerConfirmedG2Reply: replyConfirmed ? "confirmed" : "not-confirmed",
       acceptance: testComplete ? "test-input-only" : replyConfirmed ? "wearer-confirmed" : "not-confirmed",
       confirmationSource: firstUse?.confirmation?.source ?? null,
-      replyEvidence: firstUse?.replyEvidence ?? "wearer_confirmed",
+
+      replyEvidence: firstUse?.replyEvidence ??
+        (firstUse?.confirmation || firstUse?.status === "completed" ? "wearer_confirmed" : null),
       replyEvidenceReason: firstUse?.replyEvidenceReason ?? null,
+      replyWasProviderError,
+
+      replyRunErrored,
       welcome: firstUse?.completionPolicy === "reply-and-welcome" ? firstUse?.welcome?.status ?? "not-started" : "not-required-legacy",
       action: firstUseAction,
     },
@@ -309,4 +425,4 @@ function setupJourney(state, installation, route = null, firstUse = null, tailne
   };
 }
 
-module.exports = { setupInstallation, setupJourney, FIRST_USE_SUCCESS, FIRST_USE_RETRY, firstUseSuccess };
+module.exports = { setupInstallation, setupJourney, FIRST_USE_SUCCESS, FIRST_USE_RETRY, firstUseSuccess, firstUseSuccessLines, OPTIONAL_SETUP_HANDOFF, OPTIONAL_SETUP_HANDOFF_LINES, FIRST_USE_TERMINAL_ARMED, FIRST_USE_PROVIDER_ERROR_ACTION, FIRST_USE_ERRORED_RUN_REASONS, toolPolicyWarnings, FIRST_USE_PROVIDER_ERROR_CLASSES, firstUseProviderErrorClass, firstUseRunErrored, firstUseWithRunErrored };

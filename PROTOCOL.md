@@ -184,7 +184,7 @@ The supported version floor is now 0.21.1 (#3147). The 0.21.0 engine
 no safe public registry; it sits below the floor and the adapter refuses to
 start there. The `session_writer_unsupported` branch stays as defence in depth
 for a host without the registry, while reads remain available. Hermes 0.21.1 (`2237be355906fbe6065ce1815711eee52b2d646e`)
-and the certified 0.21.3 engine (`345cd2b057a452236de401d3534b8502a7465e8d`) ship
+0.21.3 (`345cd2b057a452236de401d3534b8502a7465e8d`) and the certified 0.21.5 engine (`f97608f178d1ffeca59860195ab7da295f7c8e5f`) ship
 `hermes_state_registry`, so the same mutations run through the registry there. There is no standalone-writer or ambient `SessionStore._db`
 fallback. Missing/unserved stores report `session_store_unavailable` /
 `session_profile_unserved`; read probes report `session_schema_unsupported`
@@ -604,9 +604,22 @@ Each operation has its own capability record, at `scope:gateway`, present in eve
 general `capabilities` and `overview` result. Timing is `read_only` for
 `restart.preview` and `restart.status`, `active_now` for `restart.request`. The three
 share one `supported` value: a client that cannot request a restart is not offered a
-preview of one either. It is false unless this process supervises a running gateway,
-so a gateway that cannot restart itself, and one still starting up, both advertise
-unsupported rather than inviting a call that could only fail. `supported:true` is an
+preview of one either. It is false unless the gateway is running and something
+brings it back after it exits: a supervisor (systemd, launchd, s6 or an explicit
+external supervisor), or, since #3357 (Matty, 2026-09-23), a Cloudways Managed AI
+Agents container. On Cloudways the gateway is `hermes gateway run --no-supervise`,
+a direct child of PID 1 `/entrypoint.sh`; support there needs the decisive
+Cloudways verdict (never `likely`), PID 1 being the entrypoint, and the gateway
+being its direct child. A gateway that cannot restart itself, and one still
+starting up, both advertise unsupported rather than inviting a call that could only
+fail.
+
+The restart itself is the same everywhere: the durable receipt and fence first,
+then Hermes's own `request_restart`, which refuses new turns, waits for active work
+and stops. Only the exit differs. Under a supervisor it exits 75 so the supervisor
+relaunches it. On Cloudways it exits 0 with no detached helper: PID 1 ends with it
+and Cloudways restarts the whole container. SSH sessions drop, and the phone
+reconnects on its own in 1 to 5 minutes. `supported:true` is an
 invitation, never an admission: `restart.request` is still gated natively on the
 restart snapshot, so a client that ignores the record gains nothing.
 
@@ -1213,7 +1226,7 @@ host API returns `unsupported`.
 
 **Fallback on `unsupported` (#2934).** `GatewayRunner.apply_session_options`
 ships only in upstream PR #92187; no tagged Hermes release carries it (checked
-through 0.21.3 / v2026.9.14). When the adapter answers `unsupported`, the
+through 0.21.5 / v2026.9.24). When the adapter answers `unsupported`, the
 runtime applies the same patch through Hermes's session-scoped slash commands
 as visible conversation turns, in this order: `/model <id> [--provider <p>]`,
 `/reasoning <effort>` (`reasoning_effort:""` → `/reasoning reset`; effort off
@@ -2100,8 +2113,8 @@ error document; the child never fabricates health. OpenClaw has no parent
 method and attaches no `connection-health.json`.
 
 `producer.hermesSource` has exactly three advisory states. `certified-source`
-means package `0.21.3` and a complete clean checkout at the certified
-`v2026.9.14` commit; `drifted` means a complete inspectable checkout differs;
+means package `0.21.5` and a complete clean checkout at the certified
+`v2026.9.24` commit; `drifted` means a complete inspectable checkout differs;
 `unknown` covers shallow/non-Git installs, missing objects or package metadata,
 timeouts, and any inspection ambiguity, including partial/promisor clones. The
 observed/certified short commits, shallow result, and cache timestamp use the
@@ -2170,6 +2183,37 @@ sets `observationErrorCode:"shutdown"`.
 `presence.dirty` is registered on the parent side **before** `link.start()`:
 a phone already connected while the relay boots pushes during the handshake
 window, and a `-32601` there would cost exactly the delay this lane removes.
+
+## Board moment lane (#3051 — watched-card moments to the phone)
+
+The contract (envelope, attention classes, identities, store) is
+`docs/hermes-board/contract.md` → "Moments (#3051)". This lane only carries
+it. The parent tails the board read-only every 5 s, stores pending deliveries
+with the cursor in one transaction, and pushes what is due. The phone acks
+each delivery once its Board delivery state holds it.
+
+Parent → child RPC:
+
+| Method | Params | Result |
+|---|---|---|
+| `board.moment.push` | `{moments:[envelope, …]}` (≤20) | `{ok:true, sent:<frames sent to app clients>, refused:<envelopes Node's validator refused>}`, or `{ok:false, error:"invalid_params"}`. Each valid envelope goes to every connected app as `ocuclaw.board.moment`. A push is a doorbell: `sent:0` or a failed call leaves the delivery pending, and the parent pushes it again after 15 s. |
+
+Child → parent RPC:
+
+| Method | Params | Result |
+|---|---|---|
+| `board.moment.ack` | `{deliveryId, state:"durable"\|"volatile"}` (exact keys) | `{ok:true, known:<bool>}`; only a pending delivery settles, so a repeated or late ack changes nothing. `{ok:false, error:"invalid_params"\|"store_unavailable"}` otherwise. Node retries a failed forward (not `invalid_params`) in order, at most 256 queued. |
+
+`board.moment.ack` is registered on the parent before `link.start()`, like
+`presence.dirty`. The pump starts after the handshake and stops on
+disconnect. It is idle while `passive_moments` is off.
+
+#3052: a new pump (restart or reconnect) pushes every pending delivery on its
+first tick. A push answered `sent:0` is due again on the next tick, not after
+15 s. The pump serves under the link's relay credential (kept only as a
+one-way digest); when that changes, deliveries the old pairing acked are
+pending again. Unwatching cancels that watch's pending deliveries.
+Contract: "Moments (#3051)" → "Robustness (#3052)".
 
 ## Pairing-completion lane (#1322 — private Attempt binding)
 
@@ -2444,6 +2488,7 @@ env name for it would be a remote way to widen the listener past loopback.
 | `allow_admin_from` | Hermes `gateway/slash_access.py`; OcuClaw bridges the env name `OCUCLAW_ALLOW_ADMIN_FROM` | `.env` via `OCUCLAW_ALLOW_ADMIN_FROM`, or `config.yaml` `extra.allow_admin_from` | Optional; **required for "Continue here"** (`/resume <tip> --all`) | env > yaml > unset | The wearer admin allow-list. Written as JSON (`["ocuclaw-wearer"]`) or a comma list (`ocuclaw-wearer`); either shape reaches Hermes' own `_coerce_id_list`. A non-empty list turns slash-command gating ON for the whole platform, which is safe only because `ocuclaw-wearer` is the only user id the adapter ever stamps. An empty list, a JSON object, or unparseable JSON is refused. |
 | `relayToken` | Host-generated Relay Credential; `adapter.py` bridge as `OCUCLAW_RELAY_TOKEN`; no `requires_env`, prompt, reveal, or return surface | `.env` via `OCUCLAW_RELAY_TOKEN` (the only supported source; no status, doctor, or setup surface reads a yaml secret) | **Required**; initial plugin bootstrap generates it on a provably fresh profile and validation refuses boot without it | env > unset | Downstream client auth token, constant-time checked and forwarded in `link.hello.ack`; reinstall/update/restart/re-pair preserve it, and only the locally confirmed all-device reset replaces it. |
 | `sonioxApiKey` | `adapter.py` bridge as `OCUCLAW_SONIOX_API_KEY`; deliberately absent from `requires_env` | `.env` via `OCUCLAW_SONIOX_API_KEY` (the only supported source) | Optional; required for Soniox STT only | env > unset | Credential for temporary-key mint; unset returns `soniox_temp_key_not_configured`. |
+| `typesafeApiKey` | `adapter.py` bridge as `OCUCLAW_TYPESAFE_API_KEY`; deliberately absent from `requires_env` | `.env` via `OCUCLAW_TYPESAFE_API_KEY` (the only supported source), saved by `hermes ocuclaw optional-setup save typesafe` or the phone's Add key page | Optional; required for silent input's smart word order only | env > unset | TypeSafe credential for the Jev ranker. Saving it IS the arming gesture: it turns `silentInputJev.enabled` on unless the operator wrote that flag by hand, and it outranks the deployment-time `TYPESAFE_API_KEY`, which never arms anything by itself. |
 | `stateDir` | `adapter.py` | `config.yaml` `extra.stateDir` | Optional, code-defaulted | yaml > code default | `$HERMES_HOME/ocuclaw`; Node runtime state directory. |
 | `glassesUiLive` | `adapter.py` | `config.yaml` `extra.glassesUiLive` | Optional, code-defaulted | yaml > code default | `{}` merges with `httpEnabled:true`, `llmEnabled:true`, `httpHostPolicy:"owner-grants"`, and `tickModel:""` (Hermes `ctx.llm` selects the model). Shared/hosted operators set `httpHostPolicy:"operator-only"` to revoke phone host grants. |
 | `renderGlassesUiTimeoutMs` | `adapter.py` | `config.yaml` `extra.renderGlassesUiTimeoutMs` | Optional | yaml > unset | Positive render-tool timeout override; unset/non-positive delegates to the child default. |
@@ -2488,6 +2533,52 @@ diagnostics distinguish configured `access`/`handoff` from
 observation tied to the live gateway process; missing or stale evidence is null.
 The shared capability snapshot also advertises version-1 permission readback
 for Hermes only when both loaded flags are known booleans.
+
+The same loaded-relay observation drives the credential states. A Soniox key, or
+an Even AI token whose `platforms.ocuclaw.extra.evenAiEnabled` is true, present on
+disk while the fresh observation says the live relay loaded a different value is
+`saved` (`activation.required: true`, `mode: "restart"` where the native restart
+is supported) even without a save receipt, so the terminal wizard's masked
+prompts and a hand-edited `.env` get the phone's restart offer like the phone,
+CLI and Desktop saves do (#3357). A `status` request re-observes first when the
+observation is older than 60 s or predates the current `.env`/`config.yaml`;
+stale or gateway-mismatched evidence stays `unknown`. An `unknown` capability
+may carry `reason`: `even_ai_not_enabled` (token on disk, flag off: a restart
+would not activate it, with or without a save receipt) or
+`loaded_value_differs_after_restart` (an activation was attempted for this exact
+`.env` revision, the gateway restarted since, and the relay still loaded a
+different value, so a process env, systemd unit or managed override wins; no
+further restart is offered until `.env` changes; `config.yaml` rewrites at gateway
+start do not disarm it). The phone ignores `reason` today; the CLI prints a
+plain-language line for it on stderr, keeping stdout one JSON object. An
+activation admission (`activationRequested`) lifts when the next gateway process
+observes the relay, and expires after 600 s if no gateway comes back (twice the
+top of the measured 1 to 5 minute Cloudways container restart), so a stopped
+gateway never fences later saves. An Even AI save whose token is written but
+whose `evenAiEnabled` enable does not stick (a managed `config.yaml`) records the
+token as `saved`, reports `even_ai_not_enabled`, answers the phone with
+`saved`, and a retry with the same token tries the enable again. A phone
+`credential.save` refused before any write (`busy`, `activation_pending_reconnect`,
+`invalid_value`) answers `rejected` with that code, never `outcome_unknown`. An admission written by a pre-#3357
+bundle carries no `requestedAt`; it keeps the old rule (it fences saves until a
+different gateway is live) and the new gateway's observation lifts it.
+The snapshot also carries `hostContext.cloudways` (boolean, optional, absent
+means false): true only on a decisive Cloudways Managed AI Agents verdict (the
+same `hermes ocuclaw cloudways detect` check, run once per gateway process as a
+background task after the adapter registers its handlers, false before it
+finishes and on `likely` or any error), so the activation confirm card can say
+the whole container restarts and the phone reconnects on its own in 1 to 5
+minutes. On such a host the snapshot reports `activation.supported: true` and
+`mode: "restart"` once detection has run (#3357): the Home card offers Restart
+Hermes, and the restart bounces the container. `hermes ocuclaw optional-setup
+activate` does the same from SSH after a warning that the whole container
+restarts and SSH disconnects. Unlike the phone path, the CLI path runs
+`hermes gateway restart`, which on a host with no service manager stops the
+gateway and force-kills it after 5 s, so it does not wait for active runs; its
+warning says so: "Active replies are stopped, not finished." When the restart
+bound cannot be read, it writes no activation fence and prints the manual
+dashboard instruction instead. It is named `hostContext`, not `runtimeContext`: the latter is the
+observed relay/gateway identity in `hermes ocuclaw optional-setup status`.
 
 These host permissions are independent of the phone's **Enable Debug** capture
 switch. Full report handoff requires both host permissions. Upload remains a

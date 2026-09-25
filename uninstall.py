@@ -54,6 +54,7 @@ SECRET_KEYS: Sequence[str] = (
     "OCUCLAW_RELAY_TOKEN",
     "OCUCLAW_SONIOX_API_KEY",
     "OCUCLAW_EVEN_AI_TOKEN",
+    "OCUCLAW_TYPESAFE_API_KEY",
 )
 
 # Exact files written beneath the adapter's default Node runtime stateDir.
@@ -552,7 +553,7 @@ def _safe_profile_state_dir(home: Path) -> bool:
 
 
 def _strict_raw_config(home: Path) -> Dict[str, Any]:
-    import yaml
+    from .yaml_compat import yaml
 
     path = home / "config.yaml"
     if path.is_symlink() or _resolved(path) != path.expanduser().absolute():

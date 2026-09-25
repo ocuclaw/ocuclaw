@@ -45,6 +45,8 @@ function createSilentInputJevAnswerer(opts) {
       ways: req.ways,
       replyingTo: ctx.replyingTo,
       openWords: ctx.openWords,
+
+      candidateSchema: ctx.candidateSchema,
     });
     if (!ranked.length) {
       return failure("no_candidates", now() - startedAt, 0);

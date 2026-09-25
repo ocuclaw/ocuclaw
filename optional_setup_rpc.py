@@ -1,6 +1,7 @@
 """Authenticated phone transactions; no Desktop presenter or shell shortcuts."""
 from __future__ import annotations
 
+import os
 import re
 import asyncio
 import secrets
@@ -15,9 +16,55 @@ _ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _OPS = {"status", "credential.begin", "credential.save", "credential.cancel",
         "activation.preview", "activation.apply", "activation.status", "diagnostics.preview", "diagnostics.apply",
         "route.preview", "route.apply", "route.status"}
-_FIELDS = {"soniox": "soniox", "even_ai": "evenAi"}
+# Public capability name (what the phone sends) -> this lane's internal field name.
+# Kept in step with OPTIONAL_SETUP_CAPABILITIES in the plugin's optional-setup-protocol.
+_FIELDS = {"soniox": "soniox", "even_ai": "evenAi", "typesafe": "typesafe"}
 _TTL = 180
 _RECEIPTS = "ocuclaw.optional-phone-activation.json"
+
+
+_CLOUDWAYS_CACHE: dict = {}
+
+
+def detect_cloudways_host() -> bool:
+    """Decisive Cloudways verdict, computed once per process; False on doubt or error.
+
+    Runs a `ps` subprocess, so the adapter calls this from a worker thread at
+    connect. The phone's activation confirm card says the whole container
+    restarts and the phone reconnects on its own in 1 to 5 minutes. A `likely`
+    verdict is a question for the assistant, not a fact for the card.
+    """
+    if "cloudways" not in _CLOUDWAYS_CACHE:
+        try:
+            from .cloudways import DETECT_CLOUDWAYS, detect
+            detection = detect()
+            # Recorded before the verdict: readers treat the verdict key as "detection done".
+            _CLOUDWAYS_CACHE["entrypoint"] = (detection.signals or {}).get("pid1_entrypoint_sh") is True
+            _CLOUDWAYS_CACHE["cloudways"] = detection.verdict == DETECT_CLOUDWAYS
+        except Exception:
+            _CLOUDWAYS_CACHE["cloudways"] = False
+    return _CLOUDWAYS_CACHE["cloudways"]
+
+
+def cloudways_host() -> bool:
+    """The cached verdict only; False until `detect_cloudways_host` ran. Never blocks."""
+    return _CLOUDWAYS_CACHE.get("cloudways") is True
+
+
+def cloudways_container_restart(*, parent_pid=None) -> bool:
+    """Would this gateway's own exit restart the container? Cached reads only; never blocks.
+
+    #3357 (Matty, 2026-09-23): on Cloudways the phone may restart the gateway, and the way it
+    comes back is the container restart that follows the gateway's exit. All three must hold:
+
+    - the decisive `cloudways` verdict (never `likely`, which is a question for the user);
+    - PID 1 is `/entrypoint.sh`, the process whose exit Cloudways answers with a new container;
+    - this process is PID 1's direct child. A gateway someone started by hand from an SSH shell
+      would just stop, and nothing would bring it back.
+    """
+    if not cloudways_host() or _CLOUDWAYS_CACHE.get("entrypoint") is not True:
+        return False
+    return (os.getppid() if parent_pid is None else parent_pid) == 1
 
 
 class OptionalSetupRpc:
@@ -28,9 +75,14 @@ class OptionalSetupRpc:
     Desktop routes retain their native presenterCapability gate unchanged.
     """
 
-    def __init__(self, restart_rpc, *, clock=time.time):
+    def __init__(self, restart_rpc, *, clock=time.time, observe=None):
         self.restart = restart_rpc
         self.clock = clock
+        # Adapter-supplied `async observe(home) -> disk | None`: re-records the
+        # loaded-runtime observation against the current disk files (#3357) on
+        # the adapter's serialized observation path (never on the event loop).
+        # Optional; the presence pump also refreshes it every 30 s.
+        self.observe = observe
         self.pending = {}
         self.previews = {}
         self.diagnostic_previews = {}
@@ -67,18 +119,41 @@ class OptionalSetupRpc:
         except Exception:
             return {"status": "rejected", "code": "invalid_request"}
 
-    @staticmethod
-    def _identity(home):
-        values, enabled = setup._disk_values()
-        return (str(home), tuple(values[name] for name in setup.FIELDS), enabled,
-                tuple(diagnostics.configured().items()),
-                tuple(setup._file_revision(home)), setup._read(home, setup.PENDING).get("revision"))
+    async def _status_state(self, home):
+        """One `setup.read_state` per status request, re-observed when stale.
 
-    def _snapshot(self, home):
-        observed = setup.status(home)
-        values, _ = setup._disk_values()
-        identity = (self._identity(home), observed.get("capabilities"), observed.get("diagnostics"),
-                    observed.get("activationRequested"), observed.get("runtimeContext"))
+        A save from any path changes the disk after the last loaded-runtime
+        observation; re-observing then records this exact disk, and the
+        observation's own reads replace a second read. The reads (gateway
+        liveness probe, receipts, `.env`/config parses) run off the loop.
+        Tolerates a busy lock and a failed observation: a missing refresh only
+        delays the offer until the presence pump's next observation.
+        """
+        state = await asyncio.to_thread(setup.read_state, home)
+        if self.observe is None or setup.observation_current(home, state):
+            return state
+        try:
+            observed = await self.observe(home)
+        except Exception:
+            observed = None
+        # The observation leaves the gateway record alone and returns the
+        # receipts, disk and diagnostics it read and wrote.
+        return {**state, **observed} if observed else state
+
+    @staticmethod
+    def _identity(home, state=None):
+        state = state or setup.read_state(home)
+        disk = state["disk"]
+        return (str(home), tuple(disk["values"][name] for name in setup.FIELDS), disk["enabled"],
+                tuple(state["permissions"].items()),
+                tuple(disk["files"]), state["pending"].get("revision"))
+
+    def _snapshot(self, home, state=None):
+        state = state or setup.read_state(home)
+        observed = setup.status(home, state=state)
+        values = state["disk"]["values"]
+        identity = (self._identity(home, state), observed.get("capabilities"), observed.get("reasons"),
+                    observed.get("diagnostics"), observed.get("activationRequested"), observed.get("runtimeContext"))
         if identity != self.observed:
             self.generation, self.observed = secrets.token_hex(16), identity
         supported = self.restart._restart_supported()
@@ -88,9 +163,16 @@ class OptionalSetupRpc:
             state = observed.get("capabilities", {}).get(name, "unknown")
             caps[public] = {"present": bool(values[name]),
                             "state": "saved" if state == "saved_not_activated" else state}
+            reason = (observed.get("reasons") or {}).get(name)
+            if reason:
+                caps[public]["reason"] = reason
         return {"runtime": "hermes", "generation": self.generation, "capabilities": caps,
                 "diagnostics": observed.get("diagnostics", {"supported": False}),
                 "coreComplete": self._core_complete(home),
+                # Booleans only, no paths: the confirm card's Cloudways note.
+                # Not `runtimeContext`, which `setup.status()` uses for the
+                # observed relay/gateway identity.
+                "hostContext": {"cloudways": cloudways_host()},
                 "activation": {"supported": supported, "required": pending,
                                "mode": "restart" if pending and supported else "manual" if pending else "none",
                                "affectsAllProfiles": pending}}
@@ -145,7 +227,8 @@ class OptionalSetupRpc:
             home = setup._home()  # Must be the process's selected Primary Runtime.
             self._prune()
             if operation == "status":
-                return {**result, "status": "ok", "code": "observed", "snapshot": self._snapshot(home)}
+                state = await self._status_state(home)
+                return {**result, "status": "ok", "code": "observed", "snapshot": self._snapshot(home, state)}
             if operation.startswith("credential."):
                 return self._credential(result, request, owner, home)
             if operation.startswith("diagnostics."):
@@ -200,13 +283,18 @@ class OptionalSetupRpc:
             if not value.strip():
                 return {**result, "status": "preserved", "code": "preserved", "snapshot": self._snapshot(home)}
             try:
-                name = _FIELDS[row["capability"]]
-                credentials.save_selected_value(home, name, value)
-                if name == "evenAi":
-                    setup._enable_even_ai(home)
-            except Exception:
-                return {**result, "status": "outcome_unknown", "code": "save_unconfirmed",
-                        "snapshot": self._snapshot(home)}
+                # Same save as the CLI and the wizard: value plus (Even AI)
+                # route enable in one receipt transaction.
+                setup.save_credential(home, _FIELDS[row["capability"]], value)
+            except Exception as error:
+                code = str(error) if isinstance(error, ValueError) else None
+                if code in setup.SAVE_REFUSALS:  # Refused before any write.
+                    return {**result, "code": code}
+                # ENABLE_FAILED: the token IS saved; the snapshot carries
+                # `reason: even_ai_not_enabled` for the enable.
+                if code != setup.ENABLE_FAILED:
+                    return {**result, "status": "outcome_unknown", "code": "save_unconfirmed",
+                            "snapshot": self._snapshot(home)}
         return {**result, "status": "saved", "code": "saved", "snapshot": self._snapshot(home)}
 
     def _diagnostics(self, result, request, owner, home):
@@ -249,7 +337,10 @@ class OptionalSetupRpc:
             if state.get("activationRequested"):
                 return {**result, "code": "activation_pending", "snapshot": self._snapshot(home)}
             if not state.get("restartRequired"):
-                known = (state.get("state") == "ready" and len(state.get("capabilities", {})) == 2
+                # Every optional capability has to be accounted for, not a count frozen at
+                # the two this lane shipped with (#3359 added `typesafe`).
+                known = (state.get("state") == "ready"
+                         and len(state.get("capabilities", {})) == len(setup.FIELDS)
                          and all(value in {"not_configured", "available_to_test"}
                                  for value in setup.activation_states(state).values()))
                 return {**result, "status": "ok" if known else "outcome_unknown",
@@ -309,7 +400,8 @@ class OptionalSetupRpc:
             if live is not True or not isinstance(gateway, dict):
                 return {**result, "code": "configuration_changed"}
             pending = setup._read(home, setup.PENDING)
-            pending["activationRequested"] = {"pid": gateway.get("pid"), "startTime": gateway.get("start_time")}
+            pending["activationRequested"] = setup._admission(gateway)
+            pending["activationAttempt"] = setup._attempt_marker(home, gateway)
             # Durable admission precedes native restart; a lost reply never causes a retry.
             operations[operation_id] = {"revision": row["revision"], "selected": [
                 name for name, value in setup.activation_states(state).items() if value == "saved_not_activated"]}

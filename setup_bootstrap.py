@@ -12,7 +12,7 @@ import time
 from typing import Any, Dict, Iterator, Tuple
 import uuid
 
-import yaml
+from .yaml_compat import yaml
 
 
 logger = logging.getLogger(__name__)

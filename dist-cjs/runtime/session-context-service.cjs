@@ -75,14 +75,14 @@ function createSessionContextService(opts) {
           .catch(() => null),
       ]);
     } catch {
-      return lastSnapshot;
+      return broadcastUnknownSessionContext(sessionKey);
     }
     if (sessionKey !== getActiveSessionKey()) return null;
     const session =
       describeResp && typeof describeResp === "object" && describeResp.session && typeof describeResp.session === "object"
         ? describeResp.session
         : null;
-    if (!session) return lastSnapshot;
+    if (!session) return broadcastUnknownSessionContext(sessionKey);
 
     const contextTokens = Number.isFinite(session.totalTokens)
       ? Math.floor(session.totalTokens)
@@ -133,6 +133,32 @@ function createSessionContextService(opts) {
       ...(Number.isFinite(session.costUsd) && session.costUsd >= 0
         ? { costUsd: session.costUsd }
         : {}),
+    };
+    lastSnapshot = snapshot;
+    broadcast(snapshot);
+    return snapshot;
+  }
+
+  function broadcastUnknownSessionContext(sessionKey) {
+    if (sessionKey !== getActiveSessionKey()) return null;
+    const modelKey = getActiveModelKey();
+    const catalogWindow = getActiveModelContextWindow();
+    let contextWindow = 0;
+    if (Number.isFinite(catalogWindow) && catalogWindow > 0) {
+      contextWindow = Math.floor(catalogWindow);
+    } else if (modelKey && modelContextWindowCache.has(modelKey)) {
+      contextWindow = modelContextWindowCache.get(modelKey);
+    }
+    const snapshot = {
+      type: "ocuclaw.session.context.snapshot",
+      sessionKey,
+      contextTokens: 0,
+      contextTokensKnown: false,
+      contextWindow,
+      compactionCount: 0,
+      compactionKind: "compactions",
+      runActive: !!getRunActive(),
+      snapshotAtMs: nowMs(),
     };
     lastSnapshot = snapshot;
     broadcast(snapshot);

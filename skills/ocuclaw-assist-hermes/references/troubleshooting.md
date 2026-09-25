@@ -1,6 +1,6 @@
 # Troubleshooting OcuClaw on Hermes
 
-**Guide version:** 2026-09-21 (1.3.22-hermes)
+**Guide version:** 2026-09-25 (1.3.24-hermes)
 
 This guidance was loaded through the `ocuclaw_setup` tool. Keep using the
 loaded setup skill for command, secret, checkpoint, and restart rules, and use
@@ -56,6 +56,23 @@ have them tap Connect once. Read the newest gateway log before guessing.
   `/ocuclaw-setup`. Never ask the user to assemble or read back an address.
 
 Never use session listings as phone-connect evidence.
+
+## PAIRING-FAIL
+
+`pair_phone` returned a failure code. Follow the pairing table in the loaded
+setup skill; the two cases people meet most:
+
+- `tui_window_too_small` -> the Hermes window is too small even for the
+  address/code view. Nothing was paired and the phone is not at fault. Use the
+  returned message (it names the window's size and the size needed), ask the
+  person to make the window bigger without quitting Hermes, then retry.
+- the same failure twice, or a code the table does not name -> deterministic.
+  Ask the person to run `hermes ocuclaw pair --address <verified-phoneAddress>`
+  in their own terminal, a window they open themselves. Never run it through
+  an agent tool; its QR and pairing code must never reach the model.
+
+Never suggest quitting or relaunching the Hermes TUI to retry pairing while the
+gateway may be its child: quitting the TUI stops the gateway.
 
 ## CREDENTIAL-MISSING
 
@@ -224,6 +241,22 @@ If the installed Tailscale build does not support Serve, update Tailscale
 through its official OS lane. Never substitute Funnel or a public reverse
 proxy.
 
+## TS-DNS-SELF
+
+`doctor` reports `probe_failed` and the HTTPS certificate is confirmed present:
+this node cannot resolve its own MagicDNS name. Containers and
+userspace-networking nodes hit this because Tailscale never installs a
+resolver there. Fix it on the node that runs the gateway, then run `doctor`
+again:
+
+- `tailscale set --accept-dns=true`, or
+- a `nameserver 100.100.100.100` line in that node's resolver configuration, or
+- an `/etc/hosts` line for `<node>.<tailnet>.ts.net`, spelled as `doctor`
+  printed it.
+
+A connection timeout or refusal is a different failure: that is the
+certificate, the route or the relay, not DNS.
+
 ## PROFILE-AUTHZ-DROP
 
 Detect this lane read-only:
@@ -270,7 +303,7 @@ already recorded. Show it to the user and confirm it contains no secrets or
 network addresses:
 
 ```text
-OcuClaw Hermes beta report — guide 2026-09-21 (1.3.22-hermes)
+OcuClaw Hermes beta report — guide 2026-09-25 (1.3.24-hermes)
 Hermes version:
 OcuClaw bundle version (from plugin.yaml/list output):
 Backend: hermes

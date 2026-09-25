@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import time
 from pathlib import Path
@@ -13,7 +14,8 @@ from .receipts import receipt_state_lock, resolve_receipt_home, state_dir, write
 REQUEST_FILE = "ocuclaw.desktop-credentials.json"
 LOCK_FILE = "ocuclaw.desktop-credentials.lock"
 REQUEST_TTL = 600
-FIELDS = {"soniox": "OCUCLAW_SONIOX_API_KEY", "evenAi": "OCUCLAW_EVEN_AI_TOKEN"}
+FIELDS = {"soniox": "OCUCLAW_SONIOX_API_KEY", "evenAi": "OCUCLAW_EVEN_AI_TOKEN",
+          "typesafe": "OCUCLAW_TYPESAFE_API_KEY"}
 
 
 def _home() -> Path:
@@ -104,39 +106,57 @@ def request(selected: Any) -> dict[str, Any]:
         return {"state": "unavailable"}
 
 
-def save_selected_value(home: Path, name: str, value: str) -> bool:
-    """Domain writer; callers own their authorization and LOCK_FILE admission.
-
-    Desktop keeps its presenter-capability endpoint and pending form. The phone
-    has a separate authenticated transaction; it never creates a Desktop form.
-    """
-    from hermes_cli.config import get_env_value, invalidate_env_cache, load_env, save_env_value
-    from .optional_setup import begin_save, finish_save, PENDING, _read as read_optional
-
+def validate_value(name: str, value: Any) -> str:
+    """The stripped value, or `invalid_value`."""
     if name not in FIELDS or not isinstance(value, str) or len(value) > 4096 or any(
         ord(char) < 32 or ord(char) > 126 for char in value
     ):
         raise ValueError("invalid_value")
-    value = value.strip()
-    if not value:
-        return False
-    if value != str(get_env_value(FIELDS[name]) or "").strip():
-        revision = begin_save(home, name)
-        try:
-            save_env_value(FIELDS[name], value)
-            invalidate_env_cache()
-            if load_env().get(FIELDS[name]) != value:
-                raise ValueError("save_failed")
-            finish_save(home, revision, name, saved=True)
-        except Exception:
-            finish_save(home, revision, name, saved=False)
-            raise ValueError("save_failed") from None
-        return True
-    pending = read_optional(home, PENDING)
-    if (pending.get("choices") or {}).get(name) in {"saving", "save_failed"}:
-        revision = begin_save(home, name)
-        finish_save(home, revision, name, saved=True)
-    return False
+    return value.strip()
+
+
+def _saved_value(key: str) -> str:
+    """The on-disk `.env` value, never the value this process loaded.
+
+    Inside the gateway `os.environ` holds the LOADED key; re-entering it to
+    revert a pending `.env` change must still be written (#3357).
+    """
+    from hermes_cli import config
+    config.invalidate_env_cache()
+    reader = getattr(config, "get_env_value_prefer_dotenv", None)
+    if reader is None:  # Hermes without the helper: the same precedence by hand.
+        return str(config.load_env().get(key) or os.environ.get(key) or "").strip()
+    return str(reader(key) or "").strip()
+
+
+def env_value_matches(name: str, value: str) -> bool:
+    return value == _saved_value(FIELDS[name])
+
+
+def write_env_value(name: str, value: str) -> None:
+    """Raw write through Hermes's atomic `.env` writer, then read back; no receipt.
+
+    Callers own the receipt fence (`optional_setup.save_credential`) or knowingly have
+    none (the terminal wizard without a receipt home). Raises `save_failed`
+    when the read-back disagrees, so a silent no-op never counts as saved.
+    """
+    from hermes_cli.config import invalidate_env_cache, load_env, save_env_value
+    save_env_value(FIELDS[name], value)
+    invalidate_env_cache()
+    if load_env().get(FIELDS[name]) != value:
+        raise ValueError("save_failed")
+
+
+def _save_token(save_credential, home: Path, name: str, value: str) -> None:
+    """The form saves the credential; an Even AI enable that did not stick is
+    not a failed save (the token is on disk, the receipt says `saved`). The
+    CLI reports that enable separately."""
+    from .optional_setup import ENABLE_FAILED
+    try:
+        save_credential(home, name, value)
+    except ValueError as error:
+        if str(error) != ENABLE_FAILED:
+            raise
 
 
 def submit(request_id: Any, values: Any = None, *, cancel: bool = False) -> dict[str, Any]:
@@ -170,22 +190,22 @@ def submit(request_id: Any, values: Any = None, *, cancel: bool = False) -> dict
                 present = _presence()
                 if any(not values.get(name, "").strip() and not present[name] for name in row["selected"]):
                     return {"state": "missing_value", "present": present}
-                from hermes_cli.config import get_env_value
+                from .optional_setup import save_credential
 
                 for name, value in values.items():
-                    if value.strip() and value.strip() != str(get_env_value(FIELDS[name]) or "").strip():
+                    if value.strip() and not env_value_matches(name, value.strip()):
                         # Keep activation pending across a crash after the secret
                         # writer succeeds but before the saved receipt is committed.
                         row["changed"] = True
                         write_json_receipt(state_dir(home) / REQUEST_FILE, row, durable=True)
                         try:
-                            save_selected_value(home, name, value)
+                            _save_token(save_credential, home, name, value)
                         except Exception:
                             return {"state": "save_failed", "present": _presence()}
                     elif value.strip():
                         # A previous writer may have succeeded before reporting a
                         # failure. A retry verifies its value without replacing it.
-                        save_selected_value(home, name, value)
+                        _save_token(save_credential, home, name, value)
                 row["state"] = "saved"
             write_json_receipt(state_dir(home) / REQUEST_FILE, row)
             return _public(row, direct=True)

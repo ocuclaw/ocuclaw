@@ -38,7 +38,6 @@ class RestartRpc:
     def _snapshot(self):
         from hermes_constants import get_process_hermes_home
         from hermes_cli.profiles import get_active_profile_name
-        from gateway.restart import is_gateway_supervisor_process
         from gateway.status import get_process_start_time
 
         runner = getattr(self.adapter, "gateway_runner", None)
@@ -66,8 +65,32 @@ class RestartRpc:
             "waitSeconds": max(0, int(runner._restart_after_turn_timeout)),
             "drainSeconds": max(0, int(runner._restart_drain_timeout)),
             "phase": "draining" if runner._draining else "ready",
-            "supported": bool(is_gateway_supervisor_process()),
+            "supported": self._host_restart_mode() is not None,
         }
+
+    @staticmethod
+    def _host_restart_mode():
+        """How this gateway process comes back after it exits, or None when nothing brings it back.
+
+        `"supervisor"`: systemd, launchd, s6 or an explicit external supervisor owns the process
+        and relaunches it on the service-restart exit (75). `is_gateway_supervisor_process` reads
+        four environment variables and nothing else.
+
+        `"cloudways"` (#3357, Matty 2026-09-23): a Cloudways managed container, where the gateway
+        is `hermes gateway run --no-supervise`, a direct child of PID 1 `/entrypoint.sh`, with no
+        supervisor variable set. There the gateway exiting ends the entrypoint, and Cloudways
+        restarts the whole container: SSH drops, the gateway and relay come back, and the phone
+        reconnects on its own. The ride on 2026-09-23 measured it (SSH back in 9 s, phone back in
+        92 s, the saved key loaded). The verdict is the cached one the adapter computed off the
+        loop, so this stays cheap; see `optional_setup_rpc.cloudways_container_restart`.
+        """
+        from gateway.restart import is_gateway_supervisor_process
+
+        if is_gateway_supervisor_process():
+            return "supervisor"
+        from .optional_setup_rpc import cloudways_container_restart
+
+        return "cloudways" if cloudways_container_restart() else None
 
     def _restart_supported(self):
         """#3113: the honest per-gateway answer, not a constant.
@@ -84,17 +107,18 @@ class RestartRpc:
         profile scan and two stats on every read. It still mirrors the readiness gate [_snapshot]
         applies: a runner that is not running yet would fail the very call this row invites, and a
         button that can only answer "Restart could not be confirmed" is worse than no button.
-        `is_gateway_supervisor_process` itself reads four environment variables and nothing else,
+        [_host_restart_mode] reads environment variables, a cached verdict and the parent pid,
         so it is safe on this path.
+
+        #3357: a Cloudways container counts too, because there the gateway's own exit is what
+        brings it back (see [_host_restart_mode]).
         """
         runner = getattr(self.adapter, "gateway_runner", None)
         if runner is None or not callable(getattr(runner, "request_restart", None)):
             return False
         if not getattr(runner, "_running", False):
             return False
-        from gateway.restart import is_gateway_supervisor_process
-
-        return bool(is_gateway_supervisor_process())
+        return self._host_restart_mode() is not None
 
     @staticmethod
     def _load(path):
@@ -236,7 +260,14 @@ class RestartRpc:
         except Exception:
             return fail("receipt_unavailable")
         try:
-            accepted = runner.request_restart(detached=False, via_service=True)
+            # Under a supervisor, exit 75 asks it to relaunch us. On Cloudways (#3357) nothing
+            # relaunches this process: the same drain and stop, then a plain exit 0, which ends
+            # PID 1 `/entrypoint.sh` and makes Cloudways restart the container. Exit 0 is the
+            # exact shape the 2026-09-23 ride proved (`gateway.exit_clean` then a new PID 1).
+            # Never `detached=True` there: its helper would run `hermes gateway restart` in a
+            # container that is already going away.
+            container = self._host_restart_mode() == "cloudways"
+            accepted = runner.request_restart(detached=False, via_service=not container)
             receipt["phase"] = "accepted" if accepted else "rejected"
         except Exception:
             receipt["phase"] = "unconfirmed"

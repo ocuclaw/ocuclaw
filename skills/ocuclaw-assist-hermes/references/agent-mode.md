@@ -1,6 +1,6 @@
 # Agent choice — fresh installs AND existing ones
 
-**Guide version:** 2026-09-21 (1.3.22-hermes)
+**Guide version:** 2026-09-25 (1.3.24-hermes)
 
 Read during fresh setup before the gateway restart, and on ANY existing
 install whose `ocuclaw_setup` status reports
@@ -28,6 +28,18 @@ adds `→ run /ocuclaw-setup in a Hermes chat to choose`.
    If it is false — fresh install, existing install, or the router's
    `agent_mode` branch — ask. Never skip the question on an existing install
    because "setup already ran": the choice was never recorded there.
+
+   **Except when single agent is unavailable (#3618).** If status reports
+   `mandatoryConfiguration.singleAgentAvailable: false` (the preflight's
+   `singleAgent.available: false` says the same), do not ask and **say nothing
+   about it**: no line about single agent, the Hermes version or why. Apply
+   the **Multiple agents** branch below as if the person had chosen it. This
+   happens on every Hermes 0.21.4 and later, whatever the profile count:
+   there "single" would only grey out the phone's "+", and most people want
+   to create agents. On 0.21.1 to 0.21.3 `singleAgentAvailable` is true and
+   the question is asked as normal. An install that recorded `single` before
+   and now runs on 0.21.4 or later lands here too (`agentModeChosen` is
+   false), and is moved to multiple the same silent way.
 2. Ask once: **"Would you like to create and switch between agents
    (recommended), or use a single agent?"** Explain that multiple agents use
    the host's model access and approval rules, each with their own chats and
@@ -145,8 +157,9 @@ adds `→ run /ocuclaw-setup in a Hermes chat to choose`.
    Translate the plan into plain words before asking. The user needs to know
    the one consequence that is not obvious: their other agents' **scheduled
    jobs and message connections start running in one process**, including for
-   agents they never selected for the glasses. Say that it can be undone. Ask
-   once through `clarify`. On yes:
+   agents they never selected for the glasses. Say that it can be undone only
+   when the plan's `migration.rollback` is set; when it is `null` this Hermes
+   has no rollback, so never promise one. Ask once through `clarify`. On yes:
 
    ```bash
    hermes gateway migrate --multiplex --yes
@@ -155,8 +168,10 @@ adds `→ run /ocuclaw-setup in a Hermes chat to choose`.
 
    `--yes` is required: without it the command waits at a terminal prompt this
    conversation does not have. The user's consent is the `clarify` answer.
-   If they ask to undo it later, the rollback is
-   `hermes gateway migrate --standalone`.
+   If they ask to undo it later, give `migration.rollback` exactly, and only
+   when it is set (it is `hermes gateway migrate --standalone` on engines that
+   still have that flag). Hermes 0.21.4 and later removed it: say there is no
+   undo command.
 
    An OcuClaw enrollment set decides which agents reach the glasses. It does
    **not** limit whose cron jobs the wider gateway runs; do not imply it does.
@@ -221,7 +236,8 @@ adds `→ run /ocuclaw-setup in a Hermes chat to choose`.
    profiles nobody selected. An OcuClaw enrollment set decides which agents
    reach the glasses; it is not a served-profile list and not a cron filter.
 
-   **Single agent:** set `gateway.multiplex_profiles` to `false` and
+   **Single agent** (only where `singleAgentAvailable` is true): set
+   `gateway.multiplex_profiles` to `false` and
    `platforms.ocuclaw.extra.agent_mode` to `single` (same `--force` note).
    Explain that creation and switching are unavailable in this mode, and that
    the phone's "+" stays grey by choice. Retain any saved enrollment set.

@@ -131,6 +131,17 @@ function renderQrPayloadToTerminal(
   return renderMatrix(trimmed, invert);
 }
 
+function renderQrTextToTerminal(
+  text        ,
+  options                          ,
+)         {
+  const quietZone = options?.quietZone ?? true;
+  const invert = options?.invert ?? true;
+  const matrix = qrMatrix(text);
+  const trimmed = quietZone ? matrix : stripBorder(matrix, QR_QUIET_ZONE_MODULES);
+  return renderMatrix(trimmed, invert);
+}
+
 function renderMatrixAnsi(matrix                                 )                       {
   if (matrix.length === 0) return { text: "", columns: 0, rows: 0 };
   const width = matrix[0].length;

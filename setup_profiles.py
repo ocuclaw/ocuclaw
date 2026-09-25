@@ -141,7 +141,9 @@ MIGRATE_DRY_RUN_COMMAND = "hermes gateway migrate --multiplex --dry-run"
 #: Applying needs `--yes`: without it the command prompts at a TTY the setup
 #: assistant does not have. The user's consent is taken in the chat first.
 MIGRATE_APPLY_COMMAND = "hermes gateway migrate --multiplex --yes"
-#: Upstream's own rollback, which is what makes the migration offerable.
+#: Upstream's rollback on 0.21.3 only. 0.21.4 removed `--standalone` ("there
+#: is no rollback command"), so it is offered only where the opt-out is still
+#: honoured (:func:`multiplex_opt_out_retired`, #3617).
 MIGRATE_ROLLBACK_COMMAND = "hermes gateway migrate --standalone"
 
 #: `hermes gateway migrate --dry-run` exits **0 even when the plan is
@@ -160,6 +162,76 @@ DRY_RUN_NOTICES_HEADING = "Notices:"
 #: OcuClaw-side enrollment set that replaces it.
 FLAG_KEY = "gateway.multiplex_profiles"
 AGENT_MODE_KEY = f"platforms.{PLATFORM_NAME}.extra.agent_mode"
+
+#: Hermes 0.21.4 retired the single-gateway opt-out: an explicit
+#: `gateway.multiplex_profiles: false` is ignored once a host has two
+#: profiles, and 0.21.5 also rewrites it to `true` at boot (#3618). With one
+#: profile it still holds, but there "single" only greys the phone's "+", and
+#: most people want to create agents. So OcuClaw never offers "single agent"
+#: on a retired engine, whatever the profile count (Matty, 2026-09-25). The
+#: module and its reason constant exist only on engines that retire the
+#: opt-out.
+MULTIPLEX_MODE_MODULE = "hermes_cli.gateway_multiplex_mode"
+RETIRED_OPT_OUT_ATTR = "RETIRED_OPT_OUT_REASON"
+
+_OPT_OUT_RETIRED_CACHE: Dict[str, bool] = {}
+
+
+def multiplex_opt_out_retired(
+    *, import_module: Optional[Callable[[str], Any]] = None
+) -> bool:
+    """Whether THIS ENGINE has retired `gateway.multiplex_profiles: false`.
+
+    A code probe, like :func:`migrate_capability`: the upstream module that
+    retires the opt-out carries the reason it prints. An unreadable probe is
+    "not retired", which keeps the pre-0.21.4 behaviour every older engine
+    needs. The engine cannot change under a running process, so the default
+    probe is answered once.
+    """
+    if import_module is None and "default" in _OPT_OUT_RETIRED_CACHE:
+        return _OPT_OUT_RETIRED_CACHE["default"]
+    import_fn = importlib.import_module if import_module is None else import_module
+    try:
+        module = import_fn(MULTIPLEX_MODE_MODULE)
+        retired = isinstance(getattr(module, RETIRED_OPT_OUT_ATTR, None), str)
+    except Exception:  # noqa: BLE001 - an absent module is an older engine
+        retired = False
+    if import_module is None:
+        _OPT_OUT_RETIRED_CACHE["default"] = retired
+    return retired
+
+
+def single_agent_available(*, opt_out_retired: bool) -> bool:
+    """Does OcuClaw offer "single agent" on this engine (#3618)?
+
+    Only on Hermes 0.21.1-0.21.3. On 0.21.4+ the question is never asked,
+    whatever the profile count, and "multiple" is recorded silently.
+    """
+    return not opt_out_retired
+
+
+def agent_mode_recorded(
+    agent_mode: Any,
+    multiplex: Any,
+    *,
+    opt_out_retired: bool,
+) -> bool:
+    """Is the agent-mode choice recorded, with the gateway switch agreeing?
+
+    One rule for setup status, the doctor and the Cloudways ladder. "single"
+    counts only before Hermes 0.21.4. A "single" recorded earlier on an
+    engine that has since become 0.21.4+ is not a choice any more; the next
+    setup pass records "multiple" without asking.
+    """
+    if not isinstance(multiplex, bool):
+        return False
+    if agent_mode == "multiple":
+        return multiplex is True
+    if agent_mode == "single":
+        return multiplex is False and single_agent_available(
+            opt_out_retired=opt_out_retired
+        )
+    return False
 
 
 def _engine_schema_version(
@@ -404,6 +476,7 @@ def migration_plan(
     inventory: Mapping[str, Any],
     *,
     capability: Mapping[str, Any],
+    opt_out_retired: bool = False,
 ) -> Dict[str, Any]:
     """What "multiple agents" costs on THIS host and THIS engine.
 
@@ -468,7 +541,10 @@ def migration_plan(
             "You already have other agents on this computer. Bringing them "
             "together means their scheduled jobs and message connections start "
             "running in one place — I will show you exactly what changes "
-            "before anything moves, and it can be undone."
+            "before anything moves"
+            + (
+                "." if opt_out_retired else ", and it can be undone."
+            )
         )
     elif blockers:
         gate, may = GATE_BLOCKED, False
@@ -510,7 +586,12 @@ def migration_plan(
         "blockersHeading": (
             DRY_RUN_BLOCKERS_HEADING if gate == GATE_MIGRATE_COMMAND else None
         ),
-        "rollback": MIGRATE_ROLLBACK_COMMAND if gate == GATE_MIGRATE_COMMAND else None,
+        # 0.21.4+ has no rollback (#3617): never promise one there.
+        "rollback": (
+            MIGRATE_ROLLBACK_COMMAND
+            if gate == GATE_MIGRATE_COMMAND and not opt_out_retired
+            else None
+        ),
     }
 
 
@@ -1191,7 +1272,7 @@ def _enable_in_default(default_home: Path) -> None:
         enabled = []
     if PLATFORM_NAME not in enabled:
         plugins["enabled"] = [*enabled, PLATFORM_NAME]
-        atomic_config_write(path, config, sort_keys=False)
+        atomic_config_write(path, config)
 
 
 def _clear_secondary_config(source_home: Path) -> None:
@@ -1207,7 +1288,7 @@ def _clear_secondary_config(source_home: Path) -> None:
     platforms = config.get("platforms")
     if isinstance(platforms, dict):
         platforms.pop(PLATFORM_NAME, None)
-    atomic_config_write(path, config, sort_keys=False)
+    atomic_config_write(path, config)
 
 
 # -- the whole preflight ------------------------------------------------------
@@ -1218,13 +1299,20 @@ def preflight(
     process_home: Optional[Path],
     inventory: Mapping[str, Any],
     capability: Optional[Mapping[str, Any]] = None,
+    opt_out_retired: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Every question setup must settle before it writes anything."""
     verdict = invocation_verdict(process_home=process_home)
     if capability is None:
         capability = migrate_capability()
+    if opt_out_retired is None:
+        opt_out_retired = multiplex_opt_out_retired()
 
-    migration = migration_plan(inventory, capability=capability)
+    migration = migration_plan(
+        inventory, capability=capability, opt_out_retired=opt_out_retired
+    )
+    # The migration gate's own count ("this host has one profile").
+    has_other_profiles = any(row.get("name") for row in _secondary_rows(inventory))
     transport = inventory.get("transport") or {}
     owner = transport.get("owner")
     move_needed = bool(owner) and owner != DEFAULT_PROFILE
@@ -1241,6 +1329,15 @@ def preflight(
     return {
         "invocation": verdict,
         "migration": migration,
+        # #3618: on Hermes 0.21.4+ OcuClaw never offers "single agent",
+        # whatever the profile count. The guide skips the question SILENTLY
+        # and records "multiple". A machine field only: nothing here is said
+        # to the person.
+        "singleAgent": {
+            "available": single_agent_available(opt_out_retired=opt_out_retired),
+            "optOutRetired": opt_out_retired,
+            "hostHasOtherProfiles": has_other_profiles,
+        },
         "ownershipMove": {
             "needed": move_needed,
             "source": owner if move_needed else None,
