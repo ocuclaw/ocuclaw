@@ -294,6 +294,43 @@ def continue_here_configured(extra: Any) -> bool:
     return OCUCLAW_WEARER_USER_ID in admin_ids_from_extra(block)
 
 
+def streaming_setting(raw_config: Any) -> Optional[bool]:
+    """`display.platforms.ocuclaw.streaming` as True, False, or None when unset.
+
+    Reads the key straight from `config.yaml` — the same HERMES CORE display
+    key the Cloudways ladder writes and reads back
+    (`cloudways_settings.STREAMING_KEY`). `display.streaming` (no
+    `platforms.ocuclaw` segment) is a DIFFERENT, CLI-only key and is never
+    read here; top-level `streaming.enabled` is never read either. Strings
+    follow Hermes's own coercion of the CLI's `true`/`false` spellings. None
+    (missing or unreadable) is what setup still has to fix; False is an
+    operator's explicit choice and stays theirs.
+    """
+    display = raw_config.get("display") if isinstance(raw_config, Mapping) else None
+    platforms = display.get("platforms") if isinstance(display, Mapping) else None
+    block = platforms.get(PLATFORM_NAME) if isinstance(platforms, Mapping) else None
+    value = block.get("streaming") if isinstance(block, Mapping) else None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower() in {"true", "on", "1", "yes"}
+    return None
+
+
+def streaming_configured(raw_config: Any) -> bool:
+    """Whether Hermes will stream OcuClaw replies to the glasses per turn.
+
+    Hermes 0.21.5 leaves a plugin platform's streaming off unless this key is
+    on, so a missing value is not configured. See :func:`streaming_setting`.
+    """
+    return streaming_setting(raw_config) is True
+
+
+def streaming_explicitly_off(raw_config: Any) -> bool:
+    """True when an operator set the streaming key to off on purpose."""
+    return streaming_setting(raw_config) is False
+
+
 def parse_version(raw: str) -> Optional[Tuple[int, int, int]]:
     if not raw:
         return None
@@ -630,6 +667,8 @@ def collect_health_facts(
         relayPortValid=relay_port_valid,
         evenAiEnabled=bool(extra.get("evenAiEnabled")),
         continueHereConfigured=continue_here_configured(extra),
+        streamingConfigured=streaming_configured(raw_config),
+        streamingExplicitlyOff=streaming_explicitly_off(raw_config),
         multiplexProfiles=multiplex_profiles,
         agentMode=agent_mode,
         secretsPresent=secret_inventory,

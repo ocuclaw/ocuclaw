@@ -107,14 +107,14 @@ const qrLines = state => [
   state.qrBlock,
   '',
   // F17 (#3348). "Take a photo of the QR code" is the phone control.
-  'In Even Hub open OcuClaw, tap Pair with your computer,',
+  'In Even Hub open OcuClaw, tap the Pair button,',
   'then Take a photo of the QR code.',
   'The screen advances automatically when the phone connects.',
 ]
 const manualLines = state => [
   // F17 (#3348). Only the controls the phone app actually shows:
-  // "Pair with your computer", "Enter the pairing code instead".
-  'In Even Hub open OcuClaw, tap Pair with your computer,',
+  // the Pair button ("Pair with your agent"), "Enter the pairing code instead".
+  'In Even Hub open OcuClaw, tap the Pair button,',
   'then Enter the pairing code instead:',
   '',
   String(state.addressLine ?? ''),

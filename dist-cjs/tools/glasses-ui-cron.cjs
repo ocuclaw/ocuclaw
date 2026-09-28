@@ -722,6 +722,21 @@ function createGlassesUiCronEngine(deps) {
       state.generationToken += 1;
       return true;
     },
+
+    takeValuesForFullResend(surfaceId) {
+      const state = active.get(surfaceId);
+      if (!state || state.resolved || state.tickCount === 0) return null;
+      const sent = { body: state.lastBody, items: state.lastItems, templated: !!state.lastSpec };
+      state.lastBody = undefined;
+      state.lastItems = undefined;
+      state.lastSpec = undefined;
+      emitLifecycle("cron_full_resend_armed", "debug", {
+        surfaceId,
+        sessionKey: state.sessionKey,
+        paused: isPaused(state),
+      });
+      return sent;
+    },
     pause(surfaceId) {
       const state = active.get(surfaceId);
       if (!state || state.resolved) {

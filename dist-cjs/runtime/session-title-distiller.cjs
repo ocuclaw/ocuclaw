@@ -26,7 +26,7 @@ function createSessionTitleDistiller(deps) {
     stateDir, getStateDir, nowMs, genId, emitDebug, getSessionTitleModel,
     conversationState, sessionService, isEvenAiSessionKey,
     gatewayBridge, fs, budget, subagentRuntime, cleanupDistillerSession,
-    llmComplete,
+    llmComplete, isFirstUseAttemptOpen, allowHiddenAgentFallback,
   } = deps;
   const timeoutMs = Number.isFinite(deps.timeoutMs) ? deps.timeoutMs : 30000;
 
@@ -38,7 +38,12 @@ function createSessionTitleDistiller(deps) {
 
   let subagentDispatchUnusable = false;
 
-  let llmCompleteUnusable = false;
+  const hiddenAgentFallbackAllowed = () => {
+    if (typeof allowHiddenAgentFallback === "function") {
+      try { return allowHiddenAgentFallback() === true; } catch (_e) { return false; }
+    }
+    return allowHiddenAgentFallback === true;
+  };
 
   function resolveStateDir() {
     if (typeof getStateDir === "function") {
@@ -51,6 +56,11 @@ function createSessionTitleDistiller(deps) {
     return nodePath.join(resolveStateDir(), "internal-agent-runs", internalTranscriptFilename(runId));
   }
 
+  function firstUseAttemptOpen() {
+    if (typeof isFirstUseAttemptOpen !== "function") return false;
+    try { return isFirstUseAttemptOpen() === true; } catch (_e) { return false; }
+  }
+
   function triggerGatesPass(sessionKey) {
     if (isDistillerSessionKey(sessionKey)) return false;
     if (typeof isEvenAiSessionKey === "function" && isEvenAiSessionKey(sessionKey)) return false;
@@ -60,6 +70,8 @@ function createSessionTitleDistiller(deps) {
     if (rec && rec.title) return false;
     if (sessionService.isSessionUserLocked(sessionKey)) return false;
     if (inFlight.has(sessionKey)) return false;
+
+    if (firstUseAttemptOpen()) return false;
     if (budget && typeof budget.canRun === "function" && !budget.canRun(sessionKey)) return false;
     return true;
   }
@@ -262,22 +274,20 @@ function createSessionTitleDistiller(deps) {
   async function runOnceViaLlmComplete(sessionKey, opts) {
     const { message, model } = buildDistillerInput(opts);
 
-    const agentId = opts && typeof opts.agentId === "string" && opts.agentId.trim() ? opts.agentId.trim() : null;
-    dbg("relay.session", "distiller_run_started", "debug", { sessionKey }, () => ({ chars: message.length, via: "llm-complete", agentBound: Boolean(agentId), modelOverride: model || null }));
+    dbg("relay.session", "distiller_run_started", "debug", { sessionKey }, () => ({ chars: message.length, via: "llm-complete", modelOverride: model || null }));
     const params = {
 
       messages: [{ role: "user", content: message }],
       maxTokens: 2048,
       purpose: "session-title",
     };
-    if (agentId) params.agentId = agentId;
     if (model) params.model = model;
 
     const res = await llmComplete(params);
     const text = res && typeof res.text === "string" ? res.text : "";
 
     dbg("relay.session", "distiller_llm_result", "debug", { sessionKey }, () => ({
-      sentAgentId: Boolean(agentId), sentModel: model || null,
+      sentModel: model || null,
       provider: res && res.provider, model: res && res.model, agentId: res && res.agentId,
       textEmpty: !text.trim(), usage: res && res.usage,
     }));
@@ -291,15 +301,20 @@ function createSessionTitleDistiller(deps) {
   }
 
   async function runOnce(sessionKey, opts) {
-    if (typeof llmComplete === "function" && !llmCompleteUnusable) {
+    if (typeof llmComplete === "function") {
       try {
         return await runOnceViaLlmComplete(sessionKey, opts);
       } catch (err) {
 
-        llmCompleteUnusable = true;
         dbg("relay.session", "distiller_llm_unusable", "info", { sessionKey },
           () => ({ message: err && err.message ? err.message : String(err) }));
       }
+    }
+    if (!hiddenAgentFallbackAllowed()) {
+
+      dbg("relay.session", "distiller_skip", "debug", { sessionKey }, () => ({ via: "no-hidden-agent" }));
+      if (budget && typeof budget.recordOutcome === "function") budget.recordOutcome(sessionKey, "error");
+      return "error";
     }
     if (subagentRuntime && typeof subagentRuntime.run === "function" && !subagentDispatchUnusable) {
       return runOnceViaSubagent(sessionKey, opts);

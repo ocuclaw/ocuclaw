@@ -28,6 +28,11 @@ const ACTIVITY_INTENTS = new Set([
   "session.title.update",
   "device.check",
   "interface.build",
+  "board.create",
+  "board.read",
+  "board.unblock",
+  "board.annotate",
+  "board.link",
   "generic",
 ]);
 

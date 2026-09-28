@@ -442,6 +442,40 @@ def _completion_id(record: Any) -> Optional[str]:
     return str(record.get("completionId")) if isinstance(record, Mapping) else None
 
 
+#: #3829. The pairing codes that mean "the two-minute window ran out". Nothing
+#: is wrong with the phone or the route, so the recovery is a fresh code in
+#: the SAME panel (call ``pair_phone`` again), never the terminal fallback.
+#: `completion-window-elapsed` is included for a relay older than #3829, which
+#: reported a late-approval expiry under that name.
+EXPIRED_CODES = frozenset({"expired", "completion-window-elapsed"})
+
+#: The phone's own words for an expiry (``hostReasonMessage`` in
+#: PhonePairingController.kt), so the computer and the phone agree.
+EXPIRED_MESSAGE = (
+    "Pairing took longer than the two-minute window. Nothing is wrong with "
+    "the phone. Start pairing again to get a fresh code in this same window."
+)
+
+
+def _unfinished_result(result: Mapping[str, Any]) -> Dict[str, Any]:
+    """The terminal, non-completed result the presenter reported."""
+
+    code = str(result.get("code") or "")
+    if code in EXPIRED_CODES:
+        return {
+            "ok": False,
+            "state": str(result.get("state") or "failed"),
+            "code": "expired",
+            "message": EXPIRED_MESSAGE,
+        }
+    return {
+        "ok": False,
+        "state": result["state"],
+        "code": code,
+        "message": "Pairing did not complete. The setup checkpoint remains open.",
+    }
+
+
 def _window_too_small_result(result: Mapping[str, Any]) -> Dict[str, Any]:
     """#3521. Name the window as the cause, never the phone or the G2."""
 
@@ -647,12 +681,7 @@ def run_tui_pairing(
             }
         if result["code"] == WINDOW_TOO_SMALL_CODE:
             return _window_too_small_result(result)
-        return {
-            "ok": False,
-            "state": result["state"],
-            "code": result["code"],
-            "message": "Pairing did not complete. The setup checkpoint remains open.",
-        }
+        return _unfinished_result(result)
     finally:
         server.shutdown()
         server.server_close()

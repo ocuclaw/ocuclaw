@@ -328,7 +328,7 @@ function createHermesSttLane(deps = {}) {
   }
 
   const upload = createHermesSttUpload({
-    isReady: () => !linkIsDown(), transcribeStaged,
+    isReady: () => !linkIsDown(), transcribeStaged, logger,
   });
   return { getCapabilities, transcribe, upload };
 }

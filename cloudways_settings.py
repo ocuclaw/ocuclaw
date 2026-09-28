@@ -1,6 +1,6 @@
 """Step 2 of the Cloudways ladder: the settings, through sanctioned doors only.
 
-Two settings, two different doors, and the difference is not cosmetic:
+Three settings, two different doors, and the difference is not cosmetic:
 
 * **The wearer admin allow-list** (`platforms.ocuclaw.extra.allow_admin_from`)
   is a PLATFORM setting. Hermes gives a platform plugin no API that writes
@@ -9,10 +9,14 @@ Two settings, two different doors, and the difference is not cosmetic:
   ``OCUCLAW_ALLOW_ADMIN_FROM`` through Hermes's own env writer
   (`hermes_cli.config.save_env_value`, the same door `relay_credential.py`
   uses). The plugin's seeding (#3098) carries it into `extra` at gateway start.
-* **Tool progress** (`display.platforms.ocuclaw.tool_progress`) is a HERMES
-  CORE display key. It cannot move to env seeding, so the ladder runs the
-  user's own `hermes config set` line as a subprocess — the exact line shown in
-  the consent — and confirms it with `hermes config get`.
+* **Tool progress** (`display.platforms.ocuclaw.tool_progress`) and
+  **reply streaming** (`display.platforms.ocuclaw.streaming`) are both HERMES
+  CORE display keys, read per-turn (0.21.5), never at gateway start. Neither
+  can move to env seeding, so the ladder runs the user's own `hermes config
+  set` line as a subprocess for each — the exact line shown in the consent —
+  and confirms it with `hermes config get`. `display.streaming` (no
+  `platforms.<name>` segment) is a DIFFERENT, CLI-only key and must never be
+  written here; top-level `streaming.enabled` must NEVER be written either.
 
 Three rules this module exists to keep:
 
@@ -56,6 +60,14 @@ WEARER_ID = health.OCUCLAW_WEARER_USER_ID
 #: `hermes config get` answers `false` — both spellings read back as off.
 TOOL_PROGRESS_KEY = "display.platforms.ocuclaw.tool_progress"
 TOOL_PROGRESS_VALUE = "off"
+
+#: The Hermes core display key that turns on per-platform reply streaming.
+#: Hermes 0.21.5 reads `display.platforms.<platform>.streaming` per turn.
+#: `display.streaming` (no `platforms.ocuclaw` segment) is a DIFFERENT,
+#: CLI-only key; top-level `streaming.enabled` must NEVER be written. Only
+#: :data:`STREAMING_KEY` is a sanctioned write target.
+STREAMING_KEY = "display.platforms.ocuclaw.streaming"
+STREAMING_VALUE = "true"
 
 #: `display.interface tui` is deliberately NOT here. The ladder pairs in its
 #: own terminal, so it never needs the TUI selected (evidence: #3098 / PR
@@ -115,6 +127,11 @@ SHORT_TOOL_PROGRESS_LINE = (
     "    Keep tool-progress messages out of the conversation.\n"
     "    Tool activity will still appear in the UI."
 )
+SHORT_STREAMING_LINE = (
+    "    Turn on reply streaming for the glasses.\n"
+    "    Without it the glasses show only \"typing\" for the whole reply,\n"
+    "    then the whole reply at once."
+)
 SHORT_DETAILS_HINT = "  Exact settings: add --details when running setup."
 
 ENV_DOOR_NOTE = (
@@ -154,6 +171,24 @@ def tool_progress_argv_tail() -> Tuple[str, ...]:
 def tool_progress_read_command_line() -> str:
     """The read the step quotes, and the read it actually runs."""
     return " ".join(("hermes", "config", "get", TOOL_PROGRESS_KEY))
+
+
+def streaming_command_line() -> str:
+    """The EXACT line the consent shows — and the argv that is executed.
+
+    Mirrors :func:`tool_progress_command_line`: one source for both the
+    promise and the action.
+    """
+    return " ".join(("hermes", *streaming_argv_tail()))
+
+
+def streaming_argv_tail() -> Tuple[str, ...]:
+    return ("config", "set", STREAMING_KEY, STREAMING_VALUE)
+
+
+def streaming_read_command_line() -> str:
+    """The read the step quotes, and the read it actually runs."""
+    return " ".join(("hermes", "config", "get", STREAMING_KEY))
 
 
 # -- the two doors, as seams --------------------------------------------------
@@ -275,6 +310,20 @@ def _parse_off(text: str) -> Optional[bool]:
     return None
 
 
+def _parse_on(text: str) -> Optional[bool]:
+    """True when the printed value means on, False when off, None when neither."""
+    for line in reversed(str(text or "").splitlines()):
+        word = line.strip().lower()
+        if not word:
+            continue
+        if word in _ON_WORDS:
+            return True
+        if word in _OFF_WORDS:
+            return False
+        return None
+    return None
+
+
 # -- the subprocess door ------------------------------------------------------
 
 
@@ -335,6 +384,30 @@ def read_tool_progress(ctx: Any) -> Optional[bool]:
     return None if word is None else _parse_off(word)
 
 
+def read_streaming_word(ctx: Any) -> Optional[str]:
+    """The word `hermes config get` prints for the streaming key, or None.
+
+    Mirrors :func:`read_tool_progress_word`: a managed install can exit 0
+    without writing, so this read-back is the only thing that decides whether
+    the write actually took.
+    """
+    code, out, _err = _hermes(ctx, "config", "get", STREAMING_KEY)
+    if code != 0:
+        # "Config key not set" exits 1. Unknown is not "already on".
+        return None
+    for line in reversed(str(out or "").splitlines()):
+        word = line.strip()
+        if word:
+            return word
+    return None
+
+
+def read_streaming(ctx: Any) -> Optional[bool]:
+    """Tri-state: True on, False off, None unknown (unset, or unreadable)."""
+    word = read_streaming_word(ctx)
+    return None if word is None else _parse_on(word)
+
+
 # -- the step -----------------------------------------------------------------
 
 
@@ -343,10 +416,11 @@ class _Plan:
     admin_ids: Optional[List[str]] = None  # None: the allow-list is already right
     current_ids: List[str] = field(default_factory=list)
     tool_progress: bool = False  # True: the display key still needs setting
+    streaming: bool = False  # True: the streaming key still needs turning on
 
     @property
     def empty(self) -> bool:
-        return self.admin_ids is None and not self.tool_progress
+        return self.admin_ids is None and not self.tool_progress and not self.streaming
 
 
 def _consent_lines(plan: _Plan, *, details: bool = False) -> List[str]:
@@ -365,6 +439,9 @@ def _consent_lines(plan: _Plan, *, details: bool = False) -> List[str]:
     if plan.tool_progress:
         lines.append(f"    {TOOL_PROGRESS_KEY} = {TOOL_PROGRESS_VALUE}")
         lines.append(f"      set by running: {tool_progress_command_line()}")
+    if plan.streaming:
+        lines.append(f"    {STREAMING_KEY} = {STREAMING_VALUE}")
+        lines.append(f"      set by running: {streaming_command_line()}")
     return lines
 
 
@@ -375,6 +452,7 @@ def _short_consent_lines(plan: _Plan) -> List[str]:
         for line, needed in (
             (SHORT_ALLOW_ADMIN_LINE, plan.admin_ids is not None),
             (SHORT_TOOL_PROGRESS_LINE, plan.tool_progress),
+            (SHORT_STREAMING_LINE, plan.streaming),
         )
         if needed
     ]
@@ -413,12 +491,14 @@ def apply_settings(ctx: Any) -> Any:
     if WEARER_ID not in current_ids:
         plan.admin_ids = desired_admin_ids(current_ids)
     plan.tool_progress = read_tool_progress(ctx) is not True
+    plan.streaming = read_streaming(ctx) is not True
 
     if plan.empty:
         ctx.say(f"  {ALREADY_CORRECT_MESSAGE}")
         if bool(getattr(ctx.options, "details", False)):
             ctx.say(f"    {ALLOW_ADMIN_FROM_KEY} = {admin_ids_text(current_ids)}")
             ctx.say(f"    {TOOL_PROGRESS_KEY} = {TOOL_PROGRESS_VALUE}")
+            ctx.say(f"    {STREAMING_KEY} = {STREAMING_VALUE}")
             ctx.say("    Continue here uses wearer admin access; tool activity appears in the UI, not the conversation.")
         ctx.state["settings_changed"] = False
         return ladder.StepRecord("settings", ladder.STATUS_SKIPPED, DETAIL_ALREADY_CORRECT)
@@ -535,6 +615,31 @@ def apply_settings(ctx: Any) -> Any:
                 f"`{tool_progress_read_command_line()}` reads back {word}."
             )
 
+    if plan.streaming:
+        # The exit code is NOT consulted: on a managed install this prints an
+        # error and still exits 0 — the read-back is the only verdict.
+        _hermes(ctx, *streaming_argv_tail())
+        word = read_streaming_word(ctx)
+        if _parse_on(word or "") is not True:
+            ctx.say(
+                f"  {STREAMING_KEY} still does not read back as {STREAMING_VALUE} "
+                f"after running `{streaming_command_line()}`, so the setting was "
+                "not applied. Nothing further was done."
+            )
+            ctx.state["settings_changed"] = changed
+            return ladder.StepRecord(
+                "settings",
+                ladder.STATUS_FAILED,
+                DETAIL_READ_BACK_MISMATCH,
+                exit_code=ladder.SETUP_EXIT_PROBLEM,
+            )
+        changed = True
+        if bool(getattr(ctx.options, "details", False)):
+            ctx.say(
+                f"  {STREAMING_KEY} = {STREAMING_VALUE}, and "
+                f"`{streaming_read_command_line()}` reads back {word}."
+            )
+
     ctx.state["settings_changed"] = changed
     ctx.say("  Settings applied.")
     return ladder.StepRecord("settings", ladder.STATUS_DONE, DETAIL_WRITTEN)
@@ -557,7 +662,10 @@ __all__ = [
     "SHORT_CONSENT_HEADER_ONE",
     "SHORT_CONSENT_HEADER_TWO",
     "SHORT_DETAILS_HINT",
+    "SHORT_STREAMING_LINE",
     "SHORT_TOOL_PROGRESS_LINE",
+    "STREAMING_KEY",
+    "STREAMING_VALUE",
     "TOOL_PROGRESS_KEY",
     "TOOL_PROGRESS_VALUE",
     "WEARER_ID",
@@ -568,8 +676,13 @@ __all__ = [
     "env_seed_admin_ids",
     "read_env_name",
     "read_platform_extra",
+    "read_streaming",
+    "read_streaming_word",
     "read_tool_progress",
     "read_tool_progress_word",
+    "streaming_argv_tail",
+    "streaming_command_line",
+    "streaming_read_command_line",
     "tool_progress_argv_tail",
     "tool_progress_command_line",
     "tool_progress_read_command_line",

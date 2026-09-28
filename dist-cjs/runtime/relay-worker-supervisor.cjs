@@ -3,10 +3,37 @@ const { getActiveBackendKind } = require("../gateway/backend-contract.cjs");
 const { Worker } = require("node:worker_threads");
 const { APP_PROTOCOL, DEFAULT_NUDGE_THRESHOLDS, DEFAULT_WORKER_HEALTH_THRESHOLDS, DEFAULT_WORKER_QUEUE_CAPS, DEFAULT_WORKER_RPC_LIMITS, WORKER_FEATURES, formatMainOperationReceived, normalizeRequestId, parseNonNegativeRevision } = require("./relay-worker-protocol.cjs");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
+const { runOutsideRetiredPluginCache } = require("./openclaw-plugin-cache-scope.cjs");
 const { PAIRING_CONTROL_PATH, PAIRING_ENDPOINT_PATH } = require("../domain/pairing/pairing-endpoint-address.cjs");
 
 const DEFAULT_WORKER_TYPE = "commonjs";
+const WORKER_ENTRY_BASENAME = "relay-worker-entry";
+
+function isMissingWorkerEntry(err) {
+  if (!err || (err.code !== "MODULE_NOT_FOUND" && err.code !== "ERR_MODULE_NOT_FOUND")) {
+    return false;
+  }
+  const message = typeof err.message === "string" ? err.message : "";
+  return message.includes(`${WORKER_ENTRY_BASENAME}.js'`) ||
+    message.includes(`${WORKER_ENTRY_BASENAME}.cjs'`);
+}
 const AUTOMATION_STATE_FALLBACK_MS = 1000;
+
+const APP_DISCONNECT_GRACE_ENV = "OCUCLAW_LIVEUI_RECONNECT_GRACE_MS";
+const APP_DISCONNECT_GRACE_MAX_MS = 60_000;
+
+const APP_DISCONNECT_RESUME_SETTLE_MS = 750;
+
+function resolveAppDisconnectGraceMs(options) {
+  const host = globalThis;
+  const fromEnv = host.process?.env?.[APP_DISCONNECT_GRACE_ENV];
+  const raw = fromEnv !== undefined && fromEnv !== ""
+    ? fromEnv
+    : options && options.appDisconnectGraceMs;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.min(APP_DISCONNECT_GRACE_MAX_MS, Math.floor(value));
+}
 
 function defaultWorkerFactory() {
   return new Worker(new URL("./relay-worker-entry.cjs", `file://${__filename}`), {
@@ -100,7 +127,20 @@ function createRelayWorkerSupervisor(options = {}) {
   let restartTimer = null;
   let restartAttempt = 0;
   let workerReadyWatchdog = null;
+
+  let everReady = false;
+  let terminalStartError = null;
+  let workerEntryMissing = false;
   const clients = new Map();
+  const appDisconnectGraceMs = resolveAppDisconnectGraceMs(options);
+  const appDisconnectResumeSettleMs = Number.isFinite(options.appDisconnectResumeSettleMs)
+    ? Math.max(0, Math.floor(options.appDisconnectResumeSettleMs))
+    : APP_DISCONNECT_RESUME_SETTLE_MS;
+
+  const pendingAppDisconnectDrains = new Map();
+  const appResumeSettleTimers = new Set();
+
+  const goingAwayClientIds = new Set();
   const pendingReadinessProbeRequests = new Map();
   const pendingAutomationStateRequests = new Map();
   const pendingAutomationRegistryRequests = new Map();
@@ -623,6 +663,8 @@ function createRelayWorkerSupervisor(options = {}) {
     if (!message || typeof message !== "object") return;
     if (message.kind === "worker.ready") {
       restartAttempt = 0;
+      everReady = true;
+      terminalStartError = null;
       clearWorkerReadyWatchdog();
       addressValue = message.address || null;
       wssEvents.emit("listening");
@@ -634,7 +676,26 @@ function createRelayWorkerSupervisor(options = {}) {
       return;
     }
     if (message.kind === "worker.error") {
-      logger.warn(`[relay-worker] ${message.message || "worker error"}`);
+      const bindConflict =
+        message.bindConflict && typeof message.bindConflict === "object"
+          ? message.bindConflict
+          : null;
+      if (bindConflict) {
+
+        logger.error(`[relay-worker] ${message.message || "relay port bind failed"}`);
+
+        if (options.failStartOnBindConflict === true && rejectReady && !everReady) {
+          terminalStartError = Object.assign(
+            new Error(message.message || "relay port bind failed"),
+            {
+              code: typeof message.code === "string" ? message.code : "EADDRINUSE",
+              bindConflict: { ...bindConflict },
+            },
+          );
+        }
+      } else {
+        logger.warn(`[relay-worker] ${message.message || "worker error"}`);
+      }
 
       if (rejectReady && worker && typeof worker.terminate === "function") {
         worker.terminate();
@@ -775,6 +836,7 @@ function createRelayWorkerSupervisor(options = {}) {
       }
       if (connectedEntry && connectedEntry.clientKind === "app") {
         notifyAppPresenceChanged("connected");
+        cancelAppDisconnectGrace(connectedEntry);
       }
       return;
     }
@@ -834,14 +896,18 @@ function createRelayWorkerSupervisor(options = {}) {
           typeof disconnectedEntry.sessionKey === "string" && disconnectedEntry.sessionKey
             ? disconnectedEntry.sessionKey
             : null;
-        if (drainSessionKey) {
-          if (getConnectedAppEntries(message.clientId, drainSessionKey).length === 0) {
-            options.onAppClientDisconnect(drainSessionKey);
-          }
-        } else if (getConnectedAppEntries(message.clientId).length === 0) {
-          options.onAppClientDisconnect(getActiveSessionKey());
+        const wentAway = goingAwayClientIds.has(message.clientId);
+
+        const departedKeys = appClientSessionKeys(disconnectedEntry);
+        const matchKeys = [...new Set([drainSessionKey, ...departedKeys].filter(Boolean))];
+        const sessionStillServed = getConnectedAppEntries(message.clientId).some((entry) =>
+          answersAppGrace(drainSessionKey || "", matchKeys, entry),
+        );
+        if (!sessionStillServed) {
+          drainAppSessionAfterGrace(drainSessionKey, message.clientId, wentAway, departedKeys);
         }
       }
+      goingAwayClientIds.delete(message.clientId);
       if (disconnectedEntry && disconnectedEntry.clientKind === "app") {
 
         notifyAppPresenceChanged("disconnected");
@@ -859,6 +925,9 @@ function createRelayWorkerSupervisor(options = {}) {
 
     if (message.kind === "client.goingAway") {
       const goingAwayEntry = clients.get(message.clientId) || null;
+      if (goingAwayEntry && goingAwayEntry.clientKind === "app") {
+        goingAwayClientIds.add(message.clientId);
+      }
       emitRelaySession(
         "downstream_going_away",
         (goingAwayEntry && goingAwayEntry.sessionKey) || message.sessionKey || getActiveSessionKey(),
@@ -877,6 +946,8 @@ function createRelayWorkerSupervisor(options = {}) {
     }
     if (message.kind === "client.visibility") {
       const visibilityEntry = clients.get(message.clientId) || null;
+
+      if (message.state === "visible") goingAwayClientIds.delete(message.clientId);
       emitRelaySession(
         "downstream_transport_visibility",
         (visibilityEntry && visibilityEntry.sessionKey) || getActiveSessionKey(),
@@ -1051,6 +1122,19 @@ function createRelayWorkerSupervisor(options = {}) {
       }
       return;
     }
+    if (
+      message.kind === "debug" &&
+      message.event === "worker_listen_holder_retry" &&
+      worker &&
+      rejectReady &&
+      workerReadyWatchdog &&
+      message.workerEpoch === workerEpoch
+    ) {
+
+      const delayMs =
+        message.data && Number.isFinite(message.data.delayMs) ? message.data.delayMs : 0;
+      armWorkerReadyWatchdog(worker, delayMs + workerReadyWatchdogMs());
+    }
     if (message.kind === "debug" && typeof options.emitDebug === "function") {
       options.emitDebug(
         message.category || "relay.worker.health",
@@ -1073,11 +1157,16 @@ function createRelayWorkerSupervisor(options = {}) {
   function startWorker() {
     const nextWorker = workerFactory();
     worker = nextWorker;
-    nextWorker.on("message", handleMessage);
+
+    nextWorker.on("message", (message) => runOutsideRetiredPluginCache(() => handleMessage(message)));
     nextWorker.on("error", (err) => {
       logger.error(`[relay-worker] worker error: ${err && err.message ? err.message : err}`);
 
-      wssEvents.emit("error", err);
+      if (isMissingWorkerEntry(err)) workerEntryMissing = true;
+
+      if (wssEvents.listenerCount("error") > 0) {
+        wssEvents.emit("error", err);
+      }
     });
     const startedWorker = nextWorker;
     nextWorker.on("exit", (code) => {
@@ -1101,6 +1190,24 @@ function createRelayWorkerSupervisor(options = {}) {
           wssEvents.emit("error", err);
         }
 
+        if (terminalStartError && wasPreReady && rejectReady) {
+
+          const startError = terminalStartError;
+          terminalStartError = null;
+          const reject = rejectReady;
+          resolveReady = null;
+          rejectReady = null;
+          reject(startError);
+          return;
+        }
+        terminalStartError = null;
+        if (workerEntryMissing) {
+
+          logger.warn(
+            "[relay-worker] worker entry is gone (plugin generation retired or files removed); not respawning",
+          );
+          return;
+        }
         if (!wasPreReady) {
           resetReadyPromise();
         }
@@ -1111,17 +1218,22 @@ function createRelayWorkerSupervisor(options = {}) {
     postToWorker(manifest);
     startMainHeartbeat(manifest.workerEpoch);
 
+    armWorkerReadyWatchdog(startedWorker, workerReadyWatchdogMs());
+    return nextWorker;
+  }
+
+  function armWorkerReadyWatchdog(startedWorker, delayMs) {
     clearWorkerReadyWatchdog();
-    workerReadyWatchdog = setTimeout(() => {
+    const watchdog = setTimeout(() => {
       workerReadyWatchdog = null;
       if (closing || worker !== startedWorker) return;
       logger.warn(
-        `[relay-worker] worker did not report ready within ${workerReadyWatchdogMs()}ms; terminating`,
+        `[relay-worker] worker did not report ready within ${delayMs}ms; terminating`,
       );
       if (typeof startedWorker.terminate === "function") startedWorker.terminate();
-    }, workerReadyWatchdogMs());
-    if (typeof workerReadyWatchdog.unref === "function") workerReadyWatchdog.unref();
-    return nextWorker;
+    }, delayMs);
+    if (typeof watchdog.unref === "function") watchdog.unref();
+    workerReadyWatchdog = watchdog;
   }
 
   function close() {
@@ -1138,6 +1250,7 @@ function createRelayWorkerSupervisor(options = {}) {
     }
     clearWorkerReadyWatchdog();
     stopMainHeartbeat();
+    clearAppDisconnectGraceTimers();
     if (!worker) {
       startPromise = null;
       return Promise.resolve();
@@ -1202,6 +1315,102 @@ function createRelayWorkerSupervisor(options = {}) {
   function isAppClient(clientId) {
     const entry = clients.get(clientId);
     return entry && entry.clientKind === "app";
+  }
+
+  function drainAppSessionAfterGrace(sessionKey, clientId, wentAway, departedKeys = []) {
+    if (typeof options.onAppClientDisconnect !== "function") return;
+    const graceKey = sessionKey || "";
+    const armed = pendingAppDisconnectDrains.get(graceKey);
+    if (armed) {
+      clearTimeout(armed.timer);
+      pendingAppDisconnectDrains.delete(graceKey);
+    }
+    if (appDisconnectGraceMs <= 0 || wentAway || closing) {
+      if (appDisconnectGraceMs > 0) {
+        emitRelaySession("app_disconnect_grace_skipped", sessionKey || getActiveSessionKey(), () => ({
+          clientId,
+          reason: wentAway ? "going_away" : "closing",
+        }));
+      }
+      options.onAppClientDisconnect(sessionKey || getActiveSessionKey());
+      return;
+    }
+    const armedAtMs = Date.now();
+    const matchKeys = [...new Set([sessionKey, ...departedKeys].filter(Boolean))];
+    const timer = setTimeout(() => {
+      if (pendingAppDisconnectDrains.get(graceKey)?.timer !== timer) return;
+      pendingAppDisconnectDrains.delete(graceKey);
+      const stillGone = !getConnectedAppEntries().some((entry) => answersAppGrace(graceKey, matchKeys, entry));
+      emitRelaySession("app_disconnect_grace_expired", sessionKey || getActiveSessionKey(), () => ({
+        clientId,
+        graceMs: appDisconnectGraceMs,
+        elapsedMs: Date.now() - armedAtMs,
+        drained: stillGone,
+      }));
+      if (stillGone) options.onAppClientDisconnect(sessionKey || getActiveSessionKey());
+    }, appDisconnectGraceMs);
+    if (typeof timer.unref === "function") timer.unref();
+    pendingAppDisconnectDrains.set(graceKey, { timer, armedAtMs, clientId, matchKeys });
+    emitRelaySession("app_disconnect_grace_armed", sessionKey || getActiveSessionKey(), () => ({
+      clientId,
+      graceMs: appDisconnectGraceMs,
+    }));
+  }
+
+  function appClientSessionKeys(entry) {
+    if (!entry) return [];
+    const keys = [];
+    for (const key of [entry.selectedSessionKey, entry.sessionKey]) {
+      const trimmed = typeof key === "string" ? key.trim() : "";
+      if (trimmed && !keys.includes(trimmed)) keys.push(trimmed);
+    }
+    return keys;
+  }
+
+  function answersAppGrace(graceKey, matchKeys, entry) {
+    if (!entry || entry.clientKind !== "app") return false;
+    if (!graceKey) return true;
+    return appClientSessionKeys(entry).some((key) => matchKeys.includes(key));
+  }
+
+  function cancelAppDisconnectGrace(entry) {
+    if (pendingAppDisconnectDrains.size === 0) return;
+    if (!entry || !clients.has(entry.clientId)) return;
+    let resumed = false;
+    for (const [graceKey, armed] of [...pendingAppDisconnectDrains]) {
+      if (!answersAppGrace(graceKey, armed.matchKeys || [], entry)) continue;
+      clearTimeout(armed.timer);
+      pendingAppDisconnectDrains.delete(graceKey);
+      resumed = true;
+      emitRelaySession("app_disconnect_grace_cancelled", graceKey || getActiveSessionKey(), () => ({
+        clientId: entry.clientId,
+        previousClientId: armed.clientId,
+        awayMs: Date.now() - armed.armedAtMs,
+      }));
+    }
+    if (!resumed || typeof options.onAppPresenceChanged !== "function") return;
+
+    const settle = setTimeout(() => {
+      appResumeSettleTimers.delete(settle);
+      if (closing) return;
+      try {
+        options.onAppPresenceChanged("grace_resumed");
+      } catch (err) {
+        logger.warn(
+          `[relay-worker] app presence hook failed: ${err && err.message ? err.message : err}`,
+        );
+      }
+    }, appDisconnectResumeSettleMs);
+    if (typeof settle.unref === "function") settle.unref();
+    appResumeSettleTimers.add(settle);
+  }
+
+  function clearAppDisconnectGraceTimers() {
+    for (const armed of pendingAppDisconnectDrains.values()) clearTimeout(armed.timer);
+    pendingAppDisconnectDrains.clear();
+    for (const settle of appResumeSettleTimers) clearTimeout(settle);
+    appResumeSettleTimers.clear();
+    goingAwayClientIds.clear();
   }
 
   function notifyAppPresenceChanged(reason) {
@@ -1272,6 +1481,7 @@ function createRelayWorkerSupervisor(options = {}) {
     if (wasGuarding || reported !== effective) {
       entry.selectedSessionKey = reported;
     }
+    if (entry.clientKind === "app") cancelAppDisconnectGrace(entry);
   }
 
   function deviceFactsKey(device) {
@@ -1411,6 +1621,7 @@ function createRelayWorkerSupervisor(options = {}) {
       entry.replacedSessionKey = previous && previous !== next ? previous : null;
       entry.replacedAtMs = Date.now();
       entry.selectedSessionKey = next;
+      if (entry.clientKind === "app") cancelAppDisconnectGrace(entry);
       return true;
     },
 

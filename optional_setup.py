@@ -643,12 +643,18 @@ def _record_attempt(home: Path) -> None:
         return
 
 
-#: Printed before the confirm prompt when the activation restart is the
-#: Cloudways container bounce (#3357).
-CLOUDWAYS_RESTART_WARNING = (
-    "This restarts the whole container. SSH will disconnect; reconnect in about a minute. "
+#: The two halves of the Cloudways container-restart warning. The ladder's
+#: step 3 prints the phone half only once a phone is paired: before pairing
+#: there is no phone to reconnect, so the line only confuses.
+CLOUDWAYS_RESTART_SSH_LINE = (
+    "This restarts the whole container, so SSH will drop. Reconnect in about a minute."
+)
+CLOUDWAYS_RESTART_PHONE_LINE = (
     "Your phone reconnects in 1–5 minutes. Active replies are stopped, not finished."
 )
+#: Printed before the confirm prompt when the activation restart is the
+#: Cloudways container bounce (#3357).
+CLOUDWAYS_RESTART_WARNING = f"{CLOUDWAYS_RESTART_SSH_LINE} {CLOUDWAYS_RESTART_PHONE_LINE}"
 
 
 def _cloudways_container_restart(gateway) -> bool:

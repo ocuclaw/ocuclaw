@@ -8,6 +8,20 @@ function genRunId() {
   return `ocuclaw-title-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+const HIDDEN_AGENT_FALLBACK_BEFORE = [2026, 8, 0];
+
+function hostAllowsHiddenAgentFallback(hostVersion) {
+  if (typeof hostVersion !== "string") return false;
+  const match = hostVersion.trim().match(/^(\d{4})\.(\d+)\.(\d+)/);
+  if (!match) return false;
+  const actual = [Number(match[1]), Number(match[2]), Number(match[3])];
+  for (let i = 0; i < HIDDEN_AGENT_FALLBACK_BEFORE.length; i += 1) {
+    if (actual[i] < HIDDEN_AGENT_FALLBACK_BEFORE[i]) return true;
+    if (actual[i] > HIDDEN_AGENT_FALLBACK_BEFORE[i]) return false;
+  }
+  return false;
+}
+
 function registerSessionTitleDistiller(api, service) {
   if (!api || typeof api.on !== "function") return () => {};
 
@@ -44,6 +58,13 @@ function registerSessionTitleDistiller(api, service) {
       setSessionTitle: (k, t, o) => service.setSessionTitle(k, t, o),
     },
     isEvenAiSessionKey: (k) => service.isEvenAiSessionKey(k),
+    allowHiddenAgentFallback: hostAllowsHiddenAgentFallback(
+      api && api.runtime ? api.runtime.version : undefined,
+    ),
+    isFirstUseAttemptOpen: () =>
+      typeof service.isFirstUseAttemptOpen === "function"
+        ? service.isFirstUseAttemptOpen()
+        : false,
     cleanupDistillerSession: (k) =>
       typeof service.deleteDistillerSession === "function"
         ? service.deleteDistillerSession(k)
@@ -86,16 +107,14 @@ function registerSessionTitleDistiller(api, service) {
     const sessionKey = stripAgentSessionPrefix(rawSessionKey);
     if (!sessionKey) return;
 
-    const agentId = ctx && typeof ctx.agentId === "string" && ctx.agentId.trim() ? ctx.agentId.trim() : undefined;
-
     const eventMessages = event && Array.isArray(event.messages) ? event.messages : null;
     const messages =
       eventMessages && eventMessages.length
         ? eventMessages
         : service.getRawMessages();
 
-    Promise.resolve(distiller.maybeRun(sessionKey, { messages, agentId })).catch(() => {});
+    Promise.resolve(distiller.maybeRun(sessionKey, { messages })).catch(() => {});
   });
 }
 
-module.exports = { registerSessionTitleDistiller };
+module.exports = { registerSessionTitleDistiller, hostAllowsHiddenAgentFallback };

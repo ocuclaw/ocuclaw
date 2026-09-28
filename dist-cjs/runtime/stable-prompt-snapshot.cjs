@@ -82,6 +82,13 @@ function createStablePromptSnapshotStore(opts = {}) {
       return prompt;
     },
 
+    peek(sessionKey, sessionId) {
+      const existing = byKey.get(sessionKey);
+      if (!existing || existing.sessionId !== normSessionId(sessionId)) return "";
+      existing.touchedMs = nowMs();
+      return existing.prompt;
+    },
+
     wouldChurn(sessionKey, sessionId, candidate) {
       const existing = byKey.get(sessionKey);
       if (!existing || existing.sessionId !== normSessionId(sessionId)) return false;

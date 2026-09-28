@@ -1,9 +1,9 @@
 # OcuClaw installation and lifecycle reference
 
-**Guide version:** 2026-09-25 (1.3.24-hermes)
+**Guide version:** 2026-09-28 (1.3.25-hermes)
 
-This reference is for OcuClaw train `2.1.0` and Setup Assistant guide
-`1.3.24-hermes`. Those identities are independent of the Hermes package version
+This reference is for OcuClaw train `2.1.1` and Setup Assistant guide
+`1.3.25-hermes`. Those identities are independent of the Hermes package version
 (certified baseline `0.21.5`, supported `>=0.21.1,<0.22.0`) and certified source
 commit.
 
@@ -312,6 +312,20 @@ The agent's reasoning then reaches the glasses as it is written instead of in
 whole pieces. The key is Hermes' own and gateway-wide — it changes how Hermes
 calls the model for every surface on this gateway, not just OcuClaw.
 
+### Progress notes
+
+Some models write short sentences while they work, before their answer
+("Checking the logs first."). On supported Hermes 0.21.x those get their own
+line in the glasses status bar and stay out of the conversation history. To
+silence them at the source, in the Hermes config:
+
+```yaml
+display:
+  platforms:
+    ocuclaw:
+      interim_assistant_messages: off
+```
+
 ### OcuClaw look for Hermes Desktop
 
 `/ocuclaw-setup` offers this at the end and waits for your yes. Hermes Desktop
@@ -359,16 +373,29 @@ Re-enable that retained install with `hermes plugins enable ocuclaw`, run
 For a full uninstall, first re-enable a retained disabled install with
 `hermes plugins enable ocuclaw --no-allow-tool-override`; the plugin-owned
 command cannot register while disabled. Obtain and run any permitted Managed
-Serve Route teardown as described below. Then stop the gateway so its live
-child cannot recreate state during removal, run the plugin-owned uninstall,
-and start Hermes again:
+Serve Route teardown as described below. Then run the plugin-owned uninstall.
+The same sequence works everywhere, Cloudways included:
 
 ```bash
-hermes gateway stop
 hermes ocuclaw uninstall
-hermes gateway start
-hermes gateway status
+# If it says restart_required (exit code 3):
+hermes gateway restart
+hermes ocuclaw uninstall
 ```
+
+Removal needs OcuClaw not to be running, so its live runtime cannot recreate
+state. When OcuClaw is running, the first run asks for confirmation, marks
+the uninstall pending (`$HERMES_HOME/state/ocuclaw.uninstall-pending.json`),
+and changes nothing else. While that mark exists, a restarted gateway loads
+only the `hermes ocuclaw` command: no relay, runtime or platform. The second
+run checks that the gateway started after the mark, the relay port is closed,
+no OcuClaw runtime process exists and the platform is not connected, then
+removes everything without asking again. A host whose gateway is already
+stopped finishes in one run. On Cloudways, `hermes gateway stop` restarts the
+whole container, so use `hermes gateway restart` there as shown.
+`hermes ocuclaw status` and `doctor` show "Uninstall pending" while the mark
+exists. To keep OcuClaw instead, run `hermes ocuclaw uninstall --cancel` and
+then `hermes gateway restart`.
 
 The uninstall command asks for confirmation and prints a receipt covering each
 removal, deliberate preservation, the route decision, and final absence checks.
@@ -402,11 +429,25 @@ This is the removal contract. `hermes ocuclaw uninstall` removes exactly:
 - OcuClaw's private profile state under `$HERMES_HOME/state/` — the Desktop
   presenter capability and pairing activation receipts, the TUI pairing
   capability, the pairing-completion, first-run and relay-credential
-  receipts, and their lock sidecars;
-- OcuClaw's runtime state under `$HERMES_HOME/ocuclaw/`;
+  receipts, the optional-setup receipt, the Board store
+  (`ocuclaw-board.db`), their lock sidecars, and last the uninstall-pending
+  mark;
+- `$HERMES_HOME/ocuclaw-restart-receipts.json`;
+- OcuClaw's runtime state under `$HERMES_HOME/ocuclaw/`, saved prompts
+  included;
 - the `/ocuclaw-setup` bundle and the `ocuclaw-pair` TUI widget;
 - the host-scoped Managed Serve Route receipt and its lock sidecar, but only
-  while OcuClaw can still prove it owns them and no live route remains.
+  while OcuClaw can still prove it owns them and no live route remains;
+- on Cloudways, what `hermes ocuclaw cloudways install` set up: the Tailscale
+  watchdog cron job and script, the userspace `tailscaled`, the `~/bin`
+  binaries, the install receipts and the `~/.tailscale` identity (the same
+  as `hermes ocuclaw cloudways rollback --yes --purge-identity`), plus
+  `~/.local/share/tailscale`, an empty `~/bin` and the empty host receipt
+  folder when nothing else is inside.
+
+It keeps `~/.ocuclaw/liveui-library/`: that is your own LiveUI content and the
+OpenClaw plugin may share it. The receipt names it; delete it yourself if you
+no longer want it.
 
 It never touches anything else: the shared Hermes session database, other
 plugins' storage, unrelated profile configuration, other plugins' files under

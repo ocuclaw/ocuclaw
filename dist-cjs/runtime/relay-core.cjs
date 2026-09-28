@@ -2,7 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const os = require("node:os");
-const { createFirstUseStore, createFirstUseObserver, runFirstUseOperation, firstUseBinding, classifyFirstUseReplyEvidence, firstUseResult, observeReplyEvidenceInto } = require("../setup/first-use.cjs");
+const { createFirstUseStore, createFirstUseObserver, runFirstUseOperation, firstUseBinding, classifyFirstUseReplyEvidence, firstUseResult, observeReplyEvidenceInto, firstUseAttemptHoldsSideWork, firstUseAttemptPredatesPairing } = require("../setup/first-use.cjs");
 const { setupInstallation, firstUseRunErrored, firstUseWithRunErrored, firstUseProviderErrorClass, FIRST_USE_ERRORED_RUN_REASONS } = require("../setup/setup-journey.cjs");
 const { createSetupWelcome } = require("../setup/welcome.cjs");
 const { createFirstUseRelayRun, FIRST_USE_RELAY_ARM_LINES, FIRST_USE_RELAY_ARM_ACTION, FIRST_USE_RELAY_WELCOME_LINES } = require("../setup/first-use-relay-run.cjs");
@@ -24,6 +24,7 @@ const { composeGlassesDisplaySystemPrompt } = require("../domain/glasses-display
 const { createStablePromptSnapshotStore } = require("./stable-prompt-snapshot.cjs");
 const { createActivityStatusAdapter } = require("../domain/activity-status-adapter.cjs");
 const { createEvenAiEndpoint } = require("../even-ai/even-ai-endpoint.cjs");
+const { createEvenAiRestartRecovery, createEvenAiSendJournal } = require("../even-ai/even-ai-restart-recovery.cjs");
 const { createEvenAiRequestObservation } = require("../even-ai/even-ai-request-observation.cjs");
 const { createEvenAiRouter } = require("../even-ai/even-ai-router.cjs");
 const { createEvenAiRunWaiter } = require("../even-ai/even-ai-run-waiter.cjs");
@@ -31,6 +32,7 @@ const { createEvenAiSettingsStore, normalizeEvenAiDefaultAgent } = require("../e
 const { createPluginOpenclawClient } = require("../gateway/openclaw-client.cjs");
 const { createPluginRpcGatewayBridge, scopeOpenClawSessionKey } = require("../gateway/gateway-bridge.cjs");
 const { createInputPredictionService } = require("./input-prediction-service.cjs");
+const { createBackendPrewarm } = require("./backend-prewarm.cjs");
 const { resolveInputPredictionIdentity } = require("./input-prediction-identity.cjs");
 const { createSilentInputJevAnswerer } = require("./silent-input-jev-answerer.cjs");
 const { createOpenClawAgentCreator } = require("../gateway/openclaw-agent-create.cjs");
@@ -83,6 +85,8 @@ const LIVEUI_TASK_DISCOVERY_CHANNEL_ONE =
   "The wearer may have saved LiveUI Tasks; before using shell, calendar or search tools for a job that sounds like a saved Task, call manage_liveui_tasks find_tasks.";
 
 const GLASSES_UI_MARKERS = new Set(["listening", "parked", "inflight", "processing", "refreshing"]);
+
+const LIVEUI_RECONNECT_GRACE_DEFAULT_MS = 12_000;
 function sanitizeGlassesMarker(v) { return GLASSES_UI_MARKERS.has(v) ? v : undefined; }
 
 function parseHermesFeatureTokens(raw         ) {
@@ -123,6 +127,9 @@ const SONIOX_MODELS_URL = "https://api.soniox.com/v1/models";
 const DEFAULT_SONIOX_TEMP_KEY_EXPIRES_IN_SECONDS = 3600;
 
 const DEFAULT_SONIOX_TEMP_KEY_MINT_TIMEOUT_MS = 8000;
+
+const SONIOX_TEMP_KEY_REUSE_MIN_REMAINING_MS = 10 * 60_000;
+
 const CARTESIA_ACCESS_TOKEN_URL = "https://api.cartesia.ai/access-token";
 const CARTESIA_VERSION = "2026-03-01";
 const DEFAULT_CARTESIA_ACCESS_TOKEN_EXPIRES_IN_SECONDS = 3600;
@@ -467,7 +474,18 @@ function createRelay(opts) {
     const since = typeof startedAt === "number" ? startedAt : Date.parse(startedAt);
     if (Number.isFinite(since) && lastErroredRun.at < since) return null;
 
-    return firstUseRunErrored(lastErroredRun.code);
+    let attemptId      = null;
+    try { attemptId = firstUseStore?.read()?.attemptId ?? null; } catch (_) { attemptId = null; }
+    const own = firstUseObserver?.runsForAttempt?.(attemptId) ?? [];
+    for (const runId of own) {
+      const outcome = runOutcomes.get(runId);
+      const erroredCode = outcome?.errored === true ? outcome.code
+        : lastErroredRun.runId === runId ? lastErroredRun.code
+        : undefined;
+
+      if (erroredCode !== undefined) return firstUseRunErrored(erroredCode);
+    }
+    return null;
   }
 
   function settledRunErrored(record     ) {
@@ -799,6 +817,18 @@ function createRelay(opts) {
   }
 
   const agentTurnTracker = createAgentTurnTracker({ onChange: dispatchAgentTurnChanged });
+
+  const backendPrewarm = createBackendPrewarm({
+    request: (method     , params     ) => gatewayBridge.request(method, params),
+    getBackendKind: () => getActiveBackendKind(),
+    resolveSessionKey: (requested     ) => requested || sessionService.peekSessionKey() || null,
+    scopeSessionKey: (sessionKey     ) =>
+      scopeOpenClawSessionKey(sessionKey, stableSendOptions(sessionKey, null)),
+    isTurnActive: (sessionKey     ) => agentTurnTracker.isBusy(sessionKey),
+    onOutcome: (outcome     ) => {
+      emitDebug("relay.protocol", "backend_prewarm", "debug", { sessionKey: outcome.sessionKey }, () => outcome);
+    },
+  });
   const sharedHttpServer = opts.httpServer || null;
 
   let cachedPages = null;
@@ -857,6 +887,8 @@ function createRelay(opts) {
   const syntheticTimers = new Map();
 
   const pendingCommitPublishBySession = new Map();
+
+  const scriptedAppSendBySession = new Map();
 
   const simulateToolStarts = new Map();
 
@@ -1143,12 +1175,131 @@ function createRelay(opts) {
       syntheticTimers.delete(timer);
     }
     pendingCommitPublishBySession.delete(sessionKey);
+    clearScriptedAppSend(sessionKey);
   }
 
   function clearSyntheticTimers() {
     for (const timer of syntheticTimers.keys()) clearTimeout(timer);
     syntheticTimers.clear();
     pendingCommitPublishBySession.clear();
+    clearScriptedAppSend();
+  }
+
+  const SCRIPTED_APP_SEND_TTL_MS = 60_000;
+  const SCRIPTED_APP_SEND_WAIT_MAX_MS = 10_000;
+
+  function normalizeScriptedSendText(text     ) {
+    return typeof text === "string" ? text.trim().replace(/\s+/g, " ") : "";
+  }
+
+  function clearScriptedAppSend(sessionKey      = null) {
+    const keys = sessionKey === null ? [...scriptedAppSendBySession.keys()] : [sessionKey];
+    for (const key of keys) {
+      const entry = scriptedAppSendBySession.get(key);
+      if (!entry) continue;
+      scriptedAppSendBySession.delete(key);
+      for (const wake of [...entry.waiters]) wake();
+    }
+  }
+
+  function armScriptedAppSend(sessionKey     , text     , runId     ) {
+    clearScriptedAppSend(sessionKey);
+    scriptedAppSendBySession.set(sessionKey, {
+      text,
+
+      runId: typeof runId === "string" && runId.trim() ? runId.trim() : null,
+      expiresAtMs: Date.now() + SCRIPTED_APP_SEND_TTL_MS,
+      absorbed: null,
+      waiters: new Set(),
+    });
+  }
+
+  function maybeAbsorbScriptedAppSend(id     , text     , sessionKey     ) {
+    if (scriptedAppSendBySession.size === 0) return null;
+    const key = sessionKey || sessionService.peekSessionKey() || "";
+    const entry = scriptedAppSendBySession.get(key);
+    if (!entry || entry.absorbed) return null;
+    if (Date.now() > entry.expiresAtMs) {
+      clearScriptedAppSend(key);
+      return null;
+    }
+    const sentText = typeof text === "string" ? text : "";
+    const matched = normalizeScriptedSendText(sentText) === normalizeScriptedSendText(entry.text);
+    entry.absorbed = { id, matched };
+    relayOperationRegistry.markStarted(id);
+    relayOperationRegistry.markUpstreamAck(id, { status: "scripted", runId: entry.runId });
+    conversationState.addMessage("user", buildLocalUserMessageContent(sentText, null), null, {
+      clientSendId: id,
+    });
+    emitDebug(
+      "voice.timeline",
+      "scripted_app_send_absorbed",
+      "info",
+      { sessionKey: key },
+      () => ({ messageId: id || null, textChars: sentText.length, matched }),
+    );
+    emitDebug(
+      "openclaw.message",
+      "user_message",
+      "info",
+      { sessionKey: key },
+      () => ({ text: sentText }),
+    );
+    broadcastPages();
+    for (const wake of [...entry.waiters]) wake();
+    return Promise.resolve({
+      status: "accepted",
+      scripted: true,
+      ...(entry.runId ? { runId: entry.runId } : {}),
+    });
+  }
+
+  function awaitScriptedAppSend(sessionKey     , timeoutMs     ) {
+    const entry = scriptedAppSendBySession.get(sessionKey);
+    if (!entry) {
+      return Promise.resolve({
+        status: "rejected",
+        error: "app_send_not_armed: no scripted app send is armed for this session",
+        errorCode: "app_send_not_armed",
+      });
+    }
+    const verdict = () => {
+      if (scriptedAppSendBySession.get(sessionKey) === entry) scriptedAppSendBySession.delete(sessionKey);
+      if (!entry.absorbed) {
+        return {
+          status: "rejected",
+          error: "app_send_not_armed: the scripted app send was cleared before the app sent",
+          errorCode: "app_send_not_armed",
+        };
+      }
+      return entry.absorbed.matched
+        ? { status: "accepted" }
+        : {
+          status: "rejected",
+          error: "app_send_text_mismatch: the app sent different words than the scripted turn (nothing went upstream)",
+          errorCode: "app_send_text_mismatch",
+        };
+    };
+    const pending = () => ({
+      status: "rejected",
+      error: "app_send_pending: the app has not sent the reviewed words yet",
+      errorCode: "app_send_pending",
+    });
+    if (entry.absorbed) return Promise.resolve(verdict());
+    const waitMs = Math.max(0, Math.min(SCRIPTED_APP_SEND_WAIT_MAX_MS, Math.floor(Number(timeoutMs) || 0)));
+    if (waitMs === 0) return Promise.resolve(pending());
+    return new Promise((resolve) => {
+      const wake = () => {
+        clearTimeout(timer);
+        entry.waiters.delete(wake);
+        resolve(verdict());
+      };
+      const timer = setTimeout(() => {
+        entry.waiters.delete(wake);
+        resolve(pending());
+      }, waitMs);
+      entry.waiters.add(wake);
+    });
   }
 
   function simulatedRunKeyMatchesSession(key = "", sessionKey = "") {
@@ -1241,6 +1392,9 @@ function createRelay(opts) {
   let sonioxModelsFetchStarted = false;
 
   let inFlightSonioxModelsFetch = null;
+
+  let cachedSonioxTemporaryKey                                      = null;
+  let inFlightSonioxTemporaryKeyMint                                               = null;
 
   function resolveFetchImpl() {
     return typeof opts.fetch === "function"
@@ -1394,6 +1548,49 @@ function createRelay(opts) {
     return inFlightSonioxModelsFetch;
   }
 
+  async function fetchMintWithDeadline(fetchImpl     , url     , init     , timeoutMs     , timing      = {}) {
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    let timer      = null;
+    const deadline = new Promise((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        const err      = new Error(`mint timed out after ${timeoutMs} ms`);
+        err.name = "AbortError";
+        reject(err);
+      }, timeoutMs);
+    });
+    try {
+      const response      = await Promise.race([
+        fetchImpl(url, { ...init, signal: controller.signal }),
+        deadline,
+      ]);
+      timing.headersMs = Date.now() - startedAt;
+      const rawText =
+        response && typeof response.text === "function"
+          ? await Promise.race([response.text(), deadline])
+          : "";
+      timing.bodyMs = Date.now() - startedAt - timing.headersMs;
+      return { response, rawText };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function mintTimingFields(startedAtMs     , timing     ) {
+    const phase = (v     ) => (Number.isFinite(v) ? v : null);
+    return {
+      elapsedMs: Date.now() - startedAtMs,
+      headersMs: phase(timing.headersMs),
+      bodyMs: phase(timing.bodyMs),
+    };
+  }
+
+  function formatMintTiming(fields     ) {
+    const show = (v     ) => (v === null ? "-" : v);
+    return `elapsedMs=${fields.elapsedMs} headersMs=${show(fields.headersMs)} bodyMs=${show(fields.bodyMs)}`;
+  }
+
   async function mintSonioxTemporaryKey(clientId, request) {
     const voiceSessionId = pickTrimmedString(request && request.voiceSessionId);
     if (!voiceSessionId) {
@@ -1403,9 +1600,11 @@ function createRelay(opts) {
     const sessionKey = pickTrimmedString(request && request.sessionKey) || null;
     const nowMs = Date.now();
     const resolvedSessionKey = sessionKey || sessionService.peekSessionKey() || undefined;
+    const mintTiming      = {};
     const emitIssued = (normalized, source) => {
+      const timing = mintTimingFields(nowMs, mintTiming);
       logger.info(
-        `[relay] soniox temp key issued: clientId=${clientId} voiceSessionId=${voiceSessionId} source=${source} expiresAtMs=${normalized.expiresAtMs}`,
+        `[relay] soniox temp key issued: clientId=${clientId} voiceSessionId=${voiceSessionId} source=${source} expiresAtMs=${normalized.expiresAtMs} ${formatMintTiming(timing)}`,
       );
       emitDebug(
         "voice.timeline",
@@ -1417,6 +1616,7 @@ function createRelay(opts) {
           voiceSessionId,
           expiresAtMs: normalized.expiresAtMs,
           source,
+          ...timing,
         }),
       );
       return normalized;
@@ -1460,74 +1660,30 @@ function createRelay(opts) {
         );
       }
 
-      const fetchImpl = resolveFetchImpl();
-      if (!fetchImpl) {
-        throw new Error("fetch is not available for Soniox temporary-key minting");
-      }
+      if (
+        cachedSonioxTemporaryKey &&
+        cachedSonioxTemporaryKey.servedVoiceSessionIds.has(voiceSessionId)
+      ) {
 
-      const mintAbortController = new AbortController();
-      const mintTimeoutTimer = setTimeout(
-        () => mintAbortController.abort(),
-        sonioxTemporaryKeyMintTimeoutMs,
-      );
-      let response;
-      try {
-        response = await fetchImpl(SONIOX_TEMP_KEY_URL, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${configuredSonioxApiKey}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            usage_type: "transcribe_websocket",
-            expires_in_seconds: sonioxTemporaryKeyExpiresInSeconds,
-            client_reference_id: voiceSessionId,
-          }),
-          signal: mintAbortController.signal,
-        });
-      } finally {
-        clearTimeout(mintTimeoutTimer);
+        cachedSonioxTemporaryKey = null;
       }
-
-      const rawText =
-        response && typeof response.text === "function"
-          ? await response.text()
-          : "";
-      let payload = {};
-      if (rawText) {
-        try {
-          payload = JSON.parse(rawText);
-        } catch (err) {
-          if (!response.ok) {
-            throw new Error(
-              `Soniox temporary-key request failed (${response.status}): ${tailForLog(rawText)}`,
-            );
-          }
-          throw new Error(
-            `Soniox temporary-key response was not valid JSON (${response.status})`,
-          );
-        }
-      }
-
-      if (!response.ok) {
-        const errorDetail = pickTrimmedString(
-          payload && payload.error,
-          payload && payload.message,
-          payload && payload.detail,
-          rawText,
-        ) || `HTTP ${response.status}`;
-        throw new Error(
-          `Soniox temporary-key request failed (${response.status}): ${tailForLog(errorDetail)}`,
-        );
-      }
-
+      const reusable =
+        cachedSonioxTemporaryKey &&
+        cachedSonioxTemporaryKey.expiresAtMs - nowMs >=
+          SONIOX_TEMP_KEY_REUSE_MIN_REMAINING_MS
+          ? cachedSonioxTemporaryKey
+          : null;
+      const source = reusable ? "cache" : "soniox_api";
+      const entry =
+        reusable || (await mintSharedSonioxTemporaryKey(voiceSessionId, mintTiming));
+      entry.servedVoiceSessionIds.add(voiceSessionId);
       return emitIssued(
-        normalizeSonioxTemporaryKeyResult(
-          payload || {},
+        {
           voiceSessionId,
-          nowMs,
-        ),
-        "soniox_api",
+          temporaryKey: entry.temporaryKey,
+          expiresAtMs: entry.expiresAtMs,
+        },
+        source,
       );
     } catch (err) {
       const message =
@@ -1535,8 +1691,9 @@ function createRelay(opts) {
           ? err.message
           : "Soniox temporary-key request failed";
       const code = normalizeSonioxTemporaryKeyErrorCode(err);
+      const timing = mintTimingFields(nowMs, mintTiming);
       logger.warn(
-        `[relay] soniox temp key failed: clientId=${clientId} voiceSessionId=${voiceSessionId} code=${code} message=${tailForLog(message)}`,
+        `[relay] soniox temp key failed: clientId=${clientId} voiceSessionId=${voiceSessionId} code=${code} ${formatMintTiming(timing)} message=${tailForLog(message)}`,
       );
       emitDebug(
         "voice.timeline",
@@ -1548,10 +1705,93 @@ function createRelay(opts) {
           voiceSessionId,
           code,
           message: tailForLog(message),
+          ...timing,
         }),
       );
       throw err;
     }
+  }
+
+  function mintSharedSonioxTemporaryKey(
+    voiceSessionId        ,
+    timing      = {},
+  )                                        {
+    if (!inFlightSonioxTemporaryKeyMint) {
+      inFlightSonioxTemporaryKeyMint = fetchSonioxTemporaryKey(voiceSessionId, timing)
+        .then((minted) => {
+          const entry                               = {
+            temporaryKey: minted.temporaryKey,
+            expiresAtMs: minted.expiresAtMs,
+            servedVoiceSessionIds: new Set(),
+          };
+          cachedSonioxTemporaryKey = entry;
+          return entry;
+        })
+        .finally(() => {
+          inFlightSonioxTemporaryKeyMint = null;
+        });
+    }
+    return inFlightSonioxTemporaryKeyMint;
+  }
+
+  async function fetchSonioxTemporaryKey(voiceSessionId        , timing      = {}) {
+    const nowMs = Date.now();
+    const fetchImpl = resolveFetchImpl();
+    if (!fetchImpl) {
+      throw new Error("fetch is not available for Soniox temporary-key minting");
+    }
+
+    const { response, rawText } = await fetchMintWithDeadline(
+      fetchImpl,
+      SONIOX_TEMP_KEY_URL,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${configuredSonioxApiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          usage_type: "transcribe_websocket",
+          expires_in_seconds: sonioxTemporaryKeyExpiresInSeconds,
+          client_reference_id: voiceSessionId,
+        }),
+      },
+      sonioxTemporaryKeyMintTimeoutMs,
+      timing,
+    );
+    let payload = {};
+    if (rawText) {
+      try {
+        payload = JSON.parse(rawText);
+      } catch (err) {
+        if (!response.ok) {
+          throw new Error(
+            `Soniox temporary-key request failed (${response.status}): ${tailForLog(rawText)}`,
+          );
+        }
+        throw new Error(
+          `Soniox temporary-key response was not valid JSON (${response.status})`,
+        );
+      }
+    }
+
+    if (!response.ok) {
+      const errorDetail = pickTrimmedString(
+        payload && payload.error,
+        payload && payload.message,
+        payload && payload.detail,
+        rawText,
+      ) || `HTTP ${response.status}`;
+      throw new Error(
+        `Soniox temporary-key request failed (${response.status}): ${tailForLog(errorDetail)}`,
+      );
+    }
+
+    return normalizeSonioxTemporaryKeyResult(
+      payload || {},
+      voiceSessionId,
+      nowMs,
+    );
   }
 
   function normalizeCartesiaAccessTokenResult(result, voiceSessionId, nowMs) {
@@ -1577,16 +1817,18 @@ function createRelay(opts) {
     const sessionKey = pickTrimmedString(request && request.sessionKey) || null;
     const nowMs = Date.now();
     const resolvedSessionKey = sessionKey || sessionService.peekSessionKey() || undefined;
+    const mintTiming      = {};
     const emitIssued = (normalized, source) => {
+      const timing = mintTimingFields(nowMs, mintTiming);
       logger.info(
-        `[relay] cartesia access token issued: clientId=${clientId} voiceSessionId=${voiceSessionId} source=${source} expiresAtMs=${normalized.expiresAtMs}`,
+        `[relay] cartesia access token issued: clientId=${clientId} voiceSessionId=${voiceSessionId} source=${source} expiresAtMs=${normalized.expiresAtMs} ${formatMintTiming(timing)}`,
       );
       emitDebug(
         "voice.timeline",
         "cartesia_access_token_issued",
         "info",
         { sessionKey: resolvedSessionKey },
-        () => ({ clientId, voiceSessionId, expiresAtMs: normalized.expiresAtMs, source }),
+        () => ({ clientId, voiceSessionId, expiresAtMs: normalized.expiresAtMs, source, ...timing }),
       );
       return normalized;
     };
@@ -1614,14 +1856,10 @@ function createRelay(opts) {
         throw new Error("fetch is not available for Cartesia access-token minting");
       }
 
-      const mintAbortController = new AbortController();
-      const mintTimeoutTimer = setTimeout(
-        () => mintAbortController.abort(),
-        cartesiaAccessTokenMintTimeoutMs,
-      );
-      let response;
-      try {
-        response = await fetchImpl(CARTESIA_ACCESS_TOKEN_URL, {
+      const { response, rawText } = await fetchMintWithDeadline(
+        fetchImpl,
+        CARTESIA_ACCESS_TOKEN_URL,
+        {
           method: "POST",
           headers: {
             Authorization: `Bearer ${configuredCartesiaApiKey}`,
@@ -1632,14 +1870,10 @@ function createRelay(opts) {
             grants: { stt: true },
             expires_in: cartesiaAccessTokenExpiresInSeconds,
           }),
-          signal: mintAbortController.signal,
-        });
-      } finally {
-        clearTimeout(mintTimeoutTimer);
-      }
-
-      const rawText =
-        response && typeof response.text === "function" ? await response.text() : "";
+        },
+        cartesiaAccessTokenMintTimeoutMs,
+        mintTiming,
+      );
       let payload = {};
       if (rawText) {
         try {
@@ -1672,15 +1906,16 @@ function createRelay(opts) {
       );
     } catch (err) {
       const message = err && err.message ? err.message : "Cartesia access-token request failed";
+      const timing = mintTimingFields(nowMs, mintTiming);
       logger.warn(
-        `[relay] cartesia access token failed: clientId=${clientId} voiceSessionId=${voiceSessionId} message=${tailForLog(message)}`,
+        `[relay] cartesia access token failed: clientId=${clientId} voiceSessionId=${voiceSessionId} ${formatMintTiming(timing)} message=${tailForLog(message)}`,
       );
       emitDebug(
         "voice.timeline",
         "cartesia_access_token_failed",
         "warn",
         { sessionKey: resolvedSessionKey },
-        () => ({ clientId, voiceSessionId, message: tailForLog(message) }),
+        () => ({ clientId, voiceSessionId, message: tailForLog(message), ...timing }),
       );
       throw err;
     }
@@ -2469,6 +2704,14 @@ function createRelay(opts) {
       broadcastActivity(activity, activitySource),
   });
 
+  const ownershipClient =
+    openclawClient || (gatewayBridge && gatewayBridge.rawClient) || null;
+  if (ownershipClient && typeof ownershipClient.setSessionAgentResolver === "function") {
+    ownershipClient.setSessionAgentResolver((sessionKey     ) =>
+      sessionService.getSessionAgentId(sessionKey, sessionKey),
+    );
+  }
+
   const relayHealth = createRelayHealthMonitor({
     emitDebug(event, severity, data) {
       emitDebug(
@@ -2587,7 +2830,8 @@ function createRelay(opts) {
       previous.thinkingLevel !== config.thinkingLevel ||
       previous.effectiveThinkingLevel !== config.effectiveThinkingLevel ||
       previous.thinkingDefault !== config.thinkingDefault ||
-      JSON.stringify(previous.thinkingLevels) !== JSON.stringify(config.thinkingLevels)
+      JSON.stringify(previous.thinkingLevels) !== JSON.stringify(config.thinkingLevels) ||
+      previous.fastModeSupported !== config.fastModeSupported
     )) {
       server.broadcast(handler.formatSessionModelConfig(config));
     }
@@ -2975,6 +3219,13 @@ function createRelay(opts) {
     });
   }
 
+  function unicastActivityPlanReplay(clientId     ) {
+    if (!server || !handler || !clientId || !upstreamRuntime) return;
+    const frame = upstreamRuntime.getActivityPlanReplay();
+    if (!frame) return;
+    server.unicast(clientId, handler.formatActivity(activityStatusAdapter.augmentActivity(frame)));
+  }
+
   function appClientSupportsCapabilitySnapshot(entry) {
     return !!(
       entry &&
@@ -3182,6 +3433,30 @@ function createRelay(opts) {
         reason: "glasses_disconnected",
       });
     }
+    rotateLiveUiSessionGenerationAfterDisconnect(sessionKey);
+  }
+
+  const liveUiPaintedSessionKeys      = new Set();
+  function rotateLiveUiSessionGenerationAfterDisconnect(sessionKey     ) {
+    const normalizedSessionKey = normalizeAppSessionKeyForCompare(sessionKey);
+    const keys = normalizedSessionKey
+      ? [normalizedSessionKey].filter((key) => liveUiPaintedSessionKeys.has(key))
+      : [...liveUiPaintedSessionKeys];
+    const rotated        = [];
+    for (const key of keys) {
+      liveUiPaintedSessionKeys.delete(key);
+      const generation = rotateLiveUiSessionGeneration(key);
+      if (generation) rotated.push({ sessionKey: key, liveUiSessionGeneration: generation });
+    }
+    if (rotated.length === 0) return;
+    emitDebug(
+      "glasses.lifecycle",
+      "disconnect_generation_rotated",
+      "info",
+      {},
+      () => ({ rotated }),
+    );
+    if (server) broadcastStatus();
   }
 
   const appClientSessionLeftHandlers      = new Set();
@@ -3240,6 +3515,9 @@ function createRelay(opts) {
     return () => pairingCompletedHandlers.delete(handler);
   }
   function dispatchPairingCompleted(completionId     ) {
+
+    try { if (getActiveBackendKind() === "openclaw") firstUseStore?.notePairingCompleted(); }
+    catch (err     ) { logger.warn(`[relay] setup first-use pairing note failed: ${err && err.message ? err.message : err}`); }
 
     try { if (getActiveBackendKind() === "openclaw") firstUseRelayRun?.pairingCompleted(); }
     catch (err     ) { logger.warn(`[relay] setup pairing wake failed: ${err && err.message ? err.message : err}`); }
@@ -3390,6 +3668,8 @@ function createRelay(opts) {
     const { sessionKey, liveUiSessionGeneration } = currentLiveUiSessionContext(
       params && params.sessionKey,
     );
+    const paintedSessionKey = normalizeAppSessionKeyForCompare(sessionKey);
+    if (paintedSessionKey) liveUiPaintedSessionKeys.add(paintedSessionKey);
     const renderSurfaceId = params && typeof params.surfaceId === "string" ? params.surfaceId : "";
     const payload = {
       type: "glasses_ui_render",
@@ -3976,6 +4256,12 @@ function createRelay(opts) {
     return "attachment_upstream_rejected";
   }
 
+  function settlePendingUserSend(id     ) {
+    if (conversationState && typeof conversationState.settleUserSend === "function") {
+      conversationState.settleUserSend(id);
+    }
+  }
+
   function dispatchOcuClawUserSend(params      = {}) {
     const sendId = typeof params.id === "string" ? params.id.trim() : "";
     const dedupeSessionKey = params.sessionKey || sessionService.peekSessionKey();
@@ -4065,7 +4351,7 @@ function createRelay(opts) {
       sessionService.recordDisplayToggleStates(resolvedSessionKey, {
         emoji: displaySignals.neuralEmojiReactorState === "active",
         pace: displaySignals.neuralPaceModulatorState === "active",
-        beat: displaySignals.naturalTextFlowEnabled === true,
+        beat: displaySignals.neuralPaceModulatorState === "active",
       });
     }
 
@@ -4189,6 +4475,10 @@ function createRelay(opts) {
         conversationState.addMessage("user", userContent, null, {
           clientSendId: id,
         });
+
+        if (typeof conversationState.markUserSendPending === "function") {
+          conversationState.markUserSendPending(id);
+        }
         emitDebug(
           "openclaw.message",
           "user_message",
@@ -4220,6 +4510,10 @@ function createRelay(opts) {
           }
           const ackAt = Date.now();
           observeFirstUse("ack", id, result);
+          const ackStatus = result && typeof result.status === "string"
+            ? result.status.trim().toLowerCase()
+            : "accepted";
+          if (ackStatus !== "accepted" && ackStatus !== "queued") settlePendingUserSend(id);
           const runId = result && result.runId ? result.runId : null;
 
           if (params.sentByAppClient === true) {
@@ -4272,6 +4566,7 @@ function createRelay(opts) {
         },
         (err) => {
           observeFirstUse("failed", id);
+          settlePendingUserSend(id);
           if (materializesHermesDraft) {
             sessionService.releaseDraftSessionSend(resolvedSessionKey);
           }
@@ -4467,6 +4762,7 @@ function createRelay(opts) {
   let evenAiEndpoint = null;
   let evenAiRouter = null;
   let evenAiRunWaiter = null;
+  let evenAiRestartRecovery = null;
   const pendingBufferedEvenAiResponses = new Map();
   let observationBroadcastPending = false;
   const evenAiRequestObservation = createEvenAiRequestObservation({
@@ -4755,6 +5051,16 @@ function createRelay(opts) {
     }
   }
 
+  function readinessClientEntry(clientId     ) {
+    const snapshot =
+      server && typeof server.getReadinessSnapshot === "function"
+        ? server.getReadinessSnapshot()
+        : null;
+    return snapshot && Array.isArray(snapshot.clients)
+      ? snapshot.clients.find((client     ) => client && client.clientId === clientId) || null
+      : null;
+  }
+
   const handler = createDownstreamHandler({
     logger,
     externalDebugToolsEnabled,
@@ -4774,6 +5080,9 @@ function createRelay(opts) {
     },
 
     onSend(id, text, sessionKey, attachment, clientDisplaySignals, firstUsePhoneOrigin     , firstUseClientId     ) {
+
+      const scripted = attachment ? null : maybeAbsorbScriptedAppSend(id, text, sessionKey);
+      if (scripted) return scripted;
       return dispatchOcuClawUserSend({
         id,
         text,
@@ -4880,7 +5189,17 @@ function createRelay(opts) {
       const sessionId = payload.sessionId;
       const activeSessionKey = sessionService.peekSessionKey();
       if (sessionId !== activeSessionKey) return null;
-      return activeLedgerSnapshot();
+      const snapshot = activeLedgerSnapshot();
+
+      if (
+        payload.quiet === true &&
+        snapshot !== null &&
+        payload.entriesRevision === snapshot.entriesRevision &&
+        payload.lastSeq === snapshot.lastSeq
+      ) {
+        return null;
+      }
+      return snapshot;
     },
     onResyncRequest(payload      = {}) {
       const sessionId = payload.sessionId;
@@ -5847,6 +6166,11 @@ function createRelay(opts) {
     onSimulateVoice(request) {
       const phase = request.phase;
       const text = typeof request.text === "string" ? request.text : "";
+      if (phase === "await-send") {
+        const awaitKey = (typeof request.sessionKey === "string" && request.sessionKey.trim())
+          || sessionService.peekSessionKey() || "";
+        return awaitScriptedAppSend(awaitKey, request.timeoutMs);
+      }
 
       if (phase === "reopen") {
 
@@ -5897,6 +6221,8 @@ function createRelay(opts) {
       );
       if (phase === "arm" || phase === "disarm") {
         voiceScriptingArmed = phase === "arm";
+
+        if (phase === "disarm") clearScriptedAppSend();
         return Promise.resolve({ status: "accepted" });
       }
       if (!server || !handler) {
@@ -5910,6 +6236,13 @@ function createRelay(opts) {
         return Promise.resolve({ status: "accepted" });
       }
       if (phase === "commit") {
+        if (request.awaitAppSend === true) {
+
+          server.broadcast(handler.formatListenCommitted(text, "endpoint", sessionKey));
+          dropPendingCommitPublish(sessionKey);
+          armScriptedAppSend(sessionKey, text, request.runId);
+          return Promise.resolve({ status: "accepted" });
+        }
         server.broadcast(
           handler.formatListenCommitted(text, "endpoint", request.sessionKey || null),
         );
@@ -6211,6 +6544,10 @@ function createRelay(opts) {
       }
     },
 
+    onInputStarted(_clientId     , input     ) {
+      backendPrewarm.noteInputStarted(input);
+    },
+
     onGetSkillsCatalog() {
       return upstreamRuntime
         ? upstreamRuntime.getSkillsCatalogSnapshot()
@@ -6285,14 +6622,13 @@ function createRelay(opts) {
     },
 
     isPhoneClient(clientId     ) {
-      const snapshot =
-        server && typeof server.getReadinessSnapshot === "function"
-          ? server.getReadinessSnapshot()
-          : null;
-      const entry = snapshot && Array.isArray(snapshot.clients)
-        ? snapshot.clients.find((client     ) => client && client.clientId === clientId)
-        : null;
+      const entry = readinessClientEntry(clientId);
       return !!(entry && entry.clientKind === "app");
+    },
+
+    clientNameOf(clientId     ) {
+      const entry = readinessClientEntry(clientId);
+      return entry && typeof entry.clientName === "string" ? entry.clientName : null;
     },
 
     onReviewLiveuiTask({ taskId, action, expectedDigest }     ) {
@@ -7162,6 +7498,12 @@ function createRelay(opts) {
     host: opts.host,
     port: opts.port,
     token: opts.token,
+
+    failStartOnBindConflict: opts.failStartOnBindConflict === true,
+
+    appDisconnectGraceMs: Number.isFinite(opts.liveuiReconnectGraceMs)
+      ? opts.liveuiReconnectGraceMs
+      : LIVEUI_RECONNECT_GRACE_DEFAULT_MS,
     onWorkerBackpressure: (message) => glassesBackpressureLatch.report(message),
     externalDebugToolsEnabled,
     evenAiEnabled: opts.evenAiEnabled === true,
@@ -7236,12 +7578,29 @@ function createRelay(opts) {
       if (driverSnapshot && server && handler) {
         server.unicast(clientId, handler.formatSessionDriverState(driverSnapshot));
       }
+
+      if (upstreamRuntime && typeof upstreamRuntime.getActivityPlanReplay === "function") {
+        setTimeout(() => unicastActivityPlanReplay(clientId), 0);
+      }
       if (
         Array.isArray(entry && entry.clientCapabilities) &&
         entry.clientCapabilities.includes("ledgerV1")
       ) {
 
-        setTimeout(() => broadcastEntriesForActiveLedgerClients("ledger_client_attached"), 0);
+        setTimeout(() => {
+          const snapshot = activeLedgerSnapshot();
+          if (
+            snapshot !== null &&
+            !!cachedEntries &&
+            entriesSessionId === (sessionService.peekSessionKey() || null) &&
+            entriesRevision === snapshot.entriesRevision &&
+            entriesLastSeq === snapshot.lastSeq
+          ) {
+            replyDelivery.notifyEntriesChanged();
+            return;
+          }
+          broadcastEntriesForActiveLedgerClients("ledger_client_attached");
+        }, 0);
       }
     },
     onAppPresenceChanged(reason     ) {
@@ -7569,7 +7928,8 @@ function createRelay(opts) {
     noteRunOutcomeFrame,
     observeSetupEvent: (name     , data     ) => {
       if (name === "message") observeFirstUse("reply", data);
-      if (name === "error" || name === "connectFailed" || (name === "status" && data === "disconnected")) observeFirstUse("clear");
+
+      if ((name === "error" && data?.aborted !== true) || name === "connectFailed" || (name === "status" && data === "disconnected")) observeFirstUse("clear");
     },
     logger,
     stateDir: opts.stateDir,
@@ -7866,6 +8226,20 @@ function createRelay(opts) {
       logger,
       emitDebug,
     });
+
+    if (relayBackendKind === "openclaw" && opts.stateDir) {
+      evenAiRestartRecovery = createEvenAiRestartRecovery({
+        journal: createEvenAiSendJournal({ stateDir: opts.stateDir, logger }),
+        gatewayBridge,
+        logger,
+        emitDebug,
+        dispatchGatewayUserSend(sessionKey     , send     ) {
+          return sessionService.dispatchUserSend(sessionKey, send);
+        },
+        beginPromptTurnOwnership,
+        cancelPromptTurnOwnership,
+      });
+    }
     evenAiEndpoint = createEvenAiEndpoint({
       requestObservation: evenAiRequestObservation,
       logger,
@@ -7880,6 +8254,12 @@ function createRelay(opts) {
         return evenAiSettingsStore.getSnapshot().systemPrompt;
       },
       hostProvidesReadability: relayBackendKind === "hermes",
+
+      getSharedSessionChannelPrompt(sessionKey     ) {
+        return relayBackendKind === "hermes"
+          ? stablePromptSnapshots.peek(sessionKey, sessionKey)
+          : "";
+      },
       requestTimeoutMs: opts.evenAiRequestTimeoutMs,
       gatewayUserSendHoldDeadlineMs:
         Number.isFinite(opts.greetingHoldDeadlineMs) && opts.greetingHoldDeadlineMs > 0
@@ -7895,6 +8275,7 @@ function createRelay(opts) {
       cancelPromptTurnOwnership,
       router: evenAiRouter,
       runWaiter: evenAiRunWaiter,
+      restartRecovery: evenAiRestartRecovery,
       emitDebug,
       dispatchOcuClawUserSend(params     ) {
         return dispatchOcuClawUserSend(params);
@@ -8479,6 +8860,9 @@ function createRelay(opts) {
       if (evenAiRunWaiter) {
         evenAiRunWaiter.close();
       }
+      if (evenAiRestartRecovery) {
+        evenAiRestartRecovery.close();
+      }
       if (upstreamRuntime) {
         upstreamRuntime.stop();
       }
@@ -8549,7 +8933,7 @@ function createRelay(opts) {
     __stablePromptWouldChurnForTest(sessionKey     , perTurnSignals      = {}) {
       const startEmoji = perTurnSignals.neuralEmojiReactorState === "active";
       const startPace = perTurnSignals.neuralPaceModulatorState === "active";
-      const startBeat = perTurnSignals.naturalTextFlowEnabled === true;
+      const startBeat = startPace;
       return stablePromptSnapshots.wouldChurn(
         sessionKey,
         sessionKey,
@@ -8646,6 +9030,12 @@ function createRelay(opts) {
       return sessionService.getDistillerBudget();
     },
 
+    isFirstUseAttemptOpen() {
+      if (!firstUseStore) return false;
+      try { return firstUseAttemptHoldsSideWork(firstUseStore.read(), Date.now()); }
+      catch (_) { return false; }
+    },
+
     deleteDistillerSession(sessionKey) {
       return sessionService.deleteSessions("ocuclaw", [sessionKey]);
     },
@@ -8681,7 +9071,10 @@ function createRelay(opts) {
 
           let phone      = null;
           try { phone = readSetupPhone(); } catch (_) { phone = null; }
-          const begun      = firstUseStore.begin(input.sessionKey || firstUseStore.read()?.sessionKey || sessionService.peekSessionKey(), input.retry === true, phone);
+
+          const stored      = firstUseStore.read();
+          const resumeSession = firstUseAttemptPredatesPairing(stored) ? phone?.sessionKey : stored?.sessionKey;
+          const begun      = firstUseStore.begin(input.sessionKey || resumeSession || sessionService.peekSessionKey(), input.retry === true, phone);
           const settled = settledRunErrored(begun);
           return settled ? { ...begun, replyRunErrored: settled } : begun;
         }
@@ -8821,6 +9214,14 @@ function createRelay(opts) {
 
     _clearLogicalSessionState(sessionKey) {
       clearLogicalSessionState(sessionKey, "test_hook");
+    },
+
+    _dispatchAppClientDisconnectForTest(sessionKey     ) {
+      dispatchAppClientDisconnect(sessionKey);
+    },
+
+    _currentStatusForTest() {
+      return cacheStatus(buildStatusObject());
     },
 
     sendGlassesUiRender(params) {

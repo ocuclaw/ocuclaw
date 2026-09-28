@@ -1,5 +1,6 @@
 """Hermes Board reads (#3028), the watch write (#3050, OcuClaw's own store
-in ``board_watch``) and the moment policy (#3053, the same store, in
+in ``board_watch``), the rule write and read (#3947, a watch by worker, the
+same store) and the moment policy (#3053, the same store, in
 ``board_moments``); contract in docs/hermes-board/contract.md.
 
 Stock only: read-only SQLite and board.json, never ``kanban_db_connect.connect()``
@@ -23,9 +24,13 @@ import sqlite3
 logger = logging.getLogger(__name__)
 
 OPERATIONS = {"board.status", "board.boards", "board.lanes", "board.cards", "board.card", "board.timeline",
-              "board.watch", "board.policy", "board.policy.set", "board.create", "board.receipt",
+              "board.watch", "board.watch.rule", "board.watch.rules", "board.policy", "board.policy.set",
+              "board.create", "board.receipt",
               "board.verdict", "board.comment", "board.tools.enable", "board.decompose", "board.action",
               "board.maintenance", "board.export", "board.export.part", "board.artifact", "board.artifact.part"}
+#: #3947: ``board.watch.rule`` sets a rule (a watch by worker) in OcuClaw's
+#: own store, like ``board.watch``; ``board.watch.rules`` reads this
+#: profile's rules on every board.
 #: #3050: ``board.watch`` writes OcuClaw's own store only. #3053:
 #: ``board.policy.set`` (the moment policy) does too. #3055: ``board.create``
 #: is the first native write (``board_create``); ``board.receipt`` looks up its
@@ -48,14 +53,17 @@ OPERATIONS = {"board.status", "board.boards", "board.lanes", "board.cards", "boa
 #: #3044: ``board.artifact`` and ``board.artifact.part`` open one card artifact
 #: (``board_artifacts``). They are reads: the copy lands in OcuClaw's own temp
 #: area, like an export's archive, and Hermes is never written.
-WRITES = {"board.watch", "board.policy.set", "board.create", "board.verdict", "board.comment",
+WRITES = {"board.watch", "board.watch.rule", "board.policy.set", "board.create", "board.verdict", "board.comment",
           "board.tools.enable", "board.decompose", "board.action", "board.export", "board.export.part"}
 #: #3053: the moment policy's read and write, profile-scoped, no board.
 POLICY_OPERATIONS = {"board.policy", "board.policy.set"}
+#: #3947: the rule write and the rules read, worded for a rule.
+RULE_OPERATIONS = {"board.watch.rule", "board.watch.rules"}
 READS = OPERATIONS - WRITES
 #: Operations that name one board (#3043) or one card on it (#3044, #3050), or
 #: carry an operation key (#3055).
-TARGETED = {"board.lanes", "board.cards", "board.card", "board.timeline", "board.watch", "board.create",
+TARGETED = {"board.lanes", "board.cards", "board.card", "board.timeline", "board.watch", "board.watch.rule",
+            "board.create",
             "board.receipt", "board.verdict", "board.comment", "board.decompose", "board.action",
             "board.maintenance", "board.export", "board.export.part", "board.artifact", "board.artifact.part"}
 #: #3063: the maintenance section's own operations, worded for it.
@@ -310,6 +318,14 @@ WATCH_MESSAGES = {
     "deferred": "Notify + wake isn't available yet.",
     # #3064: its own code, since the phone withdraws Board on `unsupported`.
     "wake_unsupported": "Notify + wake isn't supported by this Hermes.",
+}
+
+#: #3947: the same codes, worded for a rule (a watch by worker).
+RULE_MESSAGES = {
+    "temporarily_unavailable": "Board couldn't save this rule. Try again shortly.",
+}
+RULES_READ_MESSAGES = {
+    "temporarily_unavailable": "Board couldn't read your worker rules. Try again shortly.",
 }
 
 #: #3053: the same codes, worded for the moment policy.
@@ -1304,6 +1320,45 @@ def set_watch(profile: str, slug: str, card_id: str, db: Path, meta: Path, mode:
         raise BoardReadError("temporarily_unavailable") from None
 
 
+#: #3947: a rule's worker is a Hermes profile name, the rule ``board.create``
+#: and ``board.action`` apply to an assignee.
+_RULE_ASSIGNEE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_RULE_KEYS = {"slug", "assignee", "mode"}
+
+
+def write_rule(root: Path, payload: dict, profile: str) -> dict:
+    """#3947: set this profile's rule for one worker on one board (a watch by
+    worker). The board must exist; the worker need not have a card on it.
+    OcuClaw's own store only, never Hermes. Idempotent: a retry, or a mode
+    change, keeps the rule's first start."""
+    from . import board_moments, board_watch
+    if set(payload) != _RULE_KEYS:
+        raise BoardReadError("invalid_request")
+    slug, db, meta = _target(root, payload)
+    assignee, mode = payload.get("assignee"), payload.get("mode")
+    if not isinstance(assignee, str) or not _RULE_ASSIGNEE.match(assignee):
+        raise BoardReadError("invalid_request")
+    if not isinstance(mode, str) or mode not in board_watch.RULE_MODES:
+        raise BoardReadError("invalid_request")
+    _read(db, lambda conn: None)  # the board's store is there and readable (store_missing, schema_unsupported)
+    try:
+        board_moments.note_rule(profile, slug, assignee, db, meta, mode)
+    except (board_watch.WatchStoreError, board_moments.MomentStoreError):
+        raise BoardReadError("temporarily_unavailable") from None
+    return {"target": {"slug": slug, "name": _metadata(slug, meta)["name"]},
+            "rule": {"assignee": assignee, "mode": mode}}
+
+
+def watch_rules(profile: str) -> list:
+    """#3947: this profile's rules on every board, sorted by slug then
+    assignee (``board.watch.rules``)."""
+    from . import board_watch
+    try:
+        return board_watch.all_rules(profile)
+    except board_watch.WatchStoreError:
+        raise BoardReadError("temporarily_unavailable") from None
+
+
 def moment_policy(profile: str, payload, *, now=None) -> dict:
     """#3053: this profile's moment policy (``payload`` None), or set it to
     ``payload`` (an idempotent set). OcuClaw's own store only: nothing in
@@ -1348,6 +1403,10 @@ def handle_board(identity: dict, payload, rpc=None) -> dict:
         worded = {**worded, **WATCH_MESSAGES}
     if operation in POLICY_OPERATIONS:
         worded = POLICY_MESSAGES
+    if operation == "board.watch.rule":
+        worded = RULE_MESSAGES
+    if operation == "board.watch.rules":
+        worded = RULES_READ_MESSAGES
     if operation in CREATE_OPERATIONS:
         worded = CREATE_MESSAGES
     if operation in DECOMPOSE_OPERATIONS:
@@ -1397,11 +1456,25 @@ def handle_board(identity: dict, payload, rpc=None) -> dict:
         board["capabilities"] = board_capabilities(engine, tools)
         board["agentTools"] = tools
         return {**identity, "status": "ok", "capabilities": [], "board": board}
-    if operation == "board.watch":
+    if operation == "board.watch.rules":
+        # #3947: the rules read is gated like the policy read (moments), then like a watch.
+        moments = next(row for row in board["capabilities"] if row["key"] == "passive_moments")
+        if not moments["enabled"]:
+            return fail(moments["code"])
+    if operation in ("board.watch", "board.watch.rule", "board.watch.rules"):
         # #3050: the server enforces the watch capability, whatever the phone offered.
+        # #3947: a rule is a watch by worker, so the same capability gates it.
         watch = next(row for row in board["capabilities"] if row["key"] == "watch")
         if not watch["enabled"]:
             return fail(watch["code"])
+    if operation == "board.watch.rules":
+        try:
+            board["rules"] = watch_rules(identity["profileId"])
+        except BoardReadError as refusal:
+            return fail(refusal.code)
+        except Exception:
+            return fail("temporarily_unavailable")
+        return {**identity, "status": "ok", "capabilities": [], "board": board}
     if operation in POLICY_OPERATIONS:
         # #3053: the policy is the moments' own; the server enforces it too.
         moments = next(row for row in board["capabilities"] if row["key"] == "passive_moments")
@@ -1430,6 +1503,8 @@ def handle_board(identity: dict, payload, rpc=None) -> dict:
             board.update(read_card(root, payload, identity["profileId"]))
         elif operation == "board.watch":
             board.update(write_watch(root, payload, identity["profileId"], board["capabilities"]))
+        elif operation == "board.watch.rule":
+            board.update(write_rule(root, payload, identity["profileId"]))
         elif operation == "board.create":
             # #3055: the server enforces `create` again right before the native write.
             from . import board_create

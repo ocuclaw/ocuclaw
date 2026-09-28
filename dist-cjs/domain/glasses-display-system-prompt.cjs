@@ -25,7 +25,13 @@ const PACE_TAG_LINES =
 const BEAT_TAG_LINES =
   "  <beat/>                  — adds one brief pause at a natural thought boundary.\n" +
   "                            Use this exact self-closing tag between visible\n" +
-  "                            words only, never at the start or end; max 3.";
+  "                            words only, never at the start or end; max 3.\n" +
+  "                            Place it where a speaker would pause for\n" +
+  "                            effect: before a punchline, reveal or answer.\n" +
+  "                            Good: \"I checked the whole fridge. <beat/>Just ketchup.\"\n" +
+  "                            Bad:  \"Buy eggs, <beat/>milk, and bread.\" (splits a list)\n" +
+  "                            Never split a list, a name, a number, or a\n" +
+  "                            phrase that must read as one unit.";
 
 const SHARED_RULES =
   "Most messages need NO display markup. Use it only where it adds real warmth,\n" +

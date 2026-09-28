@@ -23,6 +23,14 @@ Agent package and leaves that runtime loading.  This module is therefore the
 only complete removal path, and it carries the recovery for the case where
 generic removal already ran: :data:`ORPHAN_RECOVERY_SOURCE`, a self-contained
 interpreter-level program that needs none of this package.
+
+Since #3765 the precondition is "OcuClaw is not running" rather than "the
+gateway is stopped" (see :mod:`uninstall_gate`). A host where the gateway is
+stopped keeps the one-phase path. Where OcuClaw runs, the first call writes
+the uninstall-pending marker and asks for one ``hermes gateway restart``; the
+restarted gateway registers only the CLI, and the same command then removes
+everything, including the Cloudways Tailscale pieces, and deletes the marker
+last.
 """
 
 from __future__ import annotations
@@ -42,10 +50,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, TextIO
 
+from . import uninstall_gate
+
 
 EXIT_OK = 0
 EXIT_PROBLEM = 1
 EXIT_USAGE = 2
+#: OcuClaw is running: the marker is written (or already was) and the
+#: operator must run `hermes gateway restart`, then this command again.
+EXIT_RESTART_REQUIRED = uninstall_gate.EXIT_RESTART_REQUIRED
 
 PLUGIN_NAME = "ocuclaw"
 SETUP_BUNDLE_NAME = "ocuclaw-setup"
@@ -72,6 +85,9 @@ RUNTIME_STATE_FILES: Sequence[str] = (
     "ocuclaw-display-toggles.json",
     "ocuclaw-model-context-windows.json",
     "ocuclaw-relay-port.json",
+    # Written by the Node runtime's saved-prompts store
+    # (extensions/ocuclaw/src/runtime/saved-prompts-store.ts).
+    "ocuclaw-saved-prompts.json",
     "ocuclaw-session-agents.json",
     "ocuclaw-session-pins.json",
     "ocuclaw-settings.json",
@@ -93,6 +109,12 @@ RUNTIME_STATE_DIRS: Sequence[str] = ("internal-agent-runs",)
 # are OcuClaw-owned files even though no product state ever reaches them.
 PROFILE_STATE_FILES: Sequence[str] = (
     ".ocuclaw.relay-credential.json.lock",
+    # The Board store (board_watch.STORE_FILENAME) and the SQLite sidecars
+    # that carry its name while a connection is open or was interrupted.
+    "ocuclaw-board.db",
+    "ocuclaw-board.db-journal",
+    "ocuclaw-board.db-shm",
+    "ocuclaw-board.db-wal",
     "ocuclaw.app-presence.json",
     "ocuclaw.cloudways-restart-pending.json",
     "ocuclaw.cloudways-setup.json",
@@ -105,10 +127,32 @@ PROFILE_STATE_FILES: Sequence[str] = (
     "ocuclaw.first-run-proof.json",
     "ocuclaw.first-run-proof.lock",
     "ocuclaw.first-run-reply-delivery.json",
+    # optional_setup.ACTIVE / optional_setup.LOCK.
+    "ocuclaw.optional-active.json",
+    "ocuclaw.optional-setup.lock",
     "ocuclaw.pairing-completion.json",
     "ocuclaw.relay-credential.json",
     "ocuclaw.tui-pairing-capability.json",
+    # uninstall_gate.MARKER_FILENAME. Listed for completeness; removal skips
+    # it in the bulk pass and deletes it last, once the plugin is gone, so a
+    # failed run leaves OcuClaw off and the same command retryable (#3765).
+    "ocuclaw.uninstall-pending.json",
 )
+
+# Exact files written directly beneath <HERMES_HOME> (not its state dir).
+# restart_rpc.py keeps its restart-operation receipts there.
+HOME_STATE_FILES: Sequence[str] = ("ocuclaw-restart-receipts.json",)
+
+
+def _default_liveui_library_dir() -> Path:
+    """Host-level LiveUI template library (glasses-ui-library.ts default root).
+
+    It is user-authored content and the OpenClaw plugin reads the same folder,
+    so uninstall preserves it and names it in the receipt.
+    """
+
+    return Path.home() / ".ocuclaw" / "liveui-library"
+
 
 NARROW_ROUTE_TEARDOWN = "tailscale serve --tls-terminated-tcp=8446 off"
 
@@ -123,9 +167,33 @@ def _write_receipt(
         stdout.write(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
         return
     stdout.write(f"OcuClaw uninstall: {receipt.get('status', 'unknown')}\n")
+    message = receipt.get("message")
+    if isinstance(message, str) and message:
+        stdout.write(f"{message}\n")
     command = receipt.get("command")
     if isinstance(command, str) and command:
         stdout.write(f"Run first: {command}\n")
+    gate = receipt.get("gate")
+    if isinstance(gate, Mapping):
+        for key, value in (gate.get("checks") or {}).items():
+            if not value:
+                stdout.write(f"Still running: {key}\n")
+    next_commands = [
+        item for item in receipt.get("nextCommands") or () if isinstance(item, str)
+    ]
+    for index, item in enumerate(next_commands, start=1):
+        stdout.write(f"Next {index}: {item}\n")
+    cancel = [
+        item for item in receipt.get("cancelCommands") or () if isinstance(item, str)
+    ]
+    if cancel:
+        stdout.write(f"To cancel instead: {' then '.join(cancel)}\n")
+    cloudways = receipt.get("cloudways")
+    if isinstance(cloudways, Mapping):
+        stdout.write(
+            "Cloudways Tailscale: "
+            f"{'removed' if cloudways.get('ok') else 'teardown failed'}\n"
+        )
     route = receipt.get("route")
     if isinstance(route, Mapping):
         stdout.write(
@@ -451,8 +519,22 @@ def _runtime_state_absent(runtime_state_dir: Path) -> bool:
 
 
 def _profile_state_absent(home: Path) -> bool:
+    """Every owned state file is gone, except the uninstall-pending marker.
+
+    The marker is removed last, after the plugin checkout, and has its own
+    final check (``uninstallMarkerAbsent``).
+    """
+
     state = home / "state"
-    return all(_path_absent(state / name) for name in PROFILE_STATE_FILES)
+    return all(
+        _path_absent(state / name)
+        for name in PROFILE_STATE_FILES
+        if name != uninstall_gate.MARKER_FILENAME
+    )
+
+
+def _home_state_absent(home: Path) -> bool:
+    return all(_path_absent(home / name) for name in HOME_STATE_FILES)
 
 
 def _default_home() -> Optional[Path]:
@@ -520,6 +602,199 @@ def _default_route_receipt(home: Path) -> tuple[Optional[Path], bool]:
         and record.get("owningGatewayFingerprint") == mine
     )
     return path, owned
+
+
+def _platform_extra(document: Mapping[str, Any]) -> Mapping[str, Any]:
+    try:
+        extra = document["platforms"][PLUGIN_NAME]["extra"]
+    except (KeyError, TypeError):
+        return {}
+    return extra if isinstance(extra, Mapping) else {}
+
+
+def _not_running_gate(
+    evidence: Mapping[str, Any],
+    observed: Mapping[str, Any],
+    home: Path,
+) -> Dict[str, Any]:
+    """Evaluate the "OcuClaw is not running" gate for this run (#3765)."""
+
+    marker_at = uninstall_gate.marker_written_at(home)
+    gate = uninstall_gate.evaluate(
+        evidence,
+        gateway_live=observed.get("gatewayLive"),
+        marker_at=marker_at,
+    )
+    gate["markerPresent"] = marker_at is not None
+    gate["relayEndpoints"] = list(evidence.get("relayEndpoints") or ())
+    return gate
+
+
+def _restart_required_receipt(
+    gate: Mapping[str, Any], *, marker: Path, marker_written: bool
+) -> Dict[str, Any]:
+    return {
+        "status": "restart_required",
+        "reason": (
+            "uninstall_pending_written"
+            if marker_written
+            else "waiting_for_gateway_restart"
+        ),
+        "message": (
+            "OcuClaw is running. It is now marked for removal and stays off "
+            "after the next gateway restart."
+            if marker_written
+            else "OcuClaw is marked for removal but is still running. "
+            "Restart the gateway first."
+        ),
+        "marker": str(marker),
+        "gate": {"checks": dict(gate.get("checks") or {}), "ok": bool(gate.get("ok"))},
+        "nextCommands": list(uninstall_gate.FINISH_COMMANDS),
+        "cancelCommands": list(uninstall_gate.CANCEL_COMMANDS),
+    }
+
+
+# -- Cloudways teardown (#3765) -------------------------------------------------
+
+#: File names the userspace tailscaled we provision writes into
+#: ``~/.local/share/tailscale`` (its logtail config and rotating logs).
+_TAILSCALED_LOG_PREFIX = "tailscaled.log"
+
+
+def _cloudways_owned_present(layout: Any) -> bool:
+    """Plugin-owned Cloudways evidence, never bare binaries.
+
+    ``~/bin/tailscale`` on its own may be the user's; the watchdog job and
+    script, this plugin's tgz install receipt, or a host CLI receipt naming
+    this provisioner are ours.
+    """
+
+    from . import cloudways, receipts
+
+    if cloudways.find_watchdog_job(layout) is not None:
+        return True
+    if layout.script_path.exists() or layout.tgz_receipt.exists():
+        return True
+    receipt = receipts.read_tailscale_cli()
+    provisioner = (
+        receipt.provisioner
+        if receipt is not None
+        else cloudways._raw_receipt_provisioner(receipts.tailscale_cli_path())
+    )
+    return provisioner == cloudways.RECEIPT_PROVISIONER
+
+
+def _remove_empty_dir(path: Optional[Path], removed: list[str]) -> Optional[str]:
+    """rmdir when empty; returns a preservation note when something stays."""
+
+    if path is None or _path_absent(path):
+        return None
+    if path.is_symlink() or not path.is_dir():
+        return "preserved_not_a_plain_directory"
+    try:
+        path.rmdir()
+    except OSError:
+        return "preserved_not_empty"
+    removed.append(str(path))
+    return None
+
+
+def _remove_tailscaled_log_dir(
+    path: Path, removed: list[str], *, binaries_removed: bool
+) -> Optional[str]:
+    """Remove ``~/.local/share/tailscale`` only when it holds nothing foreign.
+
+    Our tailscaled writes only ``tailscaled.log*`` there. A legacy supervisor
+    or any other entry means another install uses it, so it stays.
+    """
+
+    if _path_absent(path):
+        return None
+    if path.is_symlink() or not path.is_dir():
+        return "preserved_not_a_plain_directory"
+    if not binaries_removed:
+        return "preserved_binaries_kept"
+    try:
+        entries = list(path.iterdir())
+    except OSError:
+        return "preserved_unreadable"
+    for entry in entries:
+        if (
+            not entry.name.startswith(_TAILSCALED_LOG_PREFIX)
+            or entry.is_symlink()
+            or not entry.is_file()
+        ):
+            return "preserved_foreign_content"
+    for entry in entries:
+        try:
+            entry.unlink()
+        except OSError:
+            return "preserved_remove_failed"
+    try:
+        path.rmdir()
+    except OSError:
+        return "preserved_remove_failed"
+    removed.append(str(path))
+    return None
+
+
+def _cloudways_route_handled(home: Path) -> bool:
+    """True when the Cloudways rollback will turn the Serve route off itself.
+
+    On Cloudways the route lives in the userspace tailscaled, and the plain
+    `tailscale serve ... off` we would print cannot reach it (no system
+    tailscale, private socket). The rollback runs the port-scoped `off`
+    through that install's own CLI and socket, then removes the route
+    receipt, so uninstall must not stop and ask for the plain command.
+    """
+
+    try:
+        from . import cloudways
+
+        return _cloudways_owned_present(cloudways.Layout.resolve(hermes_home=home))
+    except Exception:  # noqa: BLE001 - unknown means "not handled": keep the old stop
+        return False
+
+
+def _default_cloudways_teardown(home: Path) -> Optional[Dict[str, Any]]:
+    """Undo the Cloudways install when plugin-owned pieces exist, else None.
+
+    Runs while the gateway (and the watchdog's daemon) may still be up, so the
+    rollback's port-scoped ``serve ... off`` still reaches the daemon. The
+    identity under ``~/.tailscale`` is purged unless a foreign install owns
+    the host receipt (the rollback's own keep rule).
+    """
+
+    from . import cloudways, receipts
+
+    layout = cloudways.Layout.resolve(hermes_home=home)
+    if not _cloudways_owned_present(layout):
+        return None
+    report = dict(cloudways.rollback(layout, purge_identity=True))
+    removed = list(report.get("removed") or [])
+    preserved: Dict[str, str] = {}
+    binaries_removed = not report.get("binariesKept") and _path_absent(
+        layout.tailscaled
+    )
+    note = _remove_tailscaled_log_dir(
+        layout.legacy_supervisor_dir, removed, binaries_removed=binaries_removed
+    )
+    if note:
+        preserved[str(layout.legacy_supervisor_dir)] = note
+    note = _remove_empty_dir(layout.bin_dir, removed)
+    if note:
+        preserved[str(layout.bin_dir)] = note
+    host_state = receipts.host_state_dir()
+    note = _remove_empty_dir(host_state, removed)
+    if note:
+        preserved[str(host_state)] = note
+    elif host_state is not None and _path_absent(host_state):
+        # Its parent exists only to hold that state directory.
+        _remove_empty_dir(host_state.parent, removed)
+    report["removed"] = removed
+    if preserved:
+        report["preserved"] = preserved
+    return report
 
 
 def _runtime_state_dir(home: Path, document: Mapping[str, Any]) -> Path:
@@ -802,6 +1077,76 @@ def desktop_removal_notice(home: Optional[Path] = None) -> Dict[str, Any]:
     return notice
 
 
+def _mark_pending(
+    home: Path,
+    gate: Mapping[str, Any],
+    *,
+    acquire_lock: Callable[[Path], Any],
+    json_output: bool,
+    stdout: TextIO,
+) -> int:
+    """Phase 1: write the uninstall-pending marker and ask for one restart."""
+
+    profile_lock = acquire_lock(home)
+    if profile_lock is None:
+        receipt = {"status": "busy", "reason": "uninstall_already_running"}
+        _write_receipt(receipt, json_output=json_output, stdout=stdout)
+        return EXIT_PROBLEM
+    marker = uninstall_gate.marker_path(home)
+    marker_written = False
+    try:
+        # Another run may have marked it while this one waited for consent.
+        if not uninstall_gate.uninstall_pending(home):
+            uninstall_gate.write_marker(home)
+            marker_written = True
+    except OSError:
+        receipt = {"status": "refused", "reason": "marker_unwritable"}
+        _write_receipt(receipt, json_output=json_output, stdout=stdout)
+        return EXIT_PROBLEM
+    finally:
+        _release_profile_lock(profile_lock)
+    _write_receipt(
+        _restart_required_receipt(gate, marker=marker, marker_written=marker_written),
+        json_output=json_output,
+        stdout=stdout,
+    )
+    return EXIT_RESTART_REQUIRED
+
+
+def _cancel_pending(home: Path, *, json_output: bool, stdout: TextIO) -> int:
+    """``hermes ocuclaw uninstall --cancel``: clear the marker, keep OcuClaw."""
+
+    marker = uninstall_gate.marker_path(home)
+    try:
+        cleared = uninstall_gate.remove_marker(home)
+    except OSError:
+        receipt = {
+            "status": "refused",
+            "reason": "marker_unremovable",
+            "marker": str(marker),
+        }
+        _write_receipt(receipt, json_output=json_output, stdout=stdout)
+        return EXIT_PROBLEM
+    if not cleared:
+        receipt = {
+            "status": "not_pending",
+            "message": "No OcuClaw uninstall is pending. Nothing changed.",
+        }
+        _write_receipt(receipt, json_output=json_output, stdout=stdout)
+        return EXIT_OK
+    receipt = {
+        "status": "uninstall_cancelled",
+        "message": (
+            "The pending uninstall is cancelled. OcuClaw starts again after "
+            "the next gateway restart."
+        ),
+        "removed": [str(marker)],
+        "nextCommands": [uninstall_gate.RESTART_COMMAND],
+    }
+    _write_receipt(receipt, json_output=json_output, stdout=stdout)
+    return EXIT_OK
+
+
 def run_uninstall(
     *,
     assume_yes: bool = False,
@@ -822,11 +1167,25 @@ def run_uninstall(
     facts_fn: Any = None,
     profile_secret_present_fn: Any = None,
     host_plugin_remove_fn: Optional[Callable[[Path, Path], bool]] = None,
+    running_evidence_fn: Optional[
+        Callable[[Path, Mapping[str, Any]], Mapping[str, Any]]
+    ] = None,
+    cloudways_teardown_fn: Optional[
+        Callable[[Path], Optional[Mapping[str, Any]]]
+    ] = None,
+    liveui_library_dir: Optional[Path] = None,
+    cancel: bool = False,
     input_fn: Any = input,
     stdout: Optional[TextIO] = None,
     stderr: Optional[TextIO] = None,
 ) -> int:
-    """Perform one full uninstall and print its complete receipt."""
+    """Perform one full uninstall and print its complete receipt.
+
+    While OcuClaw runs, the first call only marks it for removal and asks for
+    one gateway restart (``restart_required``, exit 3); the gateway then boots
+    without OcuClaw and the same command finishes (#3765). ``cancel`` clears
+    that mark instead.
+    """
 
     out = sys.stdout if stdout is None else stdout
     err = sys.stderr if stderr is None else stderr
@@ -836,6 +1195,8 @@ def run_uninstall(
         _write_receipt(receipt, json_output=json_output, stdout=out)
         return EXIT_USAGE
     resolved_home = _resolved(resolved_home)
+    if cancel:
+        return _cancel_pending(resolved_home, json_output=json_output, stdout=out)
     target = Path(plugin_dir) if plugin_dir is not None else resolved_home / "plugins" / PLUGIN_NAME
     loaded_from = Path(module_dir) if module_dir is not None else Path(__file__).parent
     if not _valid_install_target(resolved_home, target, loaded_from):
@@ -902,16 +1263,67 @@ def run_uninstall(
         if teardown_permitted is not None
         else _default_teardown_permitted(observed)
     )
+    collect_evidence = (
+        running_evidence_fn
+        if running_evidence_fn is not None
+        else lambda profile, document: uninstall_gate.observe(
+            profile,
+            plugin_dir=target,
+            runtime_dir=runtime,
+            platform_extra=_platform_extra(document),
+        )
+    )
+    marker = uninstall_gate.marker_path(resolved_home)
 
-    if observed.get("gatewayLive") is not False:
-        receipt = {
-            "status": "gateway_stop_required",
-            "command": "hermes gateway stop",
-        }
-        _write_receipt(receipt, json_output=json_output, stdout=out)
-        return EXIT_PROBLEM
+    # The gate is "OcuClaw is not running", not "the gateway is stopped"
+    # (#3765). On Cloudways `hermes gateway stop` restarts the container, so
+    # a stopped gateway can never be observed there, and right after any boot
+    # Hermes can report the gateway not live while OcuClaw already runs.
+    gate = _not_running_gate(
+        collect_evidence(resolved_home, config), observed, resolved_home
+    )
+    if not gate["ok"]:
+        if gate["markerPresent"]:
+            # Phase 1 already ran: never a second marker, only the same
+            # instructions again.
+            _write_receipt(
+                _restart_required_receipt(gate, marker=marker, marker_written=False),
+                json_output=json_output,
+                stdout=out,
+            )
+            return EXIT_RESTART_REQUIRED
+        if not assume_yes:
+            try:
+                err.write(
+                    "Remove OcuClaw code, setup, configuration, secrets, pairing, "
+                    "and first-run state while preserving Hermes sessions? "
+                    "OcuClaw is running, so this takes one gateway restart. [y/N] "
+                )
+                err.flush()
+                answer = input_fn()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+            if str(answer).strip().lower() not in {"y", "yes"}:
+                receipt = {"status": "cancelled", "reason": "confirmation_declined"}
+                _write_receipt(receipt, json_output=json_output, stdout=out)
+                return EXIT_PROBLEM
+        return _mark_pending(
+            resolved_home,
+            gate,
+            acquire_lock=(
+                profile_lock_fn if profile_lock_fn is not None else _try_profile_lock
+            ),
+            json_output=json_output,
+            stdout=out,
+        )
+    # A present marker is the operator's recorded consent from phase 1.
+    consent_recorded = bool(gate["markerPresent"])
 
-    if can_teardown and observed.get("serveClassification") == "ready":
+    if (
+        can_teardown
+        and observed.get("serveClassification") == "ready"
+        and not _cloudways_route_handled(resolved_home)
+    ):
         receipt = {
             "status": "route_teardown_required",
             "route": {
@@ -923,7 +1335,7 @@ def run_uninstall(
         _write_receipt(receipt, json_output=json_output, stdout=out)
         return EXIT_PROBLEM
 
-    if not assume_yes:
+    if not assume_yes and not consent_recorded:
         try:
             err.write(
                 "Remove OcuClaw code, setup, configuration, secrets, pairing, "
@@ -984,15 +1396,36 @@ def run_uninstall(
         if teardown_permitted is not None
         else _default_teardown_permitted(observed)
     )
-    if observed.get("gatewayLive") is not False:
+    gate = _not_running_gate(
+        collect_evidence(resolved_home, locked_config), observed, resolved_home
+    )
+    if not gate["ok"]:
+        # OcuClaw started while the operator was confirming. Consent is
+        # already given, so mark it now (idempotent) and ask for the restart.
+        marker_written = False
+        if not gate["markerPresent"]:
+            try:
+                uninstall_gate.write_marker(resolved_home)
+                marker_written = True
+            except OSError:
+                _release_profile_lock(profile_lock)
+                receipt = {"status": "refused", "reason": "marker_unwritable"}
+                _write_receipt(receipt, json_output=json_output, stdout=out)
+                return EXIT_PROBLEM
         _release_profile_lock(profile_lock)
-        receipt = {
-            "status": "gateway_stop_required",
-            "command": "hermes gateway stop",
-        }
-        _write_receipt(receipt, json_output=json_output, stdout=out)
-        return EXIT_PROBLEM
-    if can_teardown and observed.get("serveClassification") == "ready":
+        _write_receipt(
+            _restart_required_receipt(
+                gate, marker=marker, marker_written=marker_written
+            ),
+            json_output=json_output,
+            stdout=out,
+        )
+        return EXIT_RESTART_REQUIRED
+    if (
+        can_teardown
+        and observed.get("serveClassification") == "ready"
+        and not _cloudways_route_handled(resolved_home)
+    ):
         _release_profile_lock(profile_lock)
         receipt = {
             "status": "route_teardown_required",
@@ -1008,6 +1441,26 @@ def run_uninstall(
     removed: list[str] = []
     failures: list[str] = []
     externally_supplied_secret_keys: list[str] = []
+
+    # Cloudways first (#3765): the watchdog job, userspace tailscaled, its
+    # script, binaries, receipts and identity. The `hermes ocuclaw cloudways`
+    # verbs that could undo them vanish with the plugin, and the daemon is
+    # still reachable now for the port-scoped Serve teardown. A failure keeps
+    # the plugin (and this command) in place for a retry.
+    teardown_cloudways = (
+        cloudways_teardown_fn
+        if cloudways_teardown_fn is not None
+        else _default_cloudways_teardown
+    )
+    try:
+        cloudways_report = teardown_cloudways(resolved_home)
+    except Exception as exc:  # noqa: BLE001 - reported, and retryable
+        cloudways_report = {"ok": False, "errors": [f"{type(exc).__name__}: {exc}"]}
+    if cloudways_report is not None:
+        removed.extend(str(item) for item in cloudways_report.get("removed") or ())
+        if not cloudways_report.get("ok"):
+            failures.append("cloudways-teardown")
+
     for key in SECRET_KEYS:
         try:
             before = api.get_env_value(key)
@@ -1025,7 +1478,11 @@ def run_uninstall(
 
     state_root = resolved_home / "state"
     for name in PROFILE_STATE_FILES:
+        if name == uninstall_gate.MARKER_FILENAME:
+            continue  # removed last, once the plugin is gone
         _remove_file(state_root / name, removed, failures)
+    for name in HOME_STATE_FILES:
+        _remove_file(resolved_home / name, removed, failures)
     for name in RUNTIME_STATE_FILES:
         _remove_file(runtime / name, removed, failures)
     for name in RUNTIME_STATE_DIRS:
@@ -1055,6 +1512,12 @@ def run_uninstall(
         _remove_file(pairing_widget, removed, failures)
     if owns_desktop_pairing_plugin:
         _remove_owned_desktop_runtime(desktop_pairing_plugin, removed, failures)
+
+    liveui_library = (
+        Path(liveui_library_dir)
+        if liveui_library_dir is not None
+        else _default_liveui_library_dir()
+    )
 
     route: Dict[str, Any]
     classification = observed.get("serveClassification")
@@ -1093,6 +1556,7 @@ def run_uninstall(
     owned_state_checks = {
         "profileSecretsAbsent": profile_secrets_absent,
         "profileStateAbsent": _profile_state_absent(resolved_home),
+        "homeStateAbsent": _home_state_absent(resolved_home),
         "runtimeStateAbsent": runtime_clean,
         "setupBundleAbsent": _path_absent(setup_bundle) if owns_setup_bundle else True,
         "pairingWidgetAbsent": (
@@ -1268,8 +1732,14 @@ def run_uninstall(
     if plugin_renamed and host_plugin_remove_accepted:
         _remove_dir(tombstone, removed, failures)
 
+    # The uninstall-pending marker goes last: until the plugin is gone it is
+    # what keeps a restarted gateway from starting OcuClaw again.
+    if not failures and _path_absent(target):
+        _remove_file(marker, removed, failures)
+
     final_checks = {
         **pre_plugin_checks,
+        "uninstallMarkerAbsent": _path_absent(marker),
         "hostPluginMetadataAbsent": _host_install_metadata_absent(resolved_home),
         # The acceptance question for #2086, asked of the loader's own two
         # doors rather than of the paths this run happens to have touched.
@@ -1316,7 +1786,43 @@ def run_uninstall(
                 and not owns_desktop_pairing_plugin
                 else {}
             ),
+            **(
+                {
+                    "liveuiLibrary": (
+                        f"preserved_user_content ({liveui_library}); "
+                        "the OpenClaw plugin may share it"
+                    )
+                }
+                if not _path_absent(liveui_library)
+                else {}
+            ),
+            **{
+                f"cloudways:{path}": note
+                for path, note in (
+                    (cloudways_report or {}).get("preserved") or {}
+                ).items()
+            },
         },
+        **(
+            {
+                "cloudways": {
+                    key: cloudways_report.get(key)
+                    for key in (
+                        "ok",
+                        "jobRemoved",
+                        "serveRouteRemoved",
+                        "daemon",
+                        "identityKept",
+                        "receiptKept",
+                        "binariesKept",
+                        "errors",
+                    )
+                    if key in cloudways_report
+                }
+            }
+            if cloudways_report is not None
+            else {}
+        ),
         "route": route,
         "finalChecks": final_checks,
         "failures": sorted(set(failures)),
@@ -1352,7 +1858,9 @@ def run_uninstall(
 __all__ = [
     "EXIT_OK",
     "EXIT_PROBLEM",
+    "EXIT_RESTART_REQUIRED",
     "EXIT_USAGE",
+    "HOME_STATE_FILES",
     "ORPHAN_RECOVERY_SOURCE",
     "PROFILE_STATE_FILES",
     "RUNTIME_STATE_FILES",

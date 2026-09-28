@@ -16,6 +16,14 @@ time, so turning a watch off stops future moments for that scoped watch.
 #3052: turning it off also cancels that watch's pending deliveries
 (``board_moments.note_watch``, backed by ``due()``). The tail keeps its own
 tables (checkpoint, watch start, deliveries) in the same store file.
+
+#3947 adds rules: a watch by worker, keyed by profile + board + assignee, so
+cards that do not exist yet (a cron job's next card) can raise moments. A
+rule's mode is ``notify`` (review and question moments) or
+``notify_failures`` (review, question and failure moments); ``off`` removes
+the row, and a rule never raises a done moment. Its row keeps the board
+event it starts after (``since``). ``board_moments.note_rule`` writes it,
+together with the board's checkpoint; this module only reads rules.
 """
 from __future__ import annotations
 
@@ -34,11 +42,22 @@ RESERVED_MODES = ("notify_wake",)
 STORE_FILENAME = "ocuclaw-board.db"
 BUSY_TIMEOUT_SECONDS = 1.0
 
+#: #3947: modes a rule can be set to. ``off`` removes the row.
+RULE_MODES = ("off", "notify", "notify_failures")
+#: #3947: the moment classes each stored rule mode lets through. Never done.
+RULE_CLASSES = {"notify": ("review", "question"), "notify_failures": ("review", "question", "failure")}
+RULE_TABLE = "board_watch_rule"
+
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS board_watch ("
     " profile TEXT NOT NULL, board TEXT NOT NULL, task TEXT NOT NULL,"
     " mode TEXT NOT NULL, updated_at INTEGER NOT NULL,"
-    " PRIMARY KEY (profile, board, task))"
+    " PRIMARY KEY (profile, board, task))",
+    # #3947: rules by worker. ``since`` is the board event the rule starts after.
+    "CREATE TABLE IF NOT EXISTS board_watch_rule ("
+    " profile TEXT NOT NULL, board TEXT NOT NULL, assignee TEXT NOT NULL,"
+    " mode TEXT NOT NULL, since INTEGER NOT NULL, updated_at INTEGER NOT NULL,"
+    " PRIMARY KEY (profile, board, assignee))",
 )
 
 
@@ -67,7 +86,8 @@ def _open(create: bool) -> Optional[sqlite3.Connection]:
     try:
         conn.execute(f"PRAGMA busy_timeout = {int(BUSY_TIMEOUT_SECONDS * 1000)}")
         if create:
-            conn.execute(_SCHEMA)
+            for statement in _SCHEMA:
+                conn.execute(statement)
             if os.name == "posix":
                 os.chmod(path, 0o600)
     except (OSError, sqlite3.Error):
@@ -117,20 +137,64 @@ def watched(profile: str, board: str) -> list:
     return [row[0] for row in rows]
 
 
+def _has_rules(conn: sqlite3.Connection) -> bool:
+    """#3947: a store written before rules has no rule table; reads answer none."""
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                        [RULE_TABLE]).fetchone() is not None
+
+
 def scopes() -> list:
-    """Every ``(profile, board)`` with at least one watch on, sorted (#3051's
-    tail walks these). Reads never create the store."""
+    """Every ``(profile, board)`` with at least one watch or (#3947) rule on,
+    sorted (#3051's tail walks these). Reads never create the store."""
     conn = _open(create=False)
     if conn is None:
         return []
     try:
-        rows = conn.execute("SELECT DISTINCT profile, board FROM board_watch WHERE mode != 'off'"
-                            " ORDER BY profile, board").fetchall()
+        sql = "SELECT profile, board FROM board_watch WHERE mode != 'off'"
+        if _has_rules(conn):
+            sql += " UNION SELECT profile, board FROM board_watch_rule WHERE mode != 'off'"
+        rows = conn.execute(sql + " ORDER BY profile, board").fetchall()
     except sqlite3.Error:
         raise WatchStoreError("store unreadable") from None
     finally:
         conn.close()
     return [(row[0], row[1]) for row in rows]
+
+
+def rules(profile: str, board: str) -> dict:
+    """#3947: ``{assignee: (mode, since)}`` for this profile's rules on
+    ``board``. Reads never create the store."""
+    conn = _open(create=False)
+    if conn is None:
+        return {}
+    try:
+        if not _has_rules(conn):
+            return {}
+        rows = conn.execute("SELECT assignee, mode, since FROM board_watch_rule WHERE profile = ? AND board = ?"
+                            " AND mode != 'off'", [profile, board]).fetchall()
+    except sqlite3.Error:
+        raise WatchStoreError("store unreadable") from None
+    finally:
+        conn.close()
+    return {a: (m, int(s)) for a, m, s in rows if m in RULE_CLASSES}
+
+
+def all_rules(profile: str) -> list:
+    """#3947: this profile's rules on every board, as ``[{slug, assignee,
+    mode}]`` sorted by slug then assignee (``board.watch.rules``)."""
+    conn = _open(create=False)
+    if conn is None:
+        return []
+    try:
+        if not _has_rules(conn):
+            return []
+        rows = conn.execute("SELECT board, assignee, mode FROM board_watch_rule WHERE profile = ?"
+                            " ORDER BY board, assignee", [profile]).fetchall()
+    except sqlite3.Error:
+        raise WatchStoreError("store unreadable") from None
+    finally:
+        conn.close()
+    return [{"slug": b, "assignee": a, "mode": m} for b, a, m in rows if m in RULE_CLASSES]
 
 
 def set_mode(profile: str, board: str, task: str, mode: str,

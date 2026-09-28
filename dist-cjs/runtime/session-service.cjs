@@ -21,8 +21,10 @@ const SESSION_AGENT_CACHE_FILE = "ocuclaw-session-agents.json";
 const SESSION_ADOPT_CACHE_FILE = "ocuclaw-session-adopt-origins.json";
 const PIN_CAP_PER_KIND = 20;
 
+const TRANSCRIPT_SEARCH_CONCURRENCY = 5;
+
 const NEW_SESSION_GREETING_PROMPT =
-  "A new session was started via /new or /reset. Execute your Session Startup sequence now - read the required files before responding to the user. If BOOTSTRAP.md exists in the provided Project Context, read it and follow its instructions first. Then greet the user in your configured persona, if one is provided. Be yourself - use your defined voice, mannerisms, and mood. Keep it to 1-3 sentences and ask what they want to do. If the runtime model differs from default_model in the system prompt, mention the default model. Do not mention internal steps, files, tools, or reasoning.";
+  "A new session was started via /new or /reset. If BOOTSTRAP.md exists in the provided Project Context, follow its instructions first. Otherwise greet the user in your configured persona, if one is provided. Be yourself - use your defined voice, mannerisms, and mood. Keep it to 1-3 sentences and ask what they want to do. If the runtime model differs from default_model in the system prompt, mention the default model. Do not mention internal steps, files, tools, or reasoning.";
 
 const HERMES_NEW_SESSION_GREETING_PROMPT =
   "A new session was started via /new or /reset. Greet the user in your configured persona, if one is provided. Keep it to 1-3 sentences and ask what they want to do. Do not mention internal steps, files, tools, or reasoning.";
@@ -213,11 +215,24 @@ function createSessionService(opts = {}) {
     Number.isFinite(configuredGreetingHoldDeadlineMs) && configuredGreetingHoldDeadlineMs > 0
       ? Math.floor(configuredGreetingHoldDeadlineMs)
       : GREETING_SEND_HOLD_DEADLINE_MS;
+
+  const configuredGreetingPreempt = Reflect.get(opts, "greetingPreempt");
+  const greetingPreemptEnabled =
+    typeof configuredGreetingPreempt === "boolean"
+      ? configuredGreetingPreempt
+      :
+        !/^(0|false|off|no)$/i.test(String(process.env.OCUCLAW_GREETING_PREEMPT || "").trim());
   const greetingSendGate = createGreetingSendGate({
     deadlineMs: greetingHoldDeadlineMs,
-    onRelease({ sessionKey, reason, heldMs, heldSends }) {
+    preempt: greetingPreemptEnabled ? preemptGreetingForEarlyAsk : null,
+    isGreetingLive: isGreetingRunLive,
+    onRelease({ sessionKey, reason, heldMs, heldSends, preempted, deadlineExtensions }) {
       const severity =
-        reason === "greeting_end" ? "info" : reason === "session_reset" ? "debug" : "warn";
+        reason === "greeting_end" || reason === "greeting_aborted"
+          ? "info"
+          : reason === "session_reset"
+            ? "debug"
+            : "warn";
       if (reason === "deadline" || reason === "upstream_disconnected") {
         logger.warn(
           `[relay] New-session greeting hold released: sessionKey=${sessionKey} reason=${reason} heldMs=${heldMs} heldSends=${heldSends}`,
@@ -225,6 +240,8 @@ function createSessionService(opts = {}) {
       }
       if (
         reason === "greeting_end" ||
+        reason === "greeting_error" ||
+        reason === "greeting_aborted" ||
         reason === "deadline" ||
         reason === "upstream_disconnected" ||
         reason === "session_reset" ||
@@ -235,7 +252,13 @@ function createSessionService(opts = {}) {
           "greeting_hold_released",
           severity,
           { sessionKey },
-          () => ({ reason, heldMs, heldSends }),
+          () => ({
+            reason,
+            heldMs,
+            heldSends,
+            preempted: preempted === true,
+            deadlineExtensions: deadlineExtensions || 0,
+          }),
         );
       }
     },
@@ -359,6 +382,13 @@ function createSessionService(opts = {}) {
 
   const pendingInitialConfigSessionKeys = new Set();
 
+  const initialSeedInFlight = new Map();
+
+  const sessionModelConfigWriteGeneration = new Map();
+
+  const transcriptSearchCache = new Map();
+  const transcriptSearchCacheLimit = Math.min(200, Math.max(64, sessionLimit));
+
   const firstUserMessageCache = new Map();
   const firstUserMessageCacheLimit = Math.max(64, sessionLimit * 8);
 
@@ -369,6 +399,10 @@ function createSessionService(opts = {}) {
   const sessionTitleCachePath = resolveSessionTitleCachePath(opts.stateDir);
 
   const sessionTitleByKey = loadSessionTitleCache();
+
+  let openClawAutoLabelSupported = null;
+
+  const autoTitleReconciledKeys = new Set();
 
   const neuralSessionNamesEnabledByKey = new Map();
 
@@ -572,6 +606,10 @@ function createSessionService(opts = {}) {
       reasoningLevel: normalizeReasoningLevel(row && row.reasoningLevel),
       verboseLevel: normalizeVerboseLevel(row && row.verboseLevel),
       fastMode: !!(row && row.fastMode === true),
+
+      ...(row && typeof row.fastModeSupported === "boolean"
+        ? { fastModeSupported: row.fastModeSupported }
+        : {}),
       elevatedLevel: normalizeElevatedLevel(row && row.elevatedLevel),
 
       agentId: sessionAgentSelectorId(sessionKey),
@@ -716,6 +754,10 @@ function createSessionService(opts = {}) {
         patch && Object.prototype.hasOwnProperty.call(patch, "fastMode")
           ? patch.fastMode === true
           : base.fastMode,
+
+      ...(typeof base.fastModeSupported === "boolean"
+        ? { fastModeSupported: base.fastModeSupported }
+        : {}),
       elevatedLevel:
         patch && Object.prototype.hasOwnProperty.call(patch, "elevatedLevel")
           ? normalizeElevatedLevel(patch.elevatedLevel)
@@ -807,7 +849,43 @@ function createSessionService(opts = {}) {
   }
 
   function setSessionModelConfig(sessionKey = ensureSessionKey(), patch, options = {}) {
-    return queueSessionModelConfig(sessionKey, () => writeSessionModelConfig(sessionKey, patch, options));
+    const write = () =>
+      queueSessionModelConfig(sessionKey, () => writeSessionModelConfig(sessionKey, patch, options));
+    if (!options || Reflect.get(options, "initial") !== true ||
+      !pendingInitialConfigSessionKeys.has(sessionKey)) {
+      return write();
+    }
+
+    const inFlight = initialSeedInFlight.get(sessionKey);
+    if (inFlight) {
+      return inFlight.then((result) =>
+        result && result.status === "accepted" ? result : write());
+    }
+    const pending = write();
+    initialSeedInFlight.set(sessionKey, pending);
+    const cleanup = () => {
+      if (initialSeedInFlight.get(sessionKey) === pending) initialSeedInFlight.delete(sessionKey);
+    };
+    pending.then(cleanup, cleanup);
+    return pending;
+  }
+
+  function readBackSessionModelConfigLater(sessionKey, writeGeneration, seededConfig) {
+    Promise.resolve()
+      .then(() => fetchCurrentSessionRow(sessionKey))
+      .then((resolved) => {
+        if (!resolved || !resolved.row) return;
+        if (sessionModelConfigWriteGeneration.get(sessionKey) !== writeGeneration) return;
+        const next = buildSessionModelConfig(sessionKey, resolved.row);
+        const current = sessionModelConfigCache.get(sessionKey) || seededConfig;
+        sessionModelConfigCache.set(sessionKey, next);
+        if (JSON.stringify(next) !== JSON.stringify(current)) {
+          notifySessionModelConfigIfCurrent(sessionKey, next);
+        }
+      })
+      .catch(() => {
+
+      });
   }
 
   async function writeSessionModelConfig(
@@ -831,8 +909,17 @@ function createSessionService(opts = {}) {
       };
     }
 
+    const writeGeneration = (sessionModelConfigWriteGeneration.get(sessionKey) || 0) + 1;
+    sessionModelConfigWriteGeneration.set(sessionKey, writeGeneration);
+
+    const freshInitialSeed =
+      !!options &&
+      Reflect.get(options, "initial") === true &&
+      pendingInitialConfigSessionKeys.has(sessionKey) &&
+      gatewayBridge.kind === "openclaw" &&
+      getActiveBackendKind() !== "hermes";
     let canonicalKey = await resolveSessionCanonicalKey(sessionKey);
-    if (hasSupportedSessionKeyPrefix(sessionKey)) {
+    if (hasSupportedSessionKeyPrefix(sessionKey) && !freshInitialSeed) {
       const resolved = await fetchCurrentSessionRow(sessionKey);
       const row = resolved && resolved.row ? resolved.row : null;
       if (row && typeof row.key === "string" && row.key.trim()) {
@@ -944,11 +1031,15 @@ function createSessionService(opts = {}) {
           }
         }
 
-        try {
-          const resolved = await fetchCurrentSessionRow(sessionKey);
-          if (resolved?.row) config = buildSessionModelConfig(sessionKey, resolved.row);
-        } catch {
+        if (freshInitialSeed) {
+          readBackSessionModelConfigLater(sessionKey, writeGeneration, config);
+        } else {
+          try {
+            const resolved = await fetchCurrentSessionRow(sessionKey);
+            if (resolved?.row) config = buildSessionModelConfig(sessionKey, resolved.row);
+          } catch {
 
+          }
         }
         sessionModelConfigCache.set(sessionKey, config);
       }
@@ -998,6 +1089,8 @@ function createSessionService(opts = {}) {
           return hasSupportedSessionKeyPrefix(key) && !isEvenAiSessionKey(key);
         })
         .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
+
+      reconcileOpenClawAutoTitles(sortedRows).catch(() => {});
 
       const sessions = await Promise.all(
         sortedRows.map(async (row) => {
@@ -1477,7 +1570,7 @@ function createSessionService(opts = {}) {
     const cached = getSessionTitle(sessionKey);
     if (cached !== null) return cached;
 
-    const candidates = [row?.title, row?.label, row?.displayName];
+    const candidates = [row?.title, row?.label, row?.autoLabel, row?.displayName];
     for (const candidate of candidates) {
       if (typeof candidate !== "string") continue;
       const trimmed = candidate.trim();
@@ -1944,6 +2037,7 @@ function createSessionService(opts = {}) {
         sessionTitleByKey.delete(key);
         firstSentUserMessageBySession.delete(key);
         distillerBudget.clear(key);
+        transcriptSearchCache.delete(key);
         deleted.push(key);
       } catch (err) {
         failed.push({ key, reason: err?.message ?? "unknown" });
@@ -1990,36 +2084,43 @@ function createSessionService(opts = {}) {
     const sessions = await getTranscriptSearchSessions(kind).catch(() => []);
     const snippets = [];
     let truncated = false;
-    for (const session of sessions) {
-      if (snippets.length >= maxSnippets) {
-        truncated = true;
-        break;
-      }
-      if (
+    const searchable = sessions.map((session) => !(
+      (
         kind === "ocuclaw" &&
         (
           !hasSupportedSessionKeyPrefix(session.key) ||
           isEvenAiSessionKey(session.key) ||
           isForeignHermesSessionKey(session.key)
         )
-      ) continue;
-      if (kind === "evenai" && !isEvenAiSessionKey(session.key)) continue;
-      let history;
-      try {
-        history = await gatewayBridge.request("chat.history", {
-          sessionKey: session.key,
-          limit: 200,
-        });
-      } catch {
-        continue;
+      ) ||
+      (kind === "evenai" && !isEvenAiSessionKey(session.key))
+    ));
+
+    const loads = new Array(sessions.length);
+    let nextLoad = 0;
+    function fillWindow(scanIndex) {
+      while (nextLoad < sessions.length && nextLoad < scanIndex + TRANSCRIPT_SEARCH_CONCURRENCY) {
+        if (searchable[nextLoad]) loads[nextLoad] = loadSearchTranscript(sessions[nextLoad]);
+        nextLoad += 1;
       }
-      const messages = (history && Array.isArray(history.messages)) ? history.messages : [];
+    }
+    for (let index = 0; index < sessions.length; index += 1) {
+      const session = sessions[index];
+      if (snippets.length >= maxSnippets) {
+        truncated = true;
+        break;
+      }
+      if (!searchable[index]) continue;
+      fillWindow(index);
+      const messages = await loads[index];
+      loads[index] = null;
+      if (!messages) continue;
       for (const msg of messages) {
         if (snippets.length >= maxSnippets) {
           truncated = true;
           break;
         }
-        const text = extractRawMessageText(msg);
+        const text = msg.text;
         if (!text) continue;
         const lower = text.toLowerCase();
         const idx = lower.indexOf(needle);
@@ -2039,6 +2140,38 @@ function createSessionService(opts = {}) {
       }
     }
     return { snippets, truncated, unavailable: false };
+  }
+
+  function loadSearchTranscript(session) {
+    const updatedAt = Number.isFinite(session && session.updatedAt) ? session.updatedAt : 0;
+    const cached = updatedAt > 0 ? transcriptSearchCache.get(session.key) : null;
+    if (cached && cached.updatedAt === updatedAt) {
+
+      transcriptSearchCache.delete(session.key);
+      transcriptSearchCache.set(session.key, cached);
+      return Promise.resolve(cached.messages);
+    }
+    return Promise.resolve()
+      .then(() => gatewayBridge.request("chat.history", {
+        sessionKey: session.key,
+        limit: 200,
+      }))
+      .then((history) => {
+        const raw = (history && Array.isArray(history.messages)) ? history.messages : [];
+        const messages = [];
+        for (const msg of raw) {
+          const text = extractRawMessageText(msg);
+          if (text) messages.push({ role: typeof msg.role === "string" ? msg.role : "", text });
+        }
+        if (updatedAt > 0) {
+          transcriptSearchCache.delete(session.key);
+          transcriptSearchCache.set(session.key, { updatedAt, messages });
+          while (transcriptSearchCache.size > transcriptSearchCacheLimit) {
+            transcriptSearchCache.delete(transcriptSearchCache.keys().next().value);
+          }
+        }
+        return messages;
+      }, () => null);
   }
 
   async function getTranscriptSearchSessions(kind) {
@@ -2337,6 +2470,156 @@ function createSessionService(opts = {}) {
     return entry ? { ...entry } : null;
   }
 
+  const OPENCLAW_LABEL_SUFFIX_MAX = 9;
+
+  function sessionPatchErrorMessage(err) {
+    if (err && typeof err.message === "string") return err.message;
+    return String(err || "");
+  }
+
+  function isLabelInUseError(err) {
+    return /label already in use/i.test(sessionPatchErrorMessage(err));
+  }
+
+  function isAutoLabelRejectedError(err) {
+    return /unexpected property '?autoLabel/i.test(sessionPatchErrorMessage(err));
+  }
+
+  function isOpenClawTitleBackend() {
+    return getActiveBackendKind() !== "hermes";
+  }
+
+  async function requestSessionTitlePatch(sessionKey, canonicalKey, fields) {
+    const result = await gatewayBridge.request(
+      "sessions.patch",
+      gatewaySessionPatchRequest(sessionKey, { key: canonicalKey, ...fields }),
+    );
+    if (result && result.ok === false) {
+      const envelopeError = result.error;
+      const message =
+        typeof envelopeError === "string"
+          ? envelopeError
+          : envelopeError && typeof envelopeError.message === "string"
+            ? envelopeError.message
+            : typeof result.code === "string"
+              ? result.code
+              : "sessions.patch failed";
+      throw new Error(message);
+    }
+    return result;
+  }
+
+  function warnSessionTitlePatchFailed(sessionKey, event, details, err) {
+    const message = sessionPatchErrorMessage(err);
+    logger.warn(
+      `[relay] Session title upstream write failed: sessionKey=${sessionKey} event=${event} error=${message}`,
+    );
+    emitDebug(
+      "relay.session",
+      event,
+      "warn",
+      { sessionKey },
+      () => ({ ...details, message }),
+    );
+  }
+
+  async function writeOpenClawAutoTitle(sessionKey, canonicalKey, title) {
+    if (openClawAutoLabelSupported !== false) {
+      try {
+        await requestSessionTitlePatch(sessionKey, canonicalKey, { autoLabel: title });
+        openClawAutoLabelSupported = true;
+        return { field: "autoLabel", value: title };
+      } catch (err) {
+        if (!isAutoLabelRejectedError(err)) throw err;
+        openClawAutoLabelSupported = false;
+        emitDebug(
+          "relay.session",
+          "session_title_autolabel_unsupported",
+          "info",
+          { sessionKey },
+          () => ({ fallback: "label" }),
+        );
+      }
+    }
+    for (let attempt = 1; attempt <= OPENCLAW_LABEL_SUFFIX_MAX; attempt += 1) {
+      const value = attempt === 1 ? title : `${title} (${attempt})`;
+      try {
+        await requestSessionTitlePatch(sessionKey, canonicalKey, { label: value });
+        return { field: "label", value };
+      } catch (err) {
+        if (!isLabelInUseError(err) || attempt === OPENCLAW_LABEL_SUFFIX_MAX) {
+          throw err;
+        }
+      }
+    }
+    throw new Error("label suffixes exhausted");
+  }
+
+  function isGeneratedTitleLabel(label, title) {
+    if (label === title) return true;
+    if (!label.startsWith(`${title} (`)) return false;
+    return /^ \(\d+\)$/.test(label.slice(title.length));
+  }
+
+  async function reconcileOpenClawAutoTitles(rows) {
+    if (!isOpenClawTitleBackend() || !isUpstreamConnected()) return;
+    for (const row of rows) {
+      const key = extractShortKey(row && row.key);
+      if (!key || autoTitleReconciledKeys.has(key)) continue;
+      const entry = sessionTitleByKey.get(key);
+      if (!entry || entry.userSet === true || !entry.title) continue;
+      const label = typeof row.label === "string" ? row.label.trim() : "";
+      const autoLabel =
+        typeof row.autoLabel === "string" ? row.autoLabel.trim() : "";
+      const migrateLabel = !!label && isGeneratedTitleLabel(label, entry.title);
+      const backfill = !label && !autoLabel;
+      if (!migrateLabel && !backfill) continue;
+      if (migrateLabel && openClawAutoLabelSupported === false) continue;
+      autoTitleReconciledKeys.add(key);
+      const title = entry.title;
+      try {
+        const canonicalKey = await resolveSessionMutationKey("ocuclaw", key);
+
+        const current = sessionTitleByKey.get(key);
+        if (!current || current.userSet === true || current.title !== title) continue;
+        if (migrateLabel) {
+          await requestSessionTitlePatch(key, canonicalKey, {
+            autoLabel: title,
+            label: null,
+          });
+          openClawAutoLabelSupported = true;
+          emitDebug(
+            "relay.session",
+            "session_title_label_migrated",
+            "info",
+            { sessionKey: key },
+            () => ({ from: label, autoLabel: title }),
+          );
+        } else {
+          const written = await writeOpenClawAutoTitle(key, canonicalKey, title);
+          emitDebug(
+            "relay.session",
+            "session_title_upstream_backfilled",
+            "info",
+            { sessionKey: key },
+            () => written,
+          );
+        }
+      } catch (err) {
+        if (migrateLabel && isAutoLabelRejectedError(err)) {
+          openClawAutoLabelSupported = false;
+          continue;
+        }
+        warnSessionTitlePatchFailed(
+          key,
+          "session_title_upstream_reconcile_failed",
+          { migrateLabel },
+          err,
+        );
+      }
+    }
+  }
+
   function setSessionTitle(sessionKey, title, opts) {
     if (!isSessionMutationKeyForKind("ocuclaw", sessionKey)) {
       return { ok: false, code: "invalid_session_key" };
@@ -2388,28 +2671,72 @@ function createSessionService(opts = {}) {
       );
     }
     if (!skipUpstreamMirror && isUpstreamConnected()) {
+
+      const generatedOpenClawTitle = !nextUserSet && isOpenClawTitleBackend();
+
+      autoTitleReconciledKeys.add(sessionKey);
       resolveSessionMutationKey("ocuclaw", sessionKey)
         .then((canonicalKey) =>
-
-          gatewayBridge.request(
-            "sessions.patch",
-            gatewaySessionPatchRequest(sessionKey, {
-              key: canonicalKey,
+          generatedOpenClawTitle
+            ? writeOpenClawAutoTitle(sessionKey, canonicalKey, trimmed)
+            : requestSessionTitlePatch(sessionKey, canonicalKey, {
               label: trimmed,
-            }),
-          ),
+            }).then(() => ({ field: "label", value: trimmed })),
         )
-        .catch((err) => {
+        .then((written) => {
           emitDebug(
             "relay.session",
-            "session_title_upstream_patch_failed",
+            "session_title_upstream_written",
             "debug",
             { sessionKey },
-            () => ({ message: err && err.message ? err.message : String(err) }),
+            () => ({ ...written, origin }),
+          );
+        })
+        .catch((err) => {
+          warnSessionTitlePatchFailed(
+            sessionKey,
+            "session_title_upstream_patch_failed",
+            { origin, userSet: !!nextUserSet },
+            err,
           );
         });
     }
     return { ok: true, replaced, userSet: !!nextUserSet };
+  }
+
+  async function setOpenClawUserSessionTitle(sessionKey, title) {
+    if (typeof title !== "string" || !title.trim()) {
+      return { ok: false, code: "invalid_title" };
+    }
+    const trimmed = title.trim();
+    if (!isUpstreamConnected()) {
+      return setSessionTitle(sessionKey, trimmed, { userSet: true });
+    }
+    try {
+      const canonicalKey = await resolveSessionMutationKey("ocuclaw", sessionKey);
+      await requestSessionTitlePatch(sessionKey, canonicalKey, { label: trimmed });
+    } catch (err) {
+      if (isLabelInUseError(err)) {
+        emitDebug(
+          "relay.session",
+          "session_title_user_conflict",
+          "warn",
+          { sessionKey },
+          () => ({ title: trimmed, message: sessionPatchErrorMessage(err) }),
+        );
+        return { ok: false, code: "session_title_conflict" };
+      }
+      warnSessionTitlePatchFailed(
+        sessionKey,
+        "session_title_upstream_patch_failed",
+        { origin: "user_ui", userSet: true },
+        err,
+      );
+    }
+    return setSessionTitle(sessionKey, trimmed, {
+      userSet: true,
+      skipUpstreamMirror: true,
+    });
   }
 
   async function setUserSessionTitle(sessionKey, title) {
@@ -2417,7 +2744,7 @@ function createSessionService(opts = {}) {
       if (!isSessionMutationKeyForKind("ocuclaw", sessionKey)) {
         return { ok: false, code: "session_not_renamable" };
       }
-      return setSessionTitle(sessionKey, title, { userSet: true });
+      return setOpenClawUserSessionTitle(sessionKey, title);
     }
     if (isForeignHermesSessionKey(sessionKey)) {
       return { ok: false, code: "session_not_renamable" };
@@ -2520,22 +2847,26 @@ function createSessionService(opts = {}) {
     invalidateSessionsCache();
     if (isUpstreamConnected()) {
       resolveSessionCanonicalKey(sessionKey)
-        .then((canonicalKey) =>
-          gatewayBridge.request(
-            "sessions.patch",
-            gatewaySessionPatchRequest(sessionKey, {
-              key: canonicalKey,
-              label: null,
-            }),
-          ),
-        )
+        .then((canonicalKey) => {
+
+          if (!isOpenClawTitleBackend() || openClawAutoLabelSupported === false) {
+            return requestSessionTitlePatch(sessionKey, canonicalKey, { label: null });
+          }
+          return requestSessionTitlePatch(sessionKey, canonicalKey, {
+            label: null,
+            autoLabel: null,
+          }).catch((err) => {
+            if (!isAutoLabelRejectedError(err)) throw err;
+            openClawAutoLabelSupported = false;
+            return requestSessionTitlePatch(sessionKey, canonicalKey, { label: null });
+          });
+        })
         .catch((err) => {
-          emitDebug(
-            "relay.session",
+          warnSessionTitlePatchFailed(
+            sessionKey,
             "session_title_upstream_clear_failed",
-            "debug",
-            { sessionKey },
-            () => ({ message: err && err.message ? err.message : String(err) }),
+            {},
+            err,
           );
         });
     }
@@ -2544,6 +2875,7 @@ function createSessionService(opts = {}) {
   function clearLogicalSessionState(sessionKey) {
     if (typeof sessionKey !== "string" || !sessionKey.trim()) return;
     greetingSendGate.evict(sessionKey);
+    transcriptSearchCache.delete(sessionKey);
     clearSessionTitle(sessionKey);
     displayToggleTracker.clear(sessionKey);
     distillerBudget.clear(sessionKey);
@@ -3046,6 +3378,100 @@ function createSessionService(opts = {}) {
 
   function observeGreetingActivity(sessionKey, phase, runId, origin) {
     return greetingSendGate.onActivity(sessionKey, phase, runId, origin);
+  }
+
+  function greetingGatewayKey(sessionKey) {
+    const agentId = getSessionAgentId(sessionKey, undefined);
+    return agentId ? gatewaySessionKeyFor(sessionKey, agentId) : sessionKey;
+  }
+
+  function isGreetingRunLive({ sessionKey, runId }) {
+    if (getActiveBackendKind() === "hermes" || !gatewayBridge ||
+      typeof gatewayBridge.request !== "function" || !runId) return false;
+    return Promise.resolve()
+      .then(() => gatewayBridge.request("chat.history", {
+        sessionKey: greetingGatewayKey(sessionKey),
+        limit: 1,
+      }))
+      .then((history) => {
+        const ids = history && history.sessionInfo && Array.isArray(history.sessionInfo.activeRunIds)
+          ? history.sessionInfo.activeRunIds
+          : [];
+        const live = ids.includes(runId);
+        emitDebug(
+          "relay.protocol",
+          "greeting_hold_liveness",
+          "info",
+          { sessionKey },
+          () => ({ runId, live, activeRunCount: ids.length }),
+        );
+        return live;
+      })
+      .catch(() => false);
+  }
+
+  function preemptGreetingForEarlyAsk({
+    sessionKey, runId, heldSends, release, stillEligible, noteAbortSent, abortFailed,
+  }) {
+    if (getActiveBackendKind() === "hermes" || !gatewayBridge ||
+      typeof gatewayBridge.request !== "function") return;
+    const key = greetingGatewayKey(sessionKey);
+    const eligible = () => typeof stillEligible !== "function" || stillEligible() === true;
+    const skip = (status, extra = {}) => {
+      emitDebug(
+        "relay.protocol",
+        "greeting_preempt_result",
+        "info",
+        { sessionKey },
+        () => ({ runId, status, abortedRunId: null, ...extra }),
+      );
+    };
+    emitDebug(
+      "relay.protocol",
+      "greeting_preempt_requested",
+      "info",
+      { sessionKey },
+      () => ({ runId, heldSends }),
+    );
+    Promise.resolve()
+      .then(() => {
+        if (!eligible()) {
+          skip("skipped_text_started");
+          return null;
+        }
+        if (typeof noteAbortSent === "function") noteAbortSent();
+
+        return gatewayBridge.request("chat.abort", { sessionKey: key, runId });
+      })
+      .then((result) => {
+        if (result === null) return;
+        const runIds = result && Array.isArray(result.runIds) ? result.runIds : [];
+        const aborted = !!(result && result.aborted === true) && (!runIds.length || runIds.includes(runId));
+        emitDebug(
+          "relay.protocol",
+          "greeting_preempt_result",
+          "info",
+          { sessionKey },
+          () => ({ runId, status: aborted ? "aborted" : "not_aborted", abortedRunId: aborted ? runId : null }),
+        );
+        if (aborted) release("greeting_aborted");
+        else if (typeof abortFailed === "function") abortFailed();
+      })
+      .catch((err) => {
+
+        if (typeof abortFailed === "function") abortFailed();
+        logger.warn(
+          `[relay] New-session greeting abort failed: sessionKey=${sessionKey} ${caughtMessage(err)}`,
+        );
+      });
+  }
+
+  if (greetingPreemptEnabled && gatewayBridge && typeof gatewayBridge.on === "function") {
+    gatewayBridge.on("streaming", (frame) => {
+      if (frame && typeof frame.text === "string" && frame.text) {
+        greetingSendGate.noteGreetingText(frame.sessionKey, frame.runId);
+      }
+    });
   }
 
   function buildNewSessionDispatchErrorActivity(sessionKey, err) {

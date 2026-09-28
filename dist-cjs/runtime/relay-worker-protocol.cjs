@@ -83,6 +83,8 @@ const DEFAULT_WORKER_RPC_LIMITS = Object.freeze({
   httpMaxResponseBytes: 262_144,
 
   wsMaxMessageBytes: 25 * 1024 * 1024,
+
+  wsPerMessageDeflate: true,
 });
 
 const ALLOWED_WORKER_STATUSES = new Set([

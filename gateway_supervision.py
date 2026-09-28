@@ -102,3 +102,42 @@ def classify(
     if argv and EXTERNAL_SUPERVISOR_FLAG in [str(part) for part in argv]:
         return {"state": UNKNOWN, "supervisor": "external"}
     return {"state": UNSUPERVISED, "supervisor": None}
+
+
+# -- the Cloudways restart (#3876) ---------------------------------------------
+#
+# On a Cloudways Managed AI Agents container `/entrypoint.sh` (PID 1) runs the
+# gateway, so Hermes classifies it as unsupervised ("Running manually, not as a
+# system service"). The generic hand-off ("press Ctrl+C in the terminal where
+# it runs") then names a terminal that does not exist. There, stopping the
+# gateway ends PID 1 and Cloudways starts a fresh container, so the working
+# restart is `hermes gateway restart` from an SSH shell (SSH drops, reconnect)
+# or the Cloudways dashboard. The fact is the same one the activation restart
+# already trusts (#3357): the decisive `cloudways` verdict, PID 1 is
+# `/entrypoint.sh`, and the live gateway is PID 1's direct child. `likely`, a
+# gateway started by hand, or any fault is not Cloudways: the generic hand-off
+# stays.
+
+CLOUDWAYS_RESTART_HOST = "cloudways"
+
+
+def _cloudways_container_restart() -> bool:
+    from . import receipts
+    from .optional_setup import _cloudways_container_restart as container_restart
+
+    gateway, _, live = receipts.read_gateway_state()
+    return live is True and container_restart(gateway)
+
+
+def restart_host(
+    *, container_restart_fn: Callable[[], bool] = _cloudways_container_restart
+) -> Optional[str]:
+    """``"cloudways"`` when a gateway restart restarts this Cloudways container.
+
+    None everywhere else, including on any failure to tell: the hand-off falls
+    back to the generic words, which is what every host got before #3876.
+    """
+    try:
+        return CLOUDWAYS_RESTART_HOST if container_restart_fn() is True else None
+    except Exception:  # noqa: BLE001 - an unreadable host is an ordinary host
+        return None

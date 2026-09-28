@@ -1,20 +1,17 @@
 # OcuClaw installed
 
-Now run one command.
+Next, run one command.
 
-- **Cloudways host:** run `hermes ocuclaw cloudways setup`. Do not restart
-  your gateway first: setup saves its settings, then at step 3 asks for one
-  gateway restart that loads OcuClaw and applies them together. If that
-  restart closes SSH, reconnect and run the same command again; it carries on
-  from there.
-- **Anywhere else:** open `hermes --tui` and enter `/ocuclaw-setup`. Do not
-  restart your gateway first: setup saves its settings, then asks for one
-  gateway restart that loads OcuClaw and applies them together.
+- **On Cloudways:** `hermes ocuclaw cloudways setup`
+- **Anywhere else:** open `hermes --tui` and type `/ocuclaw-setup`
 
-Hermes prints its own restart hint below this card; ignore it here.
+Setup tells you when a restart is needed, just once.
+If SSH drops, reconnect and run the same command again.
+
+Hermes shows its own restart note below. You can skip it.
 
 Have your phone and glasses nearby. It pairs them and ends with a reply on your
 glasses display.
 
 Full guide and troubleshooting: **https://ocuclaw.com/setup**
-Also in the bundled `README.md`, or run `hermes ocuclaw doctor`.
+Stuck? Run `hermes ocuclaw doctor`.

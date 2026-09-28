@@ -1043,6 +1043,7 @@ function createGlassesUiToolHandler(deps) {
     return Number.isFinite(deps.timeoutMs) ? deps.timeoutMs : DEFAULT_RENDER_GLASSES_UI_TIMEOUT_MS;
   }
 
+  const lastWireRenderBySurface = new Map();
   const paintFloor = createPaintFloorCoalescer({
 
     paintFloorMs: Number.isFinite(deps.paintFloorMs) ? deps.paintFloorMs : DEFAULT_PAINT_FLOOR_MS,
@@ -1079,6 +1080,8 @@ function createGlassesUiToolHandler(deps) {
         emitLifecycle("send_attempt_unregistered", "warn", { surfaceId, mode: isRender ? "render" : "update" });
       }
       if (isRender) {
+        lastWireRenderBySurface.set(surfaceId, { depth: patch.__depth, spec: patch.__spec });
+        if (lastWireRenderBySurface.size > 32) pruneLastWireRenders();
         emitLifecycle("render_sent", "debug", { surfaceId, sessionKey, seq });
         deps.relay.sendGlassesUiRender({ sessionKey, surfaceId, seq, depth: patch.__depth, spec: patch.__spec, marker: patch.__marker });
       } else {
@@ -2395,7 +2398,14 @@ function createGlassesUiToolHandler(deps) {
     for (const parentId of [...openedChildBySurface.keys()]) {
       if (!surfaceStore.sessionForSurface(parentId)) openedChildBySurface.delete(parentId);
     }
+    pruneLastWireRenders();
     return reaped;
+  }
+
+  function pruneLastWireRenders() {
+    for (const surfaceId of [...lastWireRenderBySurface.keys()]) {
+      if (!surfaceStore.sessionForSurface(surfaceId)) lastWireRenderBySurface.delete(surfaceId);
+    }
   }
 
   function releaseSurfaceTerminally(
@@ -2995,6 +3005,48 @@ function createGlassesUiToolHandler(deps) {
     },
     releaseLibraryTemplateSurface(surfaceId, outcome, expectedDeclarationId = null) {
       return releaseSurfaceTerminally(surfaceId, outcome, expectedDeclarationId, "library_template_reopen");
+    },
+
+    replaySessionTop(rawSessionKey, reason) {
+      const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
+      const surfaceId = surfaceStore.topSurfaceId(sessionKey);
+      if (!surfaceId) return { replayed: false, reason: "no_surface" };
+      const facts = surfaceStore.surfaceFactsFor(surfaceId);
+      if (!facts || facts.state === "exiting" || facts.exitLatched) {
+        return { replayed: false, surfaceId, reason: "exiting" };
+      }
+      const wire = lastWireRenderBySurface.get(surfaceId) || null;
+      const recordedSpec = surfaceStore.currentSurfaceSpecForSession(sessionKey);
+      const baseSpec = wire ? wire.spec : recordedSpec;
+      const sent = cronEngine.takeValuesForFullResend(surfaceId);
+      if (!baseSpec) {
+        emitLifecycle("reconnect_replay_skipped", "debug", { sessionKey, surfaceId, reason: "no_spec" });
+        return { replayed: false, surfaceId, reason: "no_spec" };
+      }
+      const spec = { ...baseSpec };
+      if (sent && !sent.templated) {
+        if (sent.body !== undefined) spec.body = sent.body;
+        if (sent.items !== undefined) spec.items = sent.items;
+      }
+      paintFloor.enqueue({
+        surfaceId,
+        sessionKey,
+        patch: {
+          __render: true,
+          __depth: wire ? wire.depth : surfaceStore.stackDepth(sessionKey),
+          __spec: spec,
+          __recordedSpec: recordedSpec || spec,
+          __marker: displayedMarkerFor(surfaceId),
+        },
+      });
+      emitLifecycle("reconnect_replay", "info", {
+        sessionKey,
+        surfaceId,
+        reason: reason || null,
+        source: wire ? "wire" : "recorded",
+        cronValues: !!sent,
+      });
+      return { replayed: true, surfaceId, cronValues: !!sent };
     },
     drainSession(sessionKey, outcome) {
       const reaped = reapSession(sessionKey, outcome);
@@ -3612,6 +3664,32 @@ function registerGlassesUiTool(api, service, opts = {}) {
     const onAgentTurnChanged = ({ sessionKey }) => {
       if (sessionKey) handler.refreshMarkerForAgentTurn(sessionKey);
     };
+
+    const onAppPresenceChanged = (event) => {
+      const reason = event && typeof event === "object" ? event.reason : event;
+      if (reason !== "grace_resumed") return;
+      const viewed =
+        typeof service.getAppViewedSessionKeys === "function"
+          ? service.getAppViewedSessionKeys()
+          : null;
+      if (!Array.isArray(viewed)) return;
+      for (const sessionKey of viewed) {
+        try {
+          handler.replaySessionTop(sessionKey, "grace_resumed");
+        } catch (err) {
+          try {
+            if (typeof service.emitGlassesUiLifecycle === "function") {
+              service.emitGlassesUiLifecycle("reconnect_replay_failed", "warn", {
+                sessionKey,
+                error: err && err.message ? err.message : String(err),
+              });
+            }
+          } catch (_) {
+
+          }
+        }
+      }
+    };
     scopeRecord = {
       handler,
       refs: 0,
@@ -3625,6 +3703,7 @@ function registerGlassesUiTool(api, service, opts = {}) {
         onLogicalSessionReset,
         onGlassesUiNavEvent: onNavEvent,
         onAgentTurnChanged,
+        onAppPresenceChanged,
       },
     };
     scopeHost[HANDLER_SCOPE_SYMBOL] = scopeRecord;
@@ -3642,6 +3721,9 @@ function registerGlassesUiTool(api, service, opts = {}) {
     }
     if (typeof service.onAgentTurnChanged === "function") {
       service.onAgentTurnChanged(onAgentTurnChanged);
+    }
+    if (typeof service.onAppPresenceChanged === "function") {
+      service.onAppPresenceChanged(onAppPresenceChanged);
     }
   } else if (scopeRecord && scopeRecord.relayCallbacks) {
 
@@ -3672,6 +3754,9 @@ function registerGlassesUiTool(api, service, opts = {}) {
     }
     if (callbacks.onAgentTurnChanged && typeof service.onAgentTurnChanged === "function") {
       service.onAgentTurnChanged(callbacks.onAgentTurnChanged);
+    }
+    if (callbacks.onAppPresenceChanged && typeof service.onAppPresenceChanged === "function") {
+      service.onAppPresenceChanged(callbacks.onAppPresenceChanged);
     }
   }
 

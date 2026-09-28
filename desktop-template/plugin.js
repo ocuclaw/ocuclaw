@@ -1625,7 +1625,7 @@ function PulseCard({ ctx, onClose, readOnly = false }) {
     'data-pulse-agent-toggle': agentEnabled ? 'on' : 'off',
     'data-floating-no-drag': '',
     onClick: () => setPulseAgentEnabled(ctx, !agentEnabled),
-    title: 'Show the Alive agent next to the glasses in the title bar',
+    title: 'Show Speck next to the glasses in the title bar',
     style: { display: 'flex', alignItems: 'center', gap: 6, marginTop: -2, padding: 0, border: 0, background: 'transparent', color: 'var(--ui-text-tertiary)', cursor: 'pointer', textAlign: 'left' },
     children: [
       jsx('span', { style: { flex: 1, fontFamily: 'var(--font-mono, monospace)', fontSize: 8.5, letterSpacing: '.08em', textTransform: 'uppercase' }, children: 'Agent in title bar' }),
@@ -2359,6 +2359,7 @@ const noteProfileAbsence = () => {
 // always mounted (see the register() note). It claims the setup tool's pairing
 // checkpoint and summons the window at the exact moment the QR exists — the
 // operator is never asked to hold anything open waiting for it.
+// PAIRING_WATCH_BEGIN
 let watchApi = null
 let watchTimer = null
 let watchMounted = 0
@@ -2375,7 +2376,14 @@ const watchTick = async () => {
   if (!watchMounted || !watchApi || pluginAbsentStore.get()) return
   const current = ceremonyStore.get()
 
-  if (!current) {
+  // No ceremony, or one that has reached its outcome: watch for the next
+  // checkpoint. A finished outcome stays on screen for the operator to read,
+  // but it must never hold back a newer pair_phone request (#3909): the new
+  // claim replaces it with no Done click. The claim route also retries a
+  // terminal callback the setup tool has not acknowledged yet, answering with
+  // that same session until it lands or the window expires, so the finished
+  // session needs no state poll of its own.
+  if (!current || current.phase === 'outcome') {
     let claimed = null
     try {
       claimed = await watchApi('/pairing/claim', { method: 'POST', body: { presenterCapability: PRESENTER_CAPABILITY }, timeoutMs: 2500 })
@@ -2385,7 +2393,12 @@ const watchTick = async () => {
       if (isPluginAbsentError(error)) { noteProfileAbsence(); return }
     }
     if (!watchMounted) return
-    if (claimed && claimed.active) {
+    // Done or Close changed the ceremony while this claim was in flight, and
+    // that change already scheduled the next tick. A stale reply adopts
+    // nothing and schedules nothing, so one loop stays one loop.
+    if (ceremonyStore.get() !== current) return
+    // The finished session answering for itself is not a new checkpoint.
+    if (claimed && claimed.active && !(current && claimed.sessionId === current.sessionId)) {
       const adopted = adoptClaim(claimed)
       if (adopted) {
         ceremonyStore.set(adopted)
@@ -2398,10 +2411,6 @@ const watchTick = async () => {
     scheduleWatch(claimDelay())
     return
   }
-
-  // A delivered terminal outcome has nothing left to poll; clearing the
-  // ceremony restarts the claim loop.
-  if (current.phase === 'outcome' && current.callbackDelivered !== false) return
 
   try {
     const next = await watchApi(`/pairing/${encodeURIComponent(current.sessionId)}`, {
@@ -2456,6 +2465,104 @@ const usePairingWatch = api => {
     }
   }, [api])
 }
+// PAIRING_WATCH_END
+
+// ── "Get a new code" (#3909) ─────────────────────────────────────────────
+// A code that ran out leaves the chat asking "fresh code?" behind this modal
+// window, which a pointer cannot get past. The button answers that question
+// in the chat, as the person's reply, so the model calls pair_phone again and
+// the watch above swaps the fresh QR into this same window. The window never
+// mints a code itself: the chat stays the one place that starts pairing.
+// PAIRING_NEW_CODE_BEGIN
+const NEW_CODE_REPLY = 'Yes, get a new code'
+// The relay's names for "the two-minute window ran out". The setup tool
+// reports both to the chat as `expired` (EXPIRED_CODES in tui_pairing.py).
+const NEW_CODE_REASONS = ['expired', 'completion-window-elapsed']
+
+const newCodeSupported = () => typeof sdk.host?.composer?.submit === 'function' &&
+  typeof sdk.host?.request === 'function'
+
+const offersNewCode = ceremony => Boolean(ceremony) && ceremony.phase === 'outcome' &&
+  ceremony.outcomeState !== 'completed' && NEW_CODE_REASONS.includes(ceremony.reason) &&
+  newCodeSupported()
+
+const hostSessionId = key => {
+  try {
+    const value = sdk.host.state?.[key]?.get?.()
+    return typeof value === 'string' ? value : ''
+  } catch { return '' }
+}
+
+// Runtime ids of the chats that may be asking: the setup run this card
+// started, then the focused and the active chat.
+const newCodeChats = () => {
+  const run = setupRunStore.get()
+  return [...new Set([
+    run && run.status === 'running' ? run.sessionId : '',
+    hostSessionId('focusedSessionId'),
+    hostSessionId('activeSessionId'),
+  ].filter(id => typeof id === 'string' && id))]
+}
+
+// A clarify card owns the turn: the agent is blocked inside it, and a chat
+// message sent past it waits out the clarify's own five-minute timeout. So an
+// open question is answered directly, with the reply as the person's answer,
+// through the gateway's `request.answer` (its proxy for a surface that is not
+// the one showing the card). `session.events.since` is the read that returns
+// a session's open requests; a watermark past the end replays no events.
+const openClarify = async sessionId => {
+  const snapshot = await sdk.host.request('session.events.since', { session_id: sessionId, last_seen: Number.MAX_SAFE_INTEGER })
+  const open = snapshot && Array.isArray(snapshot.open_requests) ? snapshot.open_requests : []
+  return open.find(request => request && request.method === 'clarify' && typeof request.id === 'string') || null
+}
+
+// A single question takes `{ answer }`; a batch of one takes its qid. A batch
+// of several is not the fresh-code question, so it is left to the person.
+const clarifyReply = request => {
+  const questions = request.params && request.params.questions
+  if (!Array.isArray(questions)) return { answer: NEW_CODE_REPLY }
+  const qid = questions.length === 1 && questions[0] ? questions[0].qid : ''
+  return typeof qid === 'string' && qid ? { answers: { [qid]: NEW_CODE_REPLY } } : null
+}
+
+const answerOpenClarify = async chats => {
+  for (const sessionId of chats) {
+    let request = null
+    try { request = await openClarify(sessionId) } catch { continue }
+    if (!request) continue
+    const result = clarifyReply(request)
+    if (!result) return 'unanswerable'
+    try {
+      const answered = await sdk.host.request('request.answer', { id: request.id, result })
+      if (answered && answered.status === 'ok') return 'answered'
+    } catch {}
+  }
+  return 'none'
+}
+
+// With no open question, the reply is sent through the chat's composer as if
+// typed and sent: the setup run's chat when it is on screen, else the chat the
+// person is looking at. The composer refuses a chat that is not on screen.
+const sendNewCodeReply = () => {
+  const run = setupRunStore.get()
+  const targets = [run && run.status === 'running' && run.sessionId ? run.sessionId : null, null]
+  for (const target of [...new Set(targets)]) {
+    try { if (sdk.host.composer.submit(target, NEW_CODE_REPLY) === true) return true } catch {}
+  }
+  return false
+}
+
+// The button: reply in the chat, then close the result. The watch keeps
+// claiming, so the next pair_phone reopens this window on its fresh QR.
+const requestNewCode = async () => {
+  if (!newCodeSupported()) return false
+  const chats = newCodeChats()
+  const clarified = await answerOpenClarify(chats)
+  const sent = clarified === 'answered' || (clarified === 'none' && sendNewCodeReply())
+  if (sent) clearCeremony()
+  return sent
+}
+// PAIRING_NEW_CODE_END
 
 // Normalized from the visible alpha bounds of the supplied 1024px OcuClaw
 // mark, removing the transparent canvas offset. Each bit is one square logo
@@ -2614,6 +2721,16 @@ function PairingDialog({ api }) {
   const ceremony = ceremonyStore.use()
   const view = viewStore.use()
   const busy = ceremony?.phase === 'deciding'
+  // "Get a new code" progress, pinned to the outcome it was clicked on.
+  const [newCode, setNewCode] = useState(null)
+  const newCodeStatus = newCode && ceremony && newCode.sessionId === ceremony.sessionId ? newCode.status : 'idle'
+  const getNewCode = async () => {
+    const sessionId = ceremony?.sessionId
+    setNewCode({ sessionId, status: 'sending' })
+    let sent = false
+    try { sent = await requestNewCode() } catch {}
+    setNewCode(sent ? null : { sessionId, status: 'failed' })
+  }
 
   const command = async op => {
     const sessionId = ceremony?.sessionId
@@ -2642,16 +2759,16 @@ function PairingDialog({ api }) {
   if (ceremony?.phase === 'qr') {
     body = view === 'manual'
       ? jsxs('div', { style: { display: 'grid', gap: 10 }, children: [
-          // F17 (#3348). Real phone controls only: "Pair with your computer",
+          // F17 (#3348). Real phone controls only: the Pair button,
           // then "Enter the pairing code instead".
-          jsx('p', { children: 'In Even Hub open OcuClaw, tap Pair with your computer, then Enter the pairing code instead:' }),
+          jsx('p', { children: 'In Even Hub open OcuClaw, tap the Pair button, then Enter the pairing code instead:' }),
           jsx('code', { style: { overflowWrap: 'anywhere' }, children: ceremony.addressLine }),
           jsx('code', { children: ceremony.codeLine }),
           jsx('p', { style: { color: 'var(--ui-text-tertiary)' }, children: 'This is the same one-time encrypted exchange. The screen advances automatically.' }),
         ] })
       : jsxs('div', { style: { display: 'grid', gap: 10 }, children: [
           jsx(QrCanvas, { lines: ceremony.qrLines }),
-          jsx('p', { style: { textAlign: 'center' }, children: 'In Even Hub open OcuClaw, tap Pair with your computer, then Take a photo of the QR code. The screen advances automatically.' }),
+          jsx('p', { style: { textAlign: 'center' }, children: 'In Even Hub open OcuClaw, tap the Pair button, then Take a photo of the QR code. The screen advances automatically.' }),
         ] })
   } else if (ceremony?.phase === 'words') {
     body = jsxs('div', { style: { display: 'grid', gap: 14 }, children: [
@@ -2664,7 +2781,14 @@ function PairingDialog({ api }) {
   } else if (ceremony?.phase === 'outcome') {
     title = ceremony.outcomeState === 'completed' ? 'Phone paired' : 'Pairing stopped'
     body = jsx('p', { children: ceremony.message || (ceremony.outcomeState === 'completed' ? 'The phone connected back and the managed gateway confirmed it.' : 'Nothing was approved. You can retry this setup checkpoint.') })
+    if (newCodeStatus === 'failed') {
+      body = jsxs('div', { style: { display: 'grid', gap: 10 }, children: [
+        body,
+        jsx('p', { style: { color: 'var(--ui-text-tertiary)' }, children: 'The chat could not be reached. Click Done, then ask the chat for a new code.' }),
+      ] })
+    }
   }
+  const newCodeOffered = offersNewCode(ceremony)
 
   // No idle state exists any more. The window has exactly one reason to be on
   // screen — a live ceremony — so it can never be the thing that tells the
@@ -2699,7 +2823,12 @@ function PairingDialog({ api }) {
           jsx(Button, { variant: 'outline', onClick: () => void command('deny'), children: 'No — refuse this phone' }),
           jsx(Button, { onClick: () => void command('approve'), children: 'Yes — all four words match' }),
         ] }) : null,
-        ceremony.phase === 'outcome' ? jsx(DialogFooter, { children: jsx(Button, { onClick: clearCeremony, children: 'Done' }) }) : null,
+        ceremony.phase === 'outcome' && !newCodeOffered ? jsx(DialogFooter, { children: jsx(Button, { onClick: clearCeremony, children: 'Done' }) }) : null,
+        // #3909. A code that ran out: the fresh one comes from the chat.
+        ceremony.phase === 'outcome' && newCodeOffered ? jsxs(DialogFooter, { children: [
+          jsx(Button, { variant: 'outline', onClick: clearCeremony, children: 'Done' }),
+          jsx(Button, { disabled: newCodeStatus === 'sending', onClick: () => void getNewCode(), children: 'Get a new code' }),
+        ] }) : null,
       ],
     }) : null,
   })
@@ -3556,7 +3685,7 @@ function idleRest(v,q){Object.assign(q,IDLE_HANDS[v],{gazeX:.6,gazeY:.6,tilt:0,y
  if(v===DRUM)Object.assign(pointAtSelf(q,0),{lopen:.5});
  return q;}
 const actions={};
-const SIDE_BY_GROUP={Conversation:1,Work:1,Mind:1,Results:1,Web:1,Agents:1,Connection:1,Presence:1};
+const SIDE_BY_GROUP={Conversation:1,Work:1,Mind:1,Results:1,Web:1,Agents:1,Connection:1,Presence:1,Board:1};
 const transitions={
  'listening>thinking':{hold:.45,pose:{ly:27,ry:27,gazeX:.6,gazeY:-1.2,tilt:-.03}},
  'thinking>reply':{hold:.45,pose:{ly:27,ry:27,gazeX:.6,gazeY:1.1,tilt:-.06}},
@@ -3590,6 +3719,11 @@ act('delegating','Delegating','Agents','Passes a task card to a little helper.',
 act('coordinating','Multi-agent','Agents','Checks in with two helpers and points out the next job.',{x:45,y:12,gazeX:1,rx:65,ry:24,rpoint:1,lx:27,ly:23,helper:2},null,'coordinate');
 act('collaborating','Collaborating','Agents','Meets a helper halfway for a high five.',{x:38,tilt:-.05,gazeX:1,rx:64,ry:13,ropen:1,helper:1},null,'highfive');
 act('handoff','Handoff','Agents','Moves a task card across to the next helper.',{x:37,tilt:.1,rx:64,ry:22,gazeX:1,helper:1},'task','pass');
+act('filing','Filing a card','Board','Holds up a new card, slaps it into the first lane as the lane makes room, smooths it down and beams.',{},'boardfile','staged');
+act('boardcheck','Checking the board','Board','Leans in and counts the cards lane by lane with a nod for each, then gives the board a thumbs-up.',{},'boardscan','staged');
+act('unblocking','Unblocking a card','Board','Strains against a card stuck at a gate, then shoves; the gate falls and the card flies into the next lane.',{},'boardunblock','staged');
+act('annotating','Adding to a card','Board','Sticks a note on a card, writes a line on it with quick finger strokes, then reads it back with a nod.',{},'boardnote','staged');
+act('linking','Linking cards','Board','Pulls a string from one card across the board to another; it clicks on, a pulse runs along it and he beams.',{},'boardlink','staged');
 act('waiting','Waiting','Presence','Rests one hand on a ledge and taps a finger.',{y:13,tilt:.07,eye:.75,lx:30,ly:28,rx:69,ry:27,tempo:.6},'ledge','wait');
 act('queued','Queued','Presence','Keeps his place with a ticket and watches the hourglass.',{tilt:-.04,eye:.8,gazeX:1,rx:73,ry:25,tempo:.6},'hourglass','quiet');
 act('paused','Paused','Presence','Holds up a palm. The action rests; he still blinks.',{lx:26,ly:24,rx:72,ry:16,ropen:1,tempo:.4,energy:.1});
@@ -3681,7 +3815,12 @@ const staging={
  handoff:['handoffcard','Passes a tall task card toward a waiting helper.',{rx:61,ry:25,helper:1}],
  coordinating:['team','Checks two helpers arranged above and below a clear fork.',{rx:61,ry:17,rpoint:.7,helper:2}],
  collaborating:['highfive','Raises a palm to meet a small helper in a high five.',{rx:67,ry:20,ropen:1,helper:1}],
- debugging:['bug','Tracks a large escaped bug with a cautious pinching hand.',{rx:95,ry:23,rpoint:-.3}]
+ debugging:['bug','Tracks a large escaped bug with a cautious pinching hand.',{rx:95,ry:23,rpoint:-.3}],
+ filing:['boardfile','Holds up a new card, slaps it into the first lane as the lane makes room, smooths it down and beams.',{}],
+ boardcheck:['boardscan','Leans in and counts the cards lane by lane with a nod for each, then gives the board a thumbs-up.',{}],
+ unblocking:['boardunblock','Strains against a card stuck at a gate, then shoves; the gate falls and the card flies into the next lane.',{}],
+ annotating:['boardnote','Sticks a note on a card, writes a line on it with quick finger strokes, then reads it back with a nod.',{}],
+ linking:['boardlink','Pulls a string from one card across the board to another; it clicks on, a pulse runs along it and he beams.',{}]
 };
 for(const [id,[prop,description,pose]] of Object.entries(staging)){
  Object.assign(actions[id],{prop,description,loop:'staged',staged:true});
@@ -3742,6 +3881,8 @@ scene('mcpactive',31,0,-1,'point',{lx:18,ly:26,rx:96,ry:18});
 scene('deploying',28,1,1,'release',{lx:13,ly:26,rx:65,ry:25});
 scene('debugging',35,-2,1,'pinch',{lx:18,ly:26,rx:92,ry:24,rpoint:-.3});
 scene('paused warning running syncing vision',34,-2,-1,'gesture',{lx:17,ly:26,rx:63,ry:24});
+// #3769: the board stands right of the head. boardBeat below choreographs the hand and face.
+scene('filing boardcheck unblocking annotating linking',32,0,1,'board',{lx:16,ly:26,rx:63,ry:26});
 scene('camera',50,0,1,'front',{lx:32,ly:27,rx:68,ry:27});
 scene('connecting reconnecting disconnected',50,0,1,'couple',{lx:27,ly:27,rx:73,ry:27});
 // Revision 20: action-specific work, with hand and implement sharing targets.
@@ -3816,6 +3957,9 @@ for(const [i,name] of MAGIC_PERFORMANCES.entries()){
  actions['magic_'+name].magic=name;
 }
 originals.push(['interface.build','magic_telekinesis']);
+// #3769: Hermes kanban tools from the chat agent.
+originals.push(['board.create','filing'],['board.read','boardcheck'],['board.unblock','unblocking'],
+ ['board.annotate','annotating'],['board.link','linking']);
 const catalogue=originals.map(([id,a])=>({...actions[a],id,action:a,source:'OcuClaw'}));
 const mapped=new Set(originals.map(x=>x[1]));
 Object.values(actions).filter(a=>!mapped.has(a.id)).forEach(a=>catalogue.push({...a,id:'concept.'+a.id,action:a.id,source:'Concept'}));
@@ -3937,6 +4081,7 @@ function attentionFor(def,q,time){
  const a=def.action||def.id,L=def.layout;
  if(a==='coding')return {x:(q.lx+q.rx)/2,y:(q.ly+q.ry)/2};
  if(!def.staged||!L||def.static)return null;
+ if(L.interaction==='board')return null;
  const point=(x,y)=>({x:L.side<0?100-x-L.offset:x+L.offset,y});
  if(['connecting','reconnecting','disconnected','camera'].includes(a))return point(50,26);
  if(['reading','learning'].includes(a))return point(82+Math.sin(time*.65)*4,7+(time%6)/6*14+(q.propDY||0));
@@ -3947,6 +4092,81 @@ function attentionFor(def,q,time){
  if(['filesearch','searching'].includes(a))return point(83+(q.propDX||0),13+(q.propDY||0));
  if(a==='voice')return point(85,15);
  return point(85+(q.propDX||0),15+(q.propDY||0));
+}
+// #3769: the Board poses are short stories on one 6 s clock that props.js shares
+// (BOARD_CYCLE, from the snapshot's age after BOARD_LEAD lets the board rise). Hand targets are in the board's
+// pixel plane; the face acts the beat. Returns the beat's emotion.
+const BOARD_CYCLE=6,BOARD_LEAD=.6;
+function track(keys,u){
+ let i=0;while(i<keys.length-2&&u>=keys[i+1][0])i++;
+ const a=keys[i],b=keys[i+1],f=clamp((u-a[0])/(b[0]-a[0]),0,1),e=f*f*(3-2*f);
+ return a.slice(1).map((v,j)=>v+(b[j+1]-v)*e);
+}
+const pulse=(u,at,width=.3)=>u>=at&&u<at+width?Math.sin((u-at)/width*Math.PI):0;
+const BOARD_SCAN_TAPS=[[.7,71,10],[1.05,71,16],[1.6,81,10],[1.9,81,16],[2.2,81,22],[2.75,90,10]];
+function boardBeat(a,u,q,n=1){
+ const look=(x,y)=>{q.gazeX=clamp((x-q.x)/24,-1.5,1.5);q.gazeY=clamp((y-q.y)/9,-1,1);};
+ const viewer=()=>{q.gazeX=0;q.gazeY=-.2;};
+ Object.assign(q,{rpoint:0,ropen:0,rthumb:0,rrot:0,tilt:0,y:14,eye:1});
+ let emotion='curious';
+ if(a==='filing'){
+  [q.rx,q.ry]=track([[0,63,27],[.9,62,15],[1.3,61,11],[1.42,66,12],[2,67,13],[2.3,66,12],[2.5,65,12],[2.62,67,12],[2.78,65,12],[2.9,67,12],[3.4,63,26],[5.3,63,26],[5.8,64,29],[6,63,27]],u);
+  if(u>=1.42&&u<2.9)q.rpoint=.6;
+  [q.tilt,q.y]=track([[0,0,14],[1,0,14],[1.3,-.06,13],[1.45,.05,15.5],[1.8,.02,14],[3.4,0,14],[3.7,-.04,12.8],[4.1,.03,13.4],[4.5,0,13],[5,0,14],[6,0,14]],u);
+  if(u>=1.38&&u<1.62)q.eye=.3;
+  emotion=u<.9?'curious':u<2.9?'focused':u<3.4?'curious':u<4.8?'delighted':'neutral';
+  if(u<1.3)look(q.rx,q.ry-5);else if(u<3.4)look(71,10);else if(u<4.4)viewer();else if(u<5.2)look(71,10);else look(64,30);
+ }
+ if(a==='boardcheck'){
+  const taps=BOARD_SCAN_TAPS,keys=[[0,63,27],[.45,66,13]];
+  for(const [t,x,y] of taps)keys.push([t-.12,x-7,y],[t,x-5,y]);
+  keys.push([3.4,63,23],[4.4,63,23],[4.8,63,27],[6,63,27]);
+  [q.rx,q.ry]=track(keys,u);
+  if(u>=.3&&u<3.3)q.rpoint=1;
+  if(u>=3.3&&u<4.4)q.rthumb=1;
+  const nod=taps.reduce((m,[t])=>Math.max(m,pulse(u,t,.28)),0),lean=track([[0,0],[.5,1],[3.2,1],[3.6,0],[6,0]],u)[0];
+  q.x+=1.5*lean;q.tilt=.04*lean;q.y=14+.9*nod*n;
+  if(u>=3.5&&u<4.3)q.y=13.2+.8*pulse(u,3.6,.35)+.8*pulse(u,3.95,.35);
+  emotion=u<.5?'curious':u<3.3?'focused':u<4.4?'delighted':'curious';
+  const next=taps.find(([t])=>u<t+.2);
+  if(u<3.3&&next)look(next[1],next[2]);else if(u<4.4)viewer();else look(70+(u-4.4)/1.6*22,12);
+ }
+ if(a==='unblocking'){
+  const push=[[.9],[1.4],[1.9]];
+  const keys=[[0,63,27],[.8,74,16]];
+  for(const [t] of push)keys.push([t,74,16],[t+.12,76,16],[t+.3,74,16]);
+  keys.push([2.5,70,17],[2.62,80,16],[2.9,79,17],[3.3,72,21],[4.2,72,21],[4.8,64,26],[6,63,27]);
+  [q.rx,q.ry]=track(keys,u);
+  if(u>=.6&&u<3)q.ropen=.7;
+  if(u>=3.4&&u<4.1){q.rrot=Math.sin((u-3.4)*18)*.3*n;q.ropen=.5;}
+  const strain=push.reduce((m,[t])=>Math.max(m,pulse(u,t,.3)),0);
+  q.eye=1-.4*strain;q.tilt=.06-.07*strain;q.x+=strain*n;
+  if(u>=2.2&&u<2.55){q.eye=.25;q.tilt=-.06;q.y=13;}
+  if(u>=2.55&&u<2.8){q.tilt=.06;q.x+=1.5;}
+  if(u>=5.3){q.tilt=.07;}
+  emotion=u<.8?'skeptical':u<2.75?'focused':u<3.15?'surprised':u<4.4?'delighted':u<5.3?'neutral':'skeptical';
+  if(u<2.75)look(81,15);else if(u<3.15)look(90,10);else if(u<4.4)viewer();else if(u<5)look(90,20);else look(81,14);
+ }
+ if(a==='annotating'){
+  [q.rx,q.ry]=track([[0,63,27],[.8,63,15],[1.1,71,9],[1.25,77,8],[1.4,74,9],[1.5,77,9],[1.62,80,9],[1.7,75,16],[2.4,75,16],[2.8,68,22],[4.4,68,22],[4.8,63,27],[6,63,27]],u);
+  if(u>=1.7&&u<2.4){q.rx+=Math.sin(u*48)*n;q.ry+=Math.abs(Math.cos(u*24))*n;q.rpoint=.8;}
+  if(u>=1.4&&u<1.7)q.ropen=.4;
+  const nod=pulse(u,3.6,.3)+pulse(u,3.95,.3);
+  q.tilt=u>=3&&u<3.6?.07:0;q.y=14+.8*nod*n;
+  if(u>=1.58&&u<1.72)q.eye=.5;
+  emotion=u<.8?'curious':u<1.5?'skeptical':u<2.8?'focused':u<3.5?'skeptical':u<4.6?'delighted':u<5.4?'neutral':'curious';
+  if(u<1.1)look(q.rx,q.ry-6);else if(u<3.6)look(81,10);else if(u<4.4)viewer();else look(81,12);
+ }
+ if(a==='linking'){
+  [q.rx,q.ry]=track([[0,63,27],[.7,71,17],[.9,71,17],[1.3,74,21],[1.8,79,16],[2.15,82,11],[2.3,81,11],[2.6,81,11],[3,70,22],[4.4,70,22],[4.8,63,27],[6,63,27]],u);
+  if(u>=.6&&u<2.6)q.rpoint=.6;
+  if(u>=3.3&&u<4.4)q.rthumb=1;
+  q.tilt=u>=.9&&u<2.3?.04:0;q.x+=u>=.9&&u<2.3?1:0;
+  if(u>=2.3&&u<2.45)q.eye=.4;
+  emotion=u<.9?'curious':u<2.3?'focused':u<2.5?'surprised':u<4.4?'delighted':u<5.4?'neutral':'curious';
+  if(u<2.3)look(q.rx+3,q.ry);else if(u<3.3)look(75+(u-2.5)%.4/.4*11,13);else if(u<4.4)viewer();else look(72,12);
+ }
+ return emotion;
 }
 // Approved six-study choreography, in the original study's seconds. Production
 // adds only a continuous entrance before this clock and a hold after its reveal.
@@ -4053,6 +4273,9 @@ function create(initial='idle',options={}){
    const drumNow=def.action==='idle'&&!resting&&variation()===DRUM?drumBeat(age%10,drum,{...q}):null;
    drumStrike=drumNow&&drumNow.strike;
    if(drumNow&&expression==='auto')emotion=drumNow.emotion;
+   // #3769: a Board pose acts its own beat; wake, cue and transition faces still win below.
+   const boardNow=def.layout?.interaction==='board'&&!resting&&!attending;
+   if(boardNow){const felt=boardBeat(def.action||def.id,Math.max(0,age-BOARD_LEAD)%BOARD_CYCLE,q,motion);if(expression==='auto')emotion=felt;}
    if(transit&&age<.75&&expression==='auto')emotion='curious';
    if(cue||attending||wakeBeat)emotion='curious';
    for(const name of expressions.slice(1))q[name]=Number(name===emotion);
@@ -4129,7 +4352,7 @@ function create(initial='idle',options={}){
    const look=time%13.8,mirror=Math.floor(time/13.8)%2===0?1:-1;
    const glance=(start,end,delay=0)=>look>start+delay&&look<end+delay?Math.min(1,(look-start-delay)/.12,(end+delay-look)/.2):0;
    const cues=attention?[[12.2,12.7,0,0]]:[[.65,2.1,-1.8,-1],[3.1,4.45,1.8,0],[5.35,6.75,0,-1.2],[7.9,9,0,0],[10.15,11.5,-1.5,.7],[12.2,13.4,0,0]];
-   const expressive=def.magic||def.static||['thinking','error','listening','voice','idle'].includes(def.action||def.id)?0:emotion==='sleepy'?.2:1;
+   const expressive=def.magic||def.static||['thinking','error','listening','voice','idle'].includes(def.action||def.id)||boardNow?0:emotion==='sleepy'?.2:1;
    if(!attention){q.gazeX=clamp(q.gazeX,-1.5,1.5);q.gazeY=clamp(q.gazeY,-1,1);}
    for(const [start,end,x,y] of cues){
     const amount=Math.min(1,motion)*expressive,dx=x*mirror;
@@ -4224,7 +4447,8 @@ function create(initial='idle',options={}){
     if(weighted&&age<delay)goal-=Math.sign(q[k]-entryPose[k])*(k==='tilt'?.04:1.5);
     // Drum strikes must land on their letters inside one 220 ms frame.
     const drumBody=drumNow&&(head||/^[lr](x|y|rot|open|point)$/.test(k));
-    const w=(restFreeze?32:facial||micHand||drumBody?30:brow?23:head?12:k==='tempo'?5:def.loop==='code'&&/^[lr][xyrotpoint]+$/.test(k)?30:16)*response;
+    const boardHand=boardNow&&/^r(x|y|rot|open|point|thumb)$/.test(k);
+    const w=(restFreeze?32:facial||micHand||drumBody?30:boardHand?26:brow?23:head?12:k==='tempo'?5:def.loop==='code'&&/^[lr][xyrotpoint]+$/.test(k)?30:16)*response;
     [p[k],v[k]]=(weighted?springZ:spring)(p[k],v[k],goal,w,dt);
     if(weighted&&age>=delay){const allowance=k==='tilt'?.04:1;p[k]=clamp(p[k],Math.min(entryPose[k],q[k])-allowance,Math.max(entryPose[k],q[k])+allowance);}
    }
@@ -4321,7 +4545,7 @@ if(typeof module!=='undefined')module.exports=api;else root.WatchEngine=api;
 /* Upright, native-pixel activity silhouettes. No face/hand drawing here. */
 (function(root){
 'use strict';
-const kinds=['book','learnbook','paper','editpaper','title','canvas','laptop','browser','navigate','form','clipboard','checklist','puzzle','cables','unplugged','replug','wrench','magnifier','websearch','stack','cards','twocards','hourglass','bug','gear','updategear','chart','flag','upload','download','blocks','rocket','monitor','shield','camera','phone','server','serveractive','envelope','task','handoffcard','clock','speech','text','branch','device','freshpage','pause','warning','play','syncwheel','viewfinder','team','highfive','datatray','gitcards','replycard','mic'];
+const kinds=['book','learnbook','paper','editpaper','title','canvas','laptop','browser','navigate','form','clipboard','checklist','puzzle','cables','unplugged','replug','wrench','magnifier','websearch','stack','cards','twocards','hourglass','bug','gear','updategear','chart','flag','upload','download','blocks','rocket','monitor','shield','camera','phone','server','serveractive','envelope','task','handoffcard','clock','speech','text','branch','device','freshpage','pause','warning','play','syncwheel','viewfinder','team','highfive','datatray','gitcards','replycard','mic','boardfile','boardscan','boardunblock','boardnote','boardlink'];
 function draw(s,pen){
  const kind=s.prop.kind;if(!kind||s.prop.reveal<.02)return;
  if(!kinds.includes(kind))throw Error('Unauthored activity object: '+kind);
@@ -4460,6 +4684,92 @@ function draw(s,pen){
   L(71,16,79,17+fold*6,0);L(79,17+fold*6,87,16,0);break;}
  case 'task':case 'handoffcard':{
   const x=64+Math.round(kind==='handoffcard'?stroke*9:0),y=15-Math.round(kind==='task'?stroke*2:0);R(x,y,15,14);R(x+4,y+3,8,2,0);R(x+4,y+8,6,2,0);break;}
+ case 'boardfile':case 'boardscan':case 'boardunblock':case 'boardnote':case 'boardlink':{
+  // #3769: a three-lane board whose cards act out engine.js boardBeat on the same
+  // 6 s clock (the snapshot's age less its .6 s lead): header tabs over three lanes of 7x4 cards that
+  // sink behind the frame's bottom edge. A resting pose holds a settled frame.
+  const u=s.resting?{boardfile:3.6,boardscan:5,boardunblock:3.8,boardnote:4,boardlink:4}[kind]:Math.max(0,s.age-.6)%6;
+  const at=(a,b)=>Math.max(0,Math.min(1,(u-a)/(b-a))),ease=f=>f*f*(3-2*f);
+  const jolt=kind==='boardfile'&&u>=1.42&&u<1.56?1:0;
+  const lane=[68,78,87].map(x=>x+jolt);
+  const card=(x,y,{hollow=false,clip=true}={})=>{
+   for(let r=0;r<4;r++){const yy=Math.round(y)+r;if(clip&&(yy<7||yy>26))continue;
+    if(hollow&&r>0&&r<3){R(x,yy,1,1);R(x+6,yy,1,1);}else R(x,yy,7,1);
+    if(!hollow&&r===1)R(x+2,yy,3,1,0);}
+  };
+  R(66+jolt,3,30,3);R(76+jolt,3,1,3,0);R(85+jolt,3,1,3,0);
+  L(66+jolt,6,66+jolt,27);L(95+jolt,6,95+jolt,27);L(66+jolt,27,95+jolt,27);
+  if(kind==='boardfile'){
+   // The lane makes room during the wind-up; the new card lands in the gap.
+   const room=u<1.42?Math.round(ease(at(.9,1.3))*6):0;
+   for(const y of [8,14,20])card(lane[0],y+room);
+   if(u>=1.42){card(lane[0],8);if(u<2.3)R(lane[0]+6,8,1,1,0);}
+   else if(u>=.15)card(Math.round(handX)-3,Math.round(p.ry)-8,{clip:false});
+   for(const y of [8,14])card(lane[1],y);
+   card(lane[2],8);
+   if(u>=1.42&&u<1.75){L(64,7,62,5);L(76,7,78,5);R(71,6,1,1,0);}
+  }
+  if(kind==='boardscan'){
+   // A tapped card rings hollow for a moment; its lane's header tab counts it.
+   const taps=[[.7,0,8],[1.05,0,14],[1.6,1,8],[1.9,1,14],[2.2,1,20],[2.75,2,8]];
+   const counted=[0,0,0];
+   for(const [t,l,y] of taps){
+    card(lane[l],y,{hollow:u>=t&&u<t+.25});
+    if(u>=t&&u<4.6){R(lane[l]+1+2*counted[l],4,1,1,0);counted[l]++;}
+   }
+  }
+  // Lanes that scroll: slot k sits at 8+6k+sink, so k=-1 drops in from under the
+  // header while the bottom card sinks away, and the picture repeats every cycle.
+  const scroll=(x,sink,fn)=>{for(let k=-1;k<4;k++)fn(x,8+6*k+sink,k);};
+  const seg=(x0,y0,x1,y1,dots=1)=>{if(![x0,y0,x1,y1].every(Number.isFinite))return;let i=0;x0=Math.round(x0);y0=Math.round(y0);x1=Math.round(x1);y1=Math.round(y1);
+   const dx=Math.abs(x1-x0),dy=-Math.abs(y1-y0),sx=x0<x1?1:-1,sy=y0<y1?1:-1;let e=dx+dy;
+   for(;;){if(y0>=7&&y0<=26&&i++%dots===0)R(x0,y0,1,1);if(x0===x1&&y0===y1)break;const e2=2*e;if(e2>=dy){e+=dy;x0+=sx;}if(e2<=dx){e+=dx;y0+=sy;}}};
+  if(kind==='boardnote'){
+   // A note sticks on the top card's corner; a second line is written onto it.
+   const sink=Math.round(ease(at(4.6,5.1))*6);
+   const note=(x,y)=>{for(let r=0;r<3;r++){const yy=y+r;if(yy>=7&&yy<=26)R(x,yy,4,1);}if(y+1>=7)R(x+1,y+1,2,1,0);};
+   card(lane[0],8);card(lane[2],8);
+   scroll(lane[1],sink,(x,y,k)=>{card(x,y);
+    if(k===0&&u>=1.62){const w=Math.round(4*at(1.75,2.35));if(w&&y+2>=7&&y+2<=26)R(x+1,y+2,w,1,0);}
+    if(k>0&&y+2>=7&&y+2<=26)R(x+1,y+2,4,1,0);
+    if(k===1||(k===0&&u>=1.62))note(x+4,y+2);});
+   if(u>=.15&&u<1.62)note(Math.round(handX)-2,Math.round(p.ry)-7);
+  }
+  if(kind==='boardlink'){
+   // Card A (first lane) is tied to card B (third lane) one slot up; earlier
+   // pairs keep their strings as both lanes scroll.
+   const sink=Math.round(ease(at(4.5,5))*6);
+   scroll(lane[0],sink,(x,y)=>card(x,y));
+   scroll(lane[2],sink,(x,y)=>card(x,y,{hollow:u>=2.3&&u<2.5&&y===8+sink}));
+   seg(75,22+sink,86,16+sink);seg(75,28+sink,86,22+sink,2);
+   const ax=75,ay=16+sink,bx=86,by=10+sink;
+   if(u>=2.3){seg(ax,ay,bx,by);
+    if(u<3.3){const f=((u-2.5)%.4)/.4;if(u>=2.5)R(Math.round(ax+(bx-ax)*f)-1,Math.round(ay+(by-ay)*f)-1,2,2);}}
+   else if(u>=.9){const hx=Math.round(handX)+3,hy=Math.round(p.ry)-1,mx=(ax+hx)/2,my=Math.max(ay,hy)+2;seg(ax,ay,mx,my);seg(mx,my,hx,hy);}
+   if(u>=2.3&&u<2.5)for(const [px,py] of [[88,6+sink],[84,7+sink]])R(px,py,1,1);
+  }
+  if(kind==='boardunblock'){
+   // A card stuck behind a brick wall on the lane rule: the shove breaks the wall
+   // and the card flies into the next lane. Done then sinks and a new card and
+   // wall drop in, ready to be stuck again.
+   const jitter=[.9,1.4,1.9].some(t=>u>=t+.08&&u<t+.22)?1:0;
+   const fly=ease(at(2.55,2.82)),over=u>=2.82&&u<2.95?1:0;
+   const sink=Math.round(ease(at(4.5,5))*12);
+   const wall=(y,dx=0,top=0,rows=18)=>{for(let r=top;r<rows;r++){const yy=y+r;if(yy>=7&&yy<=26)R(84+dx,yy,2,1);}};
+   card(lane[0],8);
+   card(lane[2],20+sink);
+   if(u<2.55){card(lane[1]-1+jitter,14);wall(8);}
+   else if(u<4.5){
+    const x=Math.round(lane[1]-1+(lane[2]-lane[1]+1)*fly)+over,y=Math.round(14-6*fly);card(x,y);
+    if(u<2.82){L(x-5,y+1,x-2,y+1);L(x-6,y+3,x-3,y+3);}
+    if(u<2.95){const d=at(2.55,2.95),fall=Math.round(d*d*14);wall(8+fall,1,0,9);wall(8+Math.round(fall*1.3),3,9,18);}
+    if(u<2.75)for(const [px,py] of [[88,10],[88,21],[83,9],[83,21]])R(px,py,1,1);
+   }
+   else card(lane[2],8+sink);
+   if(u>=4.9){const y=Math.round(1+13*ease(at(4.9,5.3)))+(u>=5.3&&u<5.4?1:0);card(lane[1]-1,y);}
+   if(u>=5.3)wall(Math.round(-10+18*at(5.3,5.42)));
+  }
+  break;}
  case 'clock':{
   P([[74,3],[85,3],[92,10],[92,21],[85,28],[74,28],[67,21],[67,10]]);P([[75,6],[84,6],[89,11],[89,20],[84,25],[75,25],[70,20],[70,11]],0);L(79,8,79,16);L(79,16,T%4.8<2.4?85:73,19);break;}
  case 'speech':case 'text':{

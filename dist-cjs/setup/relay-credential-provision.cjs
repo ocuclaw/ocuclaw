@@ -25,8 +25,9 @@ function provisionFollowUp(requiresRestart, host = null) {
 const PROVISION_APPROVAL_BODY =
   "Let this host generate a private Relay Credential and store it at " +
   "plugins.entries.ocuclaw.config.relayToken. It runs only when no credential is " +
-  "configured: an existing credential is preserved and never rotated, so already " +
-  "paired phones keep working. The value is created on this host, is never shown " +
+  "configured: an existing credential is preserved and never rotated unless you " +
+  "ask for a new key, so already paired phones keep working. The value is " +
+  "created on this host, is never shown " +
   "to the assistant and never written to logs or receipts. ";
 
 const PROVISION_APPROVAL_RESTART_SENTENCE =
@@ -241,7 +242,8 @@ function createRelayCredentialProvision(api, options = {}) {
   const afterWrite = isRecord(options) && isRecord(options.afterWrite)
     ? options.afterWrite
     : PROVISION_AFTER_WRITE_RESTART;
-  return async function provisionRelayCredential(rawParams) {
+
+  return async function provisionRelayCredential(rawParams, handoff) {
     const loadedAtBoot = resolveLoadedAtBoot();
     validateProvisionRelayCredentialParams(rawParams);
     if (
@@ -389,6 +391,9 @@ function createRelayCredentialProvision(api, options = {}) {
         "verification_failed",
         "the persisted OpenClaw configuration did not read back the provisioned relay credential; re-read setup state before retrying and do not assume a credential is configured",
       );
+    }
+    if (isRecord(handoff) && typeof handoff.onPersisted === "function") {
+      handoff.onPersisted(persisted);
     }
 
     return {

@@ -109,8 +109,11 @@ by the POSIX stall tests.
 
 Child exit codes: `0` clean (stdin EOF / SIGTERM), `1` fatal, `3` handshake
 timeout, `4` protocol version mismatch, `98` reserved for listener bind
-failure (`EADDRINUSE` fail-fast once the relay boots in-child; spec
-§Bundles).
+failure (`EADDRINUSE` once the relay boots in-child; spec §Bundles). A
+listening holder fails at once. A holder with nothing listening (an outbound
+connection using the port as its ephemeral port) first gets 5 logged retries
+over about 21 s. Either way the failure line names the holder, and Hermes's
+reconnect ladder is the outer retry (#3749).
 
 ## Frames
 
@@ -1645,6 +1648,14 @@ surface. The parent validates both before dispatch and retains them as
 internal `MessageEvent` metadata. Hermes model input continues to read only
 `channel_prompt`, so adding ownership metadata changes no model-visible bytes.
 
+Hermes keys its cached agent on `channel_prompt` and renders it into the
+system prompt, so the child keeps it byte-stable per session. An Even AI turn
+never carries its owner text here: in Active routing it resends the OcuClaw
+session's frozen Channel-1 bytes (`promptOwner: even-ai`,
+`promptLane: logical-session-frozen`), and a background turn sends none. The
+owner text rides `liveui.prompt` as the `even_ai_owner` fragment on the user
+message instead.
+
 Result (in-band): `{status: "accepted"}` or `{status: "rejected", error}`,
 plus optional `sessionState: "resume_pending"|"suspended"` read from the
 persisted hermes session entry (spec §Error Handling: the two flags surface
@@ -1776,10 +1787,13 @@ oversize breaks). Mapping (per active ledger record):
   (the relayToken-gated Node relay IS the trusted authenticated upstream —
   non-internal MessageEvents pass the gateway sender-auth gate without the
   pairing flow).
-- Streaming is config-gated in hermes (`display.streaming.enabled`, default
-  false; transport `auto` → edit path for ocuclaw). With streaming off,
-  replies arrive as one `send` and commit at `on_session_end` — both modes
-  are handled.
+- Streaming is config-gated in hermes per platform
+  (`display.platforms.ocuclaw.streaming`, default false; transport `auto` →
+  edit path for ocuclaw). Hermes 0.21.5 reads that per-platform key per turn;
+  `display.streaming` (no `platforms.<name>` segment) is a DIFFERENT,
+  CLI-only key and does not gate this path. With streaming off, replies
+  arrive as one `send` and commit at `on_session_end` — both modes are
+  handled.
 
 ### Tool-progress ownership for the Hermes beta
 
@@ -1880,7 +1894,7 @@ Parent → child RPCs:
 |---|---|---|
 | `liveui.render` | `{callId, sessionKey, args, hostOriginated?}` | `{result, content:[{type:"text", text:<JSON result>}]}` — Node owns the per-call listen window and consumes Layer A `createGlassesUiToolHandler` unchanged. An agent call that would open a new surface in a session no app client is on is refused with `session_not_viewed` (#3209); `hostOriginated: true` (the managed first-run welcome only) skips that refusal. |
 | `liveui.abort` | `{callId?, sessionKey?, reason?}` | `{status:"accepted", aborted}` — aborts matching active render calls; Python sends this when the Hermes tool worker sees the cooperative interrupt flag or the render link deadline fires. |
-| `liveui.prompt` | `{sessionKey}` | `{context|null, fragments:[...], fragmentsConcatenated, ephemeralOnly:true}` — Node composes Channel-2 state and previews owed voicemail into a plugin-generated JSON fence for Hermes `pre_llm_call`, which injects only into the current user message. |
+| `liveui.prompt` | `{sessionKey}` | `{context|null, fragments:[...], fragmentsConcatenated, ephemeralOnly:true, promptOwner:"ocuclaw"|"even-ai"|null, neuralSessionNamesEnabled:boolean}` — Node composes Channel-2 state and previews owed voicemail into a plugin-generated JSON fence for Hermes `pre_llm_call`, which injects only into the current user message. `promptOwner` names the turn's prompt owner (dispatch rider or queued ownership ticket); Python marks an `"even-ai"` turn so `pre_tool_call` can veto `clarify` on it (#7). `neuralSessionNamesEnabled` is the phone's session-name toggle recorded at send (default `true`); when `false`, Python writes Hermes's instant first-message title at `llm` provenance so Hermes makes no title model call for that chat (see `session_title_hold.py`). |
 | `liveui.promptAck` | `{sessionKey, ackToken}` | `{status:"accepted", consumed:boolean}` — Python sends the token returned by `liveui.prompt` only after receiving a prompt context that contains voicemail, so transport timeouts do not consume owed voicemail silently and ack cannot consume entries outside that preview. |
 
 Child → parent RPCs:
@@ -2037,11 +2051,28 @@ session semantics.
 Hermes 0.20's generic plugin removal deletes only the installed checkout, so
 full product removal runs through `hermes ocuclaw uninstall` while that code is
 still available. A retained disabled install must first be enabled so Hermes
-registers the plugin-owned CLI. The command requires the gateway to be stopped,
-removes only the exact OcuClaw config and secret keys, runtime files, pairing and first-run
+registers the plugin-owned CLI. The command requires OcuClaw not to be
+running, removes only the exact OcuClaw config and secret keys, runtime files, pairing and first-run
 receipts, setup bundle, and plugin checkout, then prints an uninstall receipt.
 The shared Hermes session database and unrecognised files remain outside its
 mutation set.
+
+"Not running" replaced "gateway stopped" in #3765, because on Cloudways
+`hermes gateway stop` restarts the container and the gateway is never
+observed stopped. `uninstall_gate` proves it from the relay port (closed),
+the process table (no `hermes-runtime-entry.cjs` under this profile's
+plugin directory; `/proc` on Linux, psutil elsewhere), the platform entry
+(not built by the live gateway) and the gateway itself (stopped, or started
+after the uninstall-pending marker). When OcuClaw runs, the first call
+writes `state/ocuclaw.uninstall-pending.json` and exits 3
+(`restart_required`) with `hermes gateway restart` and
+`hermes ocuclaw uninstall` as next steps. `adapter.register` checks that
+marker first and registers only the CLI while it exists. The second call
+passes the gate, runs the Cloudways rollback (watchdog job, daemon,
+script, binaries, receipts, identity) while the daemon is still reachable,
+then the removal below, and deletes the marker last. A stopped gateway
+still finishes in one call. `hermes ocuclaw uninstall --cancel` deletes the
+marker; one restart brings OcuClaw back.
 
 Final checkout removal preserves Hermes's own install-provenance transaction:
 OcuClaw atomically parks the real checkout, invokes the documented
@@ -2406,8 +2437,8 @@ HERMES_SYNTH_TICK_INTERVAL_MS = 15000}}` and only then emits `connected
 {protocol, tickIntervalMs}` + `status "connected"` (readiness gate order is
 census-row-pinned). Handshake/boot failure → `connectFailed {reason}`; link
 EOF → `disconnected {reason}` + `status "disconnected"` before exit (pending
-run-waiters reject). Relay bind failure exits `98` (`EADDRINUSE` fail-fast,
-D7). An ack config WITHOUT `relayToken` runs the child link-only (no relay
+run-waiters reject). Relay bind failure exits `98` (`EADDRINUSE`, D7; a
+holder with nothing listening gets the bounded retries above first, #3749). An ack config WITHOUT `relayToken` runs the child link-only (no relay
 boot, no port bind, readiness never announced) — the lane the bundle pytest
 drivers and echo probes use; production configs always carry the token
 (`validate_config` requires it).

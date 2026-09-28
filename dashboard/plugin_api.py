@@ -48,7 +48,7 @@ GLASSES_STATE_STALE_AFTER_MS = 30_000
 DEVICE_STATE_STALE_AFTER_MS = 120_000
 DEVICE_STATE_CLOCK_SKEW_MS = 60_000
 PLATFORM_RECEIPT_EMPIRICAL_TTL_S = 300.0
-SETUP_GUIDE_VERSION = "2026-09-25 (1.3.24-hermes)"
+SETUP_GUIDE_VERSION = "2026-09-28 (1.3.25-hermes)"
 
 _LEG_ORDER = (
     ("hermesGateway", "Hermes gateway"),
@@ -589,6 +589,9 @@ def _public_pairing_state(session: Mapping[str, Any], body: Mapping[str, Any]) -
             "sessionId": session["id"],
             "phase": "outcome",
             "outcomeState": "completed" if state == "completed" else "failed",
+            # #3909. The presenter offers "Get a new code" only for a window
+            # that ran out, so it needs the reason, not just "failed".
+            "reason": _terminal_code(body),
             "message": (
                 "The phone connected back and the managed gateway confirmed it."
                 if state == "completed"
@@ -730,7 +733,8 @@ def _expire_pairing(session: Dict[str, Any]) -> Dict[str, Any]:
             "sessionId": session["id"],
             "phase": "outcome",
             "outcomeState": "failed",
-            "message": "The pairing request expired. Nothing was approved.",
+            "reason": "expired",
+            "message": "Pairing took longer than the two-minute window. Nothing was approved.",
         },
     )
     session["terminal"] = public

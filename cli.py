@@ -250,6 +250,12 @@ REPAIR_TEXT: Dict[str, str] = {
     "pair_phone_app": (
         "Pair the OcuClaw phone app with this host from the Setup Assistant."
     ),
+    "enable_ocuclaw_streaming": (
+        "Run: hermes config set display.platforms.ocuclaw.streaming true "
+        "(Hermes reads it on the next reply; no restart). Without it the "
+        "glasses show only \"typing\" for the whole reply, then the whole "
+        "reply at once."
+    ),
 }
 
 #: Rendered for a repair code this build does not know. New codes may be added
@@ -1949,6 +1955,7 @@ def run(
     tools_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
     profiles_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
     tailnet_daemon_fn: Optional[Callable[[], Optional[Mapping[str, Any]]]] = None,
+    uninstall_pending_fn: Optional[Callable[[], bool]] = None,
     stdout: Optional[TextIO] = None,
     stderr: Optional[TextIO] = None,
 ) -> int:
@@ -2069,6 +2076,27 @@ def run(
     except Exception:  # noqa: BLE001 - a diagnostic must not become an outage
         profiles = None
 
+    try:
+        pending_lines = (
+            render_uninstall_pending()
+            if (
+                _default_uninstall_pending()
+                if uninstall_pending_fn is None
+                else uninstall_pending_fn()
+            )
+            else []
+        )
+    except Exception:  # noqa: BLE001 - advisory only, never fatal
+        pending_lines = []
+
+    if json_output:
+        # The frozen snapshot carries no pending flag; the notice goes to
+        # stderr with the other human diagnostics.
+        for line in pending_lines:
+            err.write(line + "\n")
+    elif pending_lines:
+        out.write("\n".join(pending_lines) + "\n\n")
+
     if json_output:
         # Only the snapshot on stdout; human diagnostics go to stderr (#1273 §10).
         # The snapshot's v1 key set is frozen, so the inventory is not smuggled
@@ -2132,6 +2160,33 @@ def run(
     return status_exit_code(snapshot) if command == "status" else doctor_exit_code(
         snapshot
     )
+
+
+def _default_uninstall_pending() -> bool:
+    """Whether `hermes ocuclaw uninstall` left the pending marker (#3765)."""
+    from . import uninstall_gate
+    from .receipts import resolve_receipt_home
+
+    return uninstall_gate.uninstall_pending(resolve_receipt_home())
+
+
+def render_uninstall_pending() -> List[str]:
+    """The status/doctor notice while an uninstall waits for its restart."""
+    from . import uninstall_gate
+
+    return [
+        "Uninstall pending: OcuClaw is marked for removal and does not start.",
+        "  Finish: run `"
+        + uninstall_gate.RESTART_COMMAND
+        + "` if you have not yet, then `"
+        + uninstall_gate.UNINSTALL_COMMAND
+        + "`.",
+        "  Keep OcuClaw: run `"
+        + uninstall_gate.CANCEL_COMMAND
+        + "`, then `"
+        + uninstall_gate.RESTART_COMMAND
+        + "`.",
+    ]
 
 
 def _positive_seconds(raw: str) -> float:
@@ -2300,6 +2355,18 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
             "bind an address the phone cannot dial."
         ),
     )
+    # #3747: the wearer's explicit re-key. The same confirmed all-device reset
+    # as `reset-relay-credential` (typed `reset`, restart checked before any
+    # write, old key proved refused), then this pairing. Never automatic.
+    pair_parser.add_argument(
+        "--new-key",
+        action="store_true",
+        dest="new_key",
+        help=(
+            "First make a new relay key: asks you to type reset, restarts the "
+            "Hermes gateway, disconnects every paired phone, then pairs this one"
+        ),
+    )
 
     # `first-use` inherits `pair`'s refusals for the same reason (#3099). When
     # the phone reports no glasses SDK receipt for the reply, the only evidence
@@ -2352,9 +2419,14 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
         help="Fully remove OcuClaw while preserving shared Hermes sessions",
         description=(
             "Remove OcuClaw code, setup, exact configuration and secret keys, "
-            "pairing state, and first-run state. Shared Hermes sessions and "
-            "unrecognised files are preserved. A verified live Managed Serve "
-            "Route must be removed with the printed narrow command first."
+            "pairing state, first-run state, and on Cloudways the Tailscale "
+            "watchdog, daemon and binaries it installed. Shared Hermes "
+            "sessions and unrecognised files are preserved. If OcuClaw is "
+            "running, the first run marks it for removal and exits with code "
+            "3: run `hermes gateway restart`, then `hermes ocuclaw uninstall` "
+            "again. `--cancel` clears that mark (restart once afterwards). A "
+            "verified live Managed Serve Route must be removed with the "
+            "printed narrow command first."
         ),
     )
     uninstall_parser.add_argument(
@@ -2368,6 +2440,15 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         dest="json_output",
         help="Emit the uninstall receipt as JSON",
+    )
+    uninstall_parser.add_argument(
+        "--cancel",
+        action="store_true",
+        dest="cancel_pending",
+        help=(
+            "Cancel a pending uninstall and keep OcuClaw; run "
+            "`hermes gateway restart` afterwards"
+        ),
     )
     # Cloudways managed-Hermes path (#2979): user-owned userspace Tailscale
     # kept alive by a Hermes cron watchdog. Registered lazily-implemented like
@@ -2678,8 +2759,14 @@ def dispatch(args: argparse.Namespace) -> int:
     if command == "pair":
         # Imported lazily, like `_default_facts`, so wiring the subparser does
         # not drag the pairing surface into every `hermes` invocation.
-        from .pairing import run_pair
+        from .pairing import run_pair, run_pair_new_key
 
+        if bool(getattr(args, "new_key", False)):
+            return run_pair_new_key(
+                str(getattr(args, "address", "") or ""),
+                light_terminal=bool(getattr(args, "light_terminal", False)),
+                show_payload_text=bool(getattr(args, "show_payload_text", False)),
+            )
         return run_pair(
             str(getattr(args, "address", "") or ""),
             light_terminal=bool(getattr(args, "light_terminal", False)),
@@ -2708,6 +2795,7 @@ def dispatch(args: argparse.Namespace) -> int:
         return run_uninstall(
             assume_yes=bool(getattr(args, "assume_yes", False)),
             json_output=bool(getattr(args, "json_output", False)),
+            cancel=bool(getattr(args, "cancel_pending", False)),
         )
     if command == "cloudways":
         from .cloudways_cli import run_cloudways

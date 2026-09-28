@@ -234,6 +234,9 @@ class LinkProcess:
             "truncated_outbound": 0,
             "oversized_inbound": 0,
             "protocol_errors": 0,
+            # Requests refused with LinkOverloadedError (admission or write
+            # budget). The adapter retries closing frames; paints are dropped.
+            "overloaded": 0,
         }
 
     @property
@@ -309,6 +312,7 @@ class LinkProcess:
         if not self.ready:
             raise LinkClosedError("control link not ready")
         if len(self._pending) >= LINK_ADMISSION_LIMIT:
+            self.counters["overloaded"] += 1
             raise LinkOverloadedError("link_overloaded")
         request_id = f"p{self._next_request_id}"
         self._next_request_id += 1
@@ -390,6 +394,7 @@ class LinkProcess:
                 self._queued_bytes + proc.stdin.transport.get_write_buffer_size() + len(raw) > LINK_WRITE_MAX_BYTES):
             if frame.get("type") != FRAME_RPC_REQUEST:
                 self._finish(proc.returncode)
+            self.counters["overloaded"] += 1
             raise LinkOverloadedError("link_overloaded")
         if truncated:
             self.counters["truncated_outbound"] += 1

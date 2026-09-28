@@ -37,8 +37,20 @@ SIGKILL a real process exactly there.
 off, the quiet done moment, and quiet hours in the stored time zone, with
 unknown policy holding every push. Each card keeps at most one pending
 delivery (its newest event; older ones settle as ``coalesced``), and a card
-at its cap waits. Moments follow explicit Board watches only: native
-subscriptions (auto-subscribe on create, child inheritance) are never read.
+at its cap waits. Moments follow explicit Board watches and (#3947) rules
+only: native subscriptions (auto-subscribe on create, child inheritance) are
+never read.
+
+#3947: a rule (``board_watch.rules``) watches a worker on one board. An
+event on a card whose current assignee has a rule is a moment when it comes
+after the rule's start and its class is one the rule's mode allows (review
+and question for ``notify``, plus failure for ``notify_failures``; never
+done). A board with rules and no watched card is still tailed. Each
+delivery records what raised it (``via``: ``watch`` or ``rule:<assignee>``,
+and ``rule``: the matching rule's assignee), so ``due()`` keeps a
+rule-raised moment while its rule is on without reading Hermes. A card both
+watched and rule-matched raises one moment per event. Coalescing, the card
+cap and the policy apply unchanged.
 """
 from __future__ import annotations
 
@@ -177,7 +189,29 @@ _SCHEMA = (
 #: the moment class (so a policy change can cancel done moments), the source
 #: event id (per-card coalescing keeps the newest) and when the phone acked
 #: it (the per-card cap).
-_ADDED_COLUMNS = (("attention", "TEXT"), ("event", "INTEGER"), ("acked_at", "INTEGER"))
+#: #3947: ``via`` (``watch`` or ``rule:<assignee>``: what raised it) and
+#: ``rule`` (the matching rule's assignee, or NULL). A row stored before
+#: rules has neither and is kept by its card watch alone, as it was.
+_ADDED_COLUMNS = (("attention", "TEXT"), ("event", "INTEGER"), ("acked_at", "INTEGER"),
+                  ("via", "TEXT"), ("rule", "TEXT"))
+
+#: #3947: SQL true while a ``board_moment`` row's card watch is on.
+_WATCH_ON = ("EXISTS (SELECT 1 FROM board_watch w WHERE w.profile = board_moment.profile"
+             " AND w.board = board_moment.board AND w.task = board_moment.task AND w.mode != 'off')")
+
+
+def _rule_allows_sql() -> str:
+    """#3947: SQL true while a ``board_moment`` row's rule is on and its mode
+    still lets the row's class through."""
+    arms = " OR ".join(
+        f"(r.mode = '{mode}' AND board_moment.attention IN ({', '.join(repr(c) for c in classes)}))"
+        for mode, classes in board_watch.RULE_CLASSES.items())
+    return ("(board_moment.rule IS NOT NULL AND EXISTS (SELECT 1 FROM board_watch_rule r"
+            " WHERE r.profile = board_moment.profile AND r.board = board_moment.board"
+            f" AND r.assignee = board_moment.rule AND ({arms})))")
+
+
+_RULE_ON = _rule_allows_sql()
 
 
 class MomentStoreError(Exception):
@@ -434,12 +468,15 @@ def note_watch(profile: str, slug: str, task: str, db: Path, meta: Optional[Path
     #3038 checkpoint there. Setting ``notify`` again keeps the first start, so
     events not yet tailed are not skipped. ``off`` forgets the start and
     cancels that watch's pending deliveries (#3052); :func:`due` cancels any
-    a crash left between the two writes."""
+    a crash left between the two writes. #3947: a pending delivery a rule
+    that is still on also raised stays."""
     if mode != "notify":
         def forget(conn):
             conn.execute("DELETE FROM board_watch_since WHERE profile = ? AND board = ? AND task = ?",
                          [profile, slug, task])
             conn.execute("UPDATE board_moment SET state = 'cancelled' WHERE profile = ? AND board = ?"
+                         f" AND task = ? AND state = 'pending' AND NOT {_RULE_ON}", [profile, slug, task])
+            conn.execute("UPDATE board_moment SET via = 'rule:' || rule WHERE profile = ? AND board = ?"
                          " AND task = ? AND state = 'pending'", [profile, slug, task])
         _write(forget)
         return
@@ -460,14 +497,61 @@ def note_watch(profile: str, slug: str, task: str, db: Path, meta: Optional[Path
     _write(body)
 
 
+def _cancel_rule_pending(conn: sqlite3.Connection, profile: str, slug: str, assignee: str) -> int:
+    """#3947: cancel this rule's pending deliveries that nothing keeps now: no
+    card watch, and the rule gone or no longer letting their class through."""
+    return conn.execute(
+        "UPDATE board_moment SET state = 'cancelled' WHERE profile = ? AND board = ? AND rule = ?"
+        f" AND state = 'pending' AND NOT {_WATCH_ON} AND NOT {_RULE_ON}", [profile, slug, assignee]).rowcount
+
+
+def note_rule(profile: str, slug: str, assignee: str, db: Path, meta: Optional[Path], mode: str) -> dict:
+    """#3947: store one rule (a watch by worker) and where it starts.
+
+    ``notify`` / ``notify_failures``: the rule's moments start after the
+    board's current event (no backlog), and the board takes the #3038
+    checkpoint there if it has none. Setting a mode again, or changing it,
+    keeps the first start. Narrowing to ``notify`` cancels the rule's pending
+    failure moments; ``off`` deletes the row and cancels its pending
+    deliveries. A delivery a card watch still keeps stays either way."""
+    if mode not in board_watch.RULE_MODES:
+        raise ValueError(mode)
+    now = int(time.time())
+    if mode == "off":
+        def forget(conn):
+            conn.execute("DELETE FROM board_watch_rule WHERE profile = ? AND board = ? AND assignee = ?",
+                         [profile, slug, assignee])
+            return _cancel_rule_pending(conn, profile, slug, assignee)
+        return {"mode": mode, "cancelled": _write(forget)}
+    try:
+        _, cp = board_tail.first_watch(db, meta)
+    except (OSError, sqlite3.Error):
+        raise MomentStoreError("board unreadable") from None
+
+    def body(conn):
+        conn.execute(
+            "INSERT OR IGNORE INTO board_tail (profile, board, checkpoint, updated_at) VALUES (?, ?, ?, ?)",
+            [profile, slug, board_tail.to_json(cp), now])
+        conn.execute(
+            "INSERT INTO board_watch_rule (profile, board, assignee, mode, since, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (profile, board, assignee) DO UPDATE SET"
+            " mode = excluded.mode, updated_at = excluded.updated_at",
+            [profile, slug, assignee, mode, cp.cursor, now])
+        return _cancel_rule_pending(conn, profile, slug, assignee)
+
+    return {"mode": mode, "cancelled": _write(body)}
+
+
 def _titles(conn: sqlite3.Connection, events: list) -> dict:
+    """``{card: (title, assignee)}`` for the events' cards, in the tail's own
+    read-only transaction (#3947: the assignee is the card's current one)."""
     ids = sorted({e["task_id"] for e in events if isinstance(e.get("task_id"), str)})
     out = {}
     for start in range(0, len(ids), 200):
         chunk = ids[start:start + 200]
-        for row in conn.execute("SELECT id, title FROM tasks WHERE id IN (" + ",".join("?" for _ in chunk) + ")",
-                                chunk):
-            out[row[0]] = row[1]
+        for row in conn.execute("SELECT id, title, assignee FROM tasks WHERE id IN ("
+                                + ",".join("?" for _ in chunk) + ")", chunk):
+            out[row[0]] = (row[1], row[2])
     return out
 
 
@@ -478,7 +562,9 @@ def tail_scope(profile: str, slug: str, root: Path, *, now: Optional[int] = None
     now = int(time.time()) if now is None else now
     db, meta = bm.board_paths(root, slug)
     watched = set(board_watch.watched(profile, slug))
-    if not watched:
+    # #3947: a board with rules and no watched card is tailed too.
+    rules = board_watch.rules(profile, slug)
+    if not watched and not rules:
         return {"action": "idle", "new": 0}
     conn = _open()
     try:
@@ -527,7 +613,7 @@ def tail_scope(profile: str, slug: str, root: Path, *, now: Optional[int] = None
         # boundary and deliver no history. Current attention is in the board.
         return _resnapshot(profile, slug, stored, result.checkpoint, list(result.reasons), now)
     _at("tail.read")
-    titles = result.facts or {}
+    facts = result.facts or {}
     gateway = gateway_id()
     caps = capabilities if capabilities is not None else bm.board_capabilities()
     actions = action_guard(caps)
@@ -542,23 +628,34 @@ def tail_scope(profile: str, slug: str, root: Path, *, now: Optional[int] = None
     with_done = policy.state != "unknown" and policy.moments and policy.done
     for event in [] if off else result.events:
         task = event.get("task_id")
-        if task not in watched or not isinstance(event.get("id"), int) or event["id"] <= since.get(task, 0):
+        if not isinstance(event.get("id"), int):
+            continue
+        title_raw, assignee = facts.get(task, (None, None))
+        by_watch = task in watched and event["id"] > since.get(task, 0)
+        # #3947: the card's current assignee's rule on this board, after its start.
+        rule = rules.get(assignee) if isinstance(assignee, str) else None
+        by_rule = rule is not None and event["id"] > rule[1]
+        if not by_watch and not by_rule:
             continue
         payload = _payload(event.get("payload"))
         attention = attention_class(event.get("kind"), payload)
-        if attention is None and with_done:
+        # A rule never raises done; only a watched card's done event can be one.
+        if attention is None and with_done and by_watch:
             attention = done_class(event.get("kind"), payload)
-        if attention is None or not isinstance(event.get("created_at"), int):
+        if by_rule and attention not in board_watch.RULE_CLASSES[rule[0]]:
+            by_rule = False
+        if attention is None or not (by_watch or by_rule) or not isinstance(event.get("created_at"), int):
             continue
         if owned_by_create(profile, slug, event):
             continue
         if event["created_at"] + EXPIRY_SECONDS <= now:
             continue  # too old to interrupt; the board shows the current state
-        title = bm._clean(titles.get(task), TITLE_MAX) or "Untitled"
+        title = bm._clean(title_raw, TITLE_MAX) or "Untitled"
         env = build_envelope(gateway=gateway, profile=profile, root=root, slug=slug, board_name=board_name,
                              anchor=anchor, event=event, title=title, attention=attention, actions=actions)
         if valid_envelope(env):
-            moments.append(env)
+            # One moment per event, whatever matched it: the watch and the rule share a delivery.
+            moments.append((env, assignee if by_rule else None))
         else:
             logger.warning("[ocuclaw] board moment refused by its own validator (event %s)", event.get("id"))
 
@@ -571,16 +668,25 @@ def tail_scope(profile: str, slug: str, root: Path, *, now: Optional[int] = None
         # table is in this store, so this transaction sees the latest.
         still = {t for (t,) in c.execute(
             "SELECT task FROM board_watch WHERE profile = ? AND board = ? AND mode != 'off'", [profile, slug])}
+        # #3947: the same for a rule turned off (or narrowed) since the read.
+        still_rules = dict(c.execute(
+            "SELECT assignee, mode FROM board_watch_rule WHERE profile = ? AND board = ?", [profile, slug]))
         added = coalesced = 0
-        for env in moments:
+        for env, rule in moments:
             card = env["card"]["id"]
-            if card not in still:
+            if rule is not None and env["attention"] not in board_watch.RULE_CLASSES.get(still_rules.get(rule), ()):
+                rule = None
+            watched_now = card in still and env["event"]["id"] > since.get(card, 0)
+            if not watched_now and rule is None:
                 continue
+            via = "watch" if watched_now else f"rule:{rule}"
             cur = c.execute(
                 "INSERT OR IGNORE INTO board_moment (delivery, profile, board, task, source, envelope, state,"
-                " created_at, expires_at, attention, event) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+                " created_at, expires_at, attention, event, via, rule)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
                 [env["deliveryId"], profile, slug, card, env["sourceId"],
-                 json.dumps(env, sort_keys=True), now, env["expiresAt"], env["attention"], env["event"]["id"]])
+                 json.dumps(env, sort_keys=True), now, env["expiresAt"], env["attention"], env["event"]["id"],
+                 via, rule])
             added += cur.rowcount
             if cur.rowcount:
                 # #3053 per-card coalescing: the card's newest moment replaces
@@ -633,6 +739,9 @@ def _resnapshot(profile: str, slug: str, stored: Optional[str], fresh: Optional[
             c.execute("UPDATE board_tail SET checkpoint = ?, updated_at = ? WHERE profile = ? AND board = ?",
                       [board_tail.to_json(fresh), now, profile, slug])
         c.execute("DELETE FROM board_watch_since WHERE profile = ? AND board = ?", [profile, slug])
+        # #3947: every rule on the board starts again at the new boundary.
+        c.execute("UPDATE board_watch_rule SET since = ? WHERE profile = ? AND board = ?",
+                  [0 if fresh is None else fresh.cursor, profile, slug])
         superseded = 0
         if lifetime:
             superseded = c.execute("UPDATE board_moment SET state = 'superseded' WHERE profile = ? AND board = ?"
@@ -656,8 +765,9 @@ def _stored(conn, profile: str, slug: str) -> Optional[str]:
 
 
 def catch_up(root: Optional[Path] = None, *, now: Optional[int] = None) -> dict:
-    """One catch-up step for every watched profile and board. A board that
-    cannot be read now is skipped and tried again next time."""
+    """One catch-up step for every profile and board with a watch or (#3947)
+    a rule. A board that cannot be read now is skipped and tried again next
+    time."""
     root = bm.board_root() if root is None else root
     out = {}
     caps = bm.board_capabilities()
@@ -674,6 +784,8 @@ def due(*, now: Optional[int] = None, limit: int = PUSH_BATCH) -> list:
     ``RESEND_SECONDS`` ago without an ack. Expired ones settle as expired;
     #3052: one whose watch is gone (turned off, or its card left the board)
     settles as cancelled, whatever crash came between the two writes.
+    #3947: one a rule raised is kept while that rule is on and still lets
+    its class through, watch or not.
 
     #3053: the backend's policy decides what goes now. A profile whose
     policy is in quiet hours, or unknown (a row that does not read back, or
@@ -687,9 +799,8 @@ def due(*, now: Optional[int] = None, limit: int = PUSH_BATCH) -> list:
     def body(conn):
         conn.execute("UPDATE board_moment SET state = 'expired' WHERE state = 'pending' AND expires_at <= ?", [now])
         conn.execute(
-            "UPDATE board_moment SET state = 'cancelled' WHERE state = 'pending' AND NOT EXISTS ("
-            " SELECT 1 FROM board_watch w WHERE w.profile = board_moment.profile AND w.board = board_moment.board"
-            " AND w.task = board_moment.task AND w.mode != 'off')")
+            f"UPDATE board_moment SET state = 'cancelled' WHERE state = 'pending' AND NOT {_WATCH_ON}"
+            f" AND NOT {_RULE_ON}")
         candidates = conn.execute(
             "SELECT delivery, envelope, profile, board, task, attempts FROM board_moment WHERE state = 'pending'"
             " AND (sent_at IS NULL OR sent_at <= ?) ORDER BY created_at, delivery",
@@ -845,14 +956,14 @@ def ack(params: Any) -> dict:
 
 
 def deliveries(profile: Optional[str] = None) -> list:
-    """Every stored delivery as ``{deliveryId, profile, board, task, state, ack, attempts, attention}``
-    (evidence and tests; reads never create the store)."""
+    """Every stored delivery as ``{deliveryId, profile, board, task, state, ack, attempts, attention,
+    via, rule}`` (evidence and tests; reads never create the store)."""
     path = board_watch.store_path()
     if path is None or not path.is_file():
         return []
     conn = _open()
     try:
-        sql = "SELECT delivery, profile, board, task, state, ack, attempts, attention FROM board_moment"
+        sql = "SELECT delivery, profile, board, task, state, ack, attempts, attention, via, rule FROM board_moment"
         args: list = []
         if profile is not None:
             sql += " WHERE profile = ?"
@@ -860,7 +971,7 @@ def deliveries(profile: Optional[str] = None) -> list:
         rows = conn.execute(sql + " ORDER BY created_at, delivery", args).fetchall()
     finally:
         conn.close()
-    keys = ("deliveryId", "profile", "board", "task", "state", "ack", "attempts", "attention")
+    keys = ("deliveryId", "profile", "board", "task", "state", "ack", "attempts", "attention", "via", "rule")
     return [dict(zip(keys, row)) for row in rows]
 
 

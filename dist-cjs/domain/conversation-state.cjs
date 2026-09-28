@@ -5,6 +5,9 @@ const { marked } = require("marked");
 const DEFAULT_AGENT_NAME = "Agent";
 const REPLY_DIRECTIVE_TAG_RE = /\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]/gi;
 const REPLY_DIRECTIVE_SENTINEL = "\u0000";
+
+const EXACT_BEAT_MARKER = "<beat/>";
+const BEAT_MARKER_SENTINEL = "".repeat(EXACT_BEAT_MARKER.length);
 const STANDALONE_REPLY_DIRECTIVE_LINE_RE = /^[ \t]*\u0000[ \t]*(?:\r?\n)?/gm;
 const INLINE_REPLY_DIRECTIVE_RE = /[ \t]*\u0000[ \t]*/g;
 const SYNTHETIC_SESSION_START_PREFIX_RE = /^a\s+new\s+session\s+was\s+started\b/;
@@ -38,6 +41,9 @@ let ledgerCapable = true;
 let assistantCommitGeneration = 0;
 let assistantCommitPresent = false;
 let assistantCommitText = "";
+
+const pendingUserSendIds = new Set();
+const PENDING_USER_SEND_MAX_AGE_MS = 120_000;
 
 const DEFAULT_SEQUENCE_SESSION_KEY = "__default__";
 const SEQUENCE_SESSION_MAX = 256;
@@ -155,12 +161,16 @@ function buildDisplayEntry(msg, options = {}) {
 
   if (msg.role === "assistant") {
     text = stripAllTaggedSpans(text);
+
+    text = text.replaceAll(EXACT_BEAT_MARKER, BEAT_MARKER_SENTINEL);
   }
 
-  const { text: plainText } = markdownToPlainText(text, {
+  const { text: markdownText } = markdownToPlainText(text, {
     stripReplyTags: msg.role === "assistant",
   });
+  const plainText = markdownText.replaceAll(BEAT_MARKER_SENTINEL, EXACT_BEAT_MARKER);
   if (!plainText) return null;
+  if (msg.role === "assistant" && isSilentControlReplyText(plainText)) return null;
   const normalizedOptions = { ...options };
   if (
     msg.role === "user" &&
@@ -233,6 +243,19 @@ function countSyntheticSessionInstructionSignals(normalizedText) {
   return count;
 }
 
+const SILENT_CONTROL_REPLY_TOKENS = ["NO_REPLY", "ANNOUNCE_SKIP", "REPLY_SKIP"];
+const SILENT_CONTROL_REPLY_RES = SILENT_CONTROL_REPLY_TOKENS.map(
+  (token) => new RegExp(`^\\s*${token}(?:\\s+${token})*\\s*$`, "i"),
+);
+
+function isSilentControlReplyText(text) {
+  if (typeof text !== "string") return false;
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  const bare = trimmed.replace(/^\p{P}+|\p{P}+$/gu, "");
+  return SILENT_CONTROL_REPLY_RES.some((re) => re.test(trimmed) || re.test(bare));
+}
+
 function isLikelySyntheticSessionStarterPrompt(text) {
   const normalized = normalizeSessionStarterCandidate(text);
   if (!normalized) return false;
@@ -266,7 +289,12 @@ function formatEntry(entry) {
     return entry.name ? `• ${entry.name}: ${entry.text}` : `• ${entry.text}`;
   }
   const name = entry.name || agentName;
-  return `${name}: ${entry.text}`;
+  return `${name}: ${stripBeatMarkers(entry.text)}`;
+}
+
+function stripBeatMarkers(text = "") {
+  if (!text.includes(EXACT_BEAT_MARKER)) return text;
+  return text.replace(/ ?<beat\/>(?= )/g, "").replaceAll(EXACT_BEAT_MARKER, "");
 }
 
 function rebuildDisplayCache() {
@@ -605,6 +633,51 @@ function carryCommitRunId(next, runId, text) {
   match.runId = normalizedRunId;
 }
 
+function serverIdOf(msg) {
+  return trimmedId(msg.id ?? msg.messageId ?? msg.__openclaw?.id);
+}
+
+function carryPendingUserSends(previous, next, commitRunId) {
+  if (pendingUserSendIds.size === 0) return;
+  const seenUserIds = new Set();
+  for (const msg of previous) {
+    if (msg && msg.role === "user" && serverIdOf(msg)) seenUserIds.add(serverIdOf(msg));
+  }
+  const echoedSendIds = new Set();
+  const addedUserTexts = new Map();
+  for (const msg of next) {
+    if (!msg || typeof msg !== "object" || msg.role !== "user") continue;
+    for (const key of [msg.clientSendId, msg.sendId, msg.idempotencyKey]) {
+      if (trimmedId(key)) echoedSendIds.add(trimmedId(key));
+    }
+
+    if (seenUserIds.has(serverIdOf(msg))) continue;
+    const text = normalizeRetagMatchText(extractText(msg.content));
+    if (text) addedUserTexts.set(text, (addedUserTexts.get(text) ?? 0) + 1);
+  }
+  const committedRunId = trimmedId(commitRunId);
+  const stillPending = new Set();
+  for (const msg of previous) {
+    if (!msg || msg.role !== "user" || serverIdOf(msg)) continue;
+    const sendId = trimmedId(msg.clientSendId ?? msg.sendId);
+    if (!sendId || !pendingUserSendIds.has(sendId)) continue;
+    if (echoedSendIds.has(sendId)) continue;
+    const text = normalizeRetagMatchText(extractText(msg.content));
+    const added = addedUserTexts.get(text) ?? 0;
+    if (text && added > 0) {
+      addedUserTexts.set(text, added - 1);
+      continue;
+    }
+    if (committedRunId && trimmedId(msg.runId) === committedRunId) continue;
+    const arrival = arrivalMsOf(msg);
+    if (arrival === null || Date.now() - arrival > PENDING_USER_SEND_MAX_AGE_MS) continue;
+    next.push(msg);
+    stillPending.add(sendId);
+  }
+  pendingUserSendIds.clear();
+  for (const sendId of stillPending) pendingUserSendIds.add(sendId);
+}
+
 function findNarrationMessageIndex(target, messageId = null) {
   const wantedId = typeof messageId === "string" || typeof messageId === "number"
     ? String(messageId).trim()
@@ -690,13 +763,15 @@ const conversationState = {
     }
     const previousMessages = conversationState.getRawMessages();
     const nextMessages = Array.isArray(msgs) ? [...msgs] : [];
+    const options = sessionKey === null ? sessionKeyOrOptions : maybeOptions;
+    const opts = options && typeof options === "object" ? options : {};
     if (activeSequenceState === previousSequenceState) {
       carryArrivalStamps(previousMessages, nextMessages);
     }
+
+    carryPendingUserSends(previousMessages, nextMessages, opts.commitRunId);
     messages = nextMessages;
     if (name) agentName = name;
-    const options = sessionKey === null ? sessionKeyOrOptions : maybeOptions;
-    const opts = options && typeof options === "object" ? options : {};
 
     headNotice = opts.historyUnavailable === true
       ? HISTORY_UNAVAILABLE_MARKER
@@ -730,6 +805,8 @@ const conversationState = {
 
         stampArrival(reconciled, arrivalMsOf(existing));
         messages[existingIndex] = reconciled;
+
+        if (serverIdOf(reconciled)) pendingUserSendIds.delete(clientSendId);
         rebuildDisplayCache();
         entriesRevision += 1;
         return;
@@ -857,6 +934,21 @@ const conversationState = {
     entriesRevision += 1;
   },
 
+  markUserSendPending(clientSendId = "") {
+    const sendId = trimmedId(clientSendId);
+    if (!sendId) return false;
+    const present = conversationState.getRawMessages().some((msg) =>
+      msg && msg.role === "user" && !serverIdOf(msg) &&
+      trimmedId(msg.clientSendId ?? msg.sendId) === sendId
+    );
+    if (present) pendingUserSendIds.add(sendId);
+    return present;
+  },
+
+  settleUserSend(clientSendId = "") {
+    return pendingUserSendIds.delete(trimmedId(clientSendId));
+  },
+
   bindRunIdToClientSendId(clientSendId = "", runId = "") {
     if (typeof clientSendId !== "string" || !clientSendId.trim()) return false;
     if (typeof runId !== "string" || !runId.trim()) return false;
@@ -945,6 +1037,7 @@ const conversationState = {
     assistantCommitPresent = false;
     assistantCommitText = "";
     headNotice = null;
+    pendingUserSendIds.clear();
   },
 
   _markdownToPlainText: markdownToPlainText,
@@ -962,6 +1055,8 @@ const {
   repositionAssistantMessageMatching,
   removeLastAssistantMessageMatching,
   replaceLatestUserMessage,
+  markUserSendPending,
+  settleUserSend,
   bindRunIdToClientSendId,
   setAgentName,
   getPages,

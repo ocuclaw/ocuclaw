@@ -190,6 +190,8 @@ FACTS_KEYS_V1: Tuple[str, ...] = (
     "relayPortValid",  # bool
     "evenAiEnabled",  # bool
     "continueHereConfigured",  # bool: allow_admin_from lists the wearer id (#2509)
+    "streamingConfigured",  # bool: display.platforms.ocuclaw.streaming reads true
+    "streamingExplicitlyOff",  # bool: the same key reads false (an operator's choice)
     # -- agent choice (#2515) ---------------------------------------------
     # The raw, non-secret posture behind the phone's "+" button. Both are
     # read from config.yaml only — never from the process environment — so a
@@ -398,6 +400,31 @@ _FINDINGS: Dict[str, Tuple[str, str, str, Optional[str]]] = {
         "is off: platforms.ocuclaw.extra.allow_admin_from does not list "
         "ocuclaw-wearer.",
         "configure_continue_here",
+    ),
+    # A WARNING, not an error: replies still arrive. Unset means Hermes keeps
+    # the platform's streaming off, so the glasses show only "typing" for the
+    # whole reply and the first words wait for the model to finish (about
+    # 4.5 s later on a 150-word real-model reply, more on longer ones). Setup
+    # writes the key; this names installs that never ran that step.
+    "streaming_not_configured": (
+        "setup",
+        "warning",
+        "Reply streaming is unset: "
+        "display.platforms.ocuclaw.streaming does not read true. The glasses "
+        "will show only \"typing\" for the whole reply, then the whole reply "
+        "at once.",
+        "enable_ocuclaw_streaming",
+    ),
+    # ADVISORY: an operator set the key to false on purpose. Their choice
+    # stands; the finding only explains the slow first words.
+    "streaming_turned_off": (
+        "setup",
+        "info",
+        "Reply streaming is turned off: "
+        "display.platforms.ocuclaw.streaming reads false. The glasses "
+        "will show only \"typing\" for the whole reply, then the whole reply "
+        "at once.",
+        "enable_ocuclaw_streaming",
     ),
     "node_unavailable": (
         "setup",
@@ -649,6 +676,8 @@ def blank_facts(**overrides: Any) -> Dict[str, Any]:
         "relayPortValid": True,
         "evenAiEnabled": False,
         "continueHereConfigured": False,
+        "streamingConfigured": False,
+        "streamingExplicitlyOff": False,
         "multiplexProfiles": None,
         "agentMode": None,
         "secretsPresent": {},
@@ -838,6 +867,12 @@ def _derive_setup(facts: Mapping[str, Any], out: _Builder) -> Dict[str, Any]:
     # already `config_unreadable` above.
     if facts["configReadable"] and not facts["continueHereConfigured"]:
         out.finding("continue_here_not_configured")
+    if facts["configReadable"] and not facts["streamingConfigured"]:
+        out.finding(
+            "streaming_turned_off"
+            if facts["streamingExplicitlyOff"]
+            else "streaming_not_configured"
+        )
     if node_required and not node_available:
         out.finding("node_unavailable")
     if not runtime_available:

@@ -32,6 +32,9 @@ function parseTerminalCapabilities(value         )                       {
         ? columns
         : 0,
     rows: typeof rows === "number" && Number.isInteger(rows) && rows > 0 && rows <= 10000 ? rows : 0,
+
+    redraw: record["redraw"] === true,
+    zoom: record["zoom"] === "mac" || record["zoom"] === "pc" ? record["zoom"] : "any",
   };
 }
 

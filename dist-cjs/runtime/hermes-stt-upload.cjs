@@ -7,7 +7,7 @@ const process = require("node:process");
 
 const HERMES_UPLOAD_LIMITS = Object.freeze({
   pcmBytes: 3_999_956, chunkBytes: 16_384, queuedBytes: 262_144,
-  uploads: 4, records: 256, idleMs: 30_000, lifetimeMs: 180_000,
+  uploads: 4, records: 256, idleMs: 30_000, lifetimeMs: 180_000, orphanRpcs: 2,
 });
 
 function wavHeader(bytes) {
@@ -31,6 +31,7 @@ function createHermesSttUpload(deps) {
   const failure = (message) => ({ success: false, error: { code: "upload_failed", message } });
   const keyFor = (client, id) => JSON.stringify([client, id]);
   const terminal = (r) => r.state === "done" || r.state === "cancelled";
+  const log = (level, message) => { const fn = deps.logger && deps.logger[level]; if (typeof fn === "function") fn.call(deps.logger, message); };
 
   async function cleanup(r) {
     if (r.file) { const file = r.file; r.file = null; await file.close().catch(() => {}); }
@@ -86,8 +87,17 @@ function createHermesSttUpload(deps) {
       if (!deps.isReady() || !validId(msg.voiceSessionId) || msg.format !== "pcm_s16le" ||
           msg.sampleRateHz !== 16000 || msg.channels !== 1) return Promise.resolve(failure("upload unavailable or invalid PCM format"));
       const active = [...records.values()].filter(v => !terminal(v) || !v.cleaned || v.rpc);
-      if (records.size >= limits.records || active.length >= limits.uploads || active.some(v => v.client === client))
+
+      const mine = active.filter(v => v.client === client);
+      if (records.size >= limits.records || active.length >= limits.uploads || mine.some(v => !terminal(v) && !v.rpc))
         return Promise.resolve(failure("upload capacity exceeded"));
+
+      const orphans = mine.filter(v => v.rpc).length;
+      if (orphans >= limits.orphanRpcs) {
+        log("warn", `[hermes-stt] upload refused: ${orphans} orphaned transcriptions still running for this client (cap ${limits.orphanRpcs})`);
+        return Promise.resolve(failure("previous transcriptions still running"));
+      }
+      if (orphans) log("info", `[hermes-stt] upload admitted beside ${orphans} orphaned transcription(s)`);
       r = { client, state: "open", created: now(), touched: now(), bytes: 0, chunks: 0,
         file: null, rpc: null, result: null, cleaned: false,
         path: path.join(os.tmpdir(), `ocuclaw-stt-upload-${process.pid}-${randomUUID()}.wav`) };

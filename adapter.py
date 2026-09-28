@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import deque
 import concurrent.futures
 import contextlib
 from contextvars import ContextVar
@@ -66,7 +67,10 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from .cli import register_cli_commands
+from . import uninstall_gate
 from .session_status import SessionStatusObserver
+from .session_title_hold import SessionTitleHold, turn_user_text
+from .session_writer import SharedSessionWriter
 from .control_link import (
     HERMES_BUNDLE_DEFAULT_WS_BIND,
     HERMES_BUNDLE_DEFAULT_WS_PORT,
@@ -74,6 +78,7 @@ from .control_link import (
     LINK_TERMINATE_GRACE_S,
     RPC_METHOD_NOT_FOUND_CODE,
     LinkError,
+    LinkOverloadedError,
     LinkProcess,
     LinkRpcError,
     default_child_env,
@@ -267,6 +272,14 @@ _SECRET_ENV_TO_ADAPTER_KEY = {
 # adapter as transport provenance, so these are not required for multiplexing.
 OCUCLAW_ALLOWED_USERS_ENV = "OCUCLAW_ALLOWED_USERS"
 OCUCLAW_ALLOW_ALL_USERS_ENV = "OCUCLAW_ALLOW_ALL_USERS"
+
+
+def _swallow_task_exception(task: "asyncio.Future[Any]") -> None:
+    """Retrieve a fire-and-forget RPC's outcome so asyncio never logs it."""
+    if not task.cancelled():
+        exc = task.exception()
+        if exc is not None:
+            logger.debug("[ocuclaw] closing frame RPC finished with %s", exc)
 
 
 def _is_hermes_home_channel_onboarding_notice(text: str) -> bool:
@@ -589,6 +602,12 @@ DESKTOP_THEME_OFFER_ENABLED = "already_enabled"
 DESKTOP_THEME_OFFER_AVAILABLE = "offer"
 DESKTOP_THEME_OFFER_UNAVAILABLE = "unavailable"
 DESKTOP_THEME_OFFER_UNKNOWN = "unknown"
+# From 0.20.6 the Desktop plugin asks "Make Desktop feel like OcuClaw?" itself,
+# once, and remembers the answer on that Desktop (#3343). That answer never
+# reaches this backend, so `/ocuclaw-setup` must not ask a second time (#3911):
+# the look is already the operator's choice, made in Desktop and changed in
+# Settings > Appearance.
+DESKTOP_THEME_OFFER_DESKTOP_CHOICE = "desktop_choice"
 # requestTheme() — the door that applies a theme from outside React — arrived
 # in Hermes 0.20.6. Below that the theme is listed but must be picked by hand.
 DESKTOP_THEME_AUTOSELECT_MIN = (0, 20, 6)
@@ -609,6 +628,7 @@ def _desktop_theme_offer(
     requested: bool,
     plugin_present: bool,
     config_readable: bool,
+    desktop_chooser: bool = False,
 ) -> str:
     """What `/ocuclaw-setup` should DO about the OcuClaw look on this host."""
     if not config_readable:
@@ -617,6 +637,8 @@ def _desktop_theme_offer(
         return DESKTOP_THEME_OFFER_ENABLED
     if not plugin_present:
         return DESKTOP_THEME_OFFER_UNAVAILABLE
+    if desktop_chooser:
+        return DESKTOP_THEME_OFFER_DESKTOP_CHOICE
     return DESKTOP_THEME_OFFER_AVAILABLE
 
 
@@ -644,17 +666,22 @@ def _desktop_plugin_presence() -> Tuple[Optional[str], bool]:
 def _desktop_theme_status(raw_config: Dict[str, Any], config_readable: bool) -> Dict[str, Any]:
     requested_at = read_desktop_theme_request(raw_config) if config_readable else ""
     path, present = _desktop_plugin_presence()
+    auto_select = _desktop_theme_autoselect_supported()
     return {
         "name": DESKTOP_THEME_NAME,
         "requestedAt": requested_at or None,
         "requested": bool(requested_at),
         "pluginPath": path,
         "pluginPresent": present,
-        "autoSelectSupported": _desktop_theme_autoselect_supported(),
+        "autoSelectSupported": auto_select,
+        # The plugin's one-time theme dialog shares requestTheme's 0.20.6 gate,
+        # so the same fact says Desktop has already asked (#3911).
+        "desktopChooser": auto_select,
         "offer": _desktop_theme_offer(
             requested=bool(requested_at),
             plugin_present=present,
             config_readable=config_readable,
+            desktop_chooser=auto_select,
         ),
     }
 
@@ -787,6 +814,27 @@ SETUP_SKILL_PATH = BUNDLE_DIR / "skills" / SETUP_SKILL_NAME / "SKILL.md"
 SETUP_SKILL_DESCRIPTION = (
     "Guided OcuClaw setup, update, diagnostics, and troubleshooting for Hermes."
 )
+# The name a MODEL loads the setup skill by (#3829). Hermes qualifies a plugin
+# skill with the plugin's name, and resolves it only that way: it is absent
+# from <available_skills> and from the flat skills tree. `/ocuclaw-setup` is a
+# command a PERSON types; told to "load it via /ocuclaw-setup", a model on a
+# real Desktop run guessed `skill_view("ocuclaw-setup")`, got "not found", and
+# carried on without the skill.
+SETUP_SKILL_QUALIFIED_NAME = f"ocuclaw:{SETUP_SKILL_NAME}"
+# Its index line, as OCUCLAW_SKILLS_SYSTEM_PROMPT is glasses-ui's. It is a
+# section of its own rather than a second sentence in that one: that line is
+# the glasses-ui probe's measured index line (tools/glasses-ui-probe/
+# hermes-qualify.js reads it byte for byte), and a setup sentence inside it
+# would move every on-demand baseline for nothing. Byte-constant, like it.
+OCUCLAW_SETUP_SKILL_SECTION_ID = "ocuclaw.setup-skill"
+OCUCLAW_SETUP_SKILL_SYSTEM_PROMPT = (
+    "Plugin skill ocuclaw:ocuclaw-assist-hermes: OcuClaw setup, phone "
+    "pairing and re-pairing, updates, diagnostics and troubleshooting for the "
+    "Even G2 on Hermes. Load it with "
+    'skill_view("ocuclaw:ocuclaw-assist-hermes") before any OcuClaw setup, '
+    "pairing or repair step, including a plain request to re-pair a phone. "
+    "/ocuclaw-setup is the same skill for a person to type; you cannot run it."
+)
 # The authoring/deciding skill for the LiveUI tools (#3078). It is the same
 # skill the OpenClaw manifest ships; the bundle carries a committed mirror at
 # skills/glasses-ui/ because Hermes loads no manifest and can only open a skill
@@ -822,10 +870,12 @@ SETUP_TOOL_DESCRIPTION = (
     "enable_stream_reasoning_deltas and enable_desktop_theme — and only with "
     "confirm: true after the operator has said yes."
 )
-SETUP_GUIDE_VERSION = "2026-09-25 (1.3.24-hermes)"
+SETUP_GUIDE_VERSION = "2026-09-28 (1.3.25-hermes)"
 SETUP_SKILL_LOAD_POINTER = (
     "If the OcuClaw Setup Assistant skill is not loaded in this conversation, "
-    "load it via `/ocuclaw-setup` before mutating anything."
+    f'load it with skill_view("{SETUP_SKILL_QUALIFIED_NAME}") before mutating '
+    "anything. `/ocuclaw-setup` is the same skill for a person to type; you "
+    "cannot run it."
 )
 SETUP_REFERENCE_FILES = {
     "install_lifecycle": ("install-lifecycle.md", "Installation and lifecycle recovery"),
@@ -950,12 +1000,38 @@ HISTORY_PUSH_LIMIT = 200
 # the trailing cumulative finalize edit. Keep the open record addressable for a
 # short bounded interval; provider-abort paths still close deterministically.
 STREAM_FINALIZE_GRACE_SECONDS = 1.5
+# Reply-stream slot. Hermes' StreamConsumer calls edit_message about every
+# 50 ms with the CUMULATIVE text, and each call used to become its own
+# fire-and-forget RPC: an 8k reply put ~800 frames and several MB on the link,
+# and a stalled child let them pile up to the link's 128-request admission
+# limit, where the turn's commit, terminal activity and agent_end were
+# refused. The slot keeps at most one streaming RPC per run in flight, keeps
+# only the newest text while one is (cumulative text makes that lossless),
+# and spaces sends by this floor. The first frame of a run is never delayed.
+# `platforms.ocuclaw.extra.streamFlushMs` overrides it; 0 turns the slot off.
+STREAM_SLOT_FLOOR_MS = 100
+# A turn's closing frames (commit, terminal activity, agent_end) are retried
+# when the link refuses them as overloaded, for as long as the stream tail may
+# itself be held open, then dropped with a warning.
+CRITICAL_FRAME_RETRY_BUDGET_S = STREAM_FINALIZE_GRACE_SECONDS
+CRITICAL_FRAME_RETRY_BASE_S = 0.025
+CRITICAL_FRAME_RETRY_MAX_S = 0.4
 
 TOOL_ACTIVITY_MAX_ARG_KEYS = 32
 TOOL_ACTIVITY_MAX_ARG_ITEMS = 8
 TOOL_ACTIVITY_MAX_ARG_DEPTH = 2
 TOOL_ACTIVITY_MAX_ARG_STRING = 512
 TOOL_ACTIVITY_MAX_ARGS_JSON_BYTES = 16 * 1024
+# Hermes' native plan tool. 0.21.5 renamed `todo` to `todo_list`; the legacy
+# name still resolves on older engines, so both carry the plan snapshot.
+PLAN_TOOL_NAMES = ("todo_list", "todo")
+PLAN_RESULT_MAX_BYTES = 64 * 1024
+PLAN_MAX_ITEMS = 30
+PLAN_ITEM_MAX_CHARS = 120
+PLAN_ID_MAX_CHARS = 64
+PLAN_STATUSES = ("pending", "in_progress", "completed", "cancelled")
+# Newest plan revision per Hermes session id. Bounded; oldest entries drop.
+PLAN_REVISION_CACHE_MAX = 256
 TOOL_ACTIVITY_ALLOWED_ARG_KEYS = {
     "cmd",
     "command",
@@ -978,6 +1054,8 @@ TOOL_ACTIVITY_ALLOWED_ARG_KEYS = {
     "uri",
     "url",
 }
+#: #3769: a Hermes kanban board slug, the same shape Board accepts (board_management._SLUG).
+TOOL_ACTIVITY_KANBAN_BOARD_SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 TOOL_ACTIVITY_OMITTED_ARG_KEYS = {
     "blob",
     "body",
@@ -1134,9 +1212,29 @@ SLASH_CONFIRM_PRESENT_METHOD = "slash.confirm.present"
 SLASH_CONFIRM_RESOLVE_METHOD = "slash.confirm.resolve"
 CLARIFY_RESOLVE_METHOD = "clarify.resolve"
 CLARIFY_AWAIT_TEXT_METHOD = "clarify.await_text"
+# Even AI turns cannot answer a structured clarify (plugin issue #7, the
+# Hermes half of the OpenClaw ask_user guard). An Even AI reply is one
+# blocking HTTP request that ends with the run, and the glasses show Even
+# AI's own HUD. The clarify router drops the question on the background
+# lanes and paints an unreachable OcuClaw card on the active lane, while
+# clarify holds the run for up to an hour and the request gives up at 60 s.
+# The pre_tool_call hook vetoes clarify on Even AI turns (see
+# even_ai_clarify_block); Hermes returns the message as the tool result.
+EVEN_AI_CLARIFY_TOOL_NAME = "clarify"
+EVEN_AI_PROMPT_OWNER = "even-ai"
+EVEN_AI_CLARIFY_BLOCK_MESSAGE = (
+    "The user is talking through Even AI on their glasses, which cannot show "
+    "clarify questions. Ask the question in plain text in your reply instead, "
+    "with any options as a short numbered list in the sentence, then end your "
+    "turn. Their next Even AI message is the answer."
+)
 SESSION_ABORT_METHOD = "sessions.abort"
 SESSION_STEER_METHOD = "sessions.steer"
 SESSION_OPTIONS_APPLY_METHOD = "sessions.options.apply"
+# Hermes effort names OcuClaw shows as-is; Hermes "none" arrives as enabled:False.
+OCUCLAW_THINKING_LEVELS = frozenset(
+    {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+)
 PROFILE_OPTIONS_GET_METHOD = "profile.options.get"
 PROFILE_OPTIONS_APPLY_METHOD = "profile.options.apply"
 MULTIPLEX_DISABLED_ERROR = (
@@ -1173,6 +1271,55 @@ UPDATE_COMMAND_REFUSAL = (
     "upgrades arrive through its own supervised upgrade, which checks that "
     "everything still works before it keeps the new version."
 )
+
+
+def plan_step_glance(items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The glasses' `Step k/n` fact for a normalized plan, or None.
+
+    Only top-level items (no `parent`) count, and cancelled ones drop out of
+    n. k is the first in_progress top-level item; with none, k is
+    completed + 1 clamped to n. `content` is the in_progress child of the
+    current step when there is one, else the step itself. When every counted
+    item is completed the plan is done at n/n.
+    """
+    top = [
+        item for item in items
+        if not item.get("parent") and item.get("status") != "cancelled"
+    ]
+    total = len(top)
+    if total == 0:
+        return None
+    completed = sum(1 for item in top if item.get("status") == "completed")
+    if completed == total:
+        return {"index": total, "total": total, "done": True}
+    current_index = next(
+        (i for i, item in enumerate(top) if item.get("status") == "in_progress"),
+        None,
+    )
+    if current_index is None:
+        current_index = min(completed, total - 1)
+        current = next(
+            (item for item in top if item.get("status") == "pending"),
+            top[current_index],
+        )
+    else:
+        current = top[current_index]
+    content = str(current.get("content") or "")
+    current_id = current.get("id")
+    if current_id:
+        child = next(
+            (
+                item for item in items
+                if item.get("parent") == current_id and item.get("status") == "in_progress"
+            ),
+            None,
+        )
+        if child is not None and child.get("content"):
+            content = str(child["content"])
+    step: Dict[str, Any] = {"index": current_index + 1, "total": total, "done": False}
+    if content:
+        step["content"] = content
+    return step
 
 
 def _url_key_is_secret(key: Any) -> bool:
@@ -1641,13 +1788,24 @@ def _on_post_approval_response_hook(**kwargs: Any) -> None:
             logger.exception("[ocuclaw] post_approval_response glue failed")
 
 
-def _on_pre_tool_call_hook(**kwargs: Any) -> None:
-    """Hermes ``pre_tool_call`` observer. Emits the tool-start activity edge."""
+def _on_pre_tool_call_hook(**kwargs: Any) -> Optional[Dict[str, str]]:
+    """Hermes ``pre_tool_call`` hook. Emits the tool-start activity edge, and
+    returns a block directive only to veto clarify on an Even AI turn."""
+    directive: Optional[Dict[str, str]] = None
     for adapter in list(_ADAPTERS):
+        # A live adapter built by an older bundle import (#3625) may predate
+        # the guard; it simply does not veto.
+        guard = getattr(adapter, "even_ai_clarify_block", None)
+        if directive is None and callable(guard):
+            try:
+                directive = guard(kwargs)
+            except Exception:  # noqa: BLE001 — the guard fails open
+                logger.exception("[ocuclaw] pre_tool_call Even AI clarify guard failed")
         try:
             adapter.handle_pre_tool_call(kwargs)
         except Exception:  # noqa: BLE001 — a hook raise must never break tools
             logger.exception("[ocuclaw] pre_tool_call activity glue failed")
+    return directive
 
 
 def _on_post_tool_call_hook(**kwargs: Any) -> None:
@@ -2773,6 +2931,9 @@ def resolve_adapter_settings(config: Any) -> Dict[str, Any]:
         "handshakeTimeoutS": _float("handshakeTimeoutS", LINK_HANDSHAKE_TIMEOUT_S),
         "terminateGraceS": _float("terminateGraceS", LINK_TERMINATE_GRACE_S),
         "linkDebugStderr": bool(extra.get("linkDebugStderr")),
+        # Python-side only (never sent to the child): the reply-stream slot's
+        # floor between two streaming frames of one run. 0 disables the slot.
+        "streamFlushMs": max(0, _int("streamFlushMs", STREAM_SLOT_FLOOR_MS)),
     }
 
 
@@ -3381,6 +3542,16 @@ def _setup_status(facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     tool_progress_off = config_readable and (
         tool_progress is False or tool_progress == "off"
     )
+    # Hermes streams a platform's replies only when
+    # display.platforms.<platform>.streaming is on (display.streaming is the
+    # CLI's own key). Off, the glasses show "typing" for the whole reply and
+    # the first words wait for the whole generation. Unset gates "verified",
+    # so setup and update write it; an explicit false is the operator's choice
+    # and does not.
+    streaming_on = config_readable and health_collect.streaming_configured(raw_config)
+    streaming_off_by_choice = config_readable and health_collect.streaming_explicitly_off(
+        raw_config
+    )
     gateway = raw_config.get("gateway")
     multiplex = gateway.get("multiplex_profiles") if isinstance(gateway, dict) else None
     platform_block: Any = raw_config
@@ -3434,12 +3605,17 @@ def _setup_status(facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     status["mandatoryConfiguration"] = {
         "state": (
             "verified"
-            if tool_progress_off and agent_mode_chosen and adopt_ok
+            if tool_progress_off
+            and agent_mode_chosen
+            and adopt_ok
+            and (streaming_on or streaming_off_by_choice)
             else "missing"
             if config_readable
             else "unknown"
         ),
         "toolProgressOff": tool_progress_off,
+        "streamingOn": streaming_on,
+        "streamingOffByChoice": streaming_off_by_choice,
         "agentModeChosen": agent_mode_chosen,
         "agentMode": agent_mode if agent_mode_chosen else None,
         "singleAgentAvailable": single_agent_available(
@@ -3504,6 +3680,16 @@ def _setup_status(facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         supervision = {"state": "unknown", "supervisor": None}
     status["gatewaySupervision"] = supervision["state"]
     status["gatewaySupervisor"] = supervision["supervisor"]
+    # Which words hand the restart over (#3876): "cloudways" when a gateway
+    # restart restarts this Cloudways container (no terminal to Ctrl+C there),
+    # else null and the generic hand-off stands.
+    try:
+        from . import gateway_supervision
+
+        status["gatewayRestartHost"] = gateway_supervision.restart_host()
+    except Exception:  # noqa: BLE001 - a diagnostic must not become an outage
+        logger.exception("[ocuclaw] gateway restart host unavailable")
+        status["gatewayRestartHost"] = None
     # The Profiles inventory (#2944). Additive, exactly like the tool
     # inventory above: no existing key moves, so "the key is absent" can only
     # mean an OcuClaw older than this bundle. Read-only — it opens nothing,
@@ -4291,6 +4477,20 @@ def _admitted_is_connected(config: Any) -> bool:
 def register(ctx: Any) -> None:
     global _LAST_SETUP_BUNDLE_REPORT, _PLUGIN_CONTEXT, _LIVEUI_REGISTER_TOOL
     global _SETUP_TOOL_REGISTERED, _INPUT_PREDICTION_TASK_REGISTERED
+    # Uninstall pending (#3765): `hermes ocuclaw uninstall` ran while OcuClaw
+    # was up and asked for one gateway restart. Start nothing (no relay
+    # credential bootstrap, platform, hooks, tools or runtime); keep only the
+    # `hermes ocuclaw` CLI so the same command can finish, or be cancelled.
+    if uninstall_gate.uninstall_pending(resolve_receipt_home()):
+        logger.warning(
+            "[ocuclaw] uninstall pending: OcuClaw not started. Run `%s` to "
+            "finish, or `%s` then `%s` to keep OcuClaw",
+            uninstall_gate.UNINSTALL_COMMAND,
+            uninstall_gate.CANCEL_COMMAND,
+            uninstall_gate.RESTART_COMMAND,
+        )
+        register_cli_commands(ctx, logger)
+        return
     _PLUGIN_CONTEXT = ctx
     # Silent input (#2829): a plugin-owned auxiliary task so operators can
     # pin a cheap prediction model under `auxiliary.silent_input_prediction`
@@ -4384,6 +4584,14 @@ def register(ctx: Any) -> None:
         register_system_prompt_section(
             OCUCLAW_SKILLS_SECTION_ID,
             OCUCLAW_SKILLS_SYSTEM_PROMPT,
+            position="after_memory",
+            max_chars=2000,
+        )
+        # The same for the setup skill: without it a plain "re-pair my phone"
+        # chat never learns the qualified name (#3829).
+        register_system_prompt_section(
+            OCUCLAW_SETUP_SKILL_SECTION_ID,
+            OCUCLAW_SETUP_SKILL_SYSTEM_PROMPT,
             position="after_memory",
             max_chars=2000,
         )
@@ -4680,6 +4888,9 @@ def _build_adapter(config: Any):
             )
             self._session_status = SessionStatusObserver()
             self._phone_turn_candidate_gate = PhoneTurnCandidateGate()
+            # The phone's session-name toggle over Hermes's own titler
+            # (session_title_hold.py): sessions we held at llm provenance.
+            self._title_hold = SessionTitleHold()
             # H11 (#3348). The provider-error mark lives HERE, not on the
             # dispatch record: `_touch_record_locked` clears the record's
             # `terminal_error_code` on every note_send, and the engine's own
@@ -4795,6 +5006,21 @@ def _build_adapter(config: Any):
             # Set under _stream_tail_lock during disconnect: refuses new
             # closure stashes so the shutdown drain can run to empty.
             self._stream_tail_closing = False
+            # Reply-stream slot per runId (STREAM_SLOT_FLOOR_MS). Touched only
+            # on self._loop, so it needs no lock.
+            self._stream_flush_floor_s = self._settings["streamFlushMs"] / 1000.0
+            self._stream_slots: Dict[str, Dict[str, Any]] = {}
+            # Closing frames the link refused as overloaded, retried in order
+            # by one drain task (loop-only, like the slots).
+            self._critical_backlog: deque = deque()
+            self._critical_drain_task: Optional["asyncio.Task[Any]"] = None
+            self._link_delivery_counters: Dict[str, int] = {
+                "stream_frames_sent": 0,
+                "stream_frames_coalesced": 0,
+                "critical_retried": 0,
+                "critical_recovered": 0,
+                "critical_dropped": 0,
+            }
             self._thinking_lock = threading.RLock()
             self._thinking_text_by_run: Dict[str, str] = {}
             # Per-run monotonic ordering stamp for the tier-2 thinking lane.
@@ -4821,8 +5047,12 @@ def _build_adapter(config: Any):
             # user-facing copy. pre_tool_call arms the next send while that
             # tool is live; send() binds its minted message id. The run keeps
             # one arm until claimed so even a very fast command is covered.
+            # Hermes keeps ONE progress bubble open and edits every later
+            # tool line into it until a content send lands, so a tool that
+            # starts while a bubble is open arms nothing.
             self._pending_tool_progress_by_run: Dict[str, List[str]] = {}
             self._tool_progress_message_ids_by_run: Dict[str, set] = {}
+            self._open_tool_progress_bubble_by_run: Dict[str, str] = {}
             # #1619 origin time. Hermes commits an interim message LAZILY — the
             # commit rides the next send(), which on a tool turn is the tool
             # progress line, so the note reaches the page AFTER the command it
@@ -4845,6 +5075,9 @@ def _build_adapter(config: Any):
             # budget) and the coalescer buffer lives here too.
             self._stream_contexts: Dict[Tuple[str, str], Dict[str, Any]] = {}
             self._background_hook_turns: Dict[Tuple[str, str], None] = {}
+            # Newest todo_list revision seen per Hermes session id, so a late
+            # post_tool_call from an older plan cannot roll the glance back.
+            self._plan_revisions: Dict[str, int] = {}
             # Reconcile epoch per run. post_api_request is authoritative and
             # runs INLINE on the agent thread, so it can beat deltas that are
             # still sitting in the plugin hook queue; bumping the epoch fences
@@ -5325,6 +5558,7 @@ def _build_adapter(config: Any):
             self._slash_confirms_by_id.clear()
             link = self._link
             self._link = None
+            self._stream_slots_reset()
             with self._thinking_lock:
                 self._thinking_text_by_run.clear()
                 self._thinking_seq_by_run.clear()
@@ -5835,6 +6069,8 @@ def _build_adapter(config: Any):
                         )
                     )
             else:
+                # ~20 cumulative edits a second; _emit_event coalesces them
+                # through the run's stream slot.
                 self._emit_event(
                     "streaming",
                     streaming_event(
@@ -6154,6 +6390,22 @@ def _build_adapter(config: Any):
                 self._processing_deliveries[(record.session_key, record.run_id)] = record
             await super().on_processing_start(event)
 
+        def _deferred_by_startup_restore(self, event: Any) -> bool:
+            """True while Hermes holds ``event`` in its startup-restore queue.
+
+            Hermes 0.21.x queues inbound that lands before startup restore
+            and turn-machinery warm-up finish (``_startup_restore_queue`` on
+            the gateway runner), returns ``None`` from the message handler and
+            so reports that processing pass as a success. The queue is drained
+            by identity once the gate opens. A runner without that queue (older
+            or newer Hermes) reads as not deferred, i.e. today's behavior.
+            """
+            runner = getattr(self, "gateway_runner", None)
+            queue = getattr(runner, "_startup_restore_queue", None)
+            if not isinstance(queue, list):
+                return False
+            return any(queued is event for queued in queue)
+
         def _delivery_is_cancelled(self) -> bool:
             record = self._delivery_record.get()
             return record is not None and record.delivery_cancelled
@@ -6167,6 +6419,18 @@ def _build_adapter(config: Any):
                 getattr(event, "_ocuclaw_dispatch_session_key", "") or ""
             ).strip()
             if not run_id or not session_key:
+                return
+            if self._deferred_by_startup_restore(event):
+                # Hermes parked this inbound until startup restore finishes and
+                # will replay the SAME event object through handle_message.
+                # The run has not started: keep its record active and in
+                # flight so the replay's on_processing_start re-binds it and
+                # the reply streams under this runId instead of ending now.
+                logger.info(
+                    "[ocuclaw] dispatch %s deferred by Hermes startup restore; "
+                    "run stays open until the replay",
+                    run_id,
+                )
                 return
             self._processing_deliveries.pop((session_key, run_id), None)
             self._note_ocuclaw_reply_settled(session_key)
@@ -6411,9 +6675,52 @@ def _build_adapter(config: Any):
                 return None
             return f"hermes:{identity['ns']}:{identity['chatId']}"
 
+        def _session_options_readback(
+            self, native_key: str, default_fast: Optional[bool],
+        ) -> Dict[str, Any]:
+            """Live session thinking/fast for a session row (#3875).
+
+            Without upstream apply_session_options the bridge sets these with
+            /reasoning and /fast, which Hermes keeps as in-memory session
+            overrides, never session DB columns. Unreported, every Model menu
+            open rebuilt them as defaults. Read the overrides the same way the
+            gateway resolves them (0.21.0-0.21.5 share this SessionState shape).
+            A missing session state means no override: thinking stays the
+            profile default, fast falls back to the profile's service tier.
+            """
+            out: Dict[str, Any] = {}
+            runner = getattr(self, "gateway_runner", None)
+            peek = getattr(runner, "_peek_session_state", None)
+            conversation = None
+            if callable(peek):
+                try:
+                    state = peek(native_key)
+                    conversation = getattr(state, "conversation", None)
+                except Exception:  # noqa: BLE001 - readback must never fail the list
+                    conversation = None
+            reasoning = getattr(conversation, "reasoning_override", None)
+            if isinstance(reasoning, dict):
+                if reasoning.get("enabled", True) is False:
+                    out["thinkingLevel"] = "off"
+                else:
+                    effort = str(reasoning.get("effort") or "").strip().lower()
+                    if effort in OCUCLAW_THINKING_LEVELS:
+                        out["thinkingLevel"] = effort
+            missing = object()
+            tier = getattr(conversation, "service_tier_override", missing)
+            if tier == "priority" or tier is None:
+                # "priority" or None both mark an explicit /fast override; the
+                # unset sentinel is some other object and falls through.
+                out["fastMode"] = tier == "priority"
+            elif default_fast is not None:
+                out["fastMode"] = default_fast
+            return out
+
         async def handle_status_sessions_list(self, params: Any) -> Dict[str, Any]:
             result = await self._session_rpc.list_sessions(params)
             reasoning_by_namespace: Dict[str, Optional[str]] = {}
+            default_fast_by_namespace: Dict[str, Optional[bool]] = {}
+            fast_supported_by_namespace: Dict[str, Optional[bool]] = {}
             for row in result.get("sessions", []):
                 native_key = str(row.get("sessionKey") or "")
                 public_key = self._public_key_for_native_session(native_key)
@@ -6429,10 +6736,25 @@ def _build_adapter(config: Any):
                         options = await self.handle_profile_options_get({"ns": ns})
                         level = options.get("reasoningLevel")
                         reasoning_by_namespace[ns] = level if level in {"on", "off"} else None
+                        default_fast = options.get("defaultFastMode")
+                        default_fast_by_namespace[ns] = (
+                            default_fast if isinstance(default_fast, bool) else None
+                        )
+                        supported = options.get("fastModeSupported")
+                        fast_supported_by_namespace[ns] = (
+                            supported if isinstance(supported, bool) else None
+                        )
                     except Exception:
                         reasoning_by_namespace[ns] = None
+                        default_fast_by_namespace[ns] = None
+                        fast_supported_by_namespace[ns] = None
                 if reasoning_by_namespace[ns] is not None:
                     row["reasoningLevel"] = reasoning_by_namespace[ns]
+                row.update(self._session_options_readback(
+                    native_key, default_fast_by_namespace[ns],
+                ))
+                if fast_supported_by_namespace[ns] is not None:
+                    row["fastModeSupported"] = fast_supported_by_namespace[ns]
                 try:
                     from tools.clarify_gateway import get_pending_for_session
 
@@ -7656,6 +7978,7 @@ def _build_adapter(config: Any):
                 self._committed_ids_by_run.pop(key, None)
                 self._pending_tool_progress_by_run.pop(key, None)
                 self._tool_progress_message_ids_by_run.pop(key, None)
+                self._open_tool_progress_bubble_by_run.pop(key, None)
                 self._stream_text_origin_by_run.pop(key, None)
                 self._narration_origin_by_run.pop(key, None)
                 self._thinking_epoch_by_run.pop(key, None)
@@ -7934,6 +8257,9 @@ def _build_adapter(config: Any):
             if not key or not call_id:
                 return
             with self._thinking_lock:
+                if key in self._open_tool_progress_bubble_by_run:
+                    # Hermes edits this tool's line into the open bubble.
+                    return
                 pending = self._pending_tool_progress_by_run.setdefault(key, [])
                 if call_id not in pending:
                     pending.append(call_id)
@@ -7963,15 +8289,17 @@ def _build_adapter(config: Any):
             if not key or not resolved_id:
                 return
             with self._thinking_lock:
-                pending = self._pending_tool_progress_by_run.get(key)
-                if not pending:
+                if not self._pending_tool_progress_by_run.pop(key, None):
+                    # A content send: Hermes closes its progress bubble, so
+                    # the next tool opens a new one.
+                    self._open_tool_progress_bubble_by_run.pop(key, None)
                     return
-                pending.pop(0)
-                if not pending:
-                    self._pending_tool_progress_by_run.pop(key, None)
+                # One bubble carries every line queued before it was sent
+                # (Hermes batches them), so this send settles every arm.
                 self._tool_progress_message_ids_by_run.setdefault(key, set()).add(
                     resolved_id
                 )
+                self._open_tool_progress_bubble_by_run[key] = resolved_id
 
         def _emit_message_commit(
             self,
@@ -8717,6 +9045,45 @@ def _build_adapter(config: Any):
                     return str(entry.get("platform") or "")
             return None
 
+        def even_ai_clarify_block(
+            self, kwargs: Dict[str, Any]
+        ) -> Optional[Dict[str, str]]:
+            """Veto clarify on an Even AI turn.
+
+            A turn is Even AI when it was dispatched with promptOwner
+            "even-ai", or when pre_llm_call saw liveui.prompt report the
+            Even AI ownership ticket (a turn with no Even AI system prompt
+            carries no rider). The dispatch ledger head is the turn the session is running now,
+            so an OcuClaw turn in the same session keeps clarify. Background
+            review forks share the session id but not the turn; they are not
+            Even AI turns and are left alone.
+            """
+            if str(kwargs.get("tool_name") or "").strip() != EVEN_AI_CLARIFY_TOOL_NAME:
+                return None
+            platform = str(kwargs.get("platform") or "").strip()
+            if platform and platform != PLATFORM_NAME:
+                return None
+            if self._background_hook_turn(kwargs):
+                return None
+            session_id = str(kwargs.get("session_id") or "").strip()
+            if not session_id:
+                return None
+            row = self._session_rpc.row_by_id(session_id)
+            session_key = str((row or {}).get("session_key") or "")
+            if not session_key:
+                return None
+            record = self._ledger.head(session_key)
+            if record is None or not (
+                record.prompt_owner == EVEN_AI_PROMPT_OWNER or record.even_ai_turn
+            ):
+                return None
+            logger.info(
+                "[ocuclaw] clarify blocked on Even AI turn %s (%s)",
+                record.run_id,
+                session_key,
+            )
+            return {"action": "block", "message": EVEN_AI_CLARIFY_BLOCK_MESSAGE}
+
         def handle_pre_tool_call(self, kwargs: Dict[str, Any]) -> None:
             self._inflight_touch(kwargs)
             context = self._tool_activity_context(kwargs)
@@ -8758,6 +9125,12 @@ def _build_adapter(config: Any):
                             if key in payload["args"]
                         }
                         payload["args"]["_truncated"] = True
+                elif tool_name.startswith("kanban_"):
+                    # #3769: the board slug names where "Filing a card on <board>"
+                    # lands. Only a well-formed slug passes; titles and bodies never.
+                    board = args.get("board")
+                    if isinstance(board, str) and TOOL_ACTIVITY_KANBAN_BOARD_SLUG.match(board):
+                        payload["args"]["board"] = board
             self._emit_event("activity", payload)
 
         def handle_post_tool_call(self, kwargs: Dict[str, Any]) -> None:
@@ -8793,7 +9166,98 @@ def _build_adapter(config: Any):
             duration_ms = kwargs.get("duration_ms")
             if isinstance(duration_ms, (int, float)) and duration_ms >= 0:
                 payload["durationMs"] = int(duration_ms)
+            if not is_error and status in {"", "ok", "success"} and tool_name in PLAN_TOOL_NAMES:
+                plan = self._plan_snapshot_for_post_tool_call(kwargs)
+                if plan is not None:
+                    payload["plan"] = plan
             self._emit_event("activity", payload)
+
+        def _plan_snapshot_for_post_tool_call(
+            self, kwargs: Dict[str, Any]
+        ) -> Optional[Dict[str, Any]]:
+            """The wire plan for a todo_list result, or None to send nothing.
+
+            Mirrors Hermes' own `_normalize_todo_state`: an empty list at
+            revision 0 is an unused store (ignored); empty at revision >= 1 is
+            a real clear. Revisions only move forward per Hermes session id.
+            """
+            parsed = self._parse_plan_result(kwargs.get("result"))
+            if parsed is None:
+                return None
+            revision, raw_items = parsed
+            if not raw_items and revision == 0:
+                return None
+            session_id = str(kwargs.get("session_id") or "").strip()
+            with self._thinking_lock:
+                previous = self._plan_revisions.get(session_id)
+                if previous is not None and revision < previous:
+                    return None
+                self._plan_revisions.pop(session_id, None)
+                self._plan_revisions[session_id] = revision
+                while len(self._plan_revisions) > PLAN_REVISION_CACHE_MAX:
+                    self._plan_revisions.pop(next(iter(self._plan_revisions)))
+            if not raw_items:
+                return {"revision": revision, "cleared": True}
+            items = [self._normalize_plan_item(item) for item in raw_items]
+            summary = {"total": len(items)}
+            for plan_status in PLAN_STATUSES:
+                summary[plan_status] = sum(1 for item in items if item["status"] == plan_status)
+            plan: Dict[str, Any] = {
+                "revision": revision,
+                "items": items[:PLAN_MAX_ITEMS],
+                "summary": summary,
+            }
+            if len(items) > PLAN_MAX_ITEMS:
+                plan["truncated"] = True
+            step = plan_step_glance(items)
+            if step is not None:
+                plan["step"] = step
+            return plan
+
+        @staticmethod
+        def _parse_plan_result(result: Any) -> Optional[Tuple[int, List[Any]]]:
+            if isinstance(result, (bytes, bytearray)):
+                if len(result) > PLAN_RESULT_MAX_BYTES:
+                    return None
+                try:
+                    result = result.decode("utf-8")
+                except UnicodeDecodeError:
+                    return None
+            if isinstance(result, str):
+                if len(result.encode("utf-8", errors="replace")) > PLAN_RESULT_MAX_BYTES:
+                    return None
+                try:
+                    result = json.loads(result)
+                except (TypeError, ValueError):
+                    return None
+            if not isinstance(result, dict) or not isinstance(result.get("todos"), list):
+                return None
+            raw_revision = result.get("revision")
+            if isinstance(raw_revision, bool):
+                return None
+            try:
+                revision = max(0, int(raw_revision or 0))
+            except (TypeError, ValueError):
+                return None
+            items = [item for item in result["todos"] if isinstance(item, dict)]
+            return revision, items
+
+        @staticmethod
+        def _normalize_plan_item(item: Dict[str, Any]) -> Dict[str, Any]:
+            content = " ".join(str(item.get("content") or "").split())
+            if len(content) > PLAN_ITEM_MAX_CHARS:
+                content = content[: PLAN_ITEM_MAX_CHARS - 1].rstrip() + "…"
+            status = str(item.get("status") or "").strip().lower()
+            if status not in PLAN_STATUSES:
+                status = "pending"
+            normalized: Dict[str, Any] = {"content": content, "status": status}
+            item_id = str(item.get("id") or "").strip()[:PLAN_ID_MAX_CHARS]
+            if item_id:
+                normalized["id"] = item_id
+            parent = str(item.get("parent") or "").strip()[:PLAN_ID_MAX_CHARS]
+            if parent:
+                normalized["parent"] = parent
+            return normalized
 
         async def handle_approval_resolve(self, params: Any) -> Dict[str, Any]:
             p = params if isinstance(params, dict) else {}
@@ -9068,12 +9532,27 @@ def _build_adapter(config: Any):
                         reasoning_options["reasoningLevel"] = "on" if shown else "off"
             except Exception:
                 pass  # Unavailable readback is not evidence that reasoning is off.
+            # #3896: /fast refuses unless this check passes (gateway/
+            # slash_commands_model.py _handle_fast_command, same helper on
+            # 0.21.0-0.21.5). Ask it the same way so the wearer is never
+            # offered a Fast toggle Hermes will refuse. Unknown stays absent.
+            fast_options: Dict[str, bool] = {}
+            try:
+                from gateway.run import _resolve_gateway_model
+                from hermes_cli.models import model_supports_fast_mode
+
+                fast_options["fastModeSupported"] = bool(
+                    model_supports_fast_mode(_resolve_gateway_model(cfg))
+                )
+            except Exception:
+                pass
             return {
                 "defaultModel": f"{provider}/{model}" if provider and model else model,
                 "defaultThinking": thinking,
                 "defaultFastMode": service_tier in {"fast", "priority"},
                 "conversationToolProgress": tool_progress != "off",
                 **reasoning_options,
+                **fast_options,
             }
 
         def _apply_profile_options_sync(
@@ -9604,6 +10083,14 @@ def _build_adapter(config: Any):
             except Exception:  # noqa: BLE001
                 logger.debug("[ocuclaw] liveui prompt context unavailable", exc_info=True)
                 return None
+            if (
+                record is not None
+                and isinstance(result, dict)
+                and result.get("promptOwner") == EVEN_AI_PROMPT_OWNER
+            ):
+                record.even_ai_turn = True
+            if isinstance(result, dict):
+                self._apply_session_title_toggle(_kwargs or {}, result)
             if isinstance(result, dict) and isinstance(result.get("context"), str):
                 context = result["context"].strip()
                 fragments = result.get("fragments")
@@ -9622,6 +10109,34 @@ def _build_adapter(config: Any):
                         logger.debug("[ocuclaw] liveui prompt ack unavailable", exc_info=True)
                 return context or None
             return None
+
+        def _apply_session_title_toggle(
+            self, kwargs: Dict[str, Any], result: Dict[str, Any]
+        ) -> None:
+            """The phone's session-name toggle over Hermes's titler, for this
+            OcuClaw session only. Runs before Hermes titles the turn; any
+            failure leaves Hermes to title as usual."""
+            enabled = result.get("neuralSessionNamesEnabled")
+            if not isinstance(enabled, bool):
+                return  # an older relay: Hermes default
+            session_id = str(kwargs.get("session_id") or "").strip()
+            if not session_id:
+                return
+            if enabled and self._title_hold.held_title(session_id) is None:
+                return  # the common path: nothing held, no store access
+            try:
+                user_text = "" if enabled else turn_user_text(kwargs)
+                writer = SharedSessionWriter(default_state_db_path())
+                with writer.borrow() as db:
+                    outcome = self._title_hold.apply(db, session_id, enabled, user_text)
+            except Exception:  # noqa: BLE001 — fail open
+                logger.debug("[ocuclaw] session title toggle skipped", exc_info=True)
+                return
+            if outcome:
+                logger.info(
+                    "[ocuclaw] session title %s for %s (phone session names %s)",
+                    outcome, session_id, "on" if enabled else "off",
+                )
 
         async def handle_liveui_llm_auth(self, params: Any) -> Dict[str, Any]:
             p = params if isinstance(params, dict) else {}
@@ -10942,14 +11457,35 @@ def _build_adapter(config: Any):
                     self._session_status.observe_activity(payload)
                 except Exception:  # status is observational, never part of delivery success
                     pass
+            if name == "streaming" and self._offer_streaming(payload):
+                return None
+            run_id = payload.get("runId") if isinstance(payload, dict) else None
+            closing = None
+            if name == "message" and isinstance(run_id, str):
+                # Commits (mid-turn segments included) are closing frames for
+                # the message they seal: flush its stream first, keep the slot.
+                closing = (run_id, False)
+            elif (
+                name == "activity"
+                and isinstance(run_id, str)
+                and payload.get("origin") == "lifecycle"
+                and payload.get("phase") in ("end", "error")
+            ):
+                closing = (run_id, True)
             return self._emit_frame(
                 BACKEND_EVENT_METHOD,
                 {"name": name, "payload": payload},
                 swallow_errors=swallow_errors,
+                closes_stream=closing,
             )
 
         def _emit_hook(self, frame: Dict[str, Any]) -> None:
-            self._emit_frame(BACKEND_HOOK_METHOD, frame)
+            closing = None
+            if frame.get("name") == "agent_end":
+                ctx = frame.get("ctx")
+                run_id = ctx.get("runId") if isinstance(ctx, dict) else None
+                closing = (run_id if isinstance(run_id, str) else "", True)
+            self._emit_frame(BACKEND_HOOK_METHOD, frame, closes_stream=closing)
 
         def _emit_frame(
             self,
@@ -10957,26 +11493,256 @@ def _build_adapter(config: Any):
             params: Dict[str, Any],
             *,
             swallow_errors: bool = True,
+            closes_stream: Optional[Tuple[str, bool]] = None,
         ) -> Optional[Any]:
+            """Push one RPC to the child, fire-and-forget, from any thread.
+
+            ``closes_stream=(run_id, drop)`` marks a turn's closing frame
+            (commit, terminal activity, agent_end): the run's pending stream
+            text goes out immediately ahead of it, the slot is dropped when
+            ``drop``, and a link_overloaded refusal is retried in order
+            (``_critical_backlog``) instead of lost.
+            """
             link = self._link
             loop = self._loop
             if link is None or loop is None or loop.is_closed():
                 return None
+            critical = closes_stream is not None
 
             async def _push() -> None:
+                if critical:
+                    if self._critical_backlog:
+                        # Keep closing frames in order behind an earlier refusal.
+                        self._critical_enqueue(link, method, params)
+                        return
                 try:
                     await link.request(method, params, timeout_s=10.0)
+                except LinkOverloadedError as exc:
+                    if critical:
+                        self._critical_enqueue(link, method, params)
+                        return
+                    if not swallow_errors:
+                        raise
+                    logger.debug("[ocuclaw] %s push failed: %s", method, exc)
                 except Exception as exc:  # noqa: BLE001 — events are best-effort
                     if not swallow_errors:
                         raise
                     logger.debug("[ocuclaw] %s push failed: %s", method, exc)
 
             try:
+                if critical:
+                    run_id, drop = closes_stream
+                    if run_id:
+                        # The flush must start its write BEFORE this frame's
+                        # task is created. A task created inside _push would
+                        # queue behind closing frames already scheduled, and
+                        # the phone drops a stream frame that lands after the
+                        # terminal activity.
+                        loop.call_soon_threadsafe(self._stream_flush_for_close, link, run_id, drop)
                 # Safe from any thread (on_session_end fires on the agent's
                 # worker thread); scheduling order is FIFO per thread.
                 return asyncio.run_coroutine_threadsafe(_push(), loop)
             except RuntimeError:
                 return None
+
+        # -- reply-stream slot (loop-only state) -------------------------------
+
+        def _offer_streaming(self, payload: Dict[str, Any]) -> bool:
+            """Hand one cumulative stream paint to its run's slot; False
+            leaves it to the plain per-frame push (slot off, no runId).
+
+            Safe from any thread; the slot itself is only touched on the
+            loop, in the same FIFO as every other emitted frame, so a closing
+            frame emitted after this call always sees this text.
+            """
+            run_id = payload.get("runId") if isinstance(payload, dict) else None
+            if self._stream_flush_floor_s <= 0 or not isinstance(run_id, str) or not run_id:
+                return False
+            link = self._link
+            loop = self._loop
+            if link is None or loop is None or loop.is_closed():
+                return True
+            try:
+                loop.call_soon_threadsafe(self._stream_slot_offer, link, run_id, payload)
+            except RuntimeError:
+                pass
+            return True
+
+        def _stream_slot_offer(self, link: Any, run_id: str, payload: Dict[str, Any]) -> None:
+            slot = self._stream_slots.get(run_id)
+            if slot is None:
+                slot = {"pending": None, "inflight": False, "sentAt": None, "timer": None}
+                self._stream_slots[run_id] = slot
+            pending = slot["pending"]
+            if pending is not None:
+                if pending.get("messageId") != payload.get("messageId"):
+                    # A new message of the run: the old one's last paint is
+                    # not superseded by this text, so it goes out first.
+                    slot["pending"] = None
+                    self._stream_slot_write(link, pending)
+                else:
+                    self._link_delivery_counters["stream_frames_coalesced"] += 1
+            slot["pending"] = payload
+            self._stream_slot_pump(link, run_id, slot)
+
+        def _stream_slot_pump(self, link: Any, run_id: str, slot: Dict[str, Any]) -> None:
+            if self._link is not link:
+                # The link this slot was filled for is gone (child restart).
+                if self._stream_slots.get(run_id) is slot:
+                    self._stream_slots.pop(run_id, None)
+                return
+            if slot["inflight"] or slot["pending"] is None or slot["timer"] is not None:
+                return
+            loop = self._loop
+            if loop is None or loop.is_closed():
+                return
+            now = loop.time()
+            sent_at = slot["sentAt"]
+            due = now if sent_at is None else sent_at + self._stream_flush_floor_s
+            if due > now:
+                slot["timer"] = loop.call_later(
+                    due - now, self._stream_slot_timer, link, run_id
+                )
+                return
+            payload = slot["pending"]
+            slot["pending"] = None
+            slot["inflight"] = True
+            slot["sentAt"] = now
+            task = self._stream_slot_write(link, payload)
+            if task is None:
+                slot["inflight"] = False
+                return
+            task.add_done_callback(
+                lambda _t, _link=link, _run=run_id, _slot=slot: self._stream_slot_done(
+                    _link, _run, _slot
+                )
+            )
+
+        def _stream_slot_timer(self, link: Any, run_id: str) -> None:
+            slot = self._stream_slots.get(run_id)
+            if slot is None:
+                return
+            slot["timer"] = None
+            self._stream_slot_pump(link, run_id, slot)
+
+        def _stream_slot_done(self, link: Any, run_id: str, slot: Dict[str, Any]) -> None:
+            slot["inflight"] = False
+            if self._stream_slots.get(run_id) is slot and self._link is link:
+                self._stream_slot_pump(link, run_id, slot)
+
+        def _stream_slot_take(self, run_id: str, *, drop: bool) -> Optional[Dict[str, Any]]:
+            """Detach the run's pending paint (loop only) for a closing frame."""
+            slot = self._stream_slots.pop(run_id, None) if drop else self._stream_slots.get(run_id)
+            if slot is None:
+                return None
+            if slot["timer"] is not None:
+                slot["timer"].cancel()
+                slot["timer"] = None
+            pending = slot["pending"]
+            slot["pending"] = None
+            return pending
+
+        def _stream_flush_for_close(self, link: Any, run_id: str, drop: bool) -> None:
+            """Send the run's pending paint ahead of a closing frame (loop only)."""
+            pending = self._stream_slot_take(run_id, drop=drop)
+            if pending is not None and self._link is link:
+                self._stream_slot_write(link, pending)
+
+        def _stream_slot_write(self, link: Any, payload: Dict[str, Any]) -> Optional["asyncio.Task[Any]"]:
+            """Start one streaming RPC now (loop only); its write happens on
+            the task's first step, ahead of anything scheduled after it."""
+            self._link_delivery_counters["stream_frames_sent"] += 1
+
+            async def _send() -> None:
+                try:
+                    await link.request(
+                        BACKEND_EVENT_METHOD,
+                        {"name": "streaming", "payload": payload},
+                        timeout_s=10.0,
+                    )
+                except Exception as exc:  # noqa: BLE001 — paints are best-effort
+                    logger.debug("[ocuclaw] streaming push failed: %s", exc)
+
+            try:
+                return asyncio.ensure_future(_send())
+            except RuntimeError:
+                return None
+
+        def _stream_slots_reset(self) -> None:
+            for slot in self._stream_slots.values():
+                if slot["timer"] is not None:
+                    slot["timer"].cancel()
+            self._stream_slots.clear()
+            self._critical_backlog.clear()
+            task = self._critical_drain_task
+            self._critical_drain_task = None
+            if task is not None and not task.done():
+                task.cancel()
+
+        # -- closing-frame retry (loop-only state) ----------------------------
+
+        def _critical_enqueue(self, link: Any, method: str, params: Dict[str, Any]) -> None:
+            loop = self._loop
+            if loop is None or loop.is_closed():
+                return
+            self._link_delivery_counters["critical_retried"] += 1
+            if not self._critical_backlog:
+                logger.warning(
+                    "[ocuclaw] link overloaded: retrying closing %s frame for up to %.1fs",
+                    method,
+                    CRITICAL_FRAME_RETRY_BUDGET_S,
+                )
+            self._critical_backlog.append(
+                (link, method, params, loop.time() + CRITICAL_FRAME_RETRY_BUDGET_S)
+            )
+            if self._critical_drain_task is None or self._critical_drain_task.done():
+                self._critical_drain_task = loop.create_task(self._critical_drain())
+
+        async def _critical_drain(self) -> None:
+            loop = asyncio.get_running_loop()
+            delay = CRITICAL_FRAME_RETRY_BASE_S
+            while self._critical_backlog:
+                link, method, params, deadline = self._critical_backlog[0]
+                if self._link is not link:
+                    # The link this frame was for is gone; a reconnect replays
+                    # state from the ledger, not from this queue.
+                    self._critical_backlog.clear()
+                    return
+                attempt = asyncio.ensure_future(link.request(method, params, timeout_s=10.0))
+                # The overload check runs before the frame is written, on the
+                # attempt's first step, so one yield tells refused from sent.
+                await asyncio.sleep(0)
+                exc = attempt.exception() if attempt.done() else None
+                if not isinstance(exc, LinkOverloadedError):
+                    self._critical_backlog.popleft()
+                    delay = CRITICAL_FRAME_RETRY_BASE_S
+                    if exc is not None:
+                        # Closed or broken link: nothing left to retry into.
+                        logger.debug("[ocuclaw] closing %s retry failed: %s", method, exc)
+                        continue
+                    attempt.add_done_callback(_swallow_task_exception)
+                    self._link_delivery_counters["critical_recovered"] += 1
+                    continue
+                if loop.time() >= deadline:
+                    self._critical_backlog.popleft()
+                    self._link_delivery_counters["critical_dropped"] += 1
+                    logger.warning(
+                        "[ocuclaw] link overloaded: dropped closing %s frame after %.1fs of retries",
+                        method,
+                        CRITICAL_FRAME_RETRY_BUDGET_S,
+                    )
+                    continue
+                await asyncio.sleep(min(delay, max(0.0, deadline - loop.time())))
+                delay = min(delay * 2, CRITICAL_FRAME_RETRY_MAX_S)
+
+        def link_delivery_counters(self) -> Dict[str, int]:
+            """Health counters for the reply stream and closing-frame retry."""
+            counters = dict(self._link_delivery_counters)
+            link = self._link
+            link_counters = getattr(link, "counters", None) if link is not None else None
+            if isinstance(link_counters, dict):
+                counters["link_overloaded"] = int(link_counters.get("overloaded", 0))
+            return counters
 
         async def _janitor_loop(self) -> None:
             # D9 backstop: escaped-exception turns bypass finalize_turn (no

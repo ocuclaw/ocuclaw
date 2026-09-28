@@ -1,6 +1,6 @@
 # OcuClaw fresh install on Hermes — Steps 1–12 (plus Step 4b)
 
-**Guide version:** 2026-09-25 (1.3.24-hermes)
+**Guide version:** 2026-09-28 (1.3.25-hermes)
 
 Keep using the loaded setup skill for guardrails, the lane card, and the
 internal completion checklist.
@@ -310,6 +310,10 @@ The read-only `status.mandatoryConfiguration.toolProgressOff` must be true
 before network setup. A healthy gateway does not prove this setting. On resume,
 re-read status and skip satisfied settings; preserve all earlier receipts.
 
+Also require `status.mandatoryConfiguration.streamingOn: true`, unless
+`streamingOffByChoice: true` shows the user already set it to false. Without it
+the first words of every reply wait for the whole reply.
+
 Also require `status.mandatoryConfiguration.agentModeChosen: true`. If missing,
 call `{"operation":"agent_mode"}` and complete that choice before proceeding.
 
@@ -327,6 +331,7 @@ CHECKPOINT:
 
 ```bash
 hermes config set display.platforms.ocuclaw.tool_progress off
+hermes config set display.platforms.ocuclaw.streaming true
 hermes config set platforms.ocuclaw.extra.allow_admin_from '["ocuclaw-wearer"]'
 hermes plugins enable ocuclaw
 ```
@@ -339,7 +344,9 @@ can reach the gate. If the key already lists other ids, preserve them and append
 
 The native install normally enables the plugin; the conditional command also
 recovers an older disabled install. The non-secret commands keep Hermes'
-conversational tool-progress bubbles out of the OcuClaw transcript. Hermes TUI
+conversational tool-progress bubbles out of the OcuClaw transcript and turn on
+per-platform reply streaming; without the streaming key the glasses show only
+"typing" for the whole reply, then the whole reply at once. Hermes TUI
 and Desktop are the guided beta pairing
 surfaces: each presents the secure QR and four-word decision directly without
 routing either through the model. For a terminal install only, inspect
@@ -355,17 +362,19 @@ VERIFY the non-secret gate without reading any secret:
 
 ```bash
 hermes config get display.platforms.ocuclaw.tool_progress
+hermes config get display.platforms.ocuclaw.streaming
 hermes config get platforms.ocuclaw.extra.allow_admin_from
 ```
 
-The second read must list `ocuclaw-wearer`; re-read `ocuclaw_setup` status and
+The third read must list `ocuclaw-wearer`; re-read `ocuclaw_setup` status and
 require `mandatoryConfiguration.adoptConfigured: true`.
 
-Continue only when the tool-progress setting reports `false` (and, for a
-terminal install only, the interface reports `tui`). Hermes 0.21 stores the CLI
-value `off` as a boolean, so
-`false` is the correct readback. If the optional config-gated Hermes `/verbose`
-command changes OcuClaw's per-platform mode, restore `off` before continuing.
+Continue only when the tool-progress setting reports `false` and the streaming
+setting reports `true` (and, for a terminal install only, the interface
+reports `tui`). Hermes 0.21 stores the CLI value `off` as a boolean, so
+`false` is the correct readback for tool-progress. If the optional
+config-gated Hermes `/verbose` command changes OcuClaw's per-platform mode,
+restore `off` before continuing.
 
 ## Step 4b · Live reasoning [OPTIONAL — offer, never assume]
 
@@ -429,7 +438,10 @@ including its supervisor-specific command and wizard rule. Read
 never run `hermes gateway restart` or `hermes gateway run` from a tool: give
 the person the exact hand-off (Ctrl+C in their gateway terminal,
 `hermes gateway run` again there, then "continue") and wait for "continue".
-This is the normal case for a gateway started by hand in a terminal.
+This is the normal case for a gateway started by hand in a terminal. When
+status reports `gatewayRestartHost: cloudways`, there is no gateway terminal:
+give the Cloudways words from that section instead (`hermes gateway restart`
+in an SSH terminal or the Cloudways dashboard, reconnect, then "continue").
 
 On Cloudways, all required settings and agent choice must already be saved.
 Use the exact reconnect/session handoff in `quick_reference` before activation.
@@ -641,7 +653,7 @@ and advances automatically when the phone connects. The TUI panel opens on the
 address/code (manual) view when the QR does not fit the window, and `m` offers
 the QR only when it fits; the Desktop panel's manual toggle shows the
 address/code for the same exchange. On the
-phone, the user opens OcuClaw in Even Hub, taps **Pair with your computer**,
+phone, the user opens OcuClaw in Even Hub, taps **Pair with your agent** (older apps: **Pair with your computer**),
 then **Take a photo of the QR code**, or **Enter the pairing code instead** to
 type the address and code.
 The user
@@ -1167,9 +1179,13 @@ that unauthorized secondary turns are silent for the wearer and log
 
 Skip this step entirely when the user is not using Hermes Desktop (the TUI has
 no theme to apply). Otherwise read `status.desktopTheme.offer` from the
-receipt you already have. It says exactly one of four things:
+receipt you already have. It says exactly one of five things:
 
 - `already_enabled` -> say so in one line and go to the wrap. Change nothing.
+- `desktop_choice` -> Hermes Desktop already asked "Make Desktop feel like
+  OcuClaw?" when the plugin loaded, and it keeps that answer. Do not ask again
+  and say nothing about the look; go to the wrap. If the user asks, the look
+  changes in Settings > Appearance > Theme.
 - `unavailable` -> the OcuClaw Desktop plugin file is not on this profile; the
   gateway installs it on start, so this belongs to Step 5's restart, not to
   this step. Skip and go to the wrap.

@@ -7,7 +7,7 @@ metadata: {"hermes": {"emoji": "glasses"}}
 
 # OcuClaw Setup Assistant for Hermes
 
-**Guide version:** 2026-09-25 (1.3.24-hermes)
+**Guide version:** 2026-09-28 (1.3.25-hermes)
 
 **Provenance:** deliberately forked from the OcuClaw Setup Assistant guide
 1.0.41 at commit `fffbb2154`. That is the source guide version, not an
@@ -311,6 +311,7 @@ returned `code`, never on a guess:
 | `paired` | Continue with `wait_phone_origin`. |
 | `tui_window_too_small` | The Hermes window is too small even for the manual view. Nothing was paired and the phone is not at fault. Use the returned message: it names the window's size and the size needed. Ask the person to make this Hermes window bigger (drag its edge or maximise it; do not quit Hermes), then call `pair_phone` again. |
 | `desktop_pairing_timeout`, `tui_pairing_timeout` | The phone did not connect in time; use the returned timeout message verbatim: "Pairing timed out. Ensure OcuClaw is running on your Even G2, then retry pairing." Do not replace it with Even Hub or generic phone-ready wording. |
+| `expired` | The two-minute code ran out before pairing finished. Nothing is wrong with the phone, the route or the words. Use the returned message; it matches the phone ("Pairing took longer than the two-minute window"). Ask whether to get a fresh code; on yes call `pair_phone` again, which reopens the same surface: the Desktop pairing window for a Desktop user, the TUI panel for a terminal user. The Desktop window's "Get a new code" button replies "Yes, get a new code" for the person; that is the yes, even if it arrives before you ask. Never answer this code with the terminal fallback below and never count it toward "the same failure twice". |
 | `cancelled`, `refused` | The person cancelled or refused in the panel. Ask whether to retry; call `pair_phone` again only on yes. |
 | `tui_required` | The classic-CLI handoff above. |
 | `tui_relaunch_required` | The widget was repaired after this TUI started. Relaunch Hermes once only when a service manager runs the gateway; otherwise use the fallback below. |
@@ -319,7 +320,8 @@ returned `code`, never on a guess:
 | `profile_unresolved`, `setup_not_configured`, `gateway_not_healthy`, `relay_not_healthy`, `tailnet_route_not_verified`, `tailnet_route_not_owned`, `tailnet_identity_unavailable`, `address_unavailable`, `verification_failed` | A pre-pairing check failed and nothing was opened. Each code has its own returned message naming the cause and next step; use it, fix that one cause, then call `pair_phone` again. Only `tailnet_route_not_verified` means the private route is unverified. |
 | any other code, or the same failure twice | Deterministic: the panel will fail the same way again. Hand off the fallback below. |
 
-Fallback for a deterministic pairing failure: ask the person to run
+Fallback for a deterministic pairing failure (never for `expired`, which is
+answered by a fresh code in the same panel): ask the person to run
 `hermes ocuclaw pair --address <verified-phoneAddress>` in their own terminal,
 a separate window they open themselves. Never run it through your Terminal or
 any other tool, pipe it, or ask for its output: its QR and pairing code must
@@ -500,8 +502,11 @@ receipt.
    `hermes gateway run` from a tool: hand the restart to the person with the
    exact words in `quick_reference` → `Restarting the gateway` (Ctrl+C in
    their gateway terminal, `hermes gateway run` again there, then
-   "continue"), then re-check status. This covers every restart in this
-   skill, including the ownership move lane above. **Never start the gateway
+   "continue"), then re-check status. When status reports
+   `gatewayRestartHost: cloudways` there is no gateway terminal: use that
+   section's Cloudways words instead (`hermes gateway restart` in an SSH
+   terminal or the Cloudways dashboard, reconnect, then "continue"). This
+   covers every restart in this skill, including the ownership move lane above. **Never start the gateway
    or `tailscaled` as a tool or background child.** Optional Soniox/Even AI saves use fresh-install's grouped
    `optional-setup activate` barrier and fresh loaded-runtime status instead
    of a second generic restart; an uncertain activation remains pending.
@@ -689,9 +694,12 @@ secondary-profile rejection, not merely because multiple profiles exist.
 - Full uninstall first runs
   `hermes plugins enable ocuclaw --no-allow-tool-override` so the plugin-owned
   CLI is registered even for a disabled retained install, then
-  `hermes gateway stop`, `hermes ocuclaw uninstall`, and
-  `hermes gateway start`. The command prints its ownership receipt and
-  preserves shared Hermes sessions.
+  `hermes ocuclaw uninstall`. If it reports `restart_required` (exit 3),
+  run `hermes gateway restart` and `hermes ocuclaw uninstall` again; never
+  `hermes gateway stop` first (on Cloudways it restarts the container). The
+  command removes the Cloudways Tailscale pieces too, prints its ownership
+  receipt and preserves shared Hermes sessions. `--cancel` clears a pending
+  uninstall; restart once afterwards.
 - Multiple agents use the relay's authenticated transport provenance on
   Hermes 0.21; never enable `OCUCLAW_ALLOW_ALL_USERS` as setup. The OcuClaw
   enrollment set (#2940) selects agents and is distinct from sender
@@ -707,5 +715,11 @@ secondary-profile rejection, not merely because multiple profiles exist.
   `false`. OcuClaw's structured tool activity remains active. If the optional
   Hermes `/verbose` gateway command changes the setting, restore it before
   continuing beta validation.
+- Reply streaming is explicitly turned on for OcuClaw through
+  `display.platforms.ocuclaw.streaming` (Hermes 0.21.5 reads it per turn); the
+  expected CLI readback is `true`. `display.streaming` (no `platforms.ocuclaw`
+  segment) is a different, CLI-only key, and top-level `streaming.enabled`
+  must never be written. Without the platform key the glasses show only
+  "typing" for the whole reply, then the whole reply at once.
 - LiveUI ships ON. Do not claim its still-owed simulator or real-Even-G2 proof
   has already happened.

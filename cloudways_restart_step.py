@@ -104,9 +104,10 @@ is the difference:
 * **Only settings are waiting** — step 2 wrote ``allow_admin_from``, or an
   earlier run did. That key is read at gateway start and is needed by exactly
   one feature, "Continue here" (``PROTOCOL.md``, ``adapter.py``,
-  ``snapshot.py``'s ``continueHereConfigured``). The other setting this ladder
-  writes, ``display.platforms.ocuclaw.tool_progress``, is read live. Steps 4 to
-  8 name neither. So the ladder used to stop the user at step 3 and make them
+  ``snapshot.py``'s ``continueHereConfigured``). The other two settings this
+  ladder writes, ``display.platforms.ocuclaw.tool_progress`` and
+  ``display.platforms.ocuclaw.streaming``, are both read live, per turn. Steps
+  4 to 8 name none of them. So the ladder used to stop the user at step 3 and make them
   run the whole command again for a feature that is not needed until later: it
   now walks on, the pending marker stays standing so the owed restart is still
   recorded, and the ladder's completion output says in one line that "Continue
@@ -115,7 +116,6 @@ is the difference:
 from __future__ import annotations
 
 import os
-import textwrap
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -123,7 +123,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Tuple
 
 from . import health, receipts, relay_credential
-from .optional_setup import CLOUDWAYS_RESTART_WARNING
+from .optional_setup import CLOUDWAYS_RESTART_PHONE_LINE, CLOUDWAYS_RESTART_SSH_LINE
 
 # -- what this step reads -----------------------------------------------------
 
@@ -222,7 +222,7 @@ LOADED_MESSAGE = "OcuClaw is loaded and ready."
 #: gateway is what bounces the container here, so SSH drops and the foreground
 #: gateway that command was about to become dies with the session; PID 1 brings
 #: the real one back. The warning printed with it is the one the activation
-#: restart already shows (`optional_setup.CLOUDWAYS_RESTART_WARNING`), imported
+#: restart already shows (`optional_setup.CLOUDWAYS_RESTART_SSH_LINE` and `_PHONE_LINE`), imported
 #: rather than copied so the two can never drift. A container restart wipes
 #: shell history, so the lines end with the exact command to type again, never
 #: "press up". The dashboard stays as the one-line fallback.
@@ -241,20 +241,42 @@ RESTART_AND_RERUN_MESSAGE = "Restart the agent, then run this command again."
 RESTART_COMMAND = "hermes gateway restart"
 RERUN_COMMAND = "hermes ocuclaw cloudways setup"
 
-NOT_LOADED_LINES = (
-    f"  {NOT_LOADED_MESSAGE}",
-    "  One restart loads OcuClaw and the settings above. Type:",
-    f"    {RESTART_COMMAND}",
-    "",
-    # Wrapped like OpenClaw's two lines: one line of it wrapped mid-word in a
-    # 100-column terminal on the real box.
-    *(f"  {part}" for part in textwrap.wrap(CLOUDWAYS_RESTART_WARNING, width=86)),
-    "",
-    "  After you reconnect, type this again:",
-    f"    {RERUN_COMMAND}",
-    "",
-    "  Or restart the agent from your Cloudways dashboard.",
-)
+def not_loaded_lines(*, phone_paired: bool = False) -> Tuple[str, ...]:
+    """The step 3 restart block. The phone line only once a phone is paired.
+
+    Before pairing there is no phone to reconnect, so "Your phone reconnects"
+    only confuses (Matty's Hermes Cloudways run, 2026-09-28). OpenClaw's step 3
+    drops the same line the same way (#3975). One line each, like OpenClaw's:
+    both stay under 86 columns, so neither wraps mid-word on the real box.
+    """
+    return (
+        f"  {NOT_LOADED_MESSAGE}",
+        "  One restart loads OcuClaw and the settings above. Type:",
+        f"    {RESTART_COMMAND}",
+        "",
+        f"  {CLOUDWAYS_RESTART_SSH_LINE}",
+        *((f"  {CLOUDWAYS_RESTART_PHONE_LINE}",) if phone_paired else ()),
+        "",
+        "  After you reconnect, type this again:",
+        f"    {RERUN_COMMAND}",
+        "",
+        "  Or restart the agent from your Cloudways dashboard.",
+    )
+
+
+#: The block as a fresh box sees it: no phone paired yet.
+NOT_LOADED_LINES = not_loaded_lines()
+#: The block once a phone is paired.
+NOT_LOADED_LINES_PAIRED = not_loaded_lines(phone_paired=True)
+
+
+def _phone_paired(home: Optional[Path]) -> bool:
+    """Step 7's own already-paired check: the durable pairing receipt."""
+    # Imported here: `cloudways_pair_steps` imports the ladder, which imports
+    # this module.
+    from .cloudways_pair_steps import _already_paired
+
+    return _already_paired(home)
 
 #: Printed when this command's own marker stands and nothing can answer it — an
 #: unusable stamp, or a host that cannot say when its gateway started. Silence
@@ -780,7 +802,7 @@ def run_relay_credential(ctx: Any) -> Any:
     if not credential_present():
         # No credential at all means the plugin has never registered: the
         # gateway mints it as OcuClaw loads.
-        for line in NOT_LOADED_LINES:
+        for line in not_loaded_lines(phone_paired=_phone_paired(hermes_home)):
             ctx.say(line)
         return ladder.StepRecord(
             "relay-credential",
@@ -832,7 +854,8 @@ def run_relay_credential(ctx: Any) -> Any:
             # #3241. Every real Cloudways container lands here after step 2
             # wrote the settings, and the ladder used to stop and make the user
             # restart and run the whole command again. Nothing between here and
-            # step 8 reads either setting: `tool_progress` is read live, and
+            # step 8 reads any of these settings: `tool_progress` and
+            # `streaming` are both read live, and
             # `allow_admin_from` is read at gateway start for "Continue here"
             # alone. The marker is deliberately NOT removed: it is the only
             # record that the restart is still owed, the next run settles it
@@ -841,7 +864,7 @@ def run_relay_credential(ctx: Any) -> Any:
             return ladder.StepRecord(
                 "relay-credential", ladder.STATUS_SKIPPED, DETAIL_RESTART_DEFERRED
             )
-        for line in NOT_LOADED_LINES:
+        for line in not_loaded_lines(phone_paired=_phone_paired(hermes_home)):
             ctx.say(line)
         return ladder.StepRecord(
             "relay-credential",
@@ -938,6 +961,7 @@ __all__ = [
     "JOURNAL_DETAILS",
     "LOADED_MESSAGE",
     "NOT_LOADED_LINES",
+    "NOT_LOADED_LINES_PAIRED",
     "NOT_LOADED_MESSAGE",
     "OUTSIDE_CHANGE_NOTE",
     "PENDING_CREDENTIAL_NOT_ADOPTED",
@@ -969,6 +993,7 @@ __all__ = [
     "mark_restart_pending",
     "marker_clock",
     "marker_settled",
+    "not_loaded_lines",
     "read_gateway_health",
     "read_pending_marker",
     "restart_gateway",

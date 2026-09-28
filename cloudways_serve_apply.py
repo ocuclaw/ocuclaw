@@ -288,8 +288,82 @@ def route_progress_message(elapsed_s: float) -> str:
     return f"Still waiting for the route to answer ({waited_for(elapsed_s)} so far)."
 
 
+def _command_words(text: str) -> Tuple[str, ...]:
+    """The words of a printed command, split only on spaces outside quotes.
+
+    A quoted path with a space in it stays one word, so a wrap never lands
+    inside it. Word for word the OpenClaw ladder's ``commandWords``.
+    """
+    words = []
+    word = ""
+    quote = None
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        if quote:
+            word += ch
+            if ch == quote:
+                quote = None
+        elif ch == "\\" and index + 1 < len(text):
+            word += ch + text[index + 1]
+            index += 1
+        elif ch in ("'", '"'):
+            quote = ch
+            word += ch
+        elif ch == " ":
+            if word:
+                words.append(word)
+            word = ""
+        else:
+            word += ch
+        index += 1
+    if word:
+        words.append(word)
+    return tuple(words)
+
+
+def wrap_command_lines(
+    command: str, columns: int = 0, indent: str = "    ", continuation: str = "      "
+) -> Tuple[str, ...]:
+    """#3808. A command too wide for this window, broken between words.
+
+    Every line but the last ends in a shell line continuation and the later
+    lines are indented, so it reads cleanly and a copied block still runs as
+    one command. At 110 columns the step 6 command used to wrap mid-word
+    (``--tls-t`` / ``erminated-tcp=8446``). ``columns`` 0 (not a terminal, or
+    unknown) keeps the one line. Word for word the OpenClaw ladder's
+    ``wrapCommandLines``.
+    """
+    width = int(columns) if columns and int(columns) > 0 else 0
+    whole = f"{indent}{command}"
+    # Strictly narrower than the window: a line that fills the last column
+    # leaves some terminals with a blank line under it.
+    if width == 0 or len(whole) < width:
+        return (whole,)
+    words = _command_words(command)
+    if len(words) < 2:
+        return (whole,)
+    lines = []
+    current = f"{indent}{words[0]}"
+    for index, word in enumerate(words[1:], start=1):
+        last = index == len(words) - 1
+        candidate = f"{current} {word}"
+        # Room for the " \" that ends every line but the last.
+        if len(candidate) + (0 if last else 2) < width:
+            current = candidate
+            continue
+        lines.append(f"{current} \\")
+        current = f"{continuation}{word}"
+    lines.append(current)
+    return tuple(lines)
+
+
 def consent_lines(
-    command: str, *, override_in_force: bool = False, details: bool = False
+    command: str,
+    *,
+    override_in_force: bool = False,
+    details: bool = False,
+    columns: int = 0,
 ) -> Tuple[str, ...]:
     """The exact command, what it exposes, and to whom. Default No.
 
@@ -307,12 +381,12 @@ def consent_lines(
         return override + (
             "  Allow access from your tailnet only. Never public; never Tailscale Funnel.",
             "  If you say yes, setup will run:",
-            f"    {command}",
+            *wrap_command_lines(command, columns),
             "  Anything but yes leaves this route unchanged.",
         )
     return override + (
         "  If you say yes, setup will run:",
-        f"    {command}",
+        *wrap_command_lines(command, columns),
         "  This makes the relay reachable only from inside your own tailnet, on "
         "devices signed in to it.",
         "  It is never Tailscale Funnel and it is never public: nothing outside "
@@ -518,6 +592,7 @@ def _consent_and_apply(
             command,
             override_in_force=_assume_marker_set(ctx),
             details=bool(getattr(ctx.options, "details", False)),
+            columns=_window_columns(ctx),
         ),
         question=setup.WHOLE_WORD_CONSENT_QUESTION,
     ):
@@ -771,6 +846,17 @@ def _wait_for_route(
 
 
 # -- the pieces ---------------------------------------------------------------
+
+
+def _window_columns(ctx: Any) -> int:
+    """#3808. The width the consent's command wraps to; 0 keeps one line."""
+    columns = getattr(ctx, "columns", None)
+    if not callable(columns):
+        return 0
+    try:
+        return max(0, int(columns() or 0))
+    except Exception:  # noqa: BLE001 - an unmeasurable window is unknown
+        return 0
 
 
 def _say_block(ctx: Any, message: str) -> None:

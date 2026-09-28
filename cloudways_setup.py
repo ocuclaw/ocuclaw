@@ -165,6 +165,15 @@ RESUME_MESSAGE = (
 #: ladder, not a crash: one plain line, exit 130, and no traceback (#3146).
 INTERRUPT_MESSAGE = "Stopped at your Ctrl-C. " + RESUME_INVITATION
 
+#: #3808. Said the moment a step starts something slow, so a quiet terminal
+#: reads as work in progress and not a hang (a real box sat silent for about
+#: 20 seconds after step 1 and at step 5). Word for word the OpenClaw
+#: ladder's PROGRESS_* lines where both ladders have the same wait.
+PROGRESS_SIGN_IN_MESSAGE = "Checking the model sign-in..."
+PROGRESS_TAILSCALE_MESSAGE = "Checking Tailscale..."
+PROGRESS_TAILSCALE_INSTALL_MESSAGE = "Installing Tailscale..."
+PROGRESS_ENROLL_MESSAGE = "Getting the approval link from Tailscale..."
+
 HANDOFF_MESSAGE = (
     "Some steps are not built yet; the lines above name the command that still "
     "covers each one. Run the same command again at any time: every step re-reads "
@@ -346,8 +355,14 @@ class StepContext:
     #: returns its exit code. Output is never captured.
     run_interactive_fn: Optional[Callable[[Sequence[str]], Optional[int]]] = None
     #: ``qr_fn(text, prefix_lines)``: a terminal QR for ``text``, or ``None``
-    #: when this terminal cannot show one whole (#3483).
-    qr_fn: Optional[Callable[[str, Sequence[str]], Optional[str]]] = None
+    #: when this terminal cannot show one whole (#3483). Since #3743 it may
+    #: also answer a :class:`cloudways_qr.PendingQr`: the code drawn, and
+    #: whether it fits now. One that does not was withheld for size only, and
+    #: step 5 redraws it once the window grows.
+    qr_fn: Optional[Callable[[str, Sequence[str]], Any]] = None
+    #: The window width a printed command wraps to (#3808); ``0`` off a
+    #: terminal or when unknown. ``None`` means never wrap.
+    columns_fn: Optional[Callable[[], int]] = None
     #: Prints a block to the terminal WITHOUT recording it in the result's
     #: lines (a QR code has no place in `--json`). ``None`` falls back to say.
     show: Optional[Callable[[str], None]] = None
@@ -362,6 +377,26 @@ class StepContext:
             self.say(line, role="prompt")
         except TypeError:
             self.say(line)
+
+    def say_progress(self, message: str) -> None:
+        """#3808. One dim line the moment a step starts something slow.
+
+        Like :meth:`say_prompt`, a one-argument stand-in gets the plain line.
+        """
+        line = f"  {message}"
+        try:
+            self.say(line, role="detail")
+        except TypeError:
+            self.say(line)
+
+    def columns(self) -> int:
+        """The width a printed command wraps to; ``0`` means one line (#3808)."""
+        if self.columns_fn is None:
+            return 0
+        try:
+            return max(0, int(self.columns_fn() or 0))
+        except Exception:  # noqa: BLE001 - an unmeasurable window is unknown
+            return 0
 
 
 @dataclass
@@ -438,6 +473,8 @@ def _model_sign_in(ctx: StepContext) -> Optional[StepRecord]:
     """
     if ctx.signin_check_fn is None:
         return None
+    # The check can take 20 seconds on a real box (a live model probe).
+    ctx.say_progress(PROGRESS_SIGN_IN_MESSAGE)
     try:
         state = ctx.signin_check_fn()
     except Exception:  # noqa: BLE001 - a check that throws is "could not tell"
@@ -504,6 +541,7 @@ def step_4_tailscale(ctx: StepContext) -> StepRecord:
     The cron watchdog is what starts ``tailscaled`` here, and its fire is not
     proof: the ladder waits for the daemon to say what it is instead.
     """
+    ctx.say_progress(PROGRESS_TAILSCALE_MESSAGE)
     report = ctx.status_fn(wait_s=0.0)
     daemon = _daemon_of(report)
     script = report.get("script") if isinstance(report.get("script"), Mapping) else {}
@@ -520,6 +558,7 @@ def step_4_tailscale(ctx: StepContext) -> StepRecord:
     if already_installed:
         ctx.say("  Tailscale and its background checks are already installed.")
     else:
+        ctx.say_progress(PROGRESS_TAILSCALE_INSTALL_MESSAGE)
         install_report = ctx.install_fn()
         if not install_report.get("ok"):
             ctx.say(f"  {install_report.get('error') or 'The Tailscale install failed.'}")
@@ -587,31 +626,85 @@ STEP_5_INSTALL_TAILSCALE_LINE = (
 STEP_5_QR_LEAD_LINE = "Point your phone's camera at this code to approve this server:"
 #: #3483. Under the QR code, the same link as text.
 STEP_5_OR_OPEN_PREFIX = "Or open: "
+#: #3743. Above a code redrawn once the window grew, shared with the OpenClaw
+#: ladder word for word.
+STEP_5_REDRAW_LEAD_LINE = (
+    "The code fits now. Point your phone's camera at it to approve this server:"
+)
 
 
-def _show_approval_link(ctx: StepContext, auth_url: str, header: str) -> None:
-    """The install line, then the link as a QR code, or as text when it won't fit."""
+def _show_approval_link(ctx: StepContext, auth_url: str, header: str) -> Any:
+    """The install line, then the link as a QR code, or as text when it won't fit.
+
+    Returns the code still waiting for a bigger window (#3743), else ``None``.
+    """
     ctx.say(f"  {STEP_5_INSTALL_TAILSCALE_LINE}")
     lead = f"  {STEP_5_QR_LEAD_LINE}"
     or_open = f"  {STEP_5_OR_OPEN_PREFIX}{auth_url}"
-    code = None
+    drawn: Any = None
     if ctx.qr_fn is not None and ctx.isatty():
         try:
             # Every row the code shares the screen with, so it is drawn only
             # when the header above it and the link below it still fit.
-            code = ctx.qr_fn(
-                auth_url, (header, f"  {STEP_5_INSTALL_TAILSCALE_LINE}", lead, or_open)
+            drawn = ctx.qr_fn(
+                auth_url,
+                (
+                    header,
+                    f"  {PROGRESS_ENROLL_MESSAGE}",
+                    f"  {STEP_5_INSTALL_TAILSCALE_LINE}",
+                    lead,
+                    or_open,
+                ),
             )
         except Exception:  # noqa: BLE001 - no code; the link still works
-            code = None
+            drawn = None
+    code = None
+    pending = None
+    if isinstance(drawn, str):
+        code = drawn or None
+    elif drawn is not None and getattr(drawn, "code", None):
+        # A drawn code that does not fit was withheld for size only (#3743).
+        if getattr(drawn, "fits", False):
+            code = drawn.code
+        else:
+            pending = drawn
     if code:
         ctx.say(lead)
         (ctx.show or ctx.say)(code)
         ctx.say(or_open)
-        return
+        return None
+    if pending is not None:
+        try:
+            hints = list(pending.hint_lines())
+        except Exception:  # noqa: BLE001 - no hint, no redraw; the link still works
+            hints, pending = [], None
+        for line in hints:
+            ctx.say(f"  {line}")
     for line in STEP_5_PHONE_SIGN_IN_LINES:
         ctx.say(f"  {line}")
     ctx.say(f"    {auth_url}")
+    return pending
+
+
+def _redraw_approval_code(ctx: StepContext, pending: Any) -> None:
+    """#3743. The lead line, then the code, once. The link is already above."""
+    ctx.say(f"  {STEP_5_REDRAW_LEAD_LINE}")
+    (ctx.show or ctx.say)(pending.code)
+
+
+def _sleep_watching_code(ctx: StepContext, seconds: float, pending: Any) -> Any:
+    """Sleep, redrawing a waiting code the first time the window can show it."""
+    if pending is None:
+        ctx.sleep(seconds)
+        return None
+    from . import cloudways_qr
+
+    return cloudways_qr.sleep_watching(
+        seconds,
+        pending,
+        sleep_fn=ctx.sleep,
+        draw_fn=lambda waiting: _redraw_approval_code(ctx, waiting),
+    )
 
 
 def step_5_enrollment(ctx: StepContext) -> StepRecord:
@@ -626,6 +719,7 @@ def step_5_enrollment(ctx: StepContext) -> StepRecord:
                 "pass clears it, and nothing needs doing."
             )
         return StepRecord("enrollment", STATUS_SKIPPED, cloudways.STATE_RUNNING)
+    ctx.say_progress(PROGRESS_ENROLL_MESSAGE)
     enrolled = ctx.enroll_fn()
     if enrolled.get("state") == cloudways.STATE_RUNNING:
         ctx.say("  This server is already approved.")
@@ -643,7 +737,9 @@ def step_5_enrollment(ctx: StepContext) -> StepRecord:
         return StepRecord(
             "enrollment", STATUS_FAILED, "no-authorization-link", exit_code=SETUP_EXIT_PROBLEM
         )
-    _show_approval_link(ctx, str(auth_url), f"[5/{SETUP_STEP_COUNT}] Connect to Tailscale")
+    pending_code = _show_approval_link(
+        ctx, str(auth_url), f"[5/{SETUP_STEP_COUNT}] Connect to Tailscale"
+    )
     deadline =ctx.clock() + max(0.0, float(ctx.options.wait_s))
     last_notice = ctx.clock()
     approved = False
@@ -657,7 +753,11 @@ def step_5_enrollment(ctx: StepContext) -> StepRecord:
         if ctx.clock() - last_notice >= ctx.notice_s:
             last_notice = ctx.clock()
             ctx.say("  Waiting for server approval.")
-        ctx.sleep(min(ctx.poll_s, max(0.0, deadline - ctx.clock())))
+        # A code withheld for size is measured for every half second of this
+        # wait and drawn once it fits (#3743). Approval ends the wait as ever.
+        pending_code = _sleep_watching_code(
+            ctx, min(ctx.poll_s, max(0.0, deadline - ctx.clock())), pending_code
+        )
     if not approved:
         # A timeout costs the user nothing: the enrollment is still in flight
         # and the next run picks the same wait back up.
@@ -752,7 +852,8 @@ def run_setup(
     daemon_wait_s: float = DEFAULT_DAEMON_WAIT_S,
     signin_check_fn: Optional[Callable[[], Any]] = None,
     interactive_runner: Optional[Callable[[Sequence[str]], Optional[int]]] = None,
-    qr_fn: Optional[Callable[[str, Sequence[str]], Optional[str]]] = None,
+    qr_fn: Optional[Callable[[str, Sequence[str]], Any]] = None,
+    columns_fn: Optional[Callable[[], int]] = None,
 ) -> SetupResult:
     """Run the ladder. Returns the exit code, every line shown, and the records.
 
@@ -789,6 +890,17 @@ def run_setup(
 
     isatty = isatty_fn or _default_isatty(stream_in, stream_out)
 
+    def window_columns() -> int:
+        """#3808. The real window's width, only when the output is that window."""
+        try:
+            if not stream_out.isatty():
+                return 0
+        except Exception:  # noqa: BLE001 - a stream with no isatty is no terminal
+            return 0
+        from . import cloudways_qr
+
+        return cloudways_qr.terminal_size()[0]
+
     def choose(
         question_lines: Sequence[str], *, question: str, choices: Iterable[str]
     ) -> Optional[str]:
@@ -819,10 +931,10 @@ def run_setup(
             layout.hermes_home, env=env, hermes_bin=cloudways.hermes_bin(), runner=runner
         )
 
-    def draw_qr(text: str, prefix_lines: Sequence[str]) -> Optional[str]:
+    def draw_qr(text: str, prefix_lines: Sequence[str]) -> Any:
         from . import cloudways_qr
 
-        return cloudways_qr.terminal_qr(
+        return cloudways_qr.prepare_terminal_qr(
             text,
             stream_out=stream_out,
             stream_in=stream_in,
@@ -888,6 +1000,7 @@ def run_setup(
         signin_check_fn=signin_check_fn or check_signin,
         run_interactive_fn=interactive_runner or run_hermes_interactive,
         qr_fn=qr_fn or draw_qr,
+        columns_fn=columns_fn or window_columns,
         show=show,
     )
 

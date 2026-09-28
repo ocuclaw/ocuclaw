@@ -215,7 +215,7 @@ PAIRING_WAITING_FOR_PHONE_PHASE = "waiting-for-phone"
 #: the pair screen and the keypress together, so no separate "Press Enter" line
 #: is needed (#3483). Printed yellow, as an action, like OpenClaw.
 STEP_7_READY_LINES = (
-    "Open Even > OcuClaw > Pair with your computer on your phone, then press "
+    "Open Even > OcuClaw on your phone and tap the Pair button, then press "
     "Enter to show the code.",
     "The next pairing code expires in 2 minutes.",
 )

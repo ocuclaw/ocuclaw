@@ -1,6 +1,6 @@
 # Troubleshooting OcuClaw on Hermes
 
-**Guide version:** 2026-09-25 (1.3.24-hermes)
+**Guide version:** 2026-09-28 (1.3.25-hermes)
 
 This guidance was loaded through the `ocuclaw_setup` tool. Keep using the
 loaded setup skill for command, secret, checkpoint, and restart rules, and use
@@ -291,6 +291,26 @@ user normally does (for example SSH). `command not found` often means the
 wrong host or PATH; confirm `hermes --version` there first. Mind quotes around
 secret placeholders.
 
+## CODEX-SHARED-LOGIN
+
+Enter only when one or more agents cannot authenticate to Codex and their
+profiles share a login. This is a known upstream Hermes limitation in the
+certified release; an OcuClaw reconnect alone does not repair credentials.
+Hermes owns provider sign-in, credential storage and refresh. OcuClaw never
+logs users out, copies `auth.json`, or changes credentials, and neither do you:
+give the user these host steps to run themselves.
+
+- Main login: `hermes auth`. A profile with its own credentials:
+  `hermes --profile <name> auth`. Reconnect Codex there, restart the gateway
+  through its normal service controls, then retry the conversation in each
+  affected agent.
+- A profile holding stale credentials: remove that profile's stale Codex login
+  with Hermes's auth controls before reconnecting the shared login. Native
+  `auth logout openai-codex` also resets the selected provider, so run
+  `hermes model` in that profile to select Codex again.
+- Keep the agents and their conversations. Never copy `auth.json` between
+  profiles as a repair.
+
 ## ESCALATE
 
 Open OcuClaw's built-in **Report a bug** feature and send the diagnostic
@@ -303,7 +323,7 @@ already recorded. Show it to the user and confirm it contains no secrets or
 network addresses:
 
 ```text
-OcuClaw Hermes beta report — guide 2026-09-25 (1.3.24-hermes)
+OcuClaw Hermes beta report — guide 2026-09-28 (1.3.25-hermes)
 Hermes version:
 OcuClaw bundle version (from plugin.yaml/list output):
 Backend: hermes

@@ -1,7 +1,7 @@
 manifest_version: 1
 name: ocuclaw
 kind: platform
-version: 2.1.0
+version: 2.1.1
 description: >
   OcuClaw platform adapter for the hermes gateway. Spawns the shared OcuClaw
   Node runtime (glasses/phone relay, Even-AI endpoint, liveui engine) as a

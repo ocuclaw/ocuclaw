@@ -1,6 +1,6 @@
 # OcuClaw on Hermes — quick reference
 
-**Guide version:** 2026-09-25 (1.3.24-hermes)
+**Guide version:** 2026-09-28 (1.3.25-hermes)
 
 Use this as a lookup only. The loaded setup skill owns guardrails and
 checkpoints.
@@ -31,7 +31,7 @@ and `{"operation":"update"}`, and is authored once in
 | Optional dashboard detail | read-only OcuClaw tab at `/ocuclaw`; never a fallback dependency |
 | Relay Credential | initial plugin bootstrap generates it once on a provably fresh profile; nothing to enter; for suspected compromise/loss or established-missing recovery load `{"operation":"credential_reset"}` for the locally confirmed all-device reset |
 | All-device reset | `hermes ocuclaw reset-relay-credential` (interactive host terminal only; every phone disconnects and must re-pair) |
-| Full uninstall | run `hermes plugins enable ocuclaw --no-allow-tool-override` first so the CLI is registered, run any narrow teardown printed by `hermes ocuclaw doctor`, then `hermes gateway stop`, `hermes ocuclaw uninstall`, and `hermes gateway start`; shared Hermes sessions are preserved |
+| Full uninstall | run `hermes plugins enable ocuclaw --no-allow-tool-override` first so the CLI is registered, run any narrow teardown printed by `hermes ocuclaw doctor`, then `hermes ocuclaw uninstall`; if it reports `restart_required`, `hermes gateway restart` then `hermes ocuclaw uninstall` again (Cloudways included); shared Hermes sessions are preserved; `hermes ocuclaw uninstall --cancel` then a restart keeps OcuClaw |
 | Optional continuation | Matching advertised bundle: Home's **Optional setup** card, buttons **Set up voice** and **Set up Even AI**; later re-entry is **Settings > Voice** and **Settings > Defaults > Even AI**. The card has no other buttons, and Settings has no separate optional-setup row. Diagnostics live at **Settings > Display > debug section > Diagnostics**. Dismissing Home and skipping each capability are separate. |
 | Optional secrets | Primary: masked phone field, explicit replacement confirmation, **Save privately**. Advanced: Desktop `request_credentials` or advertised `hermes ocuclaw optional-setup save soniox` / `save even-ai` / `save typesafe` hidden prompts. |
 | Optional activation | Finish saves, then **Review activation** and explicitly confirm supported lifecycle. Reconnect and refresh loaded state; never replay an uncertain apply. Unsupported lifecycle uses the existing host handoff. Save is not activation or test proof. |
@@ -40,6 +40,8 @@ and `{"operation":"update"}`, and is authored once in
 | Set relay port | `hermes config set platforms.ocuclaw.extra.wsPort <port>` |
 | Keep tool activity off the transcript | `hermes config set display.platforms.ocuclaw.tool_progress off` |
 | Check OcuClaw tool-progress mode | `hermes config get display.platforms.ocuclaw.tool_progress` -> `false` |
+| Turn on reply streaming for the glasses | `hermes config set display.platforms.ocuclaw.streaming true` |
+| Check OcuClaw streaming mode | `hermes config get display.platforms.ocuclaw.streaming` -> `true`; without it the glasses show only "typing" for the whole reply, then the whole reply at once |
 | Turn on "Continue here" (glasses pick up a Desktop/CLI/TUI chat) | `hermes config set platforms.ocuclaw.extra.allow_admin_from '["ocuclaw-wearer"]'` |
 | Check "Continue here" | `hermes config get platforms.ocuclaw.extra.allow_admin_from` -> lists `ocuclaw-wearer`; status `mandatoryConfiguration.adoptConfigured: true` |
 | Safe bind | `hermes config set platforms.ocuclaw.extra.wsBind 127.0.0.1` |
@@ -104,9 +106,26 @@ Who supervises the gateway decides the command: read
 `service`, `unsupervised` or `unknown`. `status.gatewaySupervisor` names the
 kind (`s6`, `systemd`, `launchd`, `windows`, `external`) when one is known.
 
-On Cloudways, first follow [Cloudways reconnect and resume](cloudways.md#before-any-restart--reconnect-and-resume).
-Give the reconnect command and exact saved-session ID before the disconnect.
-Use Cloudways' existing `hermes gateway restart` path; it restarts the container.
+Read `status.gatewayRestartHost` from the same status. It decides the words
+before the ladder below does:
+
+- `gatewayRestartHost: cloudways`: the Cloudways container runs the gateway,
+  so there is no gateway terminal to Ctrl+C and `gatewaySupervision` reads
+  `unsupervised`. Stopping the gateway restarts the whole container. **Never**
+  run `hermes gateway restart` or `hermes gateway run` from a tool here either.
+  First follow [Cloudways reconnect and resume](cloudways.md#before-any-restart--reconnect-and-resume):
+  give the reconnect command and exact saved-session ID before the disconnect.
+  Then say exactly:
+
+  > Please restart your Hermes agent: in an SSH terminal on this server, run
+  > `hermes gateway restart`, or restart the agent from your Cloudways
+  > dashboard. This restarts the whole container, so SSH disconnects; reconnect
+  > in about a minute. When it is running again, say "continue".
+
+  Do not use the Ctrl+C words below on this host. On "continue", re-read
+  status and verify the restart before moving on.
+
+Otherwise (`gatewayRestartHost` is `null` or absent), the supervision decides:
 
 - `gatewaySupervision: service` (a Hermes-installed systemd unit, launchd
   agent or Windows task for this profile, or the official s6 container image):
@@ -177,8 +196,8 @@ with reason `even_ai_not_enabled`. On Cloudways still decline the wizard's
 own restart offer (it closes SSH and Hermes mid-setup), then activate from the
 phone or `hermes ocuclaw optional-setup activate`. On Cloudways both restart the
 whole container (Matty, 2026-09-23, #3357): the phone's **Restart Hermes** is
-offered there, and the CLI warns first (`This restarts the whole container. SSH
-will disconnect; reconnect in about a minute. Your phone reconnects in 1–5
+offered there, and the CLI warns first (`This restarts the whole container, so SSH
+will drop. Reconnect in about a minute. Your phone reconnects in 1–5
 minutes. Active replies are stopped, not finished.`), asks for `ACTIVATE`, then restarts. SSH drops; the phone reconnects
 on its own in 1 to 5 minutes. `status` prints a plain-language line for
 each `reasons` entry: `even_ai_not_enabled` above, and

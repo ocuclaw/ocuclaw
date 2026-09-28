@@ -1,33 +1,20 @@
-const { assembleBundle, chunkZip, sanitizeCaptureState } = require("../domain/debug-bundle.cjs");
-const { buildBundlePreview } = require("../domain/debug-bundle-preview.cjs");
-const { filterUploadEvents } = require("../domain/debug-upload-preset.cjs");
+const { chunkZip, chunkZipRange, dedupeReportEvents, sanitizeCaptureState } = require("../domain/debug-bundle.cjs");
 const { createNoisyPolicyFilter } = require("../domain/debug-store.cjs");
-const { retentionForWindow, countLanes } = require("../domain/debug-retention.cjs");
+const { retentionForWindow } = require("../domain/debug-retention.cjs");
 const { parseClientReportDiagnostics } = require("../domain/debug-client-diagnostics.cjs");
+const { runReportAssembly } = require("./debug-bundle-worker.cjs");
 
 function deduplicateReportEvents(events       ) {
-  const result        = [];
-  const seen = new Map();
-  const canonical = (value     )      => {
-    if (Array.isArray(value)) return value.map(canonical);
-    if (!value || typeof value !== "object") return value;
-    return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]));
-  };
-  for (const event of events || []) {
-    const data = event.data || {};
-    const id = typeof data.captureEpoch === "string" && /^-?[a-f0-9]{1,16}$/.test(data.captureEpoch) &&
-      Number.isSafeInteger(data.captureSeq) && data.captureSeq > 0
-      ? `${data.captureEpoch}:${data.captureSeq}` : null;
-    if (!id) { result.push(event); continue; }
-    const { source, clientId, ...originalData } = data;
-    const signature = JSON.stringify(canonical({ cat: event.cat, event: event.event,
-      severity: event.severity, screen: event.screen || null, runId: event.runId || null, data: originalData }));
-    const key = `${id}:${signature}`;
-    const prior = seen.get(key);
-    if (prior === undefined) { seen.set(key, result.length); result.push(event); }
-    else if (event.source === "phone") result[prior] = event;
-  }
-  return result;
+  return dedupeReportEvents(events);
+}
+
+const MAX_FETCH_WINDOW_PARTS = 8;
+
+let assemblyQueue               = Promise.resolve();
+function enqueueAssembly(job                    ) {
+  const run = assemblyQueue.then(job, job);
+  assemblyQueue = run.catch(() => {});
+  return run;
 }
 
 function computeAvailableSpanMs(dumpResult) {
@@ -160,6 +147,10 @@ async function handleDebugBundleRequest(deps, clientId, msg) {
     requestId: msg.requestId,
     redactionMode: msg.redactionMode,
   });
+  return enqueueAssembly(() => captureAndAssemble(deps, clientId, msg));
+}
+
+async function captureAndAssemble(deps     , clientId     , msg     ) {
 
   const windowMs =
     typeof msg.windowMs === "number" && Number.isFinite(msg.windowMs) && msg.windowMs > 0
@@ -179,16 +170,8 @@ async function handleDebugBundleRequest(deps, clientId, msg) {
   const phone = mergePhoneFold(deps, clientId, msg, dumpResult, windowMs);
   const relayAvailableSpanMs = computeAvailableSpanMs(dumpResult);
   const phoneAvailableSpanMs = phone.oldestMs === null ? 0 : Math.max(0, dumpResult.nowMs - phone.oldestMs);
-  const availableSpanMs = Math.max(relayAvailableSpanMs, phoneAvailableSpanMs);
 
-  const filtered = filterUploadEvents([...(dumpResult.events || []), ...phone.events]);
-  const uploadDump = {
-    ...dumpResult,
-    events: deduplicateReportEvents(filtered),
-  };
-  const beforeExcludes = countLanes([...(dumpResult.events || []), ...phone.events]);
-  const afterExcludes = countLanes(filtered);
-  const afterDedupe = countLanes(uploadDump.events || []);
+  const availableSpanMs = Math.max(relayAvailableSpanMs, phoneAvailableSpanMs);
 
   let connectionHealthDocument = null;
   if (typeof deps.getConnectionHealthDocument === "function") {
@@ -212,28 +195,32 @@ async function handleDebugBundleRequest(deps, clientId, msg) {
   }
 
   try {
-    const bundle = assembleBundle(uploadDump, {
-      installId: msg.installId,
-      build: deps.build,
-      redactionMode: msg.redactionMode || "structural",
-      ringCappedWindow: phone.metadata.ringCapped,
-      maxZipBytes: deps.maxZipBytes,
-      chunkBytes: deps.chunkBytes,
-      note: msg.note,
+    const { events: relayEvents, ...dump } = dumpResult;
+    const input = {
+      dump,
+      relayEvents,
+      phoneEvents: phone.events,
+      phoneMetadata: phone.metadata,
+      assemble: {
+        installId: msg.installId,
+        build: deps.build,
+        redactionMode: msg.redactionMode || "structural",
+        maxZipBytes: deps.maxZipBytes,
+        chunkBytes: deps.chunkBytes,
+        note: msg.note,
 
-      captureState: (() => {
-        const st = sanitizeCaptureState(msg.stateSnapshot);
-        return st ? { atMs: deps.now(), ...st } : null;
-      })(),
-      connectionHealthDocument,
-      clientDiagnostics: parseClientReportDiagnostics(msg.clientDiagnosticsJson, { mode: msg.redactionMode }),
-      lanes: {
-        relay: { status: "ok", automationExcluded: beforeExcludes.relay - afterExcludes.relay,
-          duplicateCopies: afterExcludes.relay - afterDedupe.relay },
-        phone: { ...phone.metadata, automationExcluded: beforeExcludes.phone - afterExcludes.phone,
-          duplicateCopies: afterExcludes.phone - afterDedupe.phone },
+        captureState: (() => {
+          const st = sanitizeCaptureState(msg.stateSnapshot);
+          return st ? { atMs: deps.now(), ...st } : null;
+        })(),
+        connectionHealthDocument,
+        clientDiagnostics: parseClientReportDiagnostics(msg.clientDiagnosticsJson, { mode: msg.redactionMode }),
       },
-    });
+    };
+
+    const bundle = typeof deps.assembleReport === "function"
+      ? await deps.assembleReport(input)
+      : await runReportAssembly(input, { logError: deps.logError });
     deps.emit("bundle_assembled", {
       requestId: msg.requestId,
       categories: bundle.metadata.categories.length,
@@ -252,6 +239,7 @@ async function handleDebugBundleRequest(deps, clientId, msg) {
       ...bundle.metadata,
       zipBytes: bundle.zip.length,
       availableSpanMs,
+      fetchWindowParts: MAX_FETCH_WINDOW_PARTS,
     });
     deps.send(clientId, {
       type: "debug-bundle-meta",
@@ -264,12 +252,12 @@ async function handleDebugBundleRequest(deps, clientId, msg) {
       type: "debug-bundle-preview",
       requestId: msg.requestId,
       bundleId,
-      sampleJson: JSON.stringify(buildBundlePreview(bundle.files, { maxEvents: 15, maxCharsPerEvent: 80 })),
+      sampleJson: bundle.sampleJson,
     });
     deps.emit("bundle_cached", {
       requestId: msg.requestId,
       bundleId,
-      parts: bundle.chunks.length,
+      parts: bundle.partCount,
     });
   } catch (err) {
 
@@ -343,11 +331,28 @@ async function handleDebugBundleFetch(deps, clientId, msg) {
     deps.send(clientId, { type: "debug-bundle-error", requestId: msg.requestId, reason: "bundle_expired" });
     return;
   }
-  const chunks = chunkZip(entry.zip, deps.chunkBytes);
+  const windowed = Number.isSafeInteger(msg.fromIndex) && msg.fromIndex >= 0 &&
+    Number.isSafeInteger(msg.count) && msg.count > 0;
+  const chunks = windowed
+    ? chunkZipRange(entry.zip, deps.chunkBytes, msg.fromIndex, Math.min(msg.count, MAX_FETCH_WINDOW_PARTS))
+    : chunkZip(entry.zip, deps.chunkBytes);
   for (const chunk of chunks) {
     deps.send(clientId, { type: "debug-bundle", requestId: msg.requestId, bundleId: msg.bundleId, partIndex: chunk.partIndex, partCount: chunk.partCount, partBase64: chunk.partBase64, bundleSha256: entry.bundleSha256 });
   }
-  deps.emit("handoff_complete", { requestId: msg.requestId, bundleId: msg.bundleId, parts: chunks.length });
+  if (!windowed) {
+    deps.emit("handoff_complete", { requestId: msg.requestId, bundleId: msg.bundleId, parts: chunks.length });
+    return;
+  }
+  if (chunks.length === 0) {
+
+    deps.emit("fetch_window_invalid", { requestId: msg.requestId, bundleId: msg.bundleId, fromIndex: msg.fromIndex });
+    deps.send(clientId, { type: "debug-bundle-error", requestId: msg.requestId, reason: "fetch_window_invalid" });
+    return;
+  }
+  const last = chunks[chunks.length - 1];
+  if (last.partIndex === last.partCount - 1) {
+    deps.emit("handoff_complete", { requestId: msg.requestId, bundleId: msg.bundleId, parts: last.partCount, windowed: true });
+  }
 }
 
 module.exports = { handleDebugBundleRequest, handleDebugBundleSave, handleDebugBundleFetch, deduplicateReportEvents };

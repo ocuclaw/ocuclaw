@@ -139,7 +139,12 @@ function createReplyDelivery({
   }
 
   function accept(connection, receipt) {
+    const outcome = acceptPending(connection, receipt);
     expire();
+    return outcome;
+  }
+
+  function acceptPending(connection, receipt) {
     const deny = (reason) => ({ ok: false, reason });
     if (!connection || connection.clientKind !== "app") return deny("not_app_client");
     const attemptId = receipt && typeof receipt === "object" ? receipt.attemptId : null;

@@ -371,6 +371,8 @@ function createRuntimeConfig(opts = {}) {
     externalDebugToolsEnabled,
     debugAutoArm: parseBool(pluginConfig.debugAutoArm, externalDebugToolsEnabled),
     allowDebugUpload: parseBool(pluginConfig.allowDebugUpload, false),
+
+    liveuiReconnectGraceMs: clampInt(pluginConfig.liveuiReconnectGraceMs, 0, 60_000, 12_000),
     debugUploadMaxZipBytes: clampInt(pluginConfig.debugUploadMaxZipBytes, 100_000, 4_300_000, 4_000_000),
     debugUploadCapturePreset: Array.isArray(pluginConfig.debugUploadCapturePreset) ? pluginConfig.debugUploadCapturePreset : undefined,
     debugBundleSaveDir: pluginConfig.debugBundleSaveDir || "",

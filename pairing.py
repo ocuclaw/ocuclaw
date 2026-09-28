@@ -50,7 +50,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, Mapping, Optional, TextIO, Tuple
 
-from . import relay_credential
+from . import cloudways_qr, relay_credential
 
 #: Exit codes, matching the sibling `status`/`doctor` contract in cli.py.
 EXIT_OK = 0
@@ -102,6 +102,9 @@ DEFAULT_WS_PORT = 47801
 
 #: How often the terminal asks the relay what changed, and for how long.
 POLL_INTERVAL_S = 1.0
+#: #3743. Above a pairing code redrawn once the window grew. Shared with the
+#: OpenClaw CLI word for word.
+QR_REDRAW_LEAD_LINE = "The code fits now. In OcuClaw tap Take a photo of the QR code."
 #: A hair over the two-minute exchange lifetime, so an expiry is OBSERVED here
 #: rather than guessed at by a timeout of our own.
 POLL_DEADLINE_S = 135.0
@@ -656,7 +659,9 @@ def _reset_succeeded(result: RelayCredentialResetResult) -> bool:
     )
 
 
-def _render_reset_result(result: RelayCredentialResetResult) -> str:
+def _render_reset_result(
+    result: RelayCredentialResetResult, *, then_pair: bool = False
+) -> str:
     if _reset_succeeded(result):
         prior_proof = (
             "The prior-credential rejection proof was not applicable because "
@@ -664,13 +669,20 @@ def _render_reset_result(result: RelayCredentialResetResult) -> str:
             if result.previous_auth == "not_applicable"
             else "The prior credential was rejected."
         )
+        # #3747: `pair --new-key` goes straight on to pairing, so it must not
+        # send the person back to the Setup Assistant first.
+        next_step = (
+            "  Every phone is disconnected. Pairing your phone now.\n"
+            if then_pair
+            else "  Every phone is disconnected. Return to /ocuclaw-setup and "
+            "securely re-pair by QR or Manual pairing.\n"
+        )
         return (
             "\n  Relay Credential reset complete. The replacement was atomically "
             "persisted and read back. The Hermes gateway explicitly restarted.\n"
             f"  The replacement was accepted. {prior_proof}\n"
-            "  Every phone is disconnected. Return to /ocuclaw-setup and "
-            "securely re-pair by QR or Manual pairing.\n"
-            "  This was an all-device reset; per-device revocation is future work.\n"
+            + next_step
+            + "  This was an all-device reset; per-device revocation is future work.\n"
         )
     messages = {
         "managed_profile": relay_credential.MANAGED_CREDENTIAL_REQUIRED_MESSAGE,
@@ -753,8 +765,13 @@ def run_reset_relay_credential(
     isatty_fn: Optional[Callable[[], bool]] = None,
     reset_fn: Optional[Callable[[], RelayCredentialResetResult]] = None,
     managed_fn: Optional[Callable[[], bool]] = None,
+    then_pair: bool = False,
 ) -> int:
-    """Run the Setup Assistant's interactive-only all-device reset action."""
+    """Run the Setup Assistant's interactive-only all-device reset action.
+
+    ``then_pair`` only changes the closing line: ``pair --new-key`` (#3747)
+    continues into pairing itself instead of sending the person back to setup.
+    """
     inp = sys.stdin if stdin is None else stdin
     out = sys.stdout if stdout is None else stdout
     err = sys.stderr if stderr is None else stderr
@@ -797,13 +814,43 @@ def run_reset_relay_credential(
             result = reset_fn()
         except BaseException:  # noqa: BLE001 - mutation receipt survives Ctrl-C
             result = RelayCredentialResetResult(False, "reset_failed")
-        out.write(_render_reset_result(result))
+        out.write(_render_reset_result(result, then_pair=then_pair))
         if was_interrupted():
             out.write(
                 "  Interrupt deferred until credential recovery completed. "
                 "Follow the result above.\n"
             )
     return EXIT_OK if _reset_succeeded(result) else EXIT_PROBLEM
+
+
+def run_pair_new_key(
+    address: str,
+    *,
+    light_terminal: bool = False,
+    show_payload_text: bool = False,
+    reset_runner: Optional[Callable[..., int]] = None,
+    pair_runner: Optional[Callable[..., int]] = None,
+) -> int:
+    """``hermes ocuclaw pair --new-key`` (#3747): a new key, then pairing.
+
+    The wearer's explicit re-key. It is the all-device reset above, unchanged
+    (the typed ``reset`` confirmation, the bounded restart lifecycle checked
+    before anything is written, the restart, and the proof that the new key is
+    accepted and the old one refused), followed by the normal pairing of this
+    command. Pairing runs only after a proven reset; any other ending returns
+    the reset's own exit code and pairs nothing. Nothing automatic ever calls
+    this: load, upgrade and doctor keep the key as it is.
+    """
+    reset_runner = run_reset_relay_credential if reset_runner is None else reset_runner
+    pair_runner = run_pair if pair_runner is None else pair_runner
+    code = reset_runner(then_pair=True)
+    if code != EXIT_OK:
+        return code
+    return pair_runner(
+        address,
+        light_terminal=light_terminal,
+        show_payload_text=show_payload_text,
+    )
 
 
 def _read_relay_credential() -> str:
@@ -1115,12 +1162,28 @@ def _outcome_text(
         )
     text = _FAILURE_TEXT.get(reason, _GENERIC_FAILURE)
     if reason == "expired":
-        text = _expiry_text(phase)
+        text = (
+            WINDOW_ELAPSED_TEXT
+            if phase in _HOST_WINDOW_PHASES
+            else _expiry_text(phase)
+        )
     if not driven and (
         reason in _START_A_NEW_ONE_REASONS or reason not in _FAILURE_TEXT
     ):
         text += START_A_NEW_ONE
     return "\n  " + text + "\n"
+
+
+#: What the phone says when the host ends an exchange as ``expired``
+#: (``hostReasonMessage`` in PhonePairingController.kt), so the computer and the
+#: phone tell one story (#3829). Used only when the HOST reported the expiry
+#: after a phone had joined: the phone was told the same thing and saved
+#: nothing. A local deadline with no host verdict keeps :func:`_expiry_text`,
+#: because then nobody knows what the phone saw.
+WINDOW_ELAPSED_TEXT = "Pairing took longer than the two-minute window."
+
+#: Phases where a host-reported expiry reached a phone that had joined.
+_HOST_WINDOW_PHASES = frozenset({"awaiting-approval", "awaiting-phone-connection"})
 
 
 def _expiry_text(phase: str) -> str:
@@ -1335,13 +1398,60 @@ def _terminal_capabilities(
     environ: Optional[Mapping[str, str]] = None,
     stdin: Optional[TextIO] = None,
 ) -> Dict[str, Any]:
-    """The terminal description sent with a create request."""
-    return {
+    """The terminal description sent with a create request.
+
+    ``zoom`` names the keys the host's "zoom out" hint shows (#3743).
+    ``redraw`` promises the host that this CLI draws the code itself once the
+    window is big enough, so the block may say "the code will appear here".
+    Only a half-block code can be redrawn here, so it needs UTF-8, and only
+    with the encoder present is the promise one this side can keep.
+    """
+    caps: Dict[str, Any] = {
         "unicode": terminal_supports_unicode(stream, environ, stdin),
         "color": terminal_supports_color(stream, environ),
         "columns": terminal_columns(),
         "rows": shutil.get_terminal_size(fallback=(0, 0)).lines,
+        "zoom": cloudways_qr.zoom_key(environ),
     }
+    if caps["unicode"] and cloudways_qr.encoder_available():
+        caps["redraw"] = True
+    return caps
+
+
+def _pending_pairing_qr(
+    block: str,
+    terminal: Mapping[str, Any],
+    payload_text: str,
+    *,
+    light_terminal: bool,
+    size_fn: Callable[[], Tuple[int, int]],
+    matrix_fn: Callable[[str], Any],
+) -> Optional["cloudways_qr.PendingQr"]:
+    """#3743. The code to redraw, when the host withheld it for size only.
+
+    The host says so by printing the "code will appear here" line, which it
+    does only for a create that declared ``redraw``. Anything else, no redraw.
+    """
+    if not terminal.get("redraw") or not payload_text:
+        return None
+    if cloudways_qr.HINT_BIGGER_LINE not in block:
+        return None
+    try:
+        matrix = matrix_fn(payload_text)
+    except Exception:  # noqa: BLE001 - no encoder: the manual path still works
+        return None
+    if not matrix:
+        return None
+    code = cloudways_qr.render_code(
+        matrix, colour=bool(terminal.get("color")), light_terminal=light_terminal
+    )
+    return cloudways_qr.PendingQr(
+        code=code,
+        fits=False,
+        columns=int(terminal.get("columns") or 0),
+        rows=int(terminal.get("rows") or 0),
+        size_fn=size_fn,
+    )
 
 
 def run_pair(
@@ -1359,6 +1469,8 @@ def run_pair(
     sleep_fn: Optional[Callable[[float], None]] = None,
     monotonic_fn: Optional[Callable[[], float]] = None,
     outcome_fn: Optional[Callable[[Mapping[str, Any]], None]] = None,
+    terminal_size_fn: Optional[Callable[[], Tuple[int, int]]] = None,
+    qr_matrix_fn: Optional[Callable[[str], Any]] = None,
 ) -> int:
     """Run one interactive pairing session. Returns the process exit code.
 
@@ -1381,6 +1493,8 @@ def run_pair(
     post_fn = _post if post_fn is None else post_fn
     sleep_fn = time.sleep if sleep_fn is None else sleep_fn
     monotonic_fn = time.monotonic if monotonic_fn is None else monotonic_fn
+    terminal_size_fn = cloudways_qr.terminal_size if terminal_size_fn is None else terminal_size_fn
+    qr_matrix_fn = cloudways_qr.qr_matrix if qr_matrix_fn is None else qr_matrix_fn
 
     # #3234c. A caller that takes the ending also owns "what to do next": the
     # ladder offers a fresh code in place, and `hermes ocuclaw pair` needs an
@@ -1491,6 +1605,25 @@ def run_pair(
         if payload_text:
             out.write(f"  Code contents: {payload_text}\n\n")
     out.flush()
+
+    # #3743. The host withheld the code for size and promised it would appear
+    # once the window grows: while the phone is awaited, measure the window
+    # every half second and draw it the first time it fits. Once.
+    pending_code = _pending_pairing_qr(
+        block,
+        terminal,
+        str(created.get("payloadText") or ""),
+        light_terminal=light_terminal,
+        size_fn=terminal_size_fn,
+        matrix_fn=qr_matrix_fn,
+    )
+
+    def redraw_code(waiting: "cloudways_qr.PendingQr") -> None:
+        try:
+            out.write(f"\n{QR_REDRAW_LEAD_LINE}\n{waiting.code}\n")
+            out.flush()
+        except Exception:  # noqa: BLE001 - a closed stream never fails a pairing
+            pass
 
     lifetime = created.get("expiresInSeconds")
     lifetime = float(lifetime) if isinstance(lifetime, (int, float)) and not isinstance(lifetime, bool) else POLL_DEADLINE_S
@@ -1625,4 +1758,9 @@ def run_pair(
             # "credential delivered; pairing unconfirmed".
             continue
 
-        sleep_fn(POLL_INTERVAL_S)
+        if pending_code is not None and phase == "waiting-for-phone" and not prompt_shown:
+            pending_code = cloudways_qr.sleep_watching(
+                POLL_INTERVAL_S, pending_code, sleep_fn=sleep_fn, draw_fn=redraw_code
+            )
+        else:
+            sleep_fn(POLL_INTERVAL_S)

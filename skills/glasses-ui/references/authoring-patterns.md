@@ -323,6 +323,13 @@ What to do, in order:
    empty stack, so re-declare everything the old surface carried: `refresh`, `staleAfterMs`,
    `queueMode`, `title`.
 
+Hosts run a **reconnect grace** (12 s by default; ADR-0015 decision 5). With it on, a
+short phone-link drop is not a drain: the surface stays up, its refresh keeps its place, the
+open call stays open, and the relay repaints the surface when the phone comes back on the
+same chat. So `glasses_disconnected` still means what it says above: the phone stayed away
+longer than the grace, or the app was closed. Never re-render on a hunch that a blip wiped
+the surface; if the call is still open, the surface is still yours.
+
 A close cousin is `session_not_viewed`: the client is connected, but the wearer has moved
 to another chat since they asked. A new surface for this chat would paint nothing, so the
 render is refused before it takes a slot. **Answer in text.** The reply waits in this chat

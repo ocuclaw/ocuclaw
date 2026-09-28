@@ -57,6 +57,12 @@ parentPort.on("message", async (message) => {
     parentPort.postMessage({
       kind: "worker.error",
       message: err && err.message ? err.message : String(err),
+
+      code: err && typeof err.code === "string" ? err.code : null,
+      bindConflict:
+        err && err.bindConflict && typeof err.bindConflict === "object"
+          ? { ...err.bindConflict }
+          : null,
     });
   }
 });

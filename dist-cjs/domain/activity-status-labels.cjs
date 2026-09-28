@@ -491,6 +491,35 @@ function labelFromExecCommand(command) {
   return execResult(`Running: ${sanitizeText(raw, DEFAULT_MAX_LABEL_CHARS)}`, "terminal", "terminal.exec");
 }
 
+const KANBAN_BOARD_SUBJECT_MAX_CHARS = 24;
+const KANBAN_BOARD_SLUG = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+const KANBAN_TOOL_LABELS = new Map([
+  ["kanban_create", ["Filing a card", "board.create"]],
+  ["kanban_show", ["Checking the board", "board.read"]],
+  ["kanban_list", ["Checking the board", "board.read"]],
+  ["kanban_unblock", ["Unblocking a card", "board.unblock"]],
+  ["kanban_comment", ["Adding to a card", "board.annotate"]],
+  ["kanban_attach", ["Adding to a card", "board.annotate"]],
+  ["kanban_attach_url", ["Adding to a card", "board.annotate"]],
+  ["kanban_attachments", ["Checking the board", "board.read"]],
+  ["kanban_link", ["Linking cards", "board.link"]],
+]);
+
+function kanbanToolLabel(lowName = "", args = {}) {
+  const [phrase, intent] = KANBAN_TOOL_LABELS.get(lowName) || ["Using the board", "generic"];
+  const rawBoard = pickString(args, ["board"]);
+  const board = rawBoard && KANBAN_BOARD_SLUG.test(rawBoard)
+    ? sanitizeText(rawBoard, KANBAN_BOARD_SUBJECT_MAX_CHARS)
+    : null;
+  return {
+    label: board ? `${phrase} on ${board}...` : `${phrase}...`,
+    detail: null,
+    category: "generic",
+    intent,
+  };
+}
+
 function mapToolLabel(toolName, activityPath, args, options) {
   const maxLabelChars = options.maxLabelChars;
   const stabilityKey = (options && options.stabilityKey) || null;
@@ -796,6 +825,26 @@ function mapToolLabel(toolName, activityPath, args, options) {
         category: "generic",
         intent: "session.manage",
       };
+
+    case "todo_list":
+    case "todo":
+      return {
+        label: "Updating tasks...",
+        detail: null,
+        category: "generic",
+        intent: "generic",
+      };
+
+    case "kanban_create":
+    case "kanban_show":
+    case "kanban_list":
+    case "kanban_unblock":
+    case "kanban_comment":
+    case "kanban_attach":
+    case "kanban_attach_url":
+    case "kanban_attachments":
+    case "kanban_link":
+      return kanbanToolLabel(lowName, args);
     default:
       if (fileName) {
         return {

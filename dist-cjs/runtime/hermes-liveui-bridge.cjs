@@ -7,7 +7,7 @@ const { isLiveuiSwitchedOff, liveuiDisabledError, liveuiDisabledResult } = requi
 const { writeCompanionSnapshot } = require("../tools/glasses-ui-companion-snapshot.cjs");
 const { createLiveuiGlassesLibraryController, dispatchLiveuiTemplateOperation, LIVEUI_TEMPLATE_TOOL_DESCRIPTION, LIVEUI_TEMPLATE_TOOL_NAME, liveuiTemplateToolParametersSchema, runLiveuiTemplateRenderLifecycle } = require("../tools/glasses-ui-template-library.cjs");
 const { dispatchLiveuiTaskOperation, LIVEUI_TASK_TOOL_DESCRIPTION, LIVEUI_TASK_TOOL_NAME, liveuiTaskToolParametersSchema } = require("../tools/glasses-ui-task-library.cjs");
-const { composeChannelTwoFragment } = require("../domain/prompt-channel-fragments.cjs");
+const { composeChannelTwoFragment, composeEvenAiTurnChannelTwoFragment } = require("../domain/prompt-channel-fragments.cjs");
 const { formatLiveuiTaskIndex, projectLiveuiTaskIndexRows } = require("../tools/glasses-ui-task-index.cjs");
 const { DEFAULT_STAGE_GRACE_MS } = require("../tools/glasses-ui-limits.cjs");
 const { DEFAULT_HERMES_NAMESPACE, HERMES_FOREIGN_KEY_MARKER, HERMES_SESSION_KEY_PREFIX, OCUCLAW_CHAT_TYPE_SEGMENT, OCUCLAW_PLATFORM_SEGMENT, isHermesSessionKey, mintedHermesSessionKey, parseHermesPublicKey, stripAgentNamespace } = require("./hermes-session-keys.cjs");
@@ -86,6 +86,16 @@ function displayStates(relay, method, sessionKey) {
     return value && typeof value === "object" ? value : { emoji: false, pace: false };
   } catch {
     return { emoji: false, pace: false };
+  }
+}
+
+function neuralSessionNamesEnabled(relay, sessionKey) {
+  try {
+    return relay && typeof relay.isNeuralSessionNamesEnabled === "function"
+      ? relay.isNeuralSessionNamesEnabled(sessionKey) !== false
+      : true;
+  } catch {
+    return true;
   }
 }
 
@@ -413,9 +423,30 @@ function createHermesLiveUiBridge(opts = {}) {
       );
     }
   };
+
+  const replayAfterGrace = (event) => {
+    const reason = event && typeof event === "object" ? event.reason : event;
+    if (reason !== "grace_resumed") return;
+    const viewed =
+      typeof relay.getAppViewedSessionKeys === "function" ? relay.getAppViewedSessionKeys() : null;
+    if (!Array.isArray(viewed)) return;
+    for (const sessionKey of viewed) {
+      try {
+        handler.replaySessionTop(normalizeHermesLiveUiSessionKey(sessionKey), "grace_resumed");
+      } catch (err) {
+        logger.warn(
+          `[hermes-liveui] reconnect replay failed: ${err && err.message ? err.message : err}`,
+        );
+      }
+    }
+  };
+  const onAppPresenceChanged = (event) => {
+    publishConnectedAppSnapshot();
+    replayAfterGrace(event);
+  };
   const unsubscribeAppState =
     typeof relay.onAppPresenceChanged === "function"
-      ? relay.onAppPresenceChanged(publishConnectedAppSnapshot)
+      ? relay.onAppPresenceChanged(onAppPresenceChanged)
       : () => {};
   const unsubscribeAgentTurn =
     typeof relay.onAgentTurnChanged === "function"
@@ -616,6 +647,27 @@ function createHermesLiveUiBridge(opts = {}) {
       includeNeuralGuidance: promptOwner !== "even-ai",
     });
     if (channelTwo) fragments.push({ kind: "channel_two", text: channelTwo });
+
+    if (promptOwner === "even-ai") {
+      try {
+        const snapshot =
+          typeof relay.getEvenAiSettingsSnapshot === "function"
+            ? relay.getEvenAiSettingsSnapshot()
+            : null;
+        const ownerPrompt =
+          snapshot && typeof snapshot.systemPrompt === "string"
+            ? snapshot.systemPrompt
+            : "";
+        const evenAi = composeEvenAiTurnChannelTwoFragment(ownerPrompt, {
+          sharesOcuClawSession: !!(queuedOwnership && queuedOwnership.sharesOcuClawSession),
+        });
+        if (evenAi) fragments.unshift({ kind: "even_ai_owner", text: evenAi });
+      } catch (err) {
+        logger.warn(
+          `[hermes-liveui] even ai owner prompt injection failed: ${String(err)}`,
+        );
+      }
+    }
     try {
       const voicemail =
         typeof handler.previewVoicemailInjection === "function"
@@ -685,6 +737,10 @@ function createHermesLiveUiBridge(opts = {}) {
       ephemeralOnly: true,
       voicemailAckToken,
       feedbackAckToken,
+
+      promptOwner: promptOwner || null,
+
+      neuralSessionNamesEnabled: neuralSessionNamesEnabled(relay, sessionKey),
     };
   }
 

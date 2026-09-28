@@ -20,6 +20,63 @@ function gatewaySessionKeyFor(sessionKey, agentId) {
   return `agent:${selectedAgent}:${key}`;
 }
 
+function isAgentSelectionRequiredError(err) {
+  if (!err) return false;
+  if (err.code === "AGENT_SELECTION_REQUIRED") return true;
+  const message = typeof err.message === "string" ? err.message : String(err);
+  return /Multiple agents are configured, but .* has no explicit owner/i.test(message);
+}
+
+function isSessionScopedMethod(method) {
+  return (
+    typeof method === "string" &&
+    (method === "agent" ||
+      method === "agent.identity.get" ||
+      method.startsWith("chat.") ||
+      method.startsWith("sessions."))
+  );
+}
+
+function scopeOpenClawRequestSessionParams(
+  method,
+  params,
+  opts = {},
+) {
+  if (!params || typeof params !== "object") return params;
+
+  if (method === "commands.list" || (method === "agent.identity.get" && !params.sessionKey)) {
+    const defaultAgentId =
+      typeof opts.defaultAgentId === "string" ? opts.defaultAgentId.trim() : "";
+    if (params.sessionKey || params.agentId || !defaultAgentId) return params;
+    return { ...params, agentId: defaultAgentId };
+  }
+  if (!isSessionScopedMethod(method)) return params;
+  let next = params;
+  for (const field of ["key", "sessionKey"]) {
+    const raw = params[field];
+    const key = typeof raw === "string" ? raw.trim() : "";
+    if (!key || isHermesSessionKey(key) || AGENT_SCOPED_SESSION_KEY_RE.test(key)) {
+      continue;
+    }
+    let agentId = typeof params.agentId === "string" ? params.agentId.trim() : "";
+    if (!agentId && typeof opts.resolveAgentId === "function") {
+      try {
+        const resolved = opts.resolveAgentId(key);
+        agentId = typeof resolved === "string" ? resolved.trim() : "";
+      } catch {
+        agentId = "";
+      }
+    }
+    if (!agentId && typeof opts.defaultAgentId === "string") {
+      agentId = opts.defaultAgentId.trim();
+    }
+    if (!agentId) continue;
+    if (next === params) next = { ...params };
+    next[field] = `agent:${agentId}:${key}`;
+  }
+  return next;
+}
+
 function relaySessionKeyFor(sessionKey) {
   const key = typeof sessionKey === "string" ? sessionKey.trim() : "";
   if (!key) return key;
@@ -27,4 +84,4 @@ function relaySessionKeyFor(sessionKey) {
   return match ? match[2] : key;
 }
 
-module.exports = { gatewaySessionKeyFor, relaySessionKeyFor };
+module.exports = { gatewaySessionKeyFor, isAgentSelectionRequiredError, scopeOpenClawRequestSessionParams, relaySessionKeyFor };

@@ -195,6 +195,10 @@ class DispatchRecord:
     session_state: Optional[str] = None
     prompt_owner: Optional[str] = None
     prompt_lane: Optional[str] = None
+    # Set by pre_llm_call when liveui.prompt reports an Even AI ownership
+    # ticket for this turn. An Even AI turn with no system prompt carries no
+    # prompt_owner rider, so this is how the clarify guard (#7) still sees it.
+    even_ai_turn: bool = False
     # Shared by the processing task and its copied async/thread contexts.
     # It remains valid after this record leaves the ledger, unlike a lookup
     # of the session head (which may already name the next turn).

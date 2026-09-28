@@ -14,12 +14,16 @@ const PHONE_CRITICAL_EVENT_NAMES = Object.freeze([
   "boot_clock_ledger",
   "timer_scheduler_driver_recreated",
   "post_canvas_watchdog_late",
+  "startup_container_slow",
+  "startup_container_late_answer",
+  "hidden_pump_mode",
   "heartbeat_degraded_suppression",
   "display_fence_timeout",
   "relay_auto_restore_gate",
   "getting_started_returning_handoff",
   "startup_default_session_requested",
   "message_screen_reentry_requested",
+  "stale_thinking_recovered",
 ]);
 
 const FORCED_CLIENT_EVENT_NAMES = Object.freeze([

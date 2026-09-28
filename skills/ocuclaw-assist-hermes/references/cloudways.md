@@ -1,6 +1,6 @@
 # Cloudways managed Hermes — userspace Tailscale kept alive by Hermes cron
 
-**Guide version:** 2026-09-25 (1.3.24-hermes)
+**Guide version:** 2026-09-28 (1.3.25-hermes)
 
 Use this branch in place of fresh-install Steps 6 and 7 when the host is a
 Cloudways **Managed AI Agents** container. Everything else in the fresh-install
@@ -256,7 +256,9 @@ If SSH reports too many authentication failures, preserve the supplied user,
 host and port and add `-o PreferredAuthentications=password -o PubkeyAuthentication=no`.
 Passwords belong in SSH's private prompt, never this conversation.
 
-Before invoking the supervisor-aware restart, record the current setup session
+Before handing over the restart (`quick_reference` → `Restarting the gateway`,
+whose Cloudways words apply when status reports `gatewayRestartHost:
+cloudways`; never the Ctrl+C words here), record the current setup session
 ID in the existing lane card. Read `HERMES_SESSION_ID` from the current terminal
 tool context when available; otherwise use `hermes sessions list` and match this
 setup conversation explicitly. If ambiguous, have the user select it. Never
@@ -428,7 +430,7 @@ the phone's Home card offers **Restart Hermes** on Cloudways, and
 `hermes ocuclaw optional-setup activate` works here. In both, the gateway exits
 and Cloudways restarts the whole container. The phone path first waits for
 active work; the CLI path does not. The CLI warns first: `This restarts the
-whole container. SSH will disconnect; reconnect in about a minute. Your phone
+whole container, so SSH will drop. Reconnect in about a minute. Your phone
 reconnects in 1–5 minutes. Active replies are stopped, not finished.` It still asks for
 `ACTIVATE`. Follow the reconnect and resume steps above before either. The
 `cloudways setup` ladder does not restart by itself; it still names the

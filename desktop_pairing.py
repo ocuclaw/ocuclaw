@@ -29,6 +29,7 @@ from .tui_pairing import (
     _ActivationState,
     _completion_id,
     _handler_for,
+    _unfinished_result,
 )
 
 
@@ -659,12 +660,7 @@ def run_desktop_pairing(
                     "not record a new pairing receipt. Pairing is not confirmed."
                 ),
             }
-        return {
-            "ok": False,
-            "state": result["state"],
-            "code": result["code"],
-            "message": "Pairing did not complete. The setup checkpoint remains open.",
-        }
+        return _unfinished_result(result)
     finally:
         server.shutdown()
         server.server_close()

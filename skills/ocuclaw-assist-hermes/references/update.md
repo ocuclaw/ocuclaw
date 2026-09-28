@@ -1,6 +1,6 @@
 # Updating OcuClaw on Hermes
 
-**Guide version:** 2026-09-25 (1.3.24-hermes)
+**Guide version:** 2026-09-28 (1.3.25-hermes)
 
 Use this for an installed, healthy OcuClaw on Hermes moving to a strictly
 higher published bundle version. It is version-neutral: it never names a
@@ -228,15 +228,21 @@ VERIFY:
 ```bash
 hermes plugins list
 hermes config get display.platforms.ocuclaw.tool_progress
+hermes config get display.platforms.ocuclaw.streaming
 hermes config get platforms.ocuclaw.extra.allow_admin_from
 ```
 
-Require the plugin to be enabled, tool progress to report `false`, and
-`allow_admin_from` to list `ocuclaw-wearer`. If a non-secret posture value
-drifted or is missing, CHECKPOINT the matching correction:
+Require the plugin to be enabled, tool progress to report `false`, streaming
+to report `true`, and `allow_admin_from` to list `ocuclaw-wearer`. Without the
+streaming key the glasses show only "typing" for the whole reply, then the
+whole reply at once. A streaming value of `false` that the user chose stays
+(status `mandatoryConfiguration.streamingOffByChoice: true`); only a missing
+key is corrected. If a non-secret posture value drifted or is missing,
+CHECKPOINT the matching correction:
 
 ```bash
 hermes config set display.platforms.ocuclaw.tool_progress off
+hermes config set display.platforms.ocuclaw.streaming true
 hermes config set platforms.ocuclaw.extra.allow_admin_from '["ocuclaw-wearer"]'
 ```
 
@@ -275,7 +281,8 @@ Then read `status.desktopTheme.offer` from the same receipt. When it says
 `offer` and the user runs Hermes Desktop, make the fresh-install Step 12 offer
 (the OcuClaw look) and, only on a plain yes, call
 `{"operation":"enable_desktop_theme","confirm":true}` once. `already_enabled`,
-`unavailable`, `unknown` and TUI-only users all mean: say nothing and move on.
+`desktop_choice` (Desktop asked itself), `unavailable`, `unknown` and TUI-only
+users all mean: say nothing and move on.
 
 ## U5 · Prove the round trip
 

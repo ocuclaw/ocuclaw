@@ -24,6 +24,15 @@ const QR_TERMINAL_ANSI = Object.freeze({
 
 const QR_ANSI_CELLS_PER_MODULE = 2;
 
+const QR_TERMINAL_ANSI_INK = Object.freeze({
+
+  light: "\u001b[97m",
+
+  dark: "\u001b[30m",
+}         );
+
+const QR_COLOUR_GLYPH_MODULE                    = "lower";
+
                                                         
 
 const EXCHANGE_ID_PATTERN = /^[0-9a-f]{32}$/;
@@ -168,6 +177,65 @@ function renderMatrixAnsi(matrix                                 )              
   };
 }
 
+function renderMatrixColour(matrix                                 )                       {
+  if (matrix.length === 0) return { text: "", columns: 0, rows: 0 };
+  const width = matrix[0].length;
+  const upper = QR_COLOUR_GLYPH_MODULE === "upper";
+  const glyph = upper ? QR_TERMINAL_GLYPHS.upper : QR_TERMINAL_GLYPHS.lower;
+  const lines           = [];
+  for (let r = 0; r < matrix.length; r += 2) {
+    const top                     = matrix[r];
+    const bottom                                 = matrix[r + 1];
+    let line = "";
+    let ink                = null;
+    let back                = null;
+    for (let c = 0; c < width; c++) {
+
+      const topDark = top[c] === true;
+      const bottomDark = bottom === undefined ? false : bottom[c] === true;
+      const glyphDark = upper ? topDark : bottomDark;
+      const backDark = upper ? bottomDark : topDark;
+      const nextBack = backDark ? QR_TERMINAL_ANSI.dark : QR_TERMINAL_ANSI.light;
+
+      const same = glyphDark === backDark;
+      if (!same) {
+        const nextInk = glyphDark ? QR_TERMINAL_ANSI_INK.dark : QR_TERMINAL_ANSI_INK.light;
+        if (nextInk !== ink) {
+          line += nextInk;
+          ink = nextInk;
+        }
+      }
+      if (nextBack !== back) {
+        line += nextBack;
+        back = nextBack;
+      }
+      line += same ? QR_TERMINAL_GLYPHS.blank : glyph;
+    }
+    lines.push(line + QR_TERMINAL_ANSI.reset);
+  }
+  return { text: lines.join("\n"), columns: width, rows: lines.length };
+}
+
+function renderQrPayloadToTerminalColour(
+  payload                  ,
+  options                                             ,
+)                       {
+  const quietZone = options?.quietZone ?? true;
+  const matrix = qrMatrix(serializeQrPayload(payload));
+  const trimmed = quietZone ? matrix : stripBorder(matrix, QR_QUIET_ZONE_MODULES);
+  return renderMatrixColour(trimmed);
+}
+
+function renderQrTextToTerminalColour(
+  text        ,
+  options                                             ,
+)                       {
+  const quietZone = options?.quietZone ?? true;
+  const matrix = qrMatrix(text);
+  const trimmed = quietZone ? matrix : stripBorder(matrix, QR_QUIET_ZONE_MODULES);
+  return renderMatrixColour(trimmed);
+}
+
 function renderQrPayloadToTerminalAnsi(
   payload                  ,
   options                                             ,
@@ -178,4 +246,4 @@ function renderQrPayloadToTerminalAnsi(
   return renderMatrixAnsi(trimmed);
 }
 
-module.exports = { QR_TERMINAL_GLYPHS, QR_TERMINAL_ANSI, QR_ANSI_CELLS_PER_MODULE, serializeQrPayload, parseQrPayload, renderQrPayloadToTerminal, renderQrPayloadToTerminalAnsi };
+module.exports = { QR_TERMINAL_GLYPHS, QR_TERMINAL_ANSI, QR_ANSI_CELLS_PER_MODULE, serializeQrPayload, parseQrPayload, renderQrPayloadToTerminal, renderQrPayloadToTerminalAnsi, QR_TERMINAL_ANSI_INK, QR_COLOUR_GLYPH_MODULE, renderQrPayloadToTerminalColour, renderQrTextToTerminalColour };

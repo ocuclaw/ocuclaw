@@ -6,6 +6,8 @@ const WebSocket = require("ws");
 const { createGatewayTimingLedger } = require("./gateway-timing-ledger.cjs");
 const { sanitizeConnectReason } = require("./sanitize-connect-reason.cjs");
 const { sanitizeProtocolFrame } = require("../runtime/downstream-handler.cjs");
+const { isAgentSelectionRequiredError, scopeOpenClawRequestSessionParams } = require("../runtime/openclaw-session-key.cjs");
+const { isTitleDistillerRun } = require("../runtime/session-title-distiller-helpers.cjs");
 
 const DEVICE_KEY_FILE = "ocuclaw-device-key.json";
 const DEVICE_TOKEN_FILE = "ocuclaw-device-token.json";
@@ -25,6 +27,7 @@ const MIN_PROTOCOL_VERSION = 3;
 const MAX_PROTOCOL_VERSION = 4;
 const HISTORY_ACTIVITY_POLL_INTERVAL_MS = 500;
 const HISTORY_ACTIVITY_POLL_LIMIT = 40;
+const RUN_SESSION_KEY_LIMIT = 64;
 const THINKING_FRAME_MAX_CHARS = 8000;
 const THINKING_FRAME_TRUNCATION_PREFIX = "[truncated]...";
 
@@ -583,6 +586,9 @@ function buildTerminalErrorActivity(data, fallbackRunId, fallbackSessionKey, fal
   const sessionKey = normalizeSessionKey(
     pickTrimmedString(source.sessionKey, fallbackSessionKey),
   );
+
+  const stopReason = pickTrimmedString(source.stopReason);
+  const aborted = source.aborted === true || (!!stopReason && stopReason.toLowerCase() === "aborted");
   const activity = {
     state: "idle",
     sessionKey,
@@ -591,6 +597,7 @@ function buildTerminalErrorActivity(data, fallbackRunId, fallbackSessionKey, fal
     phase: "error",
     isError: true,
     code,
+    ...(aborted ? { aborted: true } : {}),
   };
   const label = sanitizeFailureText(labelSource, FAILURE_LABEL_MAX_CHARS);
   const detail = sanitizeFailureText(detailSource, FAILURE_DETAIL_MAX_CHARS);
@@ -615,6 +622,11 @@ function buildStructuredError(data, fallbackMessage, fallbackCode) {
   if (code) error.code = code;
   if (requestId) error.requestId = requestId;
   if (op) error.op = op;
+
+  const stopReason = pickTrimmedString(source.stopReason);
+  if (source.aborted === true || (!!stopReason && stopReason.toLowerCase() === "aborted")) {
+    Object.assign(error, { aborted: true });
+  }
   return error;
 }
 
@@ -749,6 +761,18 @@ function normalizeRunId(rawRunId) {
   return trimmed || null;
 }
 
+function unscopeEcho(result, params, scoped) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  let next = result;
+  for (const field of ["key", "sessionKey"]) {
+    if (scoped[field] !== params[field] && result[field] === scoped[field]) {
+      if (next === result) next = { ...result };
+      next[field] = params[field];
+    }
+  }
+  return next;
+}
+
 function normalizeSessionKey(rawSessionKey) {
   if (typeof rawSessionKey !== "string") return null;
   const trimmed = rawSessionKey.trim();
@@ -856,6 +880,10 @@ class OpenClawClient extends EventEmitter {
     this._tickIntervalMs = 30000;
     this._deviceToken = null;
 
+    this._sessionDefaults = null;
+    this._agentSelectionRequiredLatched = false;
+    this._sessionAgentResolver = null;
+
     this._backoffMs = 1000;
     this._reconnectTimer = null;
 
@@ -867,6 +895,15 @@ class OpenClawClient extends EventEmitter {
     this._activeRunStartedAtMs = null;
     this._activeRunGeneration = 0;
     this._runTextBuffer = "";
+
+    const runRouting = this;
+    runRouting._runSessionKeys = new Map();
+
+    runRouting._backgroundRunText = new Map();
+
+    this._runMessageIndex = 0;
+
+    this._runItemId = null;
 
     this._chatCommandRuns = new Map();
 
@@ -938,6 +975,50 @@ class OpenClawClient extends EventEmitter {
   }
 
   request(method, params, opts) {
+    if (method === "connect") return this._requestFrame(method, params, opts);
+
+    const scoped = this._agentSelectionRequired()
+      ? this._scopeSessionParams(method, params)
+      : params;
+    const sent = this._requestFrame(method, scoped, opts);
+    if (scoped !== params) return sent.then((result) => unscopeEcho(result, params, scoped));
+    return sent.catch((err) => {
+      if (!isAgentSelectionRequiredError(err)) throw err;
+      this._agentSelectionRequiredLatched = true;
+      const retry = this._scopeSessionParams(method, params);
+      if (retry === params) throw err;
+      this._logger.info(
+        `[openclaw] ${method} needs an agent owner; retrying with an agent-scoped session key`
+      );
+      return this._requestFrame(method, retry, opts).then((result) =>
+        unscopeEcho(result, params, retry),
+      );
+    });
+  }
+
+  setSessionAgentResolver(resolver) {
+    this._sessionAgentResolver = typeof resolver === "function" ? resolver : null;
+  }
+
+  getSessionDefaults() {
+    return this._sessionDefaults ? { ...this._sessionDefaults } : null;
+  }
+
+  _agentSelectionRequired() {
+    return (
+      this._agentSelectionRequiredLatched === true ||
+      (this._sessionDefaults !== null && this._sessionDefaults.selectionRequired === true)
+    );
+  }
+
+  _scopeSessionParams(method, params) {
+    return scopeOpenClawRequestSessionParams(method, params, {
+      resolveAgentId: this._sessionAgentResolver,
+      defaultAgentId: this._sessionDefaults ? this._sessionDefaults.defaultAgentId : "",
+    });
+  }
+
+  _requestFrame(method, params, opts) {
 
     const ws = this._ws;
     const gen = this._socketGeneration;
@@ -1035,6 +1116,7 @@ class OpenClawClient extends EventEmitter {
       const status = result && result.status;
       if (result && result.runId) {
         this._activeRunId = result.runId;
+        this._rememberRunSessionKey(result.runId, key);
         this._logger.info(`[openclaw] Agent run accepted: ${result.runId}`);
       }
       return result;
@@ -1072,6 +1154,8 @@ class OpenClawClient extends EventEmitter {
     this._activeRunSessionKey = normalizeSessionKey(sessionKey);
     this._activeRunStartedAtMs = Date.now();
     this._runTextBuffer = "";
+    this._runMessageIndex = 0;
+    this._runItemId = null;
     this._gapDuringRun = false;
     this._seenThinkingSummaryIds.clear();
     this._seenThinkingFrameIds.clear();
@@ -1081,6 +1165,32 @@ class OpenClawClient extends EventEmitter {
     return this._activeRunGeneration;
   }
 
+  _rememberRunSessionKey(runId, sessionKey) {
+    const id = normalizeRunId(runId);
+    const key = normalizeSessionKey(sessionKey);
+    if (!id || !key) return;
+    const client = this;
+    const runSessionKeys = client._runSessionKeys;
+    runSessionKeys.delete(id);
+    runSessionKeys.set(id, key);
+    while (runSessionKeys.size > RUN_SESSION_KEY_LIMIT) {
+      runSessionKeys.delete(runSessionKeys.keys().next().value);
+    }
+  }
+
+  _sessionKeyForRun(runId, eventSessionKey) {
+    const direct = normalizeSessionKey(eventSessionKey);
+    if (direct) return direct;
+    const client = this;
+    const id = normalizeRunId(runId);
+    const known = id ? client._runSessionKeys.get(id) : null;
+    return known || client._activeRunSessionKey;
+  }
+
+  _isBackgroundRun(runId, sessionKey) {
+    return isTitleDistillerRun(runId, sessionKey);
+  }
+
   _invalidateActiveRun() {
     this._activeRunGeneration += 1;
     this._stopHistoryActivityPolling();
@@ -1088,6 +1198,8 @@ class OpenClawClient extends EventEmitter {
     this._activeRunSessionKey = null;
     this._activeRunStartedAtMs = null;
     this._runTextBuffer = "";
+    this._runMessageIndex = 0;
+    this._runItemId = null;
     this._gapDuringRun = false;
     this._seenThinkingSummaryIds.clear();
     this._seenThinkingFrameIds.clear();
@@ -1223,6 +1335,8 @@ class OpenClawClient extends EventEmitter {
     this._eventQueue = [];
 
     this._chatCommandRuns.clear();
+    const runRouting = this;
+    runRouting._backgroundRunText.clear();
     this._invalidateActiveRun();
 
     const url = this._gatewayUrl;
@@ -1360,7 +1474,7 @@ class OpenClawClient extends EventEmitter {
           pending.timer = null;
         }
 
-        if (payload.runId) {
+        if (payload.runId && !isTitleDistillerRun(payload.runId, null)) {
           this._activeRunId = payload.runId;
           this._logger.info(`[openclaw] Agent run accepted: ${payload.runId}`);
         }
@@ -1524,18 +1638,27 @@ class OpenClawClient extends EventEmitter {
     if (chatCommandEntry) chatCommandEntry.agentOwned = true;
     if (!stream || !data) return;
 
+    if (stream === "lifecycle" && data.phase === "start") {
+      this._rememberRunSessionKey(runId, payload.sessionKey);
+    }
+    const runSessionKey = this._sessionKeyForRun(runId, payload.sessionKey);
+    if (this._isBackgroundRun(runId, runSessionKey)) {
+      this._handleBackgroundRunEvent(runId, stream, data, runSessionKey);
+      return;
+    }
+
     switch (stream) {
       case "lifecycle":
         this._handleLifecycleEvent(runId, data, payload.sessionKey, capturedCommit);
         break;
       case "assistant":
-        this._handleAssistantEvent(runId, data);
+        this._handleAssistantEvent(runId, data, runSessionKey);
         break;
       case "tool":
-        this._handleToolEvent(runId, data);
+        this._handleToolEvent(runId, data, runSessionKey);
         break;
       case "thinking":
-        this._handleThinkingStreamEvent(runId, data);
+        this._handleThinkingStreamEvent(runId, data, runSessionKey);
         break;
       case "error":
         this._logger.error(`[openclaw] Agent error: ${JSON.stringify(data)}`);
@@ -1543,7 +1666,7 @@ class OpenClawClient extends EventEmitter {
           const terminalActivity = buildTerminalErrorActivity(
             data,
             runId || this._activeRunId,
-            payload.sessionKey || this._activeRunSessionKey,
+            runSessionKey,
             "agent_error",
           );
           if (terminalActivity.runId && terminalActivity.sessionKey) {
@@ -1676,24 +1799,106 @@ class OpenClawClient extends EventEmitter {
     }
   }
 
-  _handleAssistantEvent(runId, data) {
+  _handleBackgroundRunEvent(runId, stream, data, sessionKey) {
+    const client = this;
+    const id = normalizeRunId(runId);
+    if (!id) return;
+    if (stream === "assistant") {
+      if (typeof data.text !== "string") return;
+      client._backgroundRunText.set(id, data.text);
+      client.emit("streaming", {
+        text: data.text,
+        sessionKey,
+        runId: id,
+        gatewayReceivedAtMs: Date.now(),
+        rawAssistantChars: data.text.length,
+      });
+      return;
+    }
+    if (stream !== "lifecycle") return;
+    if (data.phase === "start") {
+      client._backgroundRunText.set(id, "");
+      client.emit("activity", {
+        state: "thinking",
+        sessionKey,
+        runId: id,
+        origin: "lifecycle",
+        phase: "start",
+      });
+      return;
+    }
+    if (data.phase === "end") {
+      const fullText = client._backgroundRunText.get(id) || "";
+      client._backgroundRunText.delete(id);
+      client._runSessionKeys.delete(id);
+      client._timingLedger.recordRunTerminal({ runId: id });
+      client.emit("message", {
+        runId: id,
+        role: "assistant",
+        content: [{ type: "text", text: fullText }],
+        sessionKey,
+        finalReplyCommitted: false,
+      });
+      client.emit("activity", {
+        state: "idle",
+        sessionKey,
+        runId: id,
+        origin: "lifecycle",
+        phase: "end",
+      });
+      return;
+    }
+    if (data.phase === "error") {
+      client._backgroundRunText.delete(id);
+      client._runSessionKeys.delete(id);
+      client._timingLedger.recordRunTerminal({ runId: id });
+      client._logger.warn(`[openclaw] Background run error: ${JSON.stringify(data)}`);
+      const terminalActivity = buildTerminalErrorActivity(
+        data,
+        id,
+        sessionKey,
+        "agent_lifecycle_error",
+      );
+      if (terminalActivity.sessionKey) client.emit("activity", terminalActivity);
+    }
+  }
+
+  _handleAssistantEvent(runId, data, sessionKey = this._activeRunSessionKey) {
     this._emitThinkingActivityFromPayload(
       runId,
-      this._activeRunSessionKey,
+      sessionKey,
       data,
       "assistant_event",
     );
 
     if (typeof data.text === "string") {
-      const previousTextLength = this._runTextBuffer.length;
+
+      if (data.text === "" && data.replace !== true) return;
+      const previousText = this._runTextBuffer;
+      const previousTextLength = previousText.length;
       const gatewayReceivedAtMs = Date.now();
       const rawAssistantChars = data.text.length;
       const assistantDeltaChars = Math.max(0, rawAssistantChars - previousTextLength);
       const firstGatewayChunk = previousTextLength <= 0;
+
+      const itemId =
+        typeof data.itemId === "string" && data.itemId.trim()
+          ? data.itemId.trim()
+          : null;
+      const newMessage = itemId && this._runItemId
+        ? itemId !== this._runItemId
+        : previousTextLength > 0 &&
+          data.replace !== true &&
+          !data.text.startsWith(previousText);
+      if (newMessage) {
+        this._runMessageIndex += 1;
+      }
+      if (itemId) this._runItemId = itemId;
       this._runTextBuffer = data.text;
       this.emit("streaming", {
         text: data.text,
-        sessionKey: this._activeRunSessionKey,
+        messageIndex: this._runMessageIndex,
+        sessionKey,
         runId: runId || this._activeRunId || null,
         gatewayReceivedAtMs,
         rawAssistantChars,
@@ -1703,7 +1908,7 @@ class OpenClawClient extends EventEmitter {
     }
   }
 
-  _handleToolEvent(runId, data) {
+  _handleToolEvent(runId, data, sessionKey = this._activeRunSessionKey) {
     if (!data || !data.name) return;
     const rawPhase = typeof data.phase === "string" ? data.phase.trim().toLowerCase() : "";
     if (rawPhase !== "start" && rawPhase !== "update" && rawPhase !== "result") return;
@@ -1721,7 +1926,7 @@ class OpenClawClient extends EventEmitter {
     const activity = {
       state: "thinking",
       tool: data.name,
-      sessionKey: this._activeRunSessionKey,
+      sessionKey,
       runId: runId || this._activeRunId || null,
       origin: "tool",
       phase: isToolStart ? "start" : "update",
@@ -1878,7 +2083,7 @@ class OpenClawClient extends EventEmitter {
     }
   }
 
-  _handleThinkingStreamEvent(runId, data) {
+  _handleThinkingStreamEvent(runId, data, sessionKey = this._activeRunSessionKey) {
     if (!isObject(data)) return;
 
     const normalizedRunId =
@@ -1922,7 +2127,7 @@ class OpenClawClient extends EventEmitter {
     if (data.thinkingSignature) payload.thinkingSignature = data.thinkingSignature;
     this._emitThinkingActivityFromPayload(
       normalizedRunId,
-      this._activeRunSessionKey,
+      sessionKey,
       payload,
       "thinking_stream",
       { frameText: cumulativeRaw },
@@ -2102,6 +2307,7 @@ class OpenClawClient extends EventEmitter {
         this._backoffMs = 1000;
 
         this._applyConnectPolicy(helloOk.policy);
+        this._applySessionDefaults(helloOk.snapshot && helloOk.snapshot.sessionDefaults);
 
         this._lastTick = Date.now();
         this._startTickWatch();
@@ -2276,6 +2482,30 @@ class OpenClawClient extends EventEmitter {
 
     if (this._reconnectTimer.unref) {
       this._reconnectTimer.unref();
+    }
+  }
+
+  _applySessionDefaults(sessionDefaults) {
+
+    this._agentSelectionRequiredLatched = false;
+    if (!sessionDefaults || typeof sessionDefaults !== "object") {
+      this._sessionDefaults = null;
+      return;
+    }
+    const defaultAgentId =
+      typeof sessionDefaults.defaultAgentId === "string"
+        ? sessionDefaults.defaultAgentId.trim()
+        : "";
+    this._sessionDefaults = {
+      defaultAgentId,
+      ownership:
+        typeof sessionDefaults.ownership === "string" ? sessionDefaults.ownership : null,
+      selectionRequired: sessionDefaults.selectionRequired === true,
+    };
+    if (this._sessionDefaults.selectionRequired) {
+      this._logger.info(
+        `[openclaw] Gateway requires explicit agent ownership; default agent=${defaultAgentId || "(none)"}`
+      );
     }
   }
 

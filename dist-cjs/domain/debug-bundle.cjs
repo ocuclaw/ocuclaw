@@ -34,6 +34,58 @@ function sanitizeCaptureState(raw) {
   return Object.keys(out).length > 0 ? out : null;
 }
 
+function dedupeReportEvents(events) {
+  const result = [];
+  const seen = new Map();
+  const canonical = (value) => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]));
+  };
+  const signatureOf = (event) => {
+    const { source, clientId, ...originalData } = event.data || {};
+    return JSON.stringify(canonical({ cat: event.cat, event: event.event,
+      severity: event.severity, screen: event.screen || null, runId: event.runId || null, data: originalData }));
+  };
+  for (const event of events || []) {
+    const data = event.data || {};
+    const id = typeof data.captureEpoch === "string" && /^-?[a-f0-9]{1,16}$/.test(data.captureEpoch) &&
+      Number.isSafeInteger(data.captureSeq) && data.captureSeq > 0
+      ? `${data.captureEpoch}:${data.captureSeq}` : null;
+    if (!id) { result.push(event); continue; }
+
+    const copies = seen.get(id);
+    if (copies === undefined) { seen.set(id, [{ signature: null, index: result.length }]); result.push(event); continue; }
+    const signature = signatureOf(event);
+    let prior = -1;
+    for (const copy of copies) {
+      if (copy.signature === null) copy.signature = signatureOf(result[copy.index]);
+      if (copy.signature === signature) { prior = copy.index; break; }
+    }
+    if (prior === -1) { copies.push({ signature, index: result.length }); result.push(event); }
+    else if (event.source === "phone") result[prior] = event;
+  }
+  return result;
+}
+
+const incidentFirstOrder = (a, b) =>
+  Number(isIncidentEvent(a)) - Number(isIncidentEvent(b)) || a.ts - b.ts || (a.seq || 0) - (b.seq || 0);
+
+function trimCuts(total, detailTotal) {
+  const cuts = [];
+  let left = total;
+  let detail = detailTotal;
+  let cut = 0;
+  while (left > 0) {
+    const removed = Math.min(Math.ceil(left * 0.1), detail || left);
+    cut += removed;
+    left -= removed;
+    detail = Math.max(0, detail - removed);
+    cuts.push(cut);
+  }
+  return cuts;
+}
+
 function assembleBundle(dumpResult, opts) {
   const appliedQuery = dumpResult.appliedQuery || {
     categories: dumpResult.categories,
@@ -41,33 +93,75 @@ function assembleBundle(dumpResult, opts) {
     untilMs: dumpResult.untilMs,
   };
 
-  let events = redactEvents(dumpResult.events, { mode: opts.redactionMode });
-  let ringCapped = opts.ringCappedWindow;
-  const zipOmitted = { phone: 0, relay: 0 };
-  opts = { ...opts, zipOmitted };
+  const events = redactEvents(dumpResult.events, { mode: opts.redactionMode });
 
-  const dropOldest = () => {
-    events.sort((a, b) => Number(isIncidentEvent(a)) - Number(isIncidentEvent(b)) || a.ts - b.ts || (a.seq || 0) - (b.seq || 0));
-    const detailCount = events.filter(event => !isIncidentEvent(event)).length;
-    const removed = Math.min(Math.ceil(events.length * 0.1), detailCount || events.length);
-    const counts = countLanes(events.slice(0, removed));
-    zipOmitted.phone += counts.phone;
-    zipOmitted.relay += counts.relay;
-    events = events.slice(removed);
+  const full = buildArtifacts(events, dumpResult, appliedQuery,
+    { ...opts, zipOmitted: { phone: 0, relay: 0 } }, opts.ringCappedWindow);
+  const done = (built) => ({ zip: built.zip, bundleSha256: built.bundleSha256, metadata: built.metadata,
+    partCount: partCountFor(built.zip, opts.chunkBytes), files: built.files });
 
-    ringCapped = true;
+  const maxZipBytes = opts.maxZipBytes;
+  if (!(typeof maxZipBytes === "number" && maxZipBytes > 0) || full.zip.length <= maxZipBytes || events.length === 0) {
+    return done(full);
+  }
+  const ordered = events.slice().sort(incidentFirstOrder);
+  let detailTotal = 0;
+  for (const event of ordered) if (!isIncidentEvent(event)) detailTotal += 1;
+  const cuts = trimCuts(ordered.length, detailTotal);
+  const steps = cuts.length;
+
+  const zipBytes = new Map();
+  let best = null;
+  const buildStep = (step) => {
+    const cut = cuts[step - 1];
+
+    return buildArtifacts(ordered.slice(cut), dumpResult, appliedQuery,
+      { ...opts, zipOmitted: countLanes(ordered.slice(0, cut)) }, true);
+  };
+  const fits = (step) => {
+    if (!zipBytes.has(step)) {
+      const built = buildStep(step);
+      zipBytes.set(step, built.zip.length);
+      if (built.zip.length <= maxZipBytes && (!best || step < best.step)) best = { step, built };
+    }
+    return zipBytes.get(step) <= maxZipBytes;
   };
 
-  let built = buildArtifacts(events, dumpResult, appliedQuery, opts, ringCapped);
-
-  if (typeof opts.maxZipBytes === "number" && opts.maxZipBytes > 0) {
-    while (built.zip.length > opts.maxZipBytes && events.length > 0) {
-      dropOldest();
-      built = buildArtifacts(events, dumpResult, appliedQuery, opts, ringCapped);
-    }
+  const target = (maxZipBytes / full.zip.length) * ordered.length;
+  let guess = steps;
+  for (let step = 1; step <= steps; step++) {
+    if (ordered.length - cuts[step - 1] <= target) { guess = step; break; }
   }
 
-  return { zip: built.zip, bundleSha256: built.bundleSha256, metadata: built.metadata, chunks: built.chunks, files: built.files };
+  let low;
+  let high;
+  if (fits(guess)) {
+    high = guess;
+    let stride = 1;
+    low = guess - stride;
+    while (low >= 1 && fits(low)) { high = low; stride *= 2; low = high - stride; }
+    low = Math.max(low, 0);
+  } else {
+    low = guess;
+    let stride = 1;
+    high = guess + stride;
+    while (high <= steps && !fits(high)) { low = high; stride *= 2; high = low + stride; }
+    if (high > steps) {
+      high = steps;
+
+      if (!fits(high)) return done(buildStep(steps));
+    }
+  }
+  while (high - low > 1) {
+    const mid = (low + high) >> 1;
+    if (fits(mid)) high = mid; else low = mid;
+  }
+  return done(best && best.step === high ? best.built : buildStep(high));
+}
+
+function partCountFor(zip, chunkBytes) {
+  const safeChunkBytes = Math.max(1, chunkBytes | 0);
+  return Math.max(1, Math.ceil(zip.length / safeChunkBytes));
 }
 
 function buildArtifacts(events, dumpResult, appliedQuery, opts, ringCapped) {
@@ -185,20 +279,25 @@ function buildArtifacts(events, dumpResult, appliedQuery, opts, ringCapped) {
 
   const zip = zipFiles(files);
   const bundleSha256 = sha256Hex(zip);
-  const chunks = chunkZip(zip, opts.chunkBytes);
 
-  return { files, summary, metadata, zip, bundleSha256, chunks };
+  return { files, summary, metadata, zip, bundleSha256 };
 }
 
 function chunkZip(zip, chunkBytes) {
+  return chunkZipRange(zip, chunkBytes, 0, Infinity);
+}
+
+function chunkZipRange(zip, chunkBytes, fromIndex, count) {
   const safeChunkBytes = Math.max(1, chunkBytes | 0);
-  const partCount = Math.max(1, Math.ceil(zip.length / safeChunkBytes));
+  const partCount = partCountFor(zip, safeChunkBytes);
+  const first = Math.max(0, Math.floor(fromIndex) || 0);
+  const end = Math.min(partCount, first + Math.max(0, count));
   const chunks = [];
-  for (let i = 0; i < partCount; i++) {
+  for (let i = first; i < end; i++) {
     const slice = zip.subarray(i * safeChunkBytes, (i + 1) * safeChunkBytes);
     chunks.push({ partIndex: i, partCount, partBase64: Buffer.from(slice).toString("base64") });
   }
   return chunks;
 }
 
-module.exports = { assembleBundle, chunkZip, sanitizeCaptureState };
+module.exports = { assembleBundle, chunkZip, chunkZipRange, dedupeReportEvents, sanitizeCaptureState };

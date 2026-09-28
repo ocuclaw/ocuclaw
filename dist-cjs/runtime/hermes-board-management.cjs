@@ -1,9 +1,9 @@
 const BOARD_OPERATIONS = new Set(["board.status", "board.boards", "board.lanes", "board.cards", "board.card", "board.timeline",
   "board.watch", "board.policy", "board.policy.set", "board.create", "board.receipt", "board.verdict",
   "board.comment", "board.tools.enable", "board.decompose", "board.action", "board.maintenance", "board.export",
-  "board.export.part", "board.artifact", "board.artifact.part"]);
+  "board.export.part", "board.artifact", "board.artifact.part", "board.watch.rule", "board.watch.rules"]);
 
-const BOARD_WRITES = new Set(["board.watch", "board.policy.set", "board.create", "board.verdict", "board.comment",
+const BOARD_WRITES = new Set(["board.watch", "board.watch.rule", "board.policy.set", "board.create", "board.verdict", "board.comment",
   "board.tools.enable", "board.decompose", "board.action", "board.export", "board.export.part"]);
 
 const TOOLS_STATES = new Set(["on", "off", "unknown"]);
@@ -62,6 +62,9 @@ const POLICY_ZONE = /^[A-Za-z][A-Za-z0-9_+-]{0,31}(?:\/[A-Za-z0-9_+-]{1,32}){0,2
 const BOARD_READS = new Set([...BOARD_OPERATIONS].filter(op => !BOARD_WRITES.has(op)));
 
 const WATCH_MODES = new Set(["off", "notify", "notify_wake"]);
+
+const RULE_MODES = new Set(["off", "notify", "notify_failures"]);
+const RULES_MAX = 200;
 
 const BOARD_CAPABILITY_KEYS = [
   "browse", "passive_moments", "wake", "agent_tools", "create", "comment",
@@ -201,6 +204,15 @@ const WATCH_ERRORS                         = {
   wake_unsupported: "Notify + wake isn't supported by this Hermes.",
 };
 
+const RULE_ERRORS                         = {
+  temporarily_unavailable: "Board couldn't save this rule. Try again shortly.",
+  invalid_request: "Board can't use this rule. Check the worker's name.",
+};
+
+const RULES_READ_ERRORS                         = {
+  temporarily_unavailable: "Board couldn't read your worker rules. Try again shortly.",
+};
+
 const POLICY_ERRORS                         = {
   temporarily_unavailable: "Board couldn't reach your moment settings. Try again shortly.",
   invalid_request: "Board can't use these moment settings. Check the times and time zone.",
@@ -216,6 +228,8 @@ const TOOLS_ERRORS                         = {
 function boardErrorMessage(op        , code        )         {
   if (op === "board.tools.enable" && Object.hasOwn(TOOLS_ERRORS, code)) return TOOLS_ERRORS[code];
   if ((op === "board.policy" || op === "board.policy.set") && Object.hasOwn(POLICY_ERRORS, code)) return POLICY_ERRORS[code];
+  if (op === "board.watch.rules" && Object.hasOwn(RULES_READ_ERRORS, code)) return RULES_READ_ERRORS[code];
+  if ((op === "board.watch.rule" || op === "board.watch.rules") && Object.hasOwn(RULE_ERRORS, code)) return RULE_ERRORS[code];
   if ((op === "board.create" || op === "board.receipt") && Object.hasOwn(CREATE_ERRORS, code)) return CREATE_ERRORS[code];
   if (op === "board.verdict" && Object.hasOwn(VERDICT_ERRORS, code)) return VERDICT_ERRORS[code];
   if (op === "board.comment" && Object.hasOwn(COMMENT_ERRORS, code)) return COMMENT_ERRORS[code];
@@ -253,7 +267,7 @@ function boardRequest(op        , raw     )      {
   if (op === "board.receipt") {
     return record(raw) && onlyKeys(raw, ["key"]) && typeof raw.key === "string" && OPERATION_KEY.test(raw.key) ? { key: raw.key } : null;
   }
-  if (op === "board.status" || op === "board.boards" || op === "board.policy") {
+  if (op === "board.status" || op === "board.boards" || op === "board.policy" || op === "board.watch.rules") {
     return raw === undefined || raw === null || (record(raw) && Object.keys(raw).length === 0) ? {} : null;
   }
   if (op === "board.policy.set") return policySet(raw);
@@ -294,6 +308,12 @@ function boardRequest(op        , raw     )      {
     if (!onlyKeys(raw, ["slug", "id", "mode"]) || typeof raw.id !== "string" || !CARD_ID.test(raw.id) ||
       typeof raw.mode !== "string" || !WATCH_MODES.has(raw.mode)) return null;
     return { slug: raw.slug, id: raw.id, mode: raw.mode };
+  }
+  if (op === "board.watch.rule") {
+
+    if (!onlyKeys(raw, ["slug", "assignee", "mode"]) || !text(raw.assignee, 64) || raw.assignee.trim() !== raw.assignee ||
+      typeof raw.mode !== "string" || !RULE_MODES.has(raw.mode)) return null;
+    return { slug: raw.slug, assignee: raw.assignee, mode: raw.mode };
   }
   if (!onlyKeys(raw, ["slug", "filter", "cursor", "limit"])) return null;
   if (typeof raw.filter !== "string" || !(raw.filter === "all" || raw.filter === "needs_you" || STATUS.test(raw.filter))) return null;
@@ -838,6 +858,23 @@ function boardResult(op        , raw     , request      = {})      {
 
     if (!record(raw.watch) || raw.watch.id !== request.id || raw.watch.mode !== request.mode) throw new Error("watch");
     out.watch = { id: raw.watch.id, mode: raw.watch.mode };
+    return out;
+  }
+  if (op === "board.watch.rule") {
+
+    out.target = target(raw.target, request.slug);
+    if (!record(raw.rule) || raw.rule.assignee !== request.assignee || raw.rule.mode !== request.mode) throw new Error("rule");
+    out.rule = { assignee: raw.rule.assignee, mode: raw.rule.mode };
+    return out;
+  }
+  if (op === "board.watch.rules") {
+
+    if (!Array.isArray(raw.rules) || raw.rules.length > RULES_MAX) throw new Error("rules");
+    out.rules = raw.rules.map((row     ) => {
+      if (!record(row) || typeof row.slug !== "string" || !SLUG.test(row.slug) || !text(row.assignee, 64) ||
+        (row.mode !== "notify" && row.mode !== "notify_failures")) throw new Error("rule row");
+      return { slug: row.slug, assignee: row.assignee, mode: row.mode };
+    });
     return out;
   }
   if (op === "board.create") {
