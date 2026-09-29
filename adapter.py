@@ -870,7 +870,7 @@ SETUP_TOOL_DESCRIPTION = (
     "enable_stream_reasoning_deltas and enable_desktop_theme — and only with "
     "confirm: true after the operator has said yes."
 )
-SETUP_GUIDE_VERSION = "2026-09-28 (1.3.25-hermes)"
+SETUP_GUIDE_VERSION = "2026-09-29 (1.3.26-hermes)"
 SETUP_SKILL_LOAD_POINTER = (
     "If the OcuClaw Setup Assistant skill is not loaded in this conversation, "
     f'load it with skill_view("{SETUP_SKILL_QUALIFIED_NAME}") before mutating '
@@ -3320,18 +3320,8 @@ def _setup_raw_config() -> Tuple[Dict[str, Any], bool]:
 
 
 def _ocuclaw_version() -> Optional[str]:
-    """The OcuClaw train version, read from the bundle manifest.
-
-    Read rather than duplicated: a second copy of the version in Python is a
-    second thing to forget on a release, and the manifest is the one the
-    publish lane already treats as authoritative.
-    """
-    try:
-        text = (BUNDLE_DIR / "plugin.yaml").read_text(encoding="utf-8")
-    except OSError:  # noqa: BLE001 - a missing manifest degrades, never raises
-        return None
-    match = re.search(r"^version:\s*([^\s#]+)", text, re.MULTILINE)
-    return match.group(1).strip() if match else None
+    """Version captured when this process loaded the plugin, not a disk update."""
+    return health_collect.ocuclaw_version()
 
 
 def _collect_gateway_facts() -> Dict[str, Any]:

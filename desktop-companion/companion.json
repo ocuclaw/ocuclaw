@@ -1,11 +1,11 @@
 {
   "format": 2,
   "identity": "ocuclaw/ocuclaw",
-  "version": "2.1.1",
-  "sha256": "ffac3d0443c9f980e2368eefc1cebafced99b86b23da5fe9e6db433e081cddee",
+  "version": "2.1.2",
+  "sha256": "f37532cb05ab50937d40ab5d4f8df6a5bac9af6e2e70828ef931e9df0e2c81ee",
   "sourceLines": [
     "// OCUCLAW-OWNED-DESKTOP-PAIRING-PLUGIN v1\n",
-    "// OCUCLAW-DESKTOP-COMPANION version=2.1.1\n",
+    "// OCUCLAW-DESKTOP-COMPANION version=2.1.2\n",
     "// Direct-human Hermes Desktop presenter. Pairing authority stays in the\n",
     "// plugin-scoped Python backend; this renderer receives public ceremony data.\n",
     "\n",

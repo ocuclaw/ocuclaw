@@ -3,6 +3,8 @@ const { redactEvents } = require("./debug-bundle-redaction.cjs");
 const { zipFiles, sha256Hex } = require("./debug-bundle-zip.cjs");
 const { strToU8 } = require("fflate");
 const { countLanes } = require("./debug-retention.cjs");
+const { sanitizeVersionMismatch } = require("./debug-version-verdict.cjs");
+const { snapshotHealthSummary } = require("./debug-health-summary.cjs");
 
 const LIVEUI_LANE = ["glasses.lifecycle", "openclaw.message", "evenai"];
 const SCHEMA_VERSION = 1;
@@ -31,6 +33,8 @@ function sanitizeCaptureState(raw) {
   num("menuDepth");
   num("readSpeedWpm");
   str("streamPageAdvanceMode", 40);
+  const mismatch = sanitizeVersionMismatch(raw.versionMismatch);
+  if (mismatch) out.versionMismatch = mismatch;
   return Object.keys(out).length > 0 ? out : null;
 }
 
@@ -264,6 +268,7 @@ function buildArtifacts(events, dumpResult, appliedQuery, opts, ringCapped) {
     totalBytes: summary.totalBytes,
     contentSha256,
     build: opts.build,
+    ...(opts.connectionHealthDocument ? snapshotHealthSummary(opts.connectionHealthDocument) : {}),
     installId: opts.installId,
     redactionMode: opts.redactionMode,
     secretsStripped: true,

@@ -1,6 +1,6 @@
 # OcuClaw Hermes wrap-up and feedback
 
-**Guide version:** 2026-09-28 (1.3.25-hermes)
+**Guide version:** 2026-09-29 (1.3.26-hermes)
 
 Use this `ocuclaw_setup` response only at a genuine finish: fresh install,
 update, or standalone fix completed. Never after an unresolved failure or

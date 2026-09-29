@@ -170,6 +170,14 @@ CLAIM_UNAVAILABLE = "route_claim_unavailable"
 # redaction pass someone can forget to run.
 
 REPAIR_TEXT: Dict[str, str] = {
+    "move_shadow_plugin_copy": (
+        "Move the stray copy outside plugins/ as a backup using the local command below. "
+        "Restart the gateway the usual way, then tap Try again on the phone. No re-pair."
+    ),
+    "restart_installed_plugin": (
+        "If loadedFromInstalled is no, resolve the stray copy first. Restart the gateway "
+        "the usual way, then tap Try again on the phone. No re-pair."
+    ),
     "read_hermes_config": (
         "Check that this profile's Hermes configuration exists and is readable, "
         "then run this command again."
@@ -2123,6 +2131,15 @@ def run(
             )
         )
         if command == "doctor":
+            try:
+                from .plugin_copies import render_local_repairs, shadow_copies
+                from .receipts import resolve_receipt_home
+
+                copy_lines = render_local_repairs(shadow_copies(resolve_receipt_home()))
+                if copy_lines:
+                    out.write("\n".join(copy_lines) + "\n")
+            except Exception:  # noqa: BLE001 - local advisory must not fail doctor
+                pass
             # `doctor` prescribes; `status` is passive by contract (#1273 §10)
             # and never prints a command. A failed observation is not an
             # outage — the report stands without the advisory.

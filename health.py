@@ -475,13 +475,22 @@ def setup_raw_config() -> Tuple[Dict[str, Any], bool]:
         return {}, False
 
 
-def ocuclaw_version() -> Optional[str]:
+def _read_loaded_version() -> Optional[str]:
     try:
         text = (BUNDLE_DIR / "plugin.yaml").read_text(encoding="utf-8")
     except OSError:
         return None
     match = re.search(r"^version:\s*([^\s#]+)", text, re.MULTILINE)
     return match.group(1).strip() if match else None
+
+
+# Capture at module load: replacing plugin.yaml on disk must not make a live
+# gateway claim it is already running the newly installed code.
+_LOADED_OCUCLAW_VERSION = _read_loaded_version()
+
+
+def ocuclaw_version() -> Optional[str]:
+    return _LOADED_OCUCLAW_VERSION
 
 
 def profile_name(home: Optional[Path]) -> Optional[str]:
@@ -589,7 +598,12 @@ def collect_health_facts(
     serve_facts_fn: Callable[[Mapping[str, Any], bool], Dict[str, Any]] = collect_serve_facts,
     runtime_entry: Path = DEFAULT_RUNTIME_ENTRY,
 ) -> Dict[str, Any]:
-    """Collect the frozen Snapshot v1 facts dict without adapter imports."""
+    """Collect the frozen Snapshot v1 facts dict without adapter imports.
+
+    Shared by adapter, CLI, dashboard, Cloudways pairing and uninstall. The
+    Desktop fleet publication endpoint does not call this on-demand collector.
+    """
+    from .plugin_copies import collect_copy_facts
     raw_config, config_readable = setup_raw_config_fn()
     platforms = raw_config.get("platforms")
     platform_config = platforms.get(PLATFORM_NAME, {}) if isinstance(platforms, dict) else {}
@@ -651,6 +665,7 @@ def collect_health_facts(
         hermesHomeFingerprint=fingerprint,
         profileResolved=home is not None,
         ocuclawVersion=ocuclaw_version_fn(),
+        **collect_copy_facts(home, Path(__file__).parent),
         hermesRelease=(
             CERTIFIED_HERMES_TAG
             if source_receipt.get("state") == STATE_CERTIFIED_SOURCE

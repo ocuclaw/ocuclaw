@@ -146,7 +146,8 @@ def _read_json(path: Path) -> Tuple[Optional[Dict[str, Any]], str]:
     import json
 
     try:
-        raw = path.read_text(encoding="utf-8")
+        # Match Hermes's runtime-status reader; Windows editors may add a BOM.
+        raw = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return None, "missing"
     except (OSError, UnicodeError):

@@ -177,6 +177,9 @@ FACTS_KEYS_V1: Tuple[str, ...] = (
     "profileResolved",  # bool: the exact profile resolved safely
     # -- producer identity ----------------------------------------------
     "ocuclawVersion",
+    "ocuclawShadowCopies",
+    "ocuclawInstalledVersion",
+    "ocuclawLoadedFromInstalled",
     "hermesRelease",
     "hermesPackageVersion",
     "hermesSource",  # provenance receipt; producer renders its three-state label
@@ -515,6 +518,18 @@ _FINDINGS: Dict[str, Tuple[str, str, str, Optional[str]]] = {
         "not be probed from here.",
         "fix_host_dns",
     ),
+    "ocuclaw_shadow_plugin_copy": (
+        LEG_OCUCLAW_RELAY,
+        "error",
+        "A stray OcuClaw plugin copy can load before the installed bundle and cause the phone's version rejection. Re-pairing will not help.",
+        "move_shadow_plugin_copy",
+    ),
+    "ocuclaw_running_version_mismatch": (
+        LEG_OCUCLAW_RELAY,
+        "error",
+        "The running OcuClaw version differs from the installed bundle and can cause the phone's version rejection. Resolve stray copies and restart the gateway; re-pairing will not help.",
+        "restart_installed_plugin",
+    ),
     "phone_app_absent": (
         LEG_PHONE_APP,
         "error",
@@ -552,7 +567,7 @@ _TOKEN_MAX_CHARS = 40
 _CLIENT_VERSION_MAX = 8
 
 
-def _sanitize_token(value: Any, *, max_chars: int = _TOKEN_MAX_CHARS) -> Optional[str]:
+def _sanitize_token(value: Any, *, max_chars: int = _TOKEN_MAX_CHARS, folder: bool = False) -> Optional[str]:
     """Reduce a fact-supplied string to a bounded, allowlisted token.
 
     Characters outside ``[A-Za-z0-9._+-]`` are dropped rather than replaced,
@@ -563,7 +578,9 @@ def _sanitize_token(value: Any, *, max_chars: int = _TOKEN_MAX_CHARS) -> Optiona
     if value is None:
         return None
     text = value if isinstance(value, str) else str(value)
-    cleaned = _TOKEN_RE.sub("", text).strip("._+-")
+    cleaned = _TOKEN_RE.sub("", text)
+    if not folder:
+        cleaned = cleaned.strip("._+-")
     if not cleaned:
         return None
     return cleaned[:max_chars]
@@ -664,6 +681,9 @@ def blank_facts(**overrides: Any) -> Dict[str, Any]:
         "hermesHomeFingerprint": None,
         "profileResolved": False,
         "ocuclawVersion": None,
+        "ocuclawShadowCopies": [],
+        "ocuclawInstalledVersion": None,
+        "ocuclawLoadedFromInstalled": None,
         "hermesRelease": None,
         "hermesPackageVersion": None,
         "hermesSource": None,
@@ -810,7 +830,7 @@ class _Builder:
         evidence_ids: Optional[List[str]] = None,
         repair_parameters: Optional[Dict[str, Any]] = None,
     ) -> None:
-        if code in self._codes:
+        if code in self._codes and code != "ocuclaw_shadow_plugin_copy":
             return
         scope, severity, summary, repair_code = _FINDINGS[code]
         self._codes.add(code)
@@ -831,6 +851,27 @@ class _Builder:
                 ),
             }
         )
+
+
+def _derive_plugin_copies(facts: Mapping[str, Any], out: _Builder) -> None:
+    running = _sanitize_token(facts["ocuclawVersion"])
+    installed = _sanitize_token(facts["ocuclawInstalledVersion"])
+    loaded = facts["ocuclawLoadedFromInstalled"]
+    parameters = {
+        "runningVersion": running,
+        "installedVersion": installed,
+        "loadedFromInstalled": _sanitize_token("yes" if loaded is True else "no" if loaded is False else "unknown"),
+    }
+    copies = facts["ocuclawShadowCopies"]
+    for copy in copies if isinstance(copies, list) else []:
+        if isinstance(copy, Mapping):
+            out.finding("ocuclaw_shadow_plugin_copy", repair_parameters={
+                **parameters,
+                "folder": _sanitize_token(copy.get("folder"), folder=True),
+                "version": _sanitize_token(copy.get("version")),
+            })
+    if running and installed and running != installed:
+        out.finding("ocuclaw_running_version_mismatch", repair_parameters=parameters)
 
 
 def _derive_setup(facts: Mapping[str, Any], out: _Builder) -> Dict[str, Any]:
@@ -1474,6 +1515,7 @@ def derive_snapshot(facts: Mapping[str, Any]) -> Dict[str, Any]:
     now = parse_timestamp(facts["observedAt"])
     out = _Builder()
 
+    _derive_plugin_copies(facts, out)
     setup = _derive_setup(facts, out)
     gateway_leg = _derive_gateway_leg(facts, now, out)
     presence_record, presence_freshness, presence_ids = _app_presence_view(

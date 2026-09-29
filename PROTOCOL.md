@@ -2900,3 +2900,24 @@ phone's original pending operation identity for receipt reconciliation.
   all accepted profile lanes. If Hermes constructs it under a secondary
   profile home override, the adapter raises before spawning the child; the
   gateway logs and skips that secondary adapter.
+
+## Plugin copy findings (Snapshot v1)
+
+`ocuclaw_shadow_plugin_copy` (error, one per discoverable noncanonical copy) and
+`ocuclaw_running_version_mismatch` (error, only when both versions are known) lead
+`findings[]`, before `phone_app_absent`. They explain version rejection without
+changing the four-leg health aggregate or phone absence behavior. Dashboard,
+phone and support consumers accept finding codes as strings; unknown repair codes
+remain readable through the static summary. The dashboard headlines findings[0].
+
+Repair parameters contain only sanitized `folder`, `version`, `installedVersion`,
+`runningVersion` and `loadedFromInstalled` (`yes`, `no`, `unknown`) tokens. No path
+enters the snapshot or support attachment. Full paths and quoted move-as-backup
+commands appear only in local human doctor output. Resolve stray copies, restart
+the gateway normally, then tap Try again; re-pairing cannot repair stale code.
+The running version is captured at module import so a disk upgrade cannot disguise
+an old live gateway. A CLI invocation observes its own loaded package.
+
+The shared health collector serves adapter/CLI/dashboard/support/setup/Cloudways/
+uninstall calls. Desktop's periodic POST /fleet/snapshot only publishes the
+presenter's fleet inventory; it never calls the connection-health collector.

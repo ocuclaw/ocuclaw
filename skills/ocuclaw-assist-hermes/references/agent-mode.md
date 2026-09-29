@@ -1,6 +1,6 @@
 # Agent choice — fresh installs AND existing ones
 
-**Guide version:** 2026-09-28 (1.3.25-hermes)
+**Guide version:** 2026-09-29 (1.3.26-hermes)
 
 Read during fresh setup before the gateway restart, and on ANY existing
 install whose `ocuclaw_setup` status reports

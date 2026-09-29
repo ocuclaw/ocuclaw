@@ -1,6 +1,6 @@
 # Cloudways managed Hermes — userspace Tailscale kept alive by Hermes cron
 
-**Guide version:** 2026-09-28 (1.3.25-hermes)
+**Guide version:** 2026-09-29 (1.3.26-hermes)
 
 Use this branch in place of fresh-install Steps 6 and 7 when the host is a
 Cloudways **Managed AI Agents** container. Everything else in the fresh-install

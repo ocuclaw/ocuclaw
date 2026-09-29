@@ -23,16 +23,14 @@ string:
     → ``gateway.status.write_runtime_status``), and re-written by the
     reconciler on 0.21.3, which is how a new profile arrives.
 
-    On 0.21.3 it is read through upstream's own
-    ``hermes_cli.gateway_multiplex_served.recorded_served_profiles`` — the one
-    private-engine seam here, guarded by a module probe — because its liveness
-    proof (pid file **and** lock **and** record, each checked against the
-    running process) is stronger than a plugin's. Everywhere else the file is
-    read directly and validated exactly the way :mod:`.profiles_report`
+    The file is read directly and validated exactly the way :mod:`.profiles_report`
     validates it for the doctor — owner home, PID liveness, and Hermes's own
     profile-name charset, through the doctor's own helpers — so the two can
-    never disagree about whether a record is usable. The state *words* are the
-    doctor's, plus two this module needs and it does not:
+    never disagree about whether a record is usable. Do not use the CLI's
+    ``recorded_served_profiles`` helper here: its gateway discovery can make
+    a synchronous control request to this gateway while we occupy the event
+    loop that must answer it (#4019). This applies to startup AND refreshes.
+    The state *words* are the doctor's, plus two this module needs and it does not:
     :data:`SERVED_STATE_ABSENT` for a live record whose ``served_profiles`` is
     missing or not a list (which the doctor reports as its ``standalone`` mode
     instead) and :data:`SERVED_STATE_UNKNOWN` for a home that could not be
@@ -257,14 +255,6 @@ CLOSED_SNAPSHOT = RouteSnapshot()
 class EngineCapabilities:
     """What the *running* engine can do, probed, never inferred from a version.
 
-    ``served_reader``
-        ``hermes_cli.gateway_multiplex_served`` is importable — upstream's own
-        "which profiles does the LIVE default multiplexer serve?" helper.
-        0.21.3 only. Its liveness proof is stronger than anything a plugin can
-        do from the file alone (pid file **and** lock **and** the record, each
-        proven against the running process's start time, command line and
-        home), so where it exists it is the answer.
-
     ``hot_reconcile``
         ``gateway.run_profile_reconcile`` exists — the module that re-publishes
         ``served_profiles`` when a profile is added or removed (30 s watcher
@@ -288,7 +278,6 @@ class EngineCapabilities:
     string is parsed or compared anywhere in this module.
     """
 
-    served_reader: bool = False
     hot_reconcile: bool = False
     allowlist_param: bool = False
     probed: bool = False
@@ -317,7 +306,6 @@ def probe_engine_capabilities() -> EngineCapabilities:
     except Exception:  # noqa: BLE001 - no Hermes on the path is not an outage
         allowlist_param = False
     return EngineCapabilities(
-        served_reader=_module_present("hermes_cli.gateway_multiplex_served"),
         hot_reconcile=_module_present("gateway.run_profile_reconcile"),
         allowlist_param=allowlist_param,
         probed=probed,
@@ -350,40 +338,7 @@ def _same_path(left: Any, right: Any) -> bool:
         return False
 
 
-def upstream_served_profiles(default_home: Path) -> Optional[List[str]]:
-    """Hermes's own answer, on the engine that has one. The version seam.
-
-    ``hermes_cli.gateway_multiplex_served.recorded_served_profiles`` is 0.21.3's
-    single source for "which profiles does the LIVE default multiplexer serve",
-    written for exactly the CLI/dashboard/plugin question this module asks. It
-    returns None for "not proved" — no live default gateway, or a record from
-    before the multiplexer wrote the key — which is this module's indeterminate.
-
-    Its liveness check resolves the *default root* itself, so it is used only
-    when that is the home being asked about; anywhere else the validated file
-    read below answers, and it is the only path on 0.21.0–0.21.2 where the
-    module does not exist at all.
-    """
-    try:
-        from hermes_constants import get_default_hermes_root
-
-        if not _same_path(get_default_hermes_root(), default_home):
-            return None
-        from hermes_cli.gateway_multiplex_served import recorded_served_profiles
-
-        served = recorded_served_profiles(Path(default_home))
-    except Exception:  # noqa: BLE001 - absent/older engine falls through
-        return None
-    if not isinstance(served, list):
-        return None
-    return [n for n in (sanitize_profile_name(item) for item in served) if n is not None]
-
-
-def read_served_profiles(
-    default_home: Optional[Path],
-    *,
-    capabilities: Optional[EngineCapabilities] = None,
-) -> Tuple[Optional[List[str]], str]:
+def read_served_profiles(default_home: Optional[Path]) -> Tuple[Optional[List[str]], str]:
     """``(names, state)`` for the profiles this gateway publishes as served.
 
     ``names`` is None for every state except :data:`SERVED_STATE_OK`; None
@@ -400,11 +355,6 @@ def read_served_profiles(
     """
     if default_home is None:
         return None, SERVED_STATE_UNKNOWN
-    caps = probe_engine_capabilities() if capabilities is None else capabilities
-    if caps.served_reader:
-        upstream = upstream_served_profiles(Path(default_home))
-        if upstream:
-            return upstream, SERVED_STATE_OK
     from .profiles_report import _read_json, record_pid_is_live
 
     record, status = _read_json(Path(default_home) / GATEWAY_STATE_FILENAME)
@@ -658,7 +608,7 @@ def resolve_routes(
 
     caps = probe_engine_capabilities() if capabilities is None else capabilities
     home = resolve_default_home() if default_home is None else default_home
-    names, served_state = read_served_profiles(home, capabilities=caps)
+    names, served_state = read_served_profiles(home)
 
     homes: Dict[str, Path] = {}
     if names is not None:

@@ -1,9 +1,11 @@
 # OcuClaw installation and lifecycle reference
 
-**Guide version:** 2026-09-28 (1.3.25-hermes)
+**Guide version:** 2026-09-29 (1.3.26-hermes)
 
-This reference is for OcuClaw train `2.1.1` and Setup Assistant guide
-`1.3.25-hermes`. Those identities are independent of the Hermes package version
+This reference is for OcuClaw train `2.1.2` and Setup Assistant guide
+`1.3.26-hermes`. The backend plugins support the existing OcuClaw `2.1.1`
+client; both compatibility floors remain `2.1.1`. These identities are independent
+of the Hermes package version
 (certified baseline `0.21.5`, supported `>=0.21.1,<0.22.0`) and certified source
 commit.
 

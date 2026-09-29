@@ -3581,9 +3581,14 @@ function createDownstreamHandler(opts) {
 
     if (
       action === "webui-debug-upload-open" ||
+      action === "webui-debug-upload-export" ||
       action === "webui-debug-upload-send" ||
       action === "webui-debug-upload-dismiss"
     ) {
+      if (action === "webui-debug-upload-open" && msg.text) {
+        if (typeof msg.text !== "string" || !/^\d{1,5}$/.test(msg.text) || Number(msg.text) < 1 || Number(msg.text) > 30000) throw new Error("invalid debug upload delay");
+        return { ...payload, text: msg.text };
+      }
       return payload;
     }
 
