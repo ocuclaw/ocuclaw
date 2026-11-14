@@ -9,7 +9,7 @@ import shlex
 from pathlib import Path
 from typing import Any, Optional
 
-import yaml
+from .yaml_compat import yaml
 
 from .profiles_report import bundle_version
 

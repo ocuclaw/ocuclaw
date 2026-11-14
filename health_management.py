@@ -205,7 +205,7 @@ def _version_outside_range():
 
     ``parse_version`` keeps the leading digits of each part, so a main label such as
     ``0.21.4``, ``0.21.4+12.gabc1234`` or ``0.21.5.dev3`` counts as its release line, and
-    ``0.22.0.dev0`` counts as 0.22.0: the next line is not the supported one. A missing or
+    ``0.24.0.dev0`` counts as 0.24.0: the next line is not the supported one. A missing or
     placeholder label (``0.0.0``) cannot be placed in the range, so it is refused.
     """
     from .health import SUPPORTED_HERMES_MAX_EXCLUSIVE, SUPPORTED_HERMES_MIN, hermes_version, parse_version

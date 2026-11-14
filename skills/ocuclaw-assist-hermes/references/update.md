@@ -22,7 +22,7 @@ This is the one wording every OcuClaw-on-Hermes surface uses. Quote it; do not
 paraphrase it, and do not reorder its steps.
 
 <!-- ocuclaw:install-block:start -->
-OcuClaw needs Hermes `>=0.21.1,<0.22.0`; the certified baseline is Hermes
+OcuClaw needs Hermes `>=0.21.1,<0.24.0`; the certified baseline is Hermes
 `0.21.5`. Install it once, in the default Hermes profile: that profile owns the
 relay the glasses pair to, and a second copy in another profile is never the
 answer.
@@ -185,7 +185,7 @@ hermes --version
 hermes plugins list
 ```
 
-Hermes must remain within `>=0.21.1,<0.22.0`, and `ocuclaw` must be installed.
+Hermes must remain within `>=0.21.1,<0.24.0`, and `ocuclaw` must be installed.
 Call `{"operation":"status"}` first. If the state is not `configured` or
 `connected`, this is not an update — call `{"operation":"troubleshooting"}` or
 `{"operation":"fresh_install"}` instead.

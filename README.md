@@ -22,7 +22,7 @@ Your Hermes agent on your Even Realities G2 smart glasses. See what it can do at
 
 ## Requirements
 
-- Hermes `>=0.21.1,<0.22.0` (Hermes 0.21.1 and later 0.21.x), and Git on the
+- Hermes `>=0.21.1,<0.24.0` (Hermes 0.21.1 through 0.23.x), and Git on the
   Hermes host.
 - Even Realities G2 smart glasses and the OcuClaw app from Even Hub.
 - Tailscale on your phone, and on the Hermes host (Cloudways setup installs

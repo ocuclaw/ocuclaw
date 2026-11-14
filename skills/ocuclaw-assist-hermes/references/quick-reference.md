@@ -13,7 +13,7 @@ and `{"operation":"update"}`, and is authored once in
 
 | Need | Command / fact |
 |---|---|
-| Supported host | non-unknown `status.hermesVersion` decides; only when it is `unknown` does `hermes --version` decide; require `>=0.21.1,<0.22.0` (certified baseline `0.21.5`) |
+| Supported host | non-unknown `status.hermesVersion` decides; only when it is `unknown` does `hermes --version` decide; require `>=0.21.1,<0.24.0` (certified baseline `0.21.5`) |
 | Install | `hermes plugins install ocuclaw/ocuclaw --enable`. On Cloudways: install, `hermes gateway restart`, then the one command `hermes ocuclaw cloudways setup`; a fresh `hermes --tui` with `/ocuclaw-setup` stays the fallback. Other hosts go straight to a fresh `hermes --tui` and `/ocuclaw-setup` with no restart first: its Step 5 restart (see `Restarting the gateway` below) loads OcuClaw and applies the saved settings together, so a local setup restarts once. Never add `--ref` — a ref-pinned install records `pinned: true` and `hermes plugins update` then refuses to move it |
 | Install from Hermes Desktop | `hermes://plugin/install?repo=ocuclaw/ocuclaw` (enabled by default); the title-bar setup card then offers **Restart gateway** and afterwards **Pair your glasses** |
 | Re-enable | `hermes plugins enable ocuclaw`, then follow `Restarting the gateway` below |

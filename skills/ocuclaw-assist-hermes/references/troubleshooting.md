@@ -10,7 +10,7 @@ matching observed evidence. Diagnose read-only before a mutation. Never widen
 
 ## HERMES-GATE-REFUSED
 
-`hermes --version` must report a version in `>=0.21.1,<0.22.0`. When the host
+`hermes --version` must report a version in `>=0.21.1,<0.24.0`. When the host
 still exposes the certified platform-registration API, the recovery row remains
 registered outside that hard range, but its checks and adapter refuse startup.
 Treat that row as best-effort on an unsupported, ABI-drifted host; the version

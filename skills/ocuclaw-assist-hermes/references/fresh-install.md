@@ -65,9 +65,9 @@ hermes --version
 
 When `{"operation":"status"}` reports a non-unknown `hermesVersion`, that
 receipt decides the gate: PASS when it is inside `supportedRange`; a version
-outside `>=0.21.1,<0.22.0` -> `HERMES-GATE-REFUSED`, regardless of the shell
+outside `>=0.21.1,<0.24.0` -> `HERMES-GATE-REFUSED`, regardless of the shell
 probe. Only when `hermesVersion` is `"unknown"` does the probe decide: Hermes
-0.21.1 or a later 0.21.x is PASS, and an earlier version (0.21.0 included) or a
+0.21.1 or a later 0.21-0.23.x is PASS, and an earlier version (0.21.0 included) or a
 later line -> `HERMES-GATE-REFUSED`.
 `command not found` beside a supported `status.hermesVersion` is the
 trust-ladder case: Hermes is installed; continue, handing commands to the
@@ -110,7 +110,7 @@ block. Continue with the applicable checks; do not change the terminal default
 or present it as an outstanding requirement in Desktop.
 
 <!-- ocuclaw:install-block:start -->
-OcuClaw needs Hermes `>=0.21.1,<0.22.0`; the certified baseline is Hermes
+OcuClaw needs Hermes `>=0.21.1,<0.24.0`; the certified baseline is Hermes
 `0.21.5`. Install it once, in the default Hermes profile: that profile owns the
 relay the glasses pair to, and a second copy in another profile is never the
 answer.

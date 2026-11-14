@@ -42,7 +42,7 @@ CERTIFIED_HERMES_VERSION = "0.21.5"
 CERTIFIED_HERMES_TAG = "v2026.9.24"
 CERTIFIED_HERMES_COMMIT = "f97608f178d1ffeca59860195ab7da295f7c8e5f"
 SUPPORTED_HERMES_MIN = (0, 21, 1)
-SUPPORTED_HERMES_MAX_EXCLUSIVE = (0, 22, 0)
+SUPPORTED_HERMES_MAX_EXCLUSIVE = (0, 24, 0)
 
 # The ONE user id the adapter stamps on every wearer-originated event
 # (adapter.py `_build_message_event` → `build_source`). Continue here (#2509)
@@ -371,6 +371,9 @@ HERMES_RELEASE_DATES = {
     "2026.9.14": "0.21.3",
     "2026.9.21": "0.21.4",
     "2026.9.24": "0.21.5",
+    "2026.10.14": "0.22.0",
+    "2026.11.5": "0.23.0",
+    "2026.11.10": "0.23.1",
 }
 
 HERMES_VERSION_UNKNOWN_HINT = (
