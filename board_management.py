@@ -176,7 +176,7 @@ REQUIRED_COLUMNS = {
 #: hold, and then enables exactly what a certified engine enables:
 #:
 #: 1. its version is inside the adapter's own support range
-#:    (``health.hermes_version_supported``: 0.21.1 <= v < 0.22.0). The same
+#:    (``health.hermes_version_supported``: 0.21.1 <= v < 0.24.0). The same
 #:    gate starts the adapter, so a build outside it (an unstamped Hermes
 #:    checkout reports ``0.0.0``) never reaches Board at all;
 #: 2. the structural probe passes: every stock name Board calls exists and

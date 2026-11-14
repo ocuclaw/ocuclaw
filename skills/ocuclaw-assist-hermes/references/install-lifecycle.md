@@ -6,7 +6,7 @@ This reference is for OcuClaw train `2.1.2` and Setup Assistant guide
 `1.3.26-hermes`. The backend plugins support the existing OcuClaw `2.1.1`
 client; both compatibility floors remain `2.1.1`. These identities are independent
 of the Hermes package version
-(certified baseline `0.21.5`, supported `>=0.21.1,<0.22.0`) and certified source
+(certified baseline `0.21.5`, supported `>=0.21.1,<0.24.0`) and certified source
 commit.
 
 The Relay Credential is host-managed: initial plugin bootstrap generates it
@@ -20,7 +20,7 @@ agent with filesystem access.
 ## Install and update
 
 <!-- ocuclaw:install-block:start -->
-OcuClaw needs Hermes `>=0.21.1,<0.22.0`; the certified baseline is Hermes
+OcuClaw needs Hermes `>=0.21.1,<0.24.0`; the certified baseline is Hermes
 `0.21.5`. Install it once, in the default Hermes profile: that profile owns the
 relay the glasses pair to, and a second copy in another profile is never the
 answer.
@@ -317,7 +317,7 @@ calls the model for every surface on this gateway, not just OcuClaw.
 ### Progress notes
 
 Some models write short sentences while they work, before their answer
-("Checking the logs first."). On supported Hermes 0.21.x those get their own
+("Checking the logs first."). On supported Hermes 0.21.x-0.23.x those get their own
 line in the glasses status bar and stay out of the conversation history. To
 silence them at the source, in the Hermes config:
 
