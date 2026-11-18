@@ -1,14 +1,16 @@
+const { AGENT_ROSTER_MIGRATION_MESSAGE, agentRosterShape, findConfiguredAgent, isAgentOwnershipRefusal, isLegacyAgentListRefusal } = require("./openclaw-agent-roster.cjs");
+
 const OPENCLAW_AGENT_EMOJI_CAPABILITY = "openclawAgentEmojiSet";
 
-function cleanText(value) {
+function cleanText(value         ) {
   return typeof value === "string" ? value.trim() : "";
 }
 
 class OpenClawAgentEmojiError extends Error {
-  code;
-  retryable;
+  code     ;
+  retryable     ;
 
-  constructor(code, message, retryable = false) {
+  constructor(code     , message     , retryable = false) {
     super(message);
     this.name = "OpenClawAgentEmojiError";
     this.code = code;
@@ -16,8 +18,11 @@ class OpenClawAgentEmojiError extends Error {
   }
 }
 
-function normalizeError(error) {
+function normalizeError(error     ) {
   if (error instanceof OpenClawAgentEmojiError) return error;
+  if (isAgentOwnershipRefusal(error)) {
+    return new OpenClawAgentEmojiError("host_migration_needed", AGENT_ROSTER_MIGRATION_MESSAGE);
+  }
   const message = cleanText(error?.message) || "OpenClaw rejected the emoji update";
   const lower = message.toLowerCase();
   if (lower.includes("base hash") || lower.includes("config changed")) {
@@ -41,7 +46,7 @@ function normalizeError(error) {
   return new OpenClawAgentEmojiError("emoji_update_failed", message, true);
 }
 
-function createOpenClawAgentEmojiUpdater(deps = {}) {
+function createOpenClawAgentEmojiUpdater(deps      = {}) {
   const gatewayBridge = deps.gatewayBridge;
   const refreshAgentsCatalog =
     typeof deps.refreshAgentsCatalog === "function" ? deps.refreshAgentsCatalog : null;
@@ -59,7 +64,7 @@ function createOpenClawAgentEmojiUpdater(deps = {}) {
     );
   }
 
-  async function perform(agentId, emoji) {
+  async function perform(agentId     , emoji     ) {
     if (!isAvailable()) {
       throw new OpenClawAgentEmojiError(
         "backend_unavailable",
@@ -77,15 +82,26 @@ function createOpenClawAgentEmojiUpdater(deps = {}) {
           true,
         );
       }
-      const patch = {
-        agents: {
-          list: [{ id: agentId, identity: { emoji } }],
-        },
-      };
-      const result = await gatewayBridge.request("config.patch", {
-        raw: JSON.stringify(patch),
+      const config = snapshot?.config;
+      const shape = agentRosterShape(config);
+      const key = cleanText(findConfiguredAgent(config, agentId)?.id) || agentId;
+      const write = (agents     ) => gatewayBridge.request("config.patch", {
+        raw: JSON.stringify({ agents }),
         baseHash,
       });
+      const entriesPatch = { entries: { [key]: { identity: { emoji } } } };
+      let result;
+      if (shape === "entries") {
+        result = await write(entriesPatch);
+      } else {
+        try {
+          result = await write({ list: [{ id: agentId, identity: { emoji } }] });
+        } catch (error) {
+
+          if (shape !== null || !isLegacyAgentListRefusal(error)) throw error;
+          result = await write(entriesPatch);
+        }
+      }
       if (!result || result.ok !== true) {
         throw new OpenClawAgentEmojiError(
           "emoji_update_indeterminate",
@@ -107,7 +123,7 @@ function createOpenClawAgentEmojiUpdater(deps = {}) {
     return { status: "updated", backend: "openclaw", agentId, emoji };
   }
 
-  function setEmoji(input = {}) {
+  function setEmoji(input      = {}) {
     const agentId = cleanText(input.agentId);
     if (!agentId) {
       return Promise.reject(

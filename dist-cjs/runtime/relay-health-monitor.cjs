@@ -24,7 +24,9 @@ function classifyFrameForRelayHealth(messageType) {
   }
   if (
     messageType === "ocuclaw.message.send.ack" ||
-    messageType === "ocuclaw.approval.resolve.ack"
+    messageType === "ocuclaw.approval.resolve.ack" ||
+    messageType === "ocuclaw.waiting.answer.result" ||
+    messageType === "ocuclaw.starmap.forgotten"
   ) {
     return "transactional";
   }
@@ -41,7 +43,8 @@ function classifyFrameForRelayHealth(messageType) {
     messageType === "ocuclaw.session.list.result" ||
     messageType === "ocuclaw.provider.usage.snapshot" ||
     messageType === "ocuclaw.model.catalog.snapshot" ||
-    messageType === "ocuclaw.skills.catalog.snapshot"
+    messageType === "ocuclaw.skills.catalog.snapshot" ||
+    messageType === "ocuclaw.starmap.snapshot"
   ) {
     return "coalescable-read";
   }
@@ -171,4 +174,4 @@ function createRelayHealthMonitor(options) {
   return { start, stop, observeSendBuffer, emitQueueDepth };
 }
 
-module.exports = { createRelayHealthMonitor, classifyFrameForRelayHealth };
+module.exports = { classifyFrameForRelayHealth, createRelayHealthMonitor };

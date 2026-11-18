@@ -1,16 +1,16 @@
 const FRAMES_KEY = Symbol.for("openclaw.pluginInstanceInvocation");
 const CACHE_STATE_KEY = Symbol.for("openclaw.pluginCache");
 const RETAINERS_KEY = Symbol.for("openclaw.pluginCacheRetainers");
-const host = globalThis;
+const host      = globalThis;
 
-function isRetired(cache) {
+function isRetired(cache     ) {
   if (!cache || typeof cache !== "object") return false;
   if (cache.retirement) return true;
   const retainers = host[RETAINERS_KEY];
   return !!(retainers && typeof retainers.get === "function" && retainers.get(cache)?.retirement);
 }
 
-function liveScope(scope) {
+function liveScope(scope     )      {
   const chain = [];
   for (let s = scope; s; s = s.parent) chain.push(s);
   let live;
@@ -21,7 +21,7 @@ function liveScope(scope) {
   return live;
 }
 
-function outsideRetiredScopeStore(run) {
+function outsideRetiredScopeStore(run     ) {
   const store = host[CACHE_STATE_KEY]?.scope;
   if (!store || typeof store.getStore !== "function" || typeof store.run !== "function") return run();
   const scope = store.getStore();
@@ -32,7 +32,7 @@ function outsideRetiredScopeStore(run) {
   return typeof store.exit === "function" ? store.exit(run) : store.run(undefined, run);
 }
 
-function outsideRetiredFrameScope(run) {
+function outsideRetiredFrameScope(run     ) {
   const frames = host[FRAMES_KEY];
   if (!frames || typeof frames.getFrame !== "function" || typeof frames.runFrame !== "function") return run();
   const frame = frames.getFrame();
@@ -42,7 +42,7 @@ function outsideRetiredFrameScope(run) {
   return frames.runFrame(frame.withScopes({ ...frame, cacheScope: scope }), run);
 }
 
-function runOutsideRetiredPluginCache(run) {
+function runOutsideRetiredPluginCache(run     ) {
   return outsideRetiredScopeStore(() => outsideRetiredFrameScope(run));
 }
 

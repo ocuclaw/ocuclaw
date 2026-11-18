@@ -20,15 +20,15 @@ All eight are built. Steps 1, 4 and 5 live here (#3101), step 2 lives in
 :mod:`cloudways_restart_step` (#3103), step 6 lives in
 :mod:`cloudways_serve_apply` (#3104) and steps 7 and 8 live in
 :mod:`cloudways_pair_steps` (#3105). Step 1 ends with the model sign-in check
-(#3482, :mod:`cloudways_signin`), and step 5 draws its approval link as a QR
-code when the terminal can show one whole (#3483, :mod:`cloudways_qr`).
+(#3482, :mod:`cloudways_signin`), and step 5 prints its approval link as text
+(#5485: no terminal draws a QR).
 """
 from __future__ import annotations
 
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclass_replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 from .terminal_output import styled
@@ -72,9 +72,9 @@ CONSENT_QUESTION = f"Type {CONSENT_ANSWER} to continue, anything else stops: "
 #: types the word.
 CONSENT_ANSWERS = frozenset({CONSENT_ANSWER})
 
-#: Step 2's answers. It changes two settings on the user's own host, the
-#: question asks for the long spelling, and people type the short one; both mean
-#: the same thing there, so both are taken. The default is still No.
+#: Step 2's answers. Its one question turns on one setting on the user's own
+#: host, people type the short spelling, and both mean the same thing there, so
+#: both are taken. The default is still No.
 SHORT_YES_CONSENT_ANSWERS = frozenset({CONSENT_ANSWER, "y"})
 
 #: Step 6's question. It publishes a route, ADR-0026 has the user type the whole
@@ -85,12 +85,22 @@ WHOLE_WORD_CONSENT_QUESTION = (
     f"Apply route? Type the full word {CONSENT_ANSWER}; anything else stops: "
 )
 
+#: Said when the answer to a consent is the setup command itself. A terminal
+#: that carries on setup by itself invites pasting the one-liner again, and
+#: that paste used to answer the question and decline it (2026-10-11,
+#: Cloudways, the restart question). The question is asked again instead.
+SETUP_COMMAND_PASTED_LINE = "  That's the setup command. Setup is already running here."
+#: How many pasted setup commands one question absorbs before the paste counts
+#: as the answer it always was: anything but the word stops.
+SETUP_COMMAND_REASKS = 2
+
 DEFAULT_ENROLL_WAIT_S = 600.0
 DEFAULT_FIRST_USE_WAIT_S = 600.0
 DEFAULT_POLL_S = 5.0
 DEFAULT_NOTICE_S = 30.0
-#: How long step 4 waits for the cron watchdog to bring the daemon up. The
-#: watchdog ticks every minute, so anything under that reports a false stall.
+#: How long step 4 waits for the daemon to settle. `install` starts it, and the
+#: OcuClaw runtime re-checks every minute, so anything under that reports a
+#: false stall.
 DEFAULT_DAEMON_WAIT_S = 90.0
 
 #: Test-lane marker, in the shape of the Hermes Reply Evidence Marker
@@ -109,6 +119,12 @@ ASSUME_CLOUDWAYS_ENV = "OCUCLAW_HERMES_ASSUME_CLOUDWAYS_HOST"
 JOURNAL_FILENAME = "ocuclaw.cloudways-setup.json"
 JOURNAL_SCHEMA_VERSION = 1
 JOURNAL_KIND = "cloudways-setup-journal"
+
+#: One run at a time per profile: a kernel lock beside the journal, taken once
+#: step 1 knows the host and held to the run's end. The kernel drops it when
+#: its holder exits, however it exits, so a closed tab never leaves it stuck.
+#: The holder writes its process id in it, for the run that finds it taken.
+LOCK_FILENAME = "ocuclaw.cloudways-setup.lock"
 
 
 # -- the refusals -------------------------------------------------------------
@@ -130,6 +146,14 @@ MANAGED_MESSAGE = (
     'This Hermes installation is managed by a package manager.\n'
     'Setup cannot change its settings here. Nothing changed.\n'
     'Ask the OcuClaw Setup Assistant for the manual steps.'
+)
+
+# #5209. Cloudways stays Tailscale-only: the container's userspace Tailscale
+# is its only way in, so a custom phone address cannot work here.
+PHONE_ADDRESS_MESSAGE = (
+    'This profile has a custom phone address set (platforms.ocuclaw.extra.phoneAddress).\n'
+    'Cloudways uses its own Tailscale route, so a custom address cannot work here. Nothing changed.\n'
+    "Clear it, then run setup again: hermes config set platforms.ocuclaw.extra.phoneAddress ''"
 )
 
 # The pairing ceremony's refusal, in its own words: a human answer needs a
@@ -156,6 +180,10 @@ RESUME_INVITATION = (
     "Run the same setup command to resume."
 )
 
+#: Said once before step 1, word for word on the OpenClaw lane
+#: (`DROPPED_TERMINAL_MESSAGE`). A rerun resumes at the first unfinished step.
+DROPPED_TERMINAL_MESSAGE = "If your terminal drops, run the same command again."
+
 RESUME_MESSAGE = (
     "Stopped. Nothing was changed by the step you declined. " + RESUME_INVITATION
 )
@@ -165,6 +193,21 @@ RESUME_MESSAGE = (
 #: ladder, not a crash: one plain line, exit 130, and no traceback (#3146).
 INTERRUPT_MESSAGE = "Stopped at your Ctrl-C. " + RESUME_INVITATION
 
+#: A second terminal, such as a new WebUI ``/terminal`` while the first still
+#: runs, says this at step 1 and waits there, changing nothing, until the
+#: first run lets the lock go. The WebUI ends a closed tab's terminal only
+#: after 15 minutes unwatched, so turning the new one away would strand the
+#: person; waiting lets it carry on the moment the old one ends.
+ALREADY_RUNNING_MESSAGE = "Setup is already running in another terminal."
+ALREADY_RUNNING_TEMPLATE = "Setup is already running in another terminal (process {pid})."
+WAITING_FOR_RUN_MESSAGE = "This one carries on if that one stops. Ctrl-C to leave it."
+#: Said once the wait ends. Every later step reads live state, as on a rerun,
+#: so what the other run finished is skipped, not done again.
+TAKING_OVER_MESSAGE = "That one stopped. This one carries on now."
+#: How often a waiting run tries the lock again. Short enough to feel at once,
+#: and each try is one non-blocking ``flock``.
+RUN_LOCK_POLL_S = 2.0
+
 #: #3808. Said the moment a step starts something slow, so a quiet terminal
 #: reads as work in progress and not a hang (a real box sat silent for about
 #: 20 seconds after step 1 and at step 5). Word for word the OpenClaw
@@ -173,6 +216,11 @@ PROGRESS_SIGN_IN_MESSAGE = "Checking the model sign-in..."
 PROGRESS_TAILSCALE_MESSAGE = "Checking Tailscale..."
 PROGRESS_TAILSCALE_INSTALL_MESSAGE = "Installing Tailscale..."
 PROGRESS_ENROLL_MESSAGE = "Getting the approval link from Tailscale..."
+#: An old-ladder box moving off the `~/bin` download (#6360). Word for word
+#: the OpenClaw ladder's `TAILSCALE_MOVE_MESSAGE`.
+TAILSCALE_MOVE_MESSAGE = (
+    "Switching to the Tailscale this server ships. Same node and sign-in, nothing to approve."
+)
 
 HANDOFF_MESSAGE = (
     "Some steps are not built yet; the lines above name the command that still "
@@ -223,6 +271,9 @@ class SetupOptions:
     #: a flag.
     hostname: Optional[str] = None
     json_output: bool = False
+    #: ``--look`` (:mod:`setup_look`). Decoration only: the same lines are
+    #: written and the same answers read whichever look draws them.
+    look: Optional[str] = None
 
     @classmethod
     def from_namespace(cls, args: Any) -> "SetupOptions":
@@ -240,6 +291,7 @@ class SetupOptions:
             details=bool(getattr(args, "details", False)),
             hostname=(str(getattr(args, "hostname", "") or "").strip() or None),
             json_output=bool(getattr(args, "json_output", False)),
+            look=(str(getattr(args, "look", "") or "").strip() or None),
         )
 
 
@@ -294,10 +346,9 @@ class StepContext:
       the reply confirmation and anything else the wearer alone owns go through
       it, so automation can never stand in for a person.
 
-    :attr:`runner` and :attr:`fetch` are the injected process runner and the
-    injected archive fetch. A step that has to spawn a subprocess uses
-    ``ctx.runner`` and never ``subprocess`` directly, or it stops being testable
-    without a real host.
+    :attr:`runner` is the injected process runner. A step that has to spawn a
+    subprocess uses ``ctx.runner`` and never ``subprocess`` directly, or it
+    stops being testable without a real host.
     """
 
     options: SetupOptions
@@ -316,7 +367,6 @@ class StepContext:
     sleep: Callable[[float], None]
     env: Mapping[str, str]
     runner: Optional[Callable[..., Any]]
-    fetch: Optional[Callable[[str, float], bytes]]
     detect_fn: Callable[[], Any]
     status_fn: Callable[..., Mapping[str, Any]]
     install_fn: Callable[[], Mapping[str, Any]]
@@ -351,21 +401,22 @@ class StepContext:
     #: "Is a model signed in and selected?" for this layout's home (#3482).
     #: ``None`` skips the check entirely.
     signin_check_fn: Optional[Callable[[], Any]] = None
-    #: Runs ``hermes <args>`` with the terminal handed straight over and
-    #: returns its exit code. Output is never captured.
-    run_interactive_fn: Optional[Callable[[Sequence[str]], Optional[int]]] = None
-    #: ``qr_fn(text, prefix_lines)``: a terminal QR for ``text``, or ``None``
-    #: when this terminal cannot show one whole (#3483). Since #3743 it may
-    #: also answer a :class:`cloudways_qr.PendingQr`: the code drawn, and
-    #: whether it fits now. One that does not was withheld for size only, and
-    #: step 5 redraws it once the window grows.
-    qr_fn: Optional[Callable[[str, Sequence[str]], Any]] = None
     #: The window width a printed command wraps to (#3808); ``0`` off a
     #: terminal or when unknown. ``None`` means never wrap.
     columns_fn: Optional[Callable[[], int]] = None
-    #: Prints a block to the terminal WITHOUT recording it in the result's
-    #: lines (a QR code has no place in `--json`). ``None`` falls back to say.
-    show: Optional[Callable[[str], None]] = None
+    #: "Is a phone on the tailnet?" for the line after step 5's approval:
+    #: True, False, or None when it cannot tell. ``None`` here reads
+    #: ``tailscale status`` through :attr:`runner`, as step 7's check does.
+    phone_present_fn: Optional[Callable[[], Optional[bool]]] = None
+    #: Step 1 calls this once it knows the host, before the sign-in check: it
+    #: takes this profile's setup lock, waiting while another run holds it,
+    #: and, in the WebUI, arms the carry-on line. ``None`` here takes no lock,
+    #: as for a step driven on its own.
+    claim_run_fn: Optional[Callable[[], None]] = None
+    #: The configured custom phone address (#5209), or ``None``. Cloudways
+    #: keeps its own userspace Tailscale, so step 1 refuses a set value.
+    #: ``None`` here skips the check, as for a step driven on its own.
+    phone_address_fn: Optional[Callable[[], Optional[str]]] = None
 
     def say_prompt(self, line: str) -> None:
         """Print ``line`` as an action prompt: the "prompt" role, yellow.
@@ -441,13 +492,24 @@ def step_1_host_check(ctx: StepContext) -> StepRecord:
         return StepRecord(
             "host-check", STATUS_REFUSED, "managed-install", exit_code=SETUP_EXIT_STOPPED
         )
+    if ctx.phone_address_fn is not None and ctx.phone_address_fn():
+        # #5209: the container has no inbound port and no root, so its own
+        # userspace Tailscale is the only way in. Refused before any write.
+        ctx.say(f"  {PHONE_ADDRESS_MESSAGE}")
+        return StepRecord(
+            "host-check", STATUS_REFUSED, "phone-address-set", exit_code=SETUP_EXIT_STOPPED
+        )
     if not ctx.options.assume_yes and not ctx.isatty():
         ctx.say(f"  {TTY_REQUIRED_MESSAGE}")
         return StepRecord(
             "host-check", STATUS_REFUSED, "no-terminal", exit_code=SETUP_EXIT_STOPPED
         )
     ctx.say(f"  {hostname} is a Cloudways Managed AI Agents container.")
-    # Only now may anything be written, the journal included.
+    # Only now may anything be written. The lock comes first: a run that finds
+    # another one going waits here and writes nothing, the journal included,
+    # until it holds the lock. Everything after this line reads live state.
+    if ctx.claim_run_fn is not None:
+        ctx.claim_run_fn()
     ctx.state["host_check_passed"] = True
     ctx.state["hostname"] = hostname
     stopped = _model_sign_in(ctx)
@@ -460,16 +522,37 @@ def _assume_cloudways(env: Mapping[str, str]) -> bool:
     return str(env.get(ASSUME_CLOUDWAYS_ENV, "")).strip() == "1"
 
 
+def configured_phone_address() -> Optional[str]:
+    """This profile's custom phone address (#5209), or ``None``. A READ only.
+
+    Fail-soft: an unreadable config is not a custom address, and the rest of
+    the ladder reads config through Hermes anyway.
+    """
+    try:
+        from . import custom_route
+        from .health import setup_raw_config
+
+        raw, _readable = setup_raw_config()
+        platforms = raw.get("platforms") if isinstance(raw, dict) else None
+        block = platforms.get("ocuclaw") if isinstance(platforms, dict) else None
+        extra = block.get("extra") if isinstance(block, dict) else None
+        return custom_route.configured_phone_address(extra)
+    except Exception:  # noqa: BLE001 - a read must not stop the ladder
+        return None
+
+
 # -- step 1, continued · model sign-in (#3482) ---------------------------------
 
 
 def _model_sign_in(ctx: StepContext) -> Optional[StepRecord]:
-    """Is a model signed in? If not, offer the sign-in right here.
+    """Is a model signed in? If not, say where to sign in, and stop.
 
     Part of step 1, not a numbered step: when a model is signed in it prints
-    nothing at all. The check and the chooser live in :mod:`cloudways_signin`.
-    Only three outcomes stop the ladder: the user chose to set it up
-    themselves, gave no answer, or a sign-in command did not finish.
+    nothing at all, and a check that cannot tell carries on too. The check
+    lives in :mod:`cloudways_signin`. #6361: setup never signs in itself. With
+    no model it names the Cloudways panel's OpenAI sign-in and stops, under
+    ``--yes`` too: that Connect restarts the container, so it has to come
+    before setup changes anything, and the same command run again carries on.
     """
     if ctx.signin_check_fn is None:
         return None
@@ -479,34 +562,14 @@ def _model_sign_in(ctx: StepContext) -> Optional[StepRecord]:
         state = ctx.signin_check_fn()
     except Exception:  # noqa: BLE001 - a check that throws is "could not tell"
         return None
-    verdict = getattr(state, "verdict", cloudways_signin.UNKNOWN)
-    if verdict in (cloudways_signin.SIGNED_IN, cloudways_signin.UNKNOWN):
-        return None
-    interactive = (
-        not ctx.options.assume_yes
-        and ctx.choose is not None
-        and ctx.run_interactive_fn is not None
-        and ctx.isatty()
-    )
-    run_command = ctx.run_interactive_fn or (lambda _args: None)
     outcome = cloudways_signin.run_sign_in(
-        state,
-        say=ctx.say,
-        choose=ctx.choose,
-        interactive=interactive,
-        run_command=run_command,
-        recheck=ctx.signin_check_fn,
+        state, say=ctx.say, rerun_command=cloudways_restart_step.RERUN_COMMAND
     )
     ctx.state["model_sign_in"] = outcome.outcome
     if not outcome.stop:
         return None
-    if outcome.failed:
-        return StepRecord(
-            "model-sign-in", STATUS_FAILED, outcome.outcome, exit_code=SETUP_EXIT_PROBLEM
-        )
-    # The manual lines already end "then run setup again".
     return StepRecord(
-        "model-sign-in", STATUS_DECLINED, outcome.outcome, exit_code=SETUP_EXIT_STOPPED
+        "model-sign-in", STATUS_REFUSED, outcome.outcome, exit_code=SETUP_EXIT_STOPPED
     )
 
 
@@ -514,8 +577,18 @@ def _model_sign_in(ctx: StepContext) -> Optional[StepRecord]:
 
 
 def step_2_settings(ctx: StepContext) -> StepRecord:
-    """One consent, sanctioned doors, every write read back (`cloudways_settings`)."""
-    return cloudways_settings.apply_settings(ctx)
+    """Settle agent mode and glasses settings before the gateway restart."""
+    from . import cloudways_agent_mode
+
+    failure = cloudways_agent_mode.configure(ctx)
+    if failure is not None:
+        return failure
+    agent_changed = bool(ctx.state.get("settings_changed"))
+    record = cloudways_settings.apply_settings(ctx)
+    ctx.state["settings_changed"] = agent_changed or bool(ctx.state.get("settings_changed"))
+    if agent_changed and record.status == STATUS_SKIPPED:
+        return StepRecord("settings", STATUS_DONE, cloudways_settings.DETAIL_WRITTEN)
+    return record
 
 
 # -- step 3 · is OcuClaw loaded, and the gateway restart ----------------------
@@ -535,43 +608,53 @@ def step_3_relay_credential(ctx: StepContext) -> StepRecord:
 # -- step 4 · Tailscale binaries and daemon -----------------------------------
 
 
-def step_4_tailscale(ctx: StepContext) -> StepRecord:
-    """Install the pinned binaries if needed, then gate on the OBSERVED daemon.
+def tailscale_fully_installed(report: Mapping[str, Any]) -> bool:
+    """Every piece of the plugin's Tailscale, from one ``cloudways.status`` report.
 
-    The cron watchdog is what starts ``tailscaled`` here, and its fire is not
-    proof: the ladder waits for the daemon to say what it is instead.
+    Not just the binaries: the runtime state is what keeps tailscaled alive
+    here, so a host that kept its binaries and receipt but lost the state, or
+    still has the old cron job, or is still on the `~/bin` download, runs the
+    install again. `install()` is idempotent. Shared with the chat step
+    machine's Tailscale start (#6377), so both flows migrate the same hosts.
+    """
+    binaries = report.get("binaries") if isinstance(report.get("binaries"), Mapping) else {}
+    supervisor = report.get("supervisor") if isinstance(report.get("supervisor"), Mapping) else {}
+    return (
+        bool(binaries.get("present"))
+        and report.get("receipt") is not None
+        and bool(supervisor.get("present"))
+        and report.get("job") is None
+        and not bool(binaries.get("movePending"))
+    )
+
+
+def step_4_tailscale(ctx: StepContext) -> StepRecord:
+    """Install the binaries if needed, then gate on the OBSERVED daemon.
+
+    `install` starts ``tailscaled`` once and the OcuClaw runtime keeps it alive
+    after that, but a start is not proof: the ladder waits for the daemon to say
+    what it is instead.
     """
     ctx.say_progress(PROGRESS_TAILSCALE_MESSAGE)
     report = ctx.status_fn(wait_s=0.0)
-    daemon = _daemon_of(report)
-    script = report.get("script") if isinstance(report.get("script"), Mapping) else {}
-    # ALL FOUR pieces, not just the binaries: the cron job is what starts
-    # tailscaled on this host, so a host that kept its binaries and receipt but
-    # lost the job or the script would skip the install and then wait forever
-    # for a daemon nothing is bringing up. `install()` is idempotent.
-    already_installed = (
-        report.get("receipt") is not None
-        and daemon.get("state") != cloudways.STATE_ABSENT
-        and report.get("job") is not None
-        and bool(script.get("present"))
-    )
+    binaries = report.get("binaries") if isinstance(report.get("binaries"), Mapping) else {}
+    move_pending = bool(binaries.get("movePending"))
+    already_installed = tailscale_fully_installed(report)
+    if move_pending:
+        ctx.say(f"  {TAILSCALE_MOVE_MESSAGE}")
     if already_installed:
         ctx.say("  Tailscale and its background checks are already installed.")
     else:
-        ctx.say_progress(PROGRESS_TAILSCALE_INSTALL_MESSAGE)
+        if not move_pending:
+            ctx.say_progress(PROGRESS_TAILSCALE_INSTALL_MESSAGE)
         install_report = ctx.install_fn()
         if not install_report.get("ok"):
             ctx.say(f"  {install_report.get('error') or 'The Tailscale install failed.'}")
             return StepRecord(
                 "tailscale", STATUS_FAILED, "install-failed", exit_code=SETUP_EXIT_PROBLEM
             )
-        ctx.say(f"  Tailscale {install_report.get('version') or cloudways.TAILSCALE_VERSION} installed.")
-        fired = install_report.get("fired") or {}
-        # Only a REPORTED failure is one. A background dispatch or a next-tick
-        # run reports no verdict, and the observed daemon state below is what
-        # decides either way, so an unreported run gets no scary line.
-        if str(fired.get("verdict") or "unreported") == "failed":
-            ctx.say("  The watchdog's first run failed. Waiting for its next tick to start the daemon.")
+        # The server's own binaries: nothing was installed, so no version.
+        ctx.say("  Tailscale is ready.")
 
     report = ctx.status_fn(wait_s=ctx.daemon_wait_s)
     daemon = _daemon_of(report)
@@ -590,8 +673,8 @@ def step_4_tailscale(ctx: StepContext) -> StepRecord:
         ctx.say("  Tailscale is running. Server approval is still needed.")
         return StepRecord("tailscale", status, state)
     ctx.say(
-        f"  The Tailscale daemon did not start (state {state}). The cron watchdog "
-        "starts it within a minute; run the same command again."
+        f"  The Tailscale daemon did not start (state {state}). OcuClaw tries "
+        "again within a minute; run the same command again."
     )
     return StepRecord("tailscale", STATUS_FAILED, str(state), exit_code=SETUP_EXIT_PROBLEM)
 
@@ -609,102 +692,89 @@ def _daemon_of(report: Mapping[str, Any]) -> Mapping[str, Any]:
 #: Shared with the OpenClaw ladder word for word (#3177); the honest clause on
 #: the second line says a phone is wanted here, never required.
 #:
-#: Since #3483 these are the PLAIN-LINK lines: what prints when the terminal
-#: cannot show the QR code whole. They stay word for word what the shared copy
-#: fixture pins.
+#: #5485: no terminal draws a QR, so the link is always printed as text. These
+#: stay word for word what the shared copy fixture pins.
 STEP_5_PHONE_SIGN_IN_LINES = (
     "On your phone, sign in to Tailscale. Open this link to approve this server:",
 )
 
-#: #3483. First in step 5 either way: the app has to be on the phone before
-#: the code or the link can do anything.
+#: #3483. First in step 5: the app has to be on the phone before the link can
+#: do anything.
 STEP_5_INSTALL_TAILSCALE_LINE = (
     "No Tailscale on your phone? Install it from the App Store or Google Play "
     "and sign in first."
 )
-#: #3483. Above the QR code, drawn with OcuClaw's own encoder (`cloudways_qr`).
-STEP_5_QR_LEAD_LINE = "Point your phone's camera at this code to approve this server:"
-#: #3483. Under the QR code, the same link as text.
-STEP_5_OR_OPEN_PREFIX = "Or open: "
-#: #3743. Above a code redrawn once the window grew, shared with the OpenClaw
-#: ladder word for word.
-STEP_5_REDRAW_LEAD_LINE = (
-    "The code fits now. Point your phone's camera at it to approve this server:"
+
+
+#: The WebUI terminal's step 5 (Matt, 2026-10-01). Its links open with a
+#: click, so the link is the whole step.
+#: Approving from the computer's browser does not put the phone on the same
+#: account the way scanning with the phone does (#3177), so the account is
+#: named.
+STEP_5_WEBUI_LINK_LINE = "Open this link and sign in to Tailscale to approve this server:"
+STEP_5_WEBUI_ACCOUNT_LINES = (
+    "Use the Tailscale account your phone uses.",
+    "No Tailscale on your phone? Install it from the App Store or Google Play.",
+)
+
+#: Said once the server is approved and no phone is on the tailnet yet. Step 7
+#: needs the phone there; asking now lets the person do it while step 6 waits
+#: for its certificate, instead of at step 7 with a pairing code running.
+STEP_5_PHONE_NEXT_LINES = (
+    "While setup finishes the next step, get your phone ready:",
+    "open Tailscale on your phone, sign in with the same account, and switch it on.",
 )
 
 
-def _show_approval_link(ctx: StepContext, auth_url: str, header: str) -> Any:
-    """The install line, then the link as a QR code, or as text when it won't fit.
+def tailnet_name_suffix(daemon: Any) -> Optional[str]:
+    """The ``-<n>`` Tailscale added to this node's name, or None.
 
-    Returns the code still waiting for a bigger window (#3743), else ``None``.
+    When old devices still hold the name this node asked for, Tailscale names
+    it ``<name>-<n>`` instead, and that ``-<n>`` shows up in the address the
+    person later sees. Asked for is ``Self.HostName`` (what ``tailscale up
+    --hostname`` set); given is the first label of ``Self.DNSName``, both from
+    the status poll that saw the approval. Only an exact ``<asked>-<digits>``
+    counts; anything else, or an unreadable status, says nothing. Same rule as
+    the OpenClaw ladder's ``tailnetNameSuffix``.
     """
-    ctx.say(f"  {STEP_5_INSTALL_TAILSCALE_LINE}")
-    lead = f"  {STEP_5_QR_LEAD_LINE}"
-    or_open = f"  {STEP_5_OR_OPEN_PREFIX}{auth_url}"
-    drawn: Any = None
-    if ctx.qr_fn is not None and ctx.isatty():
-        try:
-            # Every row the code shares the screen with, so it is drawn only
-            # when the header above it and the link below it still fit.
-            drawn = ctx.qr_fn(
-                auth_url,
-                (
-                    header,
-                    f"  {PROGRESS_ENROLL_MESSAGE}",
-                    f"  {STEP_5_INSTALL_TAILSCALE_LINE}",
-                    lead,
-                    or_open,
-                ),
-            )
-        except Exception:  # noqa: BLE001 - no code; the link still works
-            drawn = None
-    code = None
-    pending = None
-    if isinstance(drawn, str):
-        code = drawn or None
-    elif drawn is not None and getattr(drawn, "code", None):
-        # A drawn code that does not fit was withheld for size only (#3743).
-        if getattr(drawn, "fits", False):
-            code = drawn.code
-        else:
-            pending = drawn
-    if code:
-        ctx.say(lead)
-        (ctx.show or ctx.say)(code)
-        ctx.say(or_open)
+    if not isinstance(daemon, Mapping):
         return None
-    if pending is not None:
-        try:
-            hints = list(pending.hint_lines())
-        except Exception:  # noqa: BLE001 - no hint, no redraw; the link still works
-            hints, pending = [], None
-        for line in hints:
+    raw_asked = daemon.get("node_name", daemon.get("nodeName"))
+    raw_dns = daemon.get("dns_name", daemon.get("dnsName"))
+    asked = raw_asked.strip().lower() if isinstance(raw_asked, str) else ""
+    given = (raw_dns.strip().lower() if isinstance(raw_dns, str) else "").split(".")[0]
+    if not asked or not given.startswith(f"{asked}-"):
+        return None
+    suffix = given[len(asked):]
+    digits = suffix[1:]
+    return suffix if digits and all("0" <= ch <= "9" for ch in digits) else None
+
+
+def tailnet_suffix_line(suffix: str) -> str:
+    """Said right after "Server approved." Word for word the OpenClaw ladder."""
+    return (
+        f"  Tailscale added {suffix} because old devices with this name "
+        "are still in your tailnet."
+    )
+
+
+def _show_approval_link(ctx: StepContext, auth_url: str) -> None:
+    """The install line, then the link as text (#5485: no terminal draws a QR).
+
+    In the WebUI terminal, the link alone: it is clickable there.
+    """
+    from . import webui_terminal
+
+    if webui_terminal.active(ctx.env):
+        ctx.say(f"  {STEP_5_WEBUI_LINK_LINE}")
+        ctx.say(f"    {auth_url}")
+        for line in STEP_5_WEBUI_ACCOUNT_LINES:
             ctx.say(f"  {line}")
+        return
+    ctx.say(f"  {STEP_5_INSTALL_TAILSCALE_LINE}")
     for line in STEP_5_PHONE_SIGN_IN_LINES:
         ctx.say(f"  {line}")
     ctx.say(f"    {auth_url}")
-    return pending
-
-
-def _redraw_approval_code(ctx: StepContext, pending: Any) -> None:
-    """#3743. The lead line, then the code, once. The link is already above."""
-    ctx.say(f"  {STEP_5_REDRAW_LEAD_LINE}")
-    (ctx.show or ctx.say)(pending.code)
-
-
-def _sleep_watching_code(ctx: StepContext, seconds: float, pending: Any) -> Any:
-    """Sleep, redrawing a waiting code the first time the window can show it."""
-    if pending is None:
-        ctx.sleep(seconds)
-        return None
-    from . import cloudways_qr
-
-    return cloudways_qr.sleep_watching(
-        seconds,
-        pending,
-        sleep_fn=ctx.sleep,
-        draw_fn=lambda waiting: _redraw_approval_code(ctx, waiting),
-    )
 
 
 def step_5_enrollment(ctx: StepContext) -> StepRecord:
@@ -737,36 +807,59 @@ def step_5_enrollment(ctx: StepContext) -> StepRecord:
         return StepRecord(
             "enrollment", STATUS_FAILED, "no-authorization-link", exit_code=SETUP_EXIT_PROBLEM
         )
-    pending_code = _show_approval_link(
-        ctx, str(auth_url), f"[5/{SETUP_STEP_COUNT}] Connect to Tailscale"
-    )
+    _show_approval_link(ctx, str(auth_url))
     deadline =ctx.clock() + max(0.0, float(ctx.options.wait_s))
     last_notice = ctx.clock()
     approved = False
+    approved_daemon: Mapping[str, Any] = {}
     while True:
         polled = ctx.status_fn(wait_s=0.0)
         if _daemon_of(polled).get("state") == cloudways.STATE_RUNNING:
             approved = True
+            approved_daemon = _daemon_of(polled)
             break
         if ctx.clock() >= deadline:
             break
         if ctx.clock() - last_notice >= ctx.notice_s:
             last_notice = ctx.clock()
             ctx.say("  Waiting for server approval.")
-        # A code withheld for size is measured for every half second of this
-        # wait and drawn once it fits (#3743). Approval ends the wait as ever.
-        pending_code = _sleep_watching_code(
-            ctx, min(ctx.poll_s, max(0.0, deadline - ctx.clock())), pending_code
-        )
+        ctx.sleep(min(ctx.poll_s, max(0.0, deadline - ctx.clock())))
     if not approved:
         # A timeout costs the user nothing: the enrollment is still in flight
         # and the next run picks the same wait back up.
         ctx.say("  Server approval timed out. Run setup again to resume.")
         return StepRecord("enrollment", STATUS_FAILED, "timeout", exit_code=SETUP_EXIT_PROBLEM)
     ctx.say("  Server approved.")
+    suffix = tailnet_name_suffix(approved_daemon)
+    if suffix:
+        ctx.say(tailnet_suffix_line(suffix))
     ctx.state["daemon_state"] = cloudways.STATE_RUNNING
     ctx.state["stale_marker"] = False
+    _phone_next(ctx)
     return StepRecord("enrollment", STATUS_DONE, cloudways.STATE_RUNNING)
+
+
+def _phone_next(ctx: StepContext) -> None:
+    """No phone on the tailnet yet? Say what to do on it now. Never waits.
+
+    Only right after this run approved the server: a rerun that finds it
+    already approved goes on to step 7, which looks for the phone itself. An
+    unreadable answer says nothing, like step 7's check.
+    """
+    if ctx.options.no_pair:
+        return
+    try:
+        if ctx.phone_present_fn is not None:
+            present = ctx.phone_present_fn()
+        else:
+            from . import cloudways_phone_check
+
+            present = cloudways_phone_check.read_phone_presence(runner=ctx.runner)
+    except Exception:  # noqa: BLE001 - an advisory line is never a failure
+        return
+    if present is False:
+        for line in STEP_5_PHONE_NEXT_LINES:
+            ctx.say(f"  {line}")
 
 
 # -- step 6 · private route ---------------------------------------------------
@@ -833,7 +926,6 @@ def run_setup(
     *,
     layout: Optional[cloudways.Layout] = None,
     runner: Optional[Callable[..., Any]] = None,
-    fetch: Optional[Callable[[str, float], bytes]] = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     input_stream: Optional[Any] = None,
@@ -851,9 +943,9 @@ def run_setup(
     notice_s: float = DEFAULT_NOTICE_S,
     daemon_wait_s: float = DEFAULT_DAEMON_WAIT_S,
     signin_check_fn: Optional[Callable[[], Any]] = None,
-    interactive_runner: Optional[Callable[[Sequence[str]], Optional[int]]] = None,
-    qr_fn: Optional[Callable[[str, Sequence[str]], Any]] = None,
     columns_fn: Optional[Callable[[], int]] = None,
+    phone_present_fn: Optional[Callable[[], Optional[bool]]] = None,
+    phone_address_fn: Optional[Callable[[], Optional[str]]] = None,
 ) -> SetupResult:
     """Run the ladder. Returns the exit code, every line shown, and the records.
 
@@ -867,6 +959,24 @@ def run_setup(
     stream_in = sys.stdin if input_stream is None else input_stream
     stream_out = sys.stdout if output is None else output
 
+    # A look draws the run its own way (#look). It stands down by itself off a
+    # terminal and under --json, so only a person at a terminal ever sees one.
+    from . import setup_look
+
+    options = dataclass_replace(options, look=setup_look.resolve_look(options.look, env))
+    look_wanted = options.look != "plain" and not options.json_output
+    look = setup_look.open_look(
+        options.look,
+        stream_in,
+        stream_out,
+        env=env,
+        hermes_home=getattr(layout, "hermes_home", None),
+        json_output=options.json_output,
+        resumed=look_wanted and _restart_still_pending(layout),
+    )
+    if look is not None:
+        stream_in, stream_out = look.stdin, look.stdout
+
     lines: List[str] = []
     records: List[StepRecord] = []
 
@@ -874,14 +984,6 @@ def run_setup(
         lines.append(line)
         try:
             stream_out.write(styled(line, stream_out, env, role=role) + "\n")
-        except Exception:  # noqa: BLE001 - a closed stream never fails the ladder
-            pass
-
-    def show(block: str) -> None:
-        """To the terminal only: never in `lines`, so never in `--json`."""
-        try:
-            stream_out.write(block + "\n")
-            stream_out.flush()
         except Exception:  # noqa: BLE001 - a closed stream never fails the ladder
             pass
 
@@ -897,9 +999,12 @@ def run_setup(
                 return 0
         except Exception:  # noqa: BLE001 - a stream with no isatty is no terminal
             return 0
-        from . import cloudways_qr
+        import shutil
 
-        return cloudways_qr.terminal_size()[0]
+        try:
+            return max(0, int(shutil.get_terminal_size(fallback=(0, 0)).columns))
+        except Exception:  # noqa: BLE001 - unmeasurable is unknown
+            return 0
 
     def choose(
         question_lines: Sequence[str], *, question: str, choices: Iterable[str]
@@ -914,33 +1019,9 @@ def run_setup(
             lines.append(line)
         return read_choice(question_lines, question=question)
 
-    def run_hermes_interactive(args: Sequence[str]) -> Optional[int]:
-        child_env = dict(env)
-        # The profile the ladder is setting up, as `cloudways_settings._hermes`
-        # pins it, never whatever the ambient environment points at.
-        child_env["HERMES_HOME"] = str(layout.hermes_home)
-        return cloudways_signin.run_interactive(
-            [cloudways.hermes_bin(), *args],
-            env=child_env,
-            stream_in=stream_in,
-            stream_out=stream_out,
-        )
-
     def check_signin() -> Any:
         return cloudways_signin.check_signed_in(
             layout.hermes_home, env=env, hermes_bin=cloudways.hermes_bin(), runner=runner
-        )
-
-    def draw_qr(text: str, prefix_lines: Sequence[str]) -> Any:
-        from . import cloudways_qr
-
-        return cloudways_qr.prepare_terminal_qr(
-            text,
-            stream_out=stream_out,
-            stream_in=stream_in,
-            env=env,
-            light_terminal=options.light_terminal,
-            prefix_lines=prefix_lines,
         )
 
     def ask(consent_lines: Sequence[str], **wording: Any) -> bool:
@@ -964,6 +1045,47 @@ def run_setup(
             lines.append(line)
         return confirm(consent_lines, **wording) is True
 
+    held: List[int] = []
+
+    def claim_run() -> None:
+        """Step 1's claim: one run per profile, and in the WebUI this run's way back.
+
+        A run that finds another one going waits for it, trying the lock again
+        every :data:`RUN_LOCK_POLL_S` through the run's own ``sleep``, so a
+        Ctrl-C lands in the ladder's handler like any other wait's. Until the
+        lock is this run's, the ~/.bashrc line and the journal are the other
+        run's: a run that leaves while it waits touches neither.
+        """
+        try:
+            fd = take_run_lock(layout)
+        except SetupAlreadyRunning as busy:
+            ctx.state["another_run"] = True
+            say(
+                "  "
+                + (
+                    ALREADY_RUNNING_TEMPLATE.format(pid=busy.pid)
+                    if busy.pid
+                    else ALREADY_RUNNING_MESSAGE
+                )
+            )
+            say(f"  {WAITING_FOR_RUN_MESSAGE}")
+            fd = _wait_for_run_lock(layout, ctx.sleep)
+            ctx.state.pop("another_run", None)
+            say(f"  {TAKING_OVER_MESSAGE}")
+        if fd is not None:
+            held.append(fd)
+        from . import webui_terminal
+
+        if webui_terminal.active(env):
+            # Armed for the whole run, not only for step 3's restart: a run
+            # the WebUI cuts off (it ends a terminal with SIGHUP) leaves the
+            # line, so the next /terminal carries on. A run that ends where
+            # the person sees it takes the line out again (below).
+            try:
+                webui_terminal.add_carry_on(setup_look.rerun_command(options.look, env), env)
+            except Exception:  # noqa: BLE001 - step 3 still sets up its own way back
+                pass
+
     ctx = StepContext(
         options=options,
         layout=layout,
@@ -975,7 +1097,6 @@ def run_setup(
         sleep=sleep,
         env=env,
         runner=runner,
-        fetch=fetch,
         detect_fn=detect_fn or (lambda: cloudways.detect()),
         status_fn=status_fn
         or (
@@ -983,7 +1104,7 @@ def run_setup(
                 layout, runner=runner, wait_s=wait_s, clock=clock, sleep=sleep
             )
         ),
-        install_fn=install_fn or (lambda: cloudways.install(layout, fetch=fetch, runner=runner)),
+        install_fn=install_fn or (lambda: cloudways.install(layout, runner=runner)),
         enroll_fn=enroll_fn
         or (
             lambda: cloudways.enroll(
@@ -998,68 +1119,96 @@ def run_setup(
         stream_out=stream_out,
         choose=choose,
         signin_check_fn=signin_check_fn or check_signin,
-        run_interactive_fn=interactive_runner or run_hermes_interactive,
-        qr_fn=qr_fn or draw_qr,
         columns_fn=columns_fn or window_columns,
-        show=show,
+        phone_present_fn=phone_present_fn,
+        claim_run_fn=claim_run,
+        phone_address_fn=phone_address_fn or configured_phone_address,
     )
 
     exit_code = SETUP_EXIT_OK
-    for index, header, step in (SETUP_STEPS if steps is None else steps):
-        if records:
-            say("")
-        say(f"[{index}/{SETUP_STEP_COUNT}] {header}")
-        try:
-            record = step(ctx)
-        except KeyboardInterrupt:
-            # Caught HERE rather than at the CLI, so the interrupt is a step
-            # record like any other stop: the journal says which step the user
-            # left, and `--json` still ends with one summary document instead
-            # of a traceback (#3146).
-            #
-            # What this reaches: steps 1 to 6, and every bounded wait in the
-            # ladder — they all poll through `ctx.sleep`, so a Ctrl-C there
-            # arrives here. Step 7's wait for a phone to appear on the tailnet
-            # (#3178) sleeps the same way and lands here too. What it does NOT
-            # reach: the prompts in steps 7 and 8. Both ceremonies read their
-            # own answer and catch Ctrl-C at the `readline` themselves, where
-            # it counts as "no" — step 7 then POSTS a `deny` to the host,
-            # deliberately, so an abandoned approval cannot linger, and step 8
-            # ends as its own problem. That is their behaviour, not this
-            # handler's, and it is left alone.
-            say(f"  {INTERRUPT_MESSAGE}")
-            record = StepRecord(
-                _step_id(index, step),
-                STATUS_INTERRUPTED,
-                STATUS_INTERRUPTED,
-                exit_code=SETUP_EXIT_INTERRUPTED,
-            )
-        records.append(record)
-        if record.exit_code is not None:
-            exit_code = record.exit_code
-            break
-    if exit_code == SETUP_EXIT_OK and any(r.status == STATUS_NOT_BUILT for r in records):
-        say(HANDOFF_MESSAGE)
-    if exit_code == SETUP_EXIT_OK and _restart_still_pending(layout):
-        # Read from the marker on disk, not from this run's state: an earlier
-        # run may have written the settings and left before any gateway
-        # restarted, and that user is owed the same line.
-        say(CONTINUE_HERE_PENDING_MESSAGE)
-    if _asks_for_help(exit_code, records):
-        say(f"  {STUCK_HELP_MESSAGE}")
+    # The lock step 1 takes is held to the very end, the ~/.bashrc line and the
+    # journal included, so a run that starts as this one ends never has either
+    # undone under it. A run that is killed (the WebUI ends a terminal with
+    # SIGHUP) runs none of this: the kernel lets the lock go, and the line
+    # stays for the next /terminal.
+    say(DROPPED_TERMINAL_MESSAGE, role="detail")
+    say("")
+    try:
+        for index, header, step in (SETUP_STEPS if steps is None else steps):
+            if records:
+                say("")
+            say(f"[{index}/{SETUP_STEP_COUNT}] {header}")
+            try:
+                record = step(ctx)
+            except KeyboardInterrupt:
+                # Caught HERE rather than at the CLI, so the interrupt is a step
+                # record like any other stop: the journal says which step the user
+                # left, and `--json` still ends with one summary document instead
+                # of a traceback (#3146).
+                #
+                # What this reaches: steps 1 to 6, and every bounded wait in the
+                # ladder — they all poll through `ctx.sleep`, so a Ctrl-C there
+                # arrives here. Step 7's wait for a phone to appear on the tailnet
+                # (#3178) sleeps the same way and lands here too. What it does NOT
+                # reach: the prompts in steps 7 and 8. Both ceremonies read their
+                # own answer and catch Ctrl-C at the `readline` themselves, where
+                # it counts as "no" — step 7 then POSTS a `deny` to the host,
+                # deliberately, so an abandoned approval cannot linger, and step 8
+                # ends as its own problem. That is their behaviour, not this
+                # handler's, and it is left alone.
+                say(f"  {INTERRUPT_MESSAGE}")
+                record = StepRecord(
+                    _step_id(index, step),
+                    STATUS_INTERRUPTED,
+                    STATUS_INTERRUPTED,
+                    exit_code=SETUP_EXIT_INTERRUPTED,
+                )
+            records.append(record)
+            if record.exit_code is not None:
+                exit_code = record.exit_code
+                break
+        from . import webui_terminal
 
-    result = SetupResult(exit_code=exit_code, lines=lines, steps=records)
-    # Nothing is written on a refusal, the journal included.
-    if ctx.state.get("host_check_passed"):
-        try:
-            write_journal(layout, result, writer=journal_writer)
-        except KeyboardInterrupt:
-            # A second Ctrl-C, landing in the diagnostic write. The run's
-            # answer is already decided and the caller still has to print it,
-            # so this costs the journal entry and nothing else. Only
-            # KeyboardInterrupt is swallowed here; `write_journal` files its
-            # own write failures and never raises them.
-            pass
+        if webui_terminal.active(ctx.env) and not ctx.state.get("another_run"):
+            # This run ended where the person can see it (a finish, a no, a
+            # failure, Ctrl-C): the ~/.bashrc line that would carry it on has
+            # done its job. A run that left while it waited for another one
+            # leaves that run's line alone.
+            cloudways_restart_step.forget_way_back(ctx.env)
+        if exit_code == SETUP_EXIT_OK and any(r.status == STATUS_NOT_BUILT for r in records):
+            say(HANDOFF_MESSAGE)
+        if (
+            exit_code == SETUP_EXIT_OK
+            and _restart_still_pending(layout)
+            and not ctx.state.get("continue_here_declined")
+        ):
+            # Read from the marker on disk, not from this run's state: an earlier
+            # run may have written the settings and left before any gateway
+            # restarted, and that user is owed the same line. Unless this run's
+            # step 2 asked about Continue here and heard no: then Continue here is
+            # off, and a marker standing for the other two settings is no promise
+            # that it will switch on.
+            say(CONTINUE_HERE_PENDING_MESSAGE)
+        if _asks_for_help(exit_code, records):
+            say(f"  {STUCK_HELP_MESSAGE}")
+        if look is not None:
+            look.close(exit_code)
+
+        result = SetupResult(exit_code=exit_code, lines=lines, steps=records)
+        # Nothing is written on a refusal, the journal included.
+        if ctx.state.get("host_check_passed"):
+            try:
+                write_journal(layout, result, writer=journal_writer)
+            except KeyboardInterrupt:
+                # A second Ctrl-C, landing in the diagnostic write. The run's
+                # answer is already decided and the caller still has to print it,
+                # so this costs the journal entry and nothing else. Only
+                # KeyboardInterrupt is swallowed here; `write_journal` files its
+                # own write failures and never raises them.
+                pass
+    finally:
+        for fd in held:
+            release_run_lock(fd)
     return result
 
 
@@ -1129,15 +1278,25 @@ def _default_confirm(stream_in: Any, stream_out: Any, *, env=None) -> Callable[.
         try:
             for line in consent_lines:
                 stream_out.write(styled(line, stream_out, env) + "\n")
-            stream_out.write(styled(question, stream_out, env, role="prompt"))
-            stream_out.flush()
-            answer = stream_in.readline()
-            stream_out.write("\n")
+            for reask in range(SETUP_COMMAND_REASKS + 1):
+                stream_out.write(styled(question, stream_out, env, role="prompt"))
+                stream_out.flush()
+                answer = stream_in.readline()
+                stream_out.write("\n")
+                if reask == SETUP_COMMAND_REASKS or not _is_setup_command(answer):
+                    break
+                stream_out.write(styled(SETUP_COMMAND_PASTED_LINE, stream_out, env) + "\n")
         except Exception:  # noqa: BLE001 - an unanswerable prompt is a No
             return False
         return str(answer or "").strip().lower() in frozenset(answers)
 
     return confirm
+
+
+def _is_setup_command(answer: Any) -> bool:
+    """The one-liner from ocuclaw.com, or this very command, typed as an answer."""
+    text = " ".join(str(answer or "").lower().split())
+    return "ocuclaw.com/" in text or "| bash" in text or text.startswith("hermes ocuclaw")
 
 
 def _default_choose(stream_in: Any, stream_out: Any, *, env=None) -> Callable[..., Optional[str]]:
@@ -1162,6 +1321,51 @@ def _default_choose(stream_in: Any, stream_out: Any, *, env=None) -> Callable[..
         return str(answer).strip()
 
     return choose
+
+
+# -- one run at a time --------------------------------------------------------
+
+
+#: Another run holds this profile's setup lock; ``.pid`` is its process, when known.
+SetupAlreadyRunning = receipts.StateLockHeld
+
+
+def lock_path(layout: cloudways.Layout) -> Optional[Path]:
+    directory = receipts.state_dir(layout.hermes_home)
+    return None if directory is None else directory / LOCK_FILENAME
+
+
+def take_run_lock(layout: cloudways.Layout) -> Optional[int]:
+    """Take this profile's setup lock without waiting. Its descriptor, or ``None``.
+
+    ``None`` when no lock can be taken here at all: the run then goes on
+    unlocked, as every run did before the lock. Raises
+    :class:`SetupAlreadyRunning` when another run holds it, so a second
+    terminal is told at once. The file work lives in ``receipts``: this module
+    writes no file itself (``test_cloudways_settings`` holds it to that).
+    """
+    return receipts.try_state_lock(receipts.state_dir(layout.hermes_home), LOCK_FILENAME)
+
+
+def _wait_for_run_lock(
+    layout: cloudways.Layout, sleep: Callable[[float], None]
+) -> Optional[int]:
+    """Try the lock every :data:`RUN_LOCK_POLL_S` until it is free: its descriptor, or ``None``.
+
+    No deadline: the other run ends, or is ended, and the kernel lets its lock
+    go either way. The person leaves with Ctrl-C, which ``sleep`` raises.
+    """
+    while True:
+        sleep(RUN_LOCK_POLL_S)
+        try:
+            return take_run_lock(layout)
+        except SetupAlreadyRunning:
+            continue
+
+
+def release_run_lock(fd: int) -> None:
+    """Let the lock go, its process id first, so the file never names a run that ended."""
+    receipts.release_state_lock(fd)
 
 
 # -- the journal --------------------------------------------------------------

@@ -76,11 +76,11 @@ def _parse(payload) -> tuple:
     if not isinstance(payload, dict) or set(payload) != {"slug", "anchor", "id", "attachment"}:
         raise bm.BoardReadError("invalid_request")
     slug, anchor, card_id, attachment = payload["slug"], payload["anchor"], payload["id"], payload["attachment"]
-    if not isinstance(slug, str) or not bm._SLUG.match(slug):
+    if not isinstance(slug, str) or not bm._SLUG.fullmatch(slug):
         raise bm.BoardReadError("invalid_request")
-    if not isinstance(anchor, str) or not bm._ANCHOR.match(anchor):
+    if not isinstance(anchor, str) or not bm._ANCHOR.fullmatch(anchor):
         raise bm.BoardReadError("invalid_request")
-    if not isinstance(card_id, str) or not bm._CARD_ID.match(card_id):
+    if not isinstance(card_id, str) or not bm._CARD_ID.fullmatch(card_id):
         raise bm.BoardReadError("invalid_request")
     if isinstance(attachment, bool) or not isinstance(attachment, int) or not 0 <= attachment <= _ATTACHMENT_MAX:
         raise bm.BoardReadError("invalid_request")
@@ -201,7 +201,7 @@ def part(payload, profile: str, capabilities: list) -> dict:
     if not isinstance(payload, dict) or set(payload) != {"token", "part"}:
         raise bm.BoardReadError("invalid_request")
     token, index = payload["token"], payload["part"]
-    if not isinstance(token, str) or not _TOKEN.match(token):
+    if not isinstance(token, str) or not _TOKEN.fullmatch(token):
         raise bm.BoardReadError("invalid_request")
     if isinstance(index, bool) or not isinstance(index, int) or index < 0:
         raise bm.BoardReadError("invalid_request")

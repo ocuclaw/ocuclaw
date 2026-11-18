@@ -2,6 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { randomUUID } = require("node:crypto");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
+const { quarantineStateFile, versionQuarantineSuffix } = require("./state-file-quarantine.cjs");
 
 const STORE_VERSION = 1;
 const STORE_FILENAME = "ocuclaw-saved-prompts.json";
@@ -25,6 +26,7 @@ const SAVED_PROMPT_THINKING_LEVELS = Object.freeze([
   "medium",
   "high",
   "xhigh",
+  "adaptive",
   "max",
   "ultra",
 ]);
@@ -37,19 +39,19 @@ const SAVED_PROMPTS_REJECT_REASONS = Object.freeze([
   "unknown_op",
 ]);
 
-function trimmedString(value) {
+function trimmedString(value     ) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function finiteInt(value, fallback) {
+function finiteInt(value     , fallback     ) {
   const parsed = typeof value === "number" ? value : Number(value);
   return Number.isFinite(parsed) ? Math.trunc(parsed) : fallback;
 }
 
-function normalizeSavedPromptRouting(value) {
+function normalizeSavedPromptRouting(value     ) {
   const source = value && typeof value === "object" ? value : {};
   const target = trimmedString(source.target).toLowerCase();
-  const routing = {
+  const routing      = {
     target: SAVED_PROMPT_TARGETS.indexOf(target) === -1 ? "current" : target,
   };
   const agentId = trimmedString(source.agentId);
@@ -63,11 +65,11 @@ function normalizeSavedPromptRouting(value) {
   return routing;
 }
 
-function isValidSavedPromptId(value) {
+function isValidSavedPromptId(value     ) {
   return typeof value === "string" && SAVED_PROMPT_ID_RE.test(value);
 }
 
-function normalizeSavedPromptRecord(value, nowMs) {
+function normalizeSavedPromptRecord(value     , nowMs     ) {
   const source = value && typeof value === "object" ? value : {};
   const id = trimmedString(source.id);
   if (!isValidSavedPromptId(id)) return null;
@@ -83,10 +85,10 @@ function normalizeSavedPromptRecord(value, nowMs) {
   };
 }
 
-function sortPrompts(prompts) {
+function sortPrompts(prompts     ) {
   return prompts
     .slice()
-    .sort((left, right) =>
+    .sort((left     , right     ) =>
       left.order === right.order
         ? left.id < right.id
           ? -1
@@ -97,18 +99,18 @@ function sortPrompts(prompts) {
     );
 }
 
-function renumber(prompts) {
-  return sortPrompts(prompts).map((prompt, index) => ({
+function renumber(prompts     ) {
+  return sortPrompts(prompts).map((prompt     , index     ) => ({
     ...prompt,
     order: index,
   }));
 }
 
-function clonePrompt(prompt) {
+function clonePrompt(prompt     ) {
   return { ...prompt, routing: { ...prompt.routing } };
 }
 
-function normalizeSavedPromptTombstones(value) {
+function normalizeSavedPromptTombstones(value     ) {
   const source = value && typeof value === "object" ? value : {};
   const entries = [];
   for (const key of Object.keys(source)) {
@@ -118,15 +120,15 @@ function normalizeSavedPromptTombstones(value) {
     if (deletedAtMs <= 0) continue;
     entries.push([id, deletedAtMs]);
   }
-  entries.sort((left, right) => right[1] - left[1]);
-  const out = {};
+  entries.sort((left     , right     ) => right[1] - left[1]);
+  const out      = {};
   for (const entry of entries.slice(0, SAVED_PROMPT_TOMBSTONE_LIMIT)) {
     out[entry[0]] = entry[1];
   }
   return out;
 }
 
-function normalizeSavedPromptsDocument(value, nowMs) {
+function normalizeSavedPromptsDocument(value     , nowMs     ) {
   const source = value && typeof value === "object" ? value : {};
   const rawPrompts = Array.isArray(source.prompts) ? source.prompts : [];
   const seen = new Set();
@@ -146,7 +148,7 @@ function normalizeSavedPromptsDocument(value, nowMs) {
   };
 }
 
-function createSavedPromptsStore(opts = {}) {
+function createSavedPromptsStore(opts      = {}) {
   const logger = normalizeLogger(opts.logger);
   const emitDebug = typeof opts.emitDebug === "function" ? opts.emitDebug : () => {};
   const now = typeof opts.now === "function" ? opts.now : () => Date.now();
@@ -159,12 +161,12 @@ function createSavedPromptsStore(opts = {}) {
         ? path.join(opts.stateDir.trim(), STORE_FILENAME)
         : null;
 
-  let pendingWrite = null;
-  let pendingWriteTimer = null;
+  let pendingWrite      = null;
+  let pendingWriteTimer      = null;
   let writeInFlight = false;
-  let inFlightWrite = null;
+  let inFlightWrite      = null;
 
-  async function writeDocumentToDisk(document, reason) {
+  async function writeDocumentToDisk(document     , reason     ) {
     const payload =
       JSON.stringify(
         {
@@ -193,7 +195,7 @@ function createSavedPromptsStore(opts = {}) {
         statePath,
         count: document.prompts.length,
       }));
-    } catch (err) {
+    } catch (err     ) {
       logger.error(
         `[ocuclaw] failed to persist saved prompts: ${err && err.message ? err.message : err}`,
       );
@@ -229,7 +231,7 @@ function createSavedPromptsStore(opts = {}) {
     }
   }
 
-  function persist(document, reason) {
+  function persist(document     , reason     ) {
     if (!statePath) {
       emitDebug("settings.loadsave", "saved_prompts_persist_skipped", "debug", null, () => ({
         reason,
@@ -245,13 +247,22 @@ function createSavedPromptsStore(opts = {}) {
     }, PERSIST_DEBOUNCE_MS);
   }
 
-  function preserveUnusableFile(suffix) {
-    if (!statePath) return;
-    try {
-      fs.renameSync(statePath, `${statePath}.${suffix}-${Date.now()}`);
-    } catch {
-
+  function setAsideUnusableFile(suffix     , reason     , seeded     ) {
+    if (!statePath) return seeded;
+    const result = quarantineStateFile(statePath, suffix);
+    if (result.originalGone) {
+      persist(seeded, reason);
+    } else {
+      logger.error(
+        `[ocuclaw] could not move the unusable saved prompts file aside (${result.errorCode}); starting empty without overwriting it`,
+      );
+      emitDebug("settings.loadsave", "saved_prompts_quarantine_failed", "warn", null, () => ({
+        statePath,
+        reason,
+        errorCode: result.errorCode,
+      }));
     }
+    return seeded;
   }
 
   function loadInitialDocument() {
@@ -272,9 +283,11 @@ function createSavedPromptsStore(opts = {}) {
           found: parsed && parsed.version,
           expected: STORE_VERSION,
         }));
-        preserveUnusableFile("v" + (parsed && parsed.version));
-        persist(seeded, "rewrite_after_version_mismatch");
-        return seeded;
+        return setAsideUnusableFile(
+          versionQuarantineSuffix(parsed && parsed.version),
+          "rewrite_after_version_mismatch",
+          seeded,
+        );
       }
       const loaded = normalizeSavedPromptsDocument(parsed, now());
       if (!loaded.hostId) {
@@ -286,7 +299,7 @@ function createSavedPromptsStore(opts = {}) {
         count: loaded.prompts.length,
       }));
       return loaded;
-    } catch (err) {
+    } catch (err     ) {
       logger.warn(
         `[ocuclaw] failed to load saved prompts, starting empty: ${err && err.message ? err.message : err}`,
       );
@@ -294,9 +307,7 @@ function createSavedPromptsStore(opts = {}) {
         statePath,
         message: err && err.message ? err.message : String(err),
       }));
-      preserveUnusableFile("corrupt");
-      persist(seeded, "rewrite_after_load_failure");
-      return seeded;
+      return setAsideUnusableFile("corrupt", "rewrite_after_load_failure", seeded);
     }
   }
 
@@ -317,11 +328,11 @@ function createSavedPromptsStore(opts = {}) {
     return { status: "accepted", ...snapshot() };
   }
 
-  function rejected(reason) {
+  function rejected(reason     ) {
     return { status: "rejected", reason, ...snapshot() };
   }
 
-  function commit(prompts, orderUpdatedAtMs, reason, deleted) {
+  function commit(prompts     , orderUpdatedAtMs     , reason     , deleted     ) {
     document = {
       hostId: document.hostId,
       orderUpdatedAtMs,
@@ -332,10 +343,10 @@ function createSavedPromptsStore(opts = {}) {
     return accepted();
   }
 
-  function upsert(input) {
+  function upsert(input     ) {
     const record = normalizeSavedPromptRecord(input, now());
     if (!record) return rejected("invalid_prompt");
-    const existing = document.prompts.find((prompt) => prompt.id === record.id);
+    const existing = document.prompts.find((prompt     ) => prompt.id === record.id);
     if (!existing && document.prompts.length >= SAVED_PROMPTS_CAP) {
       return rejected("cap_reached");
     }
@@ -350,7 +361,7 @@ function createSavedPromptsStore(opts = {}) {
     }
 
     const order = existing ? existing.order : document.prompts.length;
-    const next = document.prompts.filter((prompt) => prompt.id !== record.id);
+    const next = document.prompts.filter((prompt     ) => prompt.id !== record.id);
     next.push({ ...record, order });
 
     const deleted = { ...document.deleted };
@@ -358,26 +369,26 @@ function createSavedPromptsStore(opts = {}) {
     return commit(next, document.orderUpdatedAtMs, "upsert", deleted);
   }
 
-  function remove(input) {
+  function remove(input     ) {
     const id = trimmedString(input && input.id);
-    const existing = document.prompts.find((prompt) => prompt.id === id);
+    const existing = document.prompts.find((prompt     ) => prompt.id === id);
     if (!existing) return rejected("not_found");
     const updatedAtMs = Math.max(0, finiteInt(input && input.updatedAtMs, now()));
     if (updatedAtMs < existing.updatedAtMs) return rejected("stale_write");
     return commit(
-      document.prompts.filter((prompt) => prompt.id !== id),
+      document.prompts.filter((prompt     ) => prompt.id !== id),
       document.orderUpdatedAtMs,
       "delete",
       { ...document.deleted, [id]: updatedAtMs },
     );
   }
 
-  function reorder(input) {
+  function reorder(input     ) {
     const ids = Array.isArray(input && input.ids) ? input.ids : null;
     if (!ids) return rejected("invalid_prompt");
     const updatedAtMs = Math.max(0, finiteInt(input && input.updatedAtMs, now()));
     if (updatedAtMs < document.orderUpdatedAtMs) return rejected("stale_write");
-    const byId = new Map(document.prompts.map((prompt) => [prompt.id, prompt]));
+    const byId = new Map(document.prompts.map((prompt     ) => [prompt.id, prompt]));
     const ordered = [];
     for (const rawId of ids) {
       const id = trimmedString(rawId);
@@ -409,7 +420,7 @@ function createSavedPromptsStore(opts = {}) {
       return snapshot();
     },
 
-    write(request) {
+    write(request     ) {
       const op = trimmedString(request && request.op).toLowerCase();
       if (op === "upsert") {
 

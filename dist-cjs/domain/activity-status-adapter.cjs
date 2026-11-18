@@ -1,7 +1,18 @@
 const { classifyRank } = require("./activity-status-arbiter.cjs");
 const { DEFAULT_MAX_LABEL_CHARS, SHORT_LABEL_MAX_CHARS, isObject, asString, normalizeLowerToken, pickString, pickStringEntry, collapseWhitespace, sanitizeText, intentFromToolName, mapToolLabel } = require("./activity-status-labels.cjs");
+const { shortenActivityProse, shortenBatchProse, shortenToolPurpose, splitBoldHeading } = require("./activity-prose.cjs");
 
 const GLOBAL_RUN_KEY = "__global__";
+
+const PENDING_PROSE_MAX_AGE_MS = 30000;
+
+const INTERNAL_HINT_KEYS = ["purpose", "thinkingProse", "thinkingSummaryLong", "thinkingLive"];
+
+const SHORT_FIT_MAX_CHARS = 40;
+
+const HEADLINE_NOTE_MAX_CHARS = 160;
+
+const HEADLINE_PHRASE_MAX_CHARS = 2000;
 const THINKING_SUMMARY_KEYS = ["summary", "thinkingSummary", "reasoningSummary", "intentLabel"];
 const THINKING_DETAIL_KEYS = ["thinking", "reasoning", "thinkingText", "analysis"];
 const GENERIC_THINKING_LABEL = "Thinking...";
@@ -73,6 +84,10 @@ function normalizeToolPhase(value) {
   return normalized === "start" || normalized === "end" ? normalized : null;
 }
 
+function normalizeModelCallSeq(value         )                {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null;
+}
+
 function isNarrationActivity(activity) {
   return (
     normalizeLowerToken(activity && activity.origin) === "narration" ||
@@ -105,6 +120,11 @@ function normalizeArgs(activity) {
   return null;
 }
 
+function claudeCodeShellPurpose(activity     , args     )                {
+  if (!activity || activity.tool !== "Bash" || !args) return null;
+  return asString(args.description) || null;
+}
+
 function pickThinkingSummary(activity) {
   return normalizeThinkingText(pickString(activity, THINKING_SUMMARY_KEYS));
 }
@@ -132,7 +152,13 @@ function resolveThinkingContent(activity, existingLabel, existingDetail, include
   ];
 
   let selected = null;
-  if (explicitSource && explicitSource !== "generic") {
+  if (explicitSource === "generic") {
+
+    selected = {
+      source: "generic",
+      label: summaryText || existingLabelText || GENERIC_THINKING_LABEL,
+    };
+  } else if (explicitSource) {
     const explicitLabel = (
       candidates.find((candidate) => (
         candidate.source === explicitSource &&
@@ -257,6 +283,12 @@ function createActivityStatusAdapter(opts) {
   const now =
     typeof options.now === "function" ? options.now : () => Date.now();
 
+  const labOn = (token        , frame      ) => {
+    if (typeof options.labs !== "function") return false;
+    const labs = options.labs(frame);
+    return Array.isArray(labs) && labs.includes(token);
+  };
+
   const runStates = new Map();
 
   function getRunState(runKey) {
@@ -267,6 +299,9 @@ function createActivityStatusAdapter(opts) {
         toolStartCount: 0,
         currentActivityId: null,
         toolContextByActivityId: new Map(),
+        pendingProse: null,
+
+        chapter: null,
         capabilities: {
           sawSummary: false,
           sawToolCall: false,
@@ -283,6 +318,95 @@ function createActivityStatusAdapter(opts) {
 
   function reset() {
     runStates.clear();
+  }
+
+  function noteProse(rawActivity     ) {
+    if (!isObject(rawActivity)) return null;
+
+    const { heading, text } = splitBoldHeading(pickString(rawActivity, THINKING_SUMMARY_KEYS));
+    if (labOn("chapters") && heading) getRunState(normalizeRunKey(rawActivity.runId)).chapter = heading;
+    if (!labOn("prose")) return null;
+
+    const prose = (rawActivity.prosePick === "last" ? null : shortenBatchProse(text)) ||
+      shortenActivityProse(text, {
+        pick: rawActivity.prosePick === "last" ? "last" : "first",
+        oneStep: true,
+      });
+    if (!prose) return null;
+    const runState = getRunState(normalizeRunKey(rawActivity.runId));
+    const previous = runState.pendingProse;
+
+    if (previous && previous.sentence === prose.sentence) return previous;
+    runState.pendingProse = {
+      label: prose.label,
+      fits: prose.fits,
+      sentence: prose.sentence,
+      modelCallSeq: normalizeModelCallSeq(rawActivity.modelCallSeq),
+      atMs: now(),
+      claimedBy: null,
+    };
+    return runState.pendingProse;
+  }
+
+  function pickShortFit(label     , fits     ) {
+    if (!label || label.length <= SHORT_FIT_MAX_CHARS || !Array.isArray(fits)) return null;
+    return fits.find((fit        ) => fit.length <= SHORT_FIT_MAX_CHARS) || fits[fits.length - 1] || null;
+  }
+
+  function proseHeadline(activity     , detailText     , maxChars         ) {
+    const longSummary = asString(activity.thinkingSummaryLong);
+    if (longSummary) {
+      const fromSummary =
+        shortenActivityProse(longSummary, { pick: "first", maxChars }) ||
+        shortenToolPurpose(longSummary, { maxChars });
+      if (fromSummary) return fromSummary;
+    }
+    const latest = shortenActivityProse(asString(activity.thinkingProse) || detailText, { pick: "last", maxChars });
+
+    if (!latest || !batchSaysMore(latest.sentence)) return latest;
+    return shortenBatchProse(latest.sentence, { maxChars }) || latest;
+  }
+
+  function batchSaysMore(sentence        ) {
+    const batch = shortenBatchProse(sentence);
+    if (!batch) return false;
+    const oneStep = shortenActivityProse(sentence, { pick: "last" });
+    const bare = (label        ) => label.replace(/\.{3}$|…$/, "").trim().length;
+    return !oneStep || bare(batch.label) > bare(oneStep.label);
+  }
+
+  const headlineNotes = new WeakMap                ();
+
+  function headlineNote(augmented     )                {
+    return isObject(augmented) ? headlineNotes.get(augmented) ?? null : null;
+  }
+
+  function liveProseHeadlines(rawActivity     ) {
+    if (!isObject(rawActivity) || !labOn("headline", rawActivity)) return false;
+    return proseHeadline(rawActivity, null) !== null;
+  }
+
+  function authoredToolLabel(activity     , runState     , activityId     , args     ) {
+    const pending = runState.pendingProse;
+    if (pending && labOn("prose") && !pending.claimedBy && now() - pending.atMs <= PENDING_PROSE_MAX_AGE_MS) {
+      const modelCallSeq = normalizeModelCallSeq(activity.modelCallSeq);
+      const otherCall =
+        pending.modelCallSeq !== null &&
+        modelCallSeq !== null &&
+        pending.modelCallSeq !== modelCallSeq;
+      if (!otherCall) {
+        pending.claimedBy = activityId || "tool";
+        return { label: pending.label, fits: pending.fits, source: "prose" };
+      }
+    }
+    if (labOn("purpose")) {
+
+      const purpose = shortenToolPurpose(
+        asString(activity.purpose) || asString(args && args.title) || claudeCodeShellPurpose(activity, args),
+      );
+      if (purpose) return { label: purpose.label, fits: purpose.fits, source: "purpose" };
+    }
+    return null;
   }
 
   function augmentActivity(rawActivity) {
@@ -335,6 +459,12 @@ function createActivityStatusAdapter(opts) {
     let category = asString(activity.category);
     let thinkingSummarySource = null;
     let suppressThinkingContent = false;
+
+    let labelSource = null;
+    let labelFits = null;
+    let toolLabel = null;
+
+    let relayHeadlineNote                = null;
     const args = normalizeArgs(activity) || {};
     const previousToolContext = activity.tool && activityId
       ? runState.toolContextByActivityId.get(activityId)
@@ -369,6 +499,10 @@ function createActivityStatusAdapter(opts) {
       ? mapToolLabel(activity.tool, activity.path, args, {
         maxLabelChars,
         stabilityKey: activityId,
+
+        meta: asString(activity.meta),
+
+        delegation: activity.delegation,
       })
       : null;
     const isNarration = isNarrationActivity(activity);
@@ -397,6 +531,27 @@ function createActivityStatusAdapter(opts) {
         detail = resolvedThinking.detail;
       }
 
+      if (
+        includeThinking &&
+        labOn("headline", activity) &&
+        (thinkingSummarySource === "detail" || thinkingSummarySource === "generic")
+      ) {
+        const headline = proseHeadline(activity, resolvedThinking.detail);
+        if (headline) {
+          label = headline.label;
+          thinkingSummarySource = "summary";
+          labelSource = "prose";
+          labelFits = headline.fits.length > 0 ? headline.fits : null;
+          shortLabel = pickShortFit(headline.label, headline.fits);
+          const whole = proseHeadline(activity, resolvedThinking.detail, HEADLINE_NOTE_MAX_CHARS);
+          const phrase = (whole || headline).label.replace(/\.{3}$|…$/, "").trim();
+
+          const uncut = whole ? proseHeadline(activity, resolvedThinking.detail, HEADLINE_PHRASE_MAX_CHARS) : null;
+          const wasCut = !whole || (!!uncut && uncut.label !== whole.label);
+          relayHeadlineNote = phrase ? (wasCut ? `${phrase}…` : phrase) : null;
+        }
+      }
+
       if (label && isExplanatoryThinkingLabel(label) && label.length > SHORT_LABEL_MAX_CHARS) {
         shortLabel = label;
       }
@@ -409,17 +564,36 @@ function createActivityStatusAdapter(opts) {
         thinkingSummarySource = null;
       }
     } else if (!label && activity.tool) {
-      if (previousToolContext && !hasCurrentToolContext) {
+
+      const authoredContext =
+        previousToolContext && previousToolContext.labelSource ? previousToolContext : null;
+      if (previousToolContext && (authoredContext || !hasCurrentToolContext)) {
         label = previousToolContext.label;
         shortLabel = previousToolContext.shortLabel || null;
         if (!detail) detail = previousToolContext.detail;
         if (!category) category = previousToolContext.category;
+        labelSource = previousToolContext.labelSource || null;
+        labelFits = previousToolContext.labelFits || null;
+        toolLabel = previousToolContext.toolLabel || null;
       }
       if (!label) {
-        const mapped = mappedTool;
-        label = mapped.label;
-        shortLabel = mapped.shortLabel || null;
-        if (!detail) detail = mapped.detail;
+        const mapped      = mappedTool;
+        const authored = !previousToolContext && toolPhase !== "end"
+          ? authoredToolLabel(activity, runState, activityId, args)
+          : null;
+        if (authored) {
+          label = authored.label;
+          labelSource = authored.source;
+          labelFits = authored.fits.length > 0 ? authored.fits : null;
+          shortLabel = pickShortFit(authored.label, authored.fits);
+
+          toolLabel = mapped.label || null;
+          if (!detail) detail = mapped.detail || mapped.label;
+        } else {
+          label = mapped.label;
+          shortLabel = mapped.shortLabel || null;
+          if (!detail) detail = mapped.detail;
+        }
         if (!category) category = mapped.category;
       }
     }
@@ -434,7 +608,9 @@ function createActivityStatusAdapter(opts) {
         intentFromToolName(normalizeLowerToken(activity.tool), args)
       );
     } else if (isThinking) {
-      intent = isExplanatoryThinkingLabel(label) ? "thinking_summary" : "thinking";
+      intent = thinkingSummarySource !== "generic" && isExplanatoryThinkingLabel(label)
+        ? "thinking_summary"
+        : "thinking";
     }
 
     if (activity.tool && activityId && label) {
@@ -444,8 +620,15 @@ function createActivityStatusAdapter(opts) {
         detail: detail || null,
         category: category || null,
         intent: intent || null,
+        labelSource,
+        labelFits,
+        toolLabel,
+        chapter: previousToolContext ? previousToolContext.chapter || null : runState.chapter,
       });
     }
+    const chapter = activity.tool && activityId && labOn("chapters")
+      ? (runState.toolContextByActivityId.get(activityId) || {}).chapter || null
+      : null;
 
     const result = {
       ...activity,
@@ -453,6 +636,11 @@ function createActivityStatusAdapter(opts) {
       seq,
       phase: preserveErrorPhase ? "error" : phase,
     };
+    for (const key of INTERNAL_HINT_KEYS) delete result[key];
+    delete result.labelSource;
+    delete result.labelFits;
+    delete result.toolLabel;
+    delete result.chapter;
 
     delete result.buildKind;
     const buildKind = intent === "interface.build"
@@ -552,6 +740,13 @@ function createActivityStatusAdapter(opts) {
       delete result.toolPhase;
     }
 
+    const modelCallSeq = normalizeModelCallSeq(activity.modelCallSeq);
+    if (modelCallSeq !== null) {
+      result.modelCallSeq = modelCallSeq;
+    } else {
+      delete result.modelCallSeq;
+    }
+
     delete result.shortLabel;
     if (enabled) {
       if (label) {
@@ -576,6 +771,21 @@ function createActivityStatusAdapter(opts) {
       if (detail) result.detail = sanitizeText(detail, Math.max(maxLabelChars, 200));
       if (category) result.category = sanitizeIdPart(category.toLowerCase()) || "generic";
       if (thinkingSummarySource) result.thinkingSummarySource = thinkingSummarySource;
+      if (label && labelSource) {
+        result.labelSource = labelSource;
+        if (labelFits) {
+          result.labelFits = labelFits.map((fit        ) =>
+            sanitizeText(lowercaseLeadingWord(fit), maxLabelChars));
+        }
+        if (toolLabel) {
+          result.toolLabel = sanitizeText(lowercaseLeadingWord(toolLabel), maxLabelChars);
+        }
+      }
+
+      if (chapter) {
+        result.chapter = sanitizeText(chapter, maxLabelChars);
+        result.toolLabel = sanitizeText(lowercaseLeadingWord(toolLabel || label), maxLabelChars);
+      }
       const resultSummary = asString(activity.resultSummary);
       if (resultSummary) {
         result.resultSummary = sanitizeText(resultSummary, Math.max(maxLabelChars, 200));
@@ -587,11 +797,18 @@ function createActivityStatusAdapter(opts) {
       delete result.intent;
     }
 
+    if (relayHeadlineNote && result.labelSource === "prose" && result.label) {
+      headlineNotes.set(result, sanitizeText(relayHeadlineNote, HEADLINE_NOTE_MAX_CHARS));
+    }
+
     return result;
   }
 
   return {
     augmentActivity,
+    headlineNote,
+    liveProseHeadlines,
+    noteProse,
     reset,
   };
 }

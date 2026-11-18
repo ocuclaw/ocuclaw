@@ -66,12 +66,13 @@ WELCOME_HANDOFF_MESSAGE = (
     "Double-tap the welcome on your glasses to finish."
 )
 
-#: Said once setup is complete. Three lines, one sentence each, so none wraps
+#: Said once setup is complete. Four lines, one sentence each, so none wraps
 #: mid-word in a 100-column terminal. Byte for byte the OpenClaw first-use
 #: verb's OPTIONAL_SETUP_HANDOFF_LINES.
 OPTIONAL_SETUP_HANDOFF_LINES = (
     "Optional: on your phone, the Optional setup card on Home offers voice and Even AI.",
-    "You can also reach them later under Settings > Voice and Settings > Defaults > Even AI.",
+    "It shows after the glasses basics and things to try.",
+    "You can also reach them later under Settings > Voice and Settings > Even AI.",
     "Choose what you want, or leave it for later.",
 )
 
@@ -193,8 +194,7 @@ BLOCKING_ATTEMPT_STATES = frozenset(
 #: wearer is never asked a question without being told why it is being asked.
 REPLY_DELIVERY_REASON_LINES: Dict[str, str] = {
     "simulator_lane_not_eligible": (
-        "That reply was accepted on the simulator lane, which never evidences "
-        "a real installation."
+        "This was the simulator, so setup can't check the glasses itself."
     ),
     # #3242: same rule — name the phone, not the credential behind it.
     "binding_changed": (
@@ -228,6 +228,9 @@ ERRORED_RUN_VERDICT = (
 ERRORED_RUN_RETRY_COMMAND = "hermes ocuclaw first-use"
 MODEL_LOGIN_COMMAND = "hermes model"
 MODEL_CHECK_COMMAND = "hermes -z hello"
+#: A Claude plan (the DirectSDK plugin) signs in through Claude Code itself;
+#: Hermes never holds that login, so `hermes model` cannot renew it.
+CLAUDE_LOGIN_COMMAND = "claude auth login"
 
 #: A closed vocabulary, shared with the OpenClaw lane and the phone's labels.
 PROVIDER_ERROR_CLASSES = ("auth", "quota", "rate_limit", "overloaded", "model_error")
@@ -258,7 +261,8 @@ def provider_error_class_line(error_class: str) -> str:
     if error_class == "auth":
         return (
             "The model provider rejected the sign-in. Sign in to the model "
-            f"again (`{MODEL_LOGIN_COMMAND}`), then run {retry} and send a "
+            f"again (`{MODEL_LOGIN_COMMAND}`; on a Claude plan, "
+            f"`{CLAUDE_LOGIN_COMMAND}`), then run {retry} and send a "
             "fresh message."
         )
     if error_class == "quota":

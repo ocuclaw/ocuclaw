@@ -8,6 +8,7 @@ Four profile-scoped records (#1273 §8 / #1268 / #1321), plus one host-scoped:
     <HERMES_HOME>/state/ocuclaw.relay-credential.json  durable discriminator
     ~/.evenclaw/state/ocuclaw.managed-serve-route.json  host-wide, durable
     <HERMES_HOME>/state/ocuclaw.cloudways-restart-pending.json  ladder marker
+    <HERMES_HOME>/state/ocuclaw.gateway-sender-gate.json  live-writer only
 
 Scope follows what each record describes. The first four describe one profile's
 state and are exact-profile. The last is the Cloudways ladder's own note that
@@ -69,15 +70,17 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 APP_PRESENCE_FILENAME = "ocuclaw.app-presence.json"
 FIRST_RUN_PROOF_FILENAME = "ocuclaw.first-run-proof.json"
 GATEWAY_STATE_FILENAME = "gateway_state.json"
+SERVING_FILENAME = "ocuclaw.serving.json"
 STATE_DIRNAME = "state"
 
 APP_PRESENCE_SCHEMA_VERSION = 2
 FIRST_RUN_PROOF_SCHEMA_VERSION = 1
+SERVING_SCHEMA_VERSION = 1
 
 RECEIPT_FILE_MODE = 0o600
 RECEIPT_DIR_MODE = 0o700
@@ -182,6 +185,11 @@ def app_presence_path(home: Optional[Path] = None) -> Optional[Path]:
 def first_run_proof_path(home: Optional[Path] = None) -> Optional[Path]:
     directory = state_dir(home)
     return None if directory is None else directory / FIRST_RUN_PROOF_FILENAME
+
+
+def serving_path(home: Optional[Path] = None) -> Optional[Path]:
+    directory = state_dir(home)
+    return None if directory is None else directory / SERVING_FILENAME
 
 
 def gateway_state_path(home: Optional[Path] = None) -> Optional[Path]:
@@ -415,6 +423,75 @@ def receipt_state_lock(directory: Optional[Path], filename: str) -> Iterator[boo
             os.close(fd)
         except OSError:
             pass
+
+
+class StateLockHeld(Exception):
+    """Another process holds a :func:`try_state_lock` lock. ``pid`` is that process, when known."""
+
+    def __init__(self, pid: Optional[int]) -> None:
+        super().__init__(pid)
+        self.pid = pid
+
+
+def try_state_lock(directory: Optional[Path], filename: str) -> Optional[int]:
+    """Take a sidecar lock without waiting, and write this process id in it.
+
+    Its descriptor, or ``None`` when no lock can be taken here at all (no
+    directory, a file that will not open, no ``flock``): the caller then goes
+    on unlocked. Raises :class:`StateLockHeld` when another process holds it.
+    :func:`receipt_state_lock` waits, and reads a taken lock and a broken one
+    alike; this tells a second caller at once, and only when the lock is
+    really taken. The kernel drops it when the holder exits, however it exits.
+    Let it go with :func:`release_state_lock`.
+    """
+    if directory is None or not filename:
+        return None
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - POSIX only
+        return None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        _harden_receipt_path(directory, is_dir=True)
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(directory / filename, flags, RECEIPT_FILE_MODE)
+    except (OSError, ReceiptUnavailableError):
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        holder = _state_lock_holder(fd)
+        os.close(fd)
+        raise StateLockHeld(holder) from None
+    except OSError:
+        os.close(fd)
+        return None
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+    except OSError:
+        pass  # Held all the same; a second caller just cannot name it.
+    return fd
+
+
+def _state_lock_holder(fd: int) -> Optional[int]:
+    try:
+        text = os.pread(fd, 32, 0).decode("ascii", "replace").strip()
+    except OSError:
+        return None
+    return int(text) if text.isdigit() and int(text) > 0 else None
+
+
+def release_state_lock(fd: int) -> None:
+    """Let a :func:`try_state_lock` lock go, its process id first, so the file never names a process that let go."""
+    try:
+        os.ftruncate(fd, 0)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
 
 
 @contextlib.contextmanager
@@ -834,6 +911,53 @@ def read_app_presence(
     return record, status, (writer_is_live(record) if record is not None else None)
 
 
+# -- serving receipt ----------------------------------------------------------
+#
+# The OcuClaw version the gateway process serves. A Hermes plugin update
+# replaces plugin.yaml and reloads the modules in place, but the adapter and
+# Node child built before it keep serving the old code until a gateway
+# restart (Hermes 0.22.3+ Desktop "Update"). Only the gateway knows which
+# code it runs, so it publishes that here for the Desktop backend.
+
+
+def build_serving_body(
+    *,
+    profile_fingerprint: Optional[str],
+    version: Optional[str],
+    pid: Optional[int] = None,
+    start_time: Optional[int] = None,
+    updated_at: Optional[str] = None,
+    setup_configuration_fingerprint: Optional[str] = None,
+) -> Dict[str, Any]:
+    resolved_pid = os.getpid() if pid is None else int(pid)
+    return {
+        "schemaVersion": SERVING_SCHEMA_VERSION,
+        "profileFingerprint": profile_fingerprint,
+        "pid": resolved_pid,
+        "start_time": (
+            process_start_time(resolved_pid) if start_time is None else start_time
+        ),
+        "version": version,
+        "updated_at": updated_at or now_iso(),
+        **({"setupConfigurationFingerprint": setup_configuration_fingerprint}
+           if setup_configuration_fingerprint is not None else {}),
+    }
+
+
+def write_serving(body: Mapping[str, Any], *, home: Optional[Path] = None) -> Path:
+    path = serving_path(home)
+    if path is None:
+        raise ReceiptUnavailableError("no profile-scoped Hermes home resolved")
+    return write_json_receipt(path, body)
+
+
+def read_serving(
+    expected_fingerprint: Optional[str], *, home: Optional[Path] = None
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    record, status = _read_json(serving_path(home))
+    return _qualify(record, status, expected_fingerprint, SERVING_SCHEMA_VERSION)
+
+
 # -- first-run proof receipt --------------------------------------------------
 
 
@@ -1146,10 +1270,19 @@ TAILSCALE_CLI_SCHEMA_VERSION = 1
 _LOOPBACK_PROXY_HOSTS = ("127.0.0.1", "::1", "localhost")
 
 
+#: The one dial mode a receipt may name besides SOCKS5 (#6482). A daemon we
+#: adopted may have no SOCKS listener of its own, and we never restart it to
+#: add one, so probes reach the tailnet through `tailscale nc` on its socket.
+DIAL_TAILSCALE_NC = "tailscale-nc"
+
+
 class TailscaleCli(NamedTuple):
     argv: Tuple[str, ...]
     socks5: Optional[Tuple[str, int]]
     provisioner: str
+    # Defaulted so the receipts written before #6482, and every constructor
+    # that predates it, still mean "SOCKS5 or direct dial".
+    dial: Optional[str] = None
 
 
 def tailscale_cli_path(state_dir: Optional[Path] = None) -> Optional[Path]:
@@ -1179,21 +1312,37 @@ def parse_socks5(value: Any) -> Optional[Tuple[str, int]]:
 
 
 def build_tailscale_cli_body(
-    *, argv: Sequence[str], socks5: Optional[str], provisioner: str
+    *,
+    argv: Sequence[str],
+    socks5: Optional[str],
+    provisioner: str,
+    dial: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Validate and shape the receipt. Raises ``ValueError`` on a bad argv."""
+    """Validate and shape the receipt. Raises ``ValueError`` on a bad argv.
+
+    ``dial`` is omitted from the body when None, so a receipt without it is
+    byte-for-byte what readers before #6482 expect.
+    """
     cleaned = [str(part) for part in argv if isinstance(part, str) and part.strip()]
     if not cleaned or not os.path.isabs(cleaned[0]):
         raise ValueError("tailscale CLI argv must start with an absolute binary path")
     if socks5 is not None and parse_socks5(socks5) is None:
         raise ValueError("socks5 must be a loopback host:port")
-    return {
+    if dial is not None and dial != DIAL_TAILSCALE_NC:
+        raise ValueError(f"dial must be {DIAL_TAILSCALE_NC!r} or None")
+    if dial is not None and socks5 is not None:
+        # One way to reach the tailnet per receipt; a reader must never guess.
+        raise ValueError("a receipt names either a SOCKS5 proxy or a dial mode, not both")
+    body: Dict[str, Any] = {
         "schemaVersion": TAILSCALE_CLI_SCHEMA_VERSION,
         "argv": cleaned,
         "socks5": socks5,
         "provisioner": str(provisioner or "unknown"),
         "writtenAt": now_iso(),
     }
+    if dial is not None:
+        body["dial"] = dial
+    return body
 
 
 def write_tailscale_cli(body: Mapping[str, Any], *, state_dir: Optional[Path] = None) -> Path:
@@ -1234,10 +1383,15 @@ def read_tailscale_cli(*, state_dir: Optional[Path] = None) -> Optional[Tailscal
     if len(parts) != len(argv) or not os.path.isabs(parts[0]):
         return None
     provisioner = record.get("provisioner")
+    socks5 = parse_socks5(record.get("socks5"))
+    # An unknown dial value reads as no dial mode: the reader falls back to
+    # SOCKS5 or a direct dial rather than running something it does not know.
+    dial = DIAL_TAILSCALE_NC if record.get("dial") == DIAL_TAILSCALE_NC and socks5 is None else None
     return TailscaleCli(
         argv=parts,
-        socks5=parse_socks5(record.get("socks5")),
+        socks5=socks5,
         provisioner=provisioner if isinstance(provisioner, str) else "unknown",
+        dial=dial,
     )
 
 
@@ -1311,7 +1465,83 @@ def remove_restart_pending(*, home: Optional[Path] = None) -> bool:
     return True
 
 
+# -- the gateway's sender gate ------------------------------------------------
+
+GATEWAY_SENDER_GATE_FILENAME = "ocuclaw.gateway-sender-gate.json"
+GATEWAY_SENDER_GATE_SCHEMA_VERSION = 1
+
+
+def gateway_sender_gate_path(home: Optional[Path] = None) -> Optional[Path]:
+    """Where the gateway records the sender allowlists its own process reads.
+
+    Doctor is a separate process and cannot see the gateway's environment, so
+    an allowlist exported where the gateway starts is invisible to it. The
+    adapter runs inside the gateway and writes what it sees here; doctor reads
+    it only while the writer is still the live process.
+    """
+    directory = state_dir(home)
+    return None if directory is None else directory / GATEWAY_SENDER_GATE_FILENAME
+
+
+def build_gateway_sender_gate_body(
+    *,
+    profile_fingerprint: Optional[str],
+    multiplexed: Optional[bool],
+    sender_allowlists: Optional[Mapping[str, Sequence[str]]],
+    pid: Optional[int] = None,
+    start_time: Optional[int] = None,
+    updated_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    """The v1 body. Lists are carried only for a gateway that is not
+    multiplexed: a multiplexer ignores its process environment for these
+    gates, so its lists would be noise. Sender ids are not secrets."""
+    resolved_pid = os.getpid() if pid is None else int(pid)
+    lists: Optional[Dict[str, List[str]]] = None
+    if multiplexed is False and isinstance(sender_allowlists, Mapping):
+        lists = {
+            str(name): [str(item) for item in ids]
+            for name, ids in sender_allowlists.items()
+            if isinstance(ids, (list, tuple))
+        }
+    return {
+        "schemaVersion": GATEWAY_SENDER_GATE_SCHEMA_VERSION,
+        "profileFingerprint": profile_fingerprint,
+        "pid": resolved_pid,
+        "start_time": (
+            process_start_time(resolved_pid) if start_time is None else start_time
+        ),
+        "updated_at": updated_at or now_iso(),
+        "multiplexed": multiplexed if isinstance(multiplexed, bool) else None,
+        "senderAllowlists": lists,
+    }
+
+
+def write_gateway_sender_gate(
+    body: Mapping[str, Any], *, home: Optional[Path] = None
+) -> Path:
+    path = gateway_sender_gate_path(home)
+    if path is None:
+        raise ReceiptUnavailableError("no profile-scoped Hermes home resolved")
+    return write_json_receipt(path, body)
+
+
+def read_gateway_sender_gate(
+    expected_fingerprint: Optional[str], *, home: Optional[Path] = None
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Read + qualify the sender-gate receipt. Writer liveness is the caller's."""
+    record, status = _read_json(gateway_sender_gate_path(home))
+    return _qualify(
+        record, status, expected_fingerprint, GATEWAY_SENDER_GATE_SCHEMA_VERSION
+    )
+
+
 __all__ = [
+    "GATEWAY_SENDER_GATE_FILENAME",
+    "GATEWAY_SENDER_GATE_SCHEMA_VERSION",
+    "build_gateway_sender_gate_body",
+    "gateway_sender_gate_path",
+    "read_gateway_sender_gate",
+    "write_gateway_sender_gate",
     "RESTART_PENDING_FILENAME",
     "RESTART_PENDING_KIND",
     "RESTART_PENDING_SCHEMA_VERSION",
@@ -1321,6 +1551,7 @@ __all__ = [
     "write_restart_pending",
     "TAILSCALE_CLI_FILENAME",
     "TAILSCALE_CLI_SCHEMA_VERSION",
+    "DIAL_TAILSCALE_NC",
     "TailscaleCli",
     "build_tailscale_cli_body",
     "parse_socks5",

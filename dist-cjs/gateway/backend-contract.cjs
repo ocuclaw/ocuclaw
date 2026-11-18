@@ -21,6 +21,8 @@ const BRIDGE_REQUEST_METHODS = Object.freeze([
   "agents.files.get",
   "agents.files.set",
   "agents.list",
+
+  "agents.route",
   "chat.history",
   "chat.send",
   "commands.list",
@@ -57,6 +59,9 @@ const BRIDGE_REQUEST_METHODS = Object.freeze([
   "sessions.resolve",
   "sessions.steer",
   "skills.status",
+
+  "starmap.forget",
+  "starmap.graph",
   "status",
   "usage.status",
 ]);
@@ -73,6 +78,7 @@ const BRIDGE_EVENTS = Object.freeze([
   "history",
   "message",
   "protocol",
+  "runSignal",
   "status",
   "streaming",
   "thinking",
@@ -93,15 +99,15 @@ function isKnownBackendKind(kind) {
   return typeof kind === "string" && BACKEND_KINDS.indexOf(kind) !== -1;
 }
 
-function isKnownPromptOwner(owner) {
+function isKnownPromptOwner(owner         ) {
   return typeof owner === "string" && PROMPT_OWNERS.indexOf(owner) !== -1;
 }
 
-function isKnownPromptLane(lane) {
+function isKnownPromptLane(lane         ) {
   return typeof lane === "string" && PROMPT_LANES.indexOf(lane) !== -1;
 }
 
-function normalizeBridgePrompt(requestOptions) {
+function normalizeBridgePrompt(requestOptions     ) {
   if (!requestOptions || typeof requestOptions !== "object") return null;
 
   const hasPrompt =

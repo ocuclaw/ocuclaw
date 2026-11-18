@@ -1,12 +1,14 @@
-const HERMES_AUTOMATION_READS = new Set(["automations.options", "automations.read", "automations.preview", "automations.receipt"]);
+const { starterRows } = require("./hermes-starter-kinds.cjs");
+
+const HERMES_AUTOMATION_READS = new Set(["automations.options", "automations.read", "automations.preview", "automations.receipt", "automations.starters"]);
 const HERMES_AUTOMATION_OPERATIONS = new Set([...HERMES_AUTOMATION_READS, "automations.create", "automations.update", "automations.delete", "automations.cancel"]);
-const token = (v) => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);
-const object = (v) => v && typeof v === "object" && !Array.isArray(v);
-const text = (v, max = 500) => typeof v === "string" && v.length <= max && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(v) ? v : "";
+const token = (v     ) => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);
+const object = (v     ) => v && typeof v === "object" && !Array.isArray(v);
+const text = (v     , max = 500) => typeof v === "string" && v.length <= max && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(v) ? v : "";
 const fieldNames = ["name", "prompt", "schedule", "deliver", "model", "provider", "enabled_toolsets", "context_from"];
-function fields(raw) {
+function fields(raw     )      {
   if (!object(raw) || Object.keys(raw).some(k => !fieldNames.includes(k))) return undefined;
-  const out = {};
+  const out      = {};
   for (const [key, value] of Object.entries(raw)) {
     if (["enabled_toolsets", "context_from"].includes(key)) {
       if (value === null) out[key] = null;
@@ -18,9 +20,9 @@ function fields(raw) {
   }
   return out;
 }
-function automationsRequest(operation, raw) {
+function automationsRequest(operation     , raw     ) {
   if (!HERMES_AUTOMATION_OPERATIONS.has(operation) || !object(raw)) return undefined;
-  const allowed = operation === "automations.options" ? [] : operation === "automations.read" ? ["jobId"] :
+  const allowed = operation === "automations.options" || operation === "automations.starters" ? [] : operation === "automations.read" ? ["jobId"] :
     operation === "automations.receipt" ? ["operationId"] : operation === "automations.preview" ? ["jobId", "revision", "fields", "template", "templateValues"] :
     ["operationId", "producedAt", "expiresAt", ...(operation === "automations.create" ? ["fields", "template", "templateValues", "reviewHash"] : operation === "automations.update" ? ["jobId", "revision", "fields", "reviewHash"] : ["jobId", "revision"])];
   if (Object.keys(raw).some(k => !allowed.includes(k))) return undefined;
@@ -38,28 +40,29 @@ function automationsRequest(operation, raw) {
   }
   return { ...raw };
 }
-function job(raw) {
+function job(raw     )      {
   if (!object(raw) || !token(raw.id) || !/^[a-f0-9]{64}$/.test(raw.revision) || !fields(raw.fields)) return null;
-  return { id: raw.id, revision: raw.revision, fields: fields(raw.fields), skills: Array.isArray(raw.skills) ? raw.skills.slice(0, 100).map((v) => text(v, 160)).filter(Boolean) : [],
+  return { id: raw.id, revision: raw.revision, fields: fields(raw.fields), skills: Array.isArray(raw.skills) ? raw.skills.slice(0, 100).map((v     ) => text(v, 160)).filter(Boolean) : [],
     nextRunAt: text(raw.nextRunAt), timezone: text(raw.timezone), reviewHash: text(raw.reviewHash), failureDestination: "same_as_delivery" };
 }
-function automationsResult(raw) {
+function automationsResult(raw     )      {
   if (!object(raw)) return undefined;
-  const out = {};
+  const out      = {};
   if (raw.job) out.job = job(raw.job);
   if (raw.preview) {
     if (!/^[a-f0-9]{64}$/.test(raw.preview.reviewHash) || !job(raw.preview)) return undefined;
     out.preview = job(raw.preview);
   }
+  if (raw.starters !== undefined) out.starters = starterRows(raw.starters);
   if (raw.options) {
     const o = raw.options;
     out.options = { timezone: text(o.timezone), failureDestination: "same_as_delivery",
-      destinations: (Array.isArray(o.destinations) ? o.destinations : []).slice(0, 100).map((d) => ({ id: text(d.id), name: text(d.name), available: d.available === true })),
-      advanced: (Array.isArray(o.advanced) ? o.advanced : []).filter((d) => ["model", "provider", "enabled_toolsets", "context_from"].includes(d.field)).map((d) => ({ field: d.field, supported: d.supported === true })),
-      templates: (Array.isArray(o.templates) ? o.templates : []).slice(0, 100).filter((t) => token(t.key)).map((t) => ({ key: t.key, title: text(t.title), description: text(t.description, 4000),
-        fields: (Array.isArray(t.fields) ? t.fields : []).slice(0, 100).filter((f) => token(f.name)).map((f) => ({ name: f.name, type: text(f.type), label: text(f.label),
+      destinations: (Array.isArray(o.destinations) ? o.destinations : []).slice(0, 100).map((d     ) => ({ id: text(d.id), name: text(d.name), available: d.available === true })),
+      advanced: (Array.isArray(o.advanced) ? o.advanced : []).filter((d     ) => ["model", "provider", "enabled_toolsets", "context_from"].includes(d.field)).map((d     ) => ({ field: d.field, supported: d.supported === true })),
+      templates: (Array.isArray(o.templates) ? o.templates : []).slice(0, 100).filter((t     ) => token(t.key)).map((t     ) => ({ key: t.key, title: text(t.title), description: text(t.description, 4000),
+        fields: (Array.isArray(t.fields) ? t.fields : []).slice(0, 100).filter((f     ) => token(f.name)).map((f     ) => ({ name: f.name, type: text(f.type), label: text(f.label),
           default: typeof f.default === "number" && Number.isFinite(f.default) ? String(f.default) : text(f.default, 16000), optional: f.optional === true, strict: f.strict === true, help: text(f.help, 4000),
-          options: (Array.isArray(f.options) ? f.options : []).slice(0, 100).map((v) => text(String(v))) })) })) };
+          options: (Array.isArray(f.options) ? f.options : []).slice(0, 100).map((v     ) => text(String(v))) })) })) };
   }
   if (raw.receipt) {
     const r = raw.receipt;
@@ -74,4 +77,4 @@ function automationsResult(raw) {
   return out;
 }
 
-module.exports = { HERMES_AUTOMATION_OPERATIONS, HERMES_AUTOMATION_READS, automationsRequest, automationsResult };
+module.exports = { HERMES_AUTOMATION_READS, HERMES_AUTOMATION_OPERATIONS, automationsRequest, automationsResult };

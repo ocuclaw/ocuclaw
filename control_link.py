@@ -40,6 +40,7 @@ FRAME_RPC_REQUEST = "link.rpc.request"
 FRAME_RPC_RESPONSE = "link.rpc.response"
 
 RPC_METHOD_NOT_FOUND_CODE = -32601
+PRIVATE_CONTROL_METHOD = "botScreen.control"
 
 # Child exit codes (mirrors LINK_EXIT_CODES in the Node module).
 EXIT_CLEAN = 0
@@ -88,7 +89,7 @@ class LinkRpcError(LinkError):
         self.code = code
 
 
-def encode_link_frame(frame: Dict[str, Any]) -> Tuple[bytes, bool]:
+def encode_link_frame(frame: Dict[str, Any], private_response: bool = False) -> Tuple[bytes, bool]:
     """Serialize a frame to one NDJSON line, applying the truncation rule.
 
     Returns ``(line_bytes, truncated)``. A frame whose serialized form
@@ -99,10 +100,14 @@ def encode_link_frame(frame: Dict[str, Any]) -> Tuple[bytes, bool]:
     from the encoder (never inferred from the serialized bytes: payload data
     may legitimately contain a nested ``"truncated": true``).
     """
-    line = json.dumps(frame, separators=(",", ":"), ensure_ascii=False)
-    raw = line.encode("utf-8")
+    line, raw = _json_line(frame)
     if len(raw) <= LINK_MAX_LINE_BYTES:
         return raw + b"\n", False
+    if private_response or frame.get("method") in (PRIVATE_CONTROL_METHOD, "botScreen.snapshot"):
+        # No payload head, byte count, text count or resume-capability echo.
+        marker = {"v": LINK_PROTOCOL_VERSION, "type": frame.get("type"),
+                  "id": frame.get("id"), "method": PRIVATE_CONTROL_METHOD, "truncated": True}
+        return json.dumps(marker, separators=(",", ":")).encode("utf-8") + b"\n", True
     marker: Dict[str, Any] = {"v": frame.get("v"), "type": frame.get("type")}
     if "id" in frame:
         marker["id"] = frame["id"]
@@ -113,10 +118,22 @@ def encode_link_frame(frame: Dict[str, Any]) -> Tuple[bytes, bool]:
     marker["truncated"] = True
     marker["originalBytes"] = len(raw)
     marker["payloadHead"] = line[:LINK_TRUNCATION_HEAD_CHARS]
-    marker_raw = json.dumps(marker, separators=(",", ":"), ensure_ascii=False).encode(
-        "utf-8"
-    )
-    return marker_raw + b"\n", True
+    return _json_line(marker)[1] + b"\n", True
+
+
+def _json_line(value: Any) -> Tuple[str, bytes]:
+    """``value`` as compact JSON text and its UTF-8 bytes; never raises on a lone surrogate.
+
+    Text is sent as itself. A lone surrogate (a tool argument can carry one, DeepSec
+    finding_2db4afd2955e3604) has no UTF-8 form, so that frame goes all-ASCII instead: JSON
+    ``\\uXXXX`` escapes the child parses back to the same UTF-16 text.
+    """
+    line = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    try:
+        return line, line.encode("utf-8")
+    except UnicodeEncodeError:
+        line = json.dumps(value, separators=(",", ":"), ensure_ascii=True)
+        return line, line.encode("ascii")
 
 
 class NdjsonLineSplitter:
@@ -219,6 +236,7 @@ class LinkProcess:
         self._closed = False
         self._next_request_id = 1
         self._pending: Dict[str, asyncio.Future] = {}
+        self._private_response_ids: deque[str] = deque(maxlen=256)
         self._reader_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._writer_task: Optional[asyncio.Task] = None
@@ -316,6 +334,8 @@ class LinkProcess:
             raise LinkOverloadedError("link_overloaded")
         request_id = f"p{self._next_request_id}"
         self._next_request_id += 1
+        if method in (PRIVATE_CONTROL_METHOD, "botScreen.snapshot"):
+            self._private_response_ids.append(request_id)
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
         frame: Dict[str, Any] = {
@@ -383,13 +403,13 @@ class LinkProcess:
 
     # -- internals -----------------------------------------------------------
 
-    def _send_frame(self, frame: Dict[str, Any]) -> bool:
+    def _send_frame(self, frame: Dict[str, Any], private_response: bool = False) -> bool:
         """Write a frame; returns False when the truncation rule replaced it
         with a marker (the peer sees an explicit marker, never a split)."""
         proc = self._proc
         if self._closed or proc is None or proc.stdin is None or proc.returncode is not None:
             raise LinkClosedError("control link closed")
-        raw, truncated = encode_link_frame(frame)
+        raw, truncated = encode_link_frame(frame, private_response)
         if (len(self._write_queue) >= LINK_ADMISSION_LIMIT or
                 self._queued_bytes + proc.stdin.transport.get_write_buffer_size() + len(raw) > LINK_WRITE_MAX_BYTES):
             if frame.get("type") != FRAME_RPC_REQUEST:
@@ -398,11 +418,11 @@ class LinkProcess:
             raise LinkOverloadedError("link_overloaded")
         if truncated:
             self.counters["truncated_outbound"] += 1
-            self._log.warning(
-                "[ocuclaw] outbound %s frame truncated (cap %d bytes)",
-                frame.get("type"),
-                LINK_MAX_LINE_BYTES,
-            )
+            if private_response or frame.get("method") in (PRIVATE_CONTROL_METHOD, "botScreen.snapshot"):
+                self._log.warning("[ocuclaw] private control frame rejected: frame too large")
+            else:
+                self._log.warning("[ocuclaw] outbound %s frame truncated (cap %d bytes)",
+                                  frame.get("type"), LINK_MAX_LINE_BYTES)
         self.counters["frames_out"] += 1
         request_id = frame.get("id") if frame.get("type") == FRAME_RPC_REQUEST else None
         owner = asyncio.current_task() if request_id is not None else None
@@ -510,11 +530,8 @@ class LinkProcess:
     def _handle_oversize(self, size: int) -> None:
         self.counters["oversized_inbound"] += 1
         self.counters["protocol_errors"] += 1
-        self._log.warning(
-            "[ocuclaw] dropped oversized control-link line (%d bytes > %d)",
-            size,
-            LINK_MAX_LINE_BYTES,
-        )
+        # Its method may occur after the cap: unparsed bytes cannot be classified.
+        self._log.warning("[ocuclaw] dropped oversized control-link line")
 
     def _handle_line(self, line: bytes) -> None:
         if self._closed:
@@ -531,19 +548,22 @@ class LinkProcess:
         self.counters["frames_in"] += 1
         version = frame.get("v")
         frame_type = frame.get("type")
+        private = (frame.get("method") in (PRIVATE_CONTROL_METHOD, "botScreen.snapshot") or
+                   str(frame.get("id")) in self._private_response_ids)
         if version != LINK_PROTOCOL_VERSION:
             self.counters["protocol_errors"] += 1
             if not self._ready:
                 self._handshake_error = LinkHandshakeError(
-                    f"protocol version mismatch: child sent v={version}, "
-                    f"expected v={LINK_PROTOCOL_VERSION}"
+                    "private control protocol version mismatch" if private else
+                    f"protocol version mismatch: child sent v={version}, expected v={LINK_PROTOCOL_VERSION}"
                 )
                 if self._hello_event is not None:
                     self._hello_event.set()
             else:
-                self._log.warning(
-                    "[ocuclaw] dropping frame with protocol version %r", version
-                )
+                if private:
+                    self._log.warning("[ocuclaw] dropping private control frame: protocol version mismatch")
+                else:
+                    self._log.warning("[ocuclaw] dropping frame with protocol version %r", version)
             return
         if not self._ready:
             if frame_type == FRAME_HELLO:
@@ -552,9 +572,10 @@ class LinkProcess:
                     self._hello_event.set()
             else:
                 self.counters["protocol_errors"] += 1
-                self._log.warning(
-                    "[ocuclaw] dropping pre-handshake frame %r", frame_type
-                )
+                if private:
+                    self._log.warning("[ocuclaw] dropping private control frame before handshake")
+                else:
+                    self._log.warning("[ocuclaw] dropping pre-handshake frame %r", frame_type)
             return
         if frame_type == FRAME_RPC_RESPONSE:
             self._handle_response(frame)
@@ -568,7 +589,10 @@ class LinkProcess:
             task.add_done_callback(self._handler_tasks.discard)
             return
         self.counters["protocol_errors"] += 1
-        self._log.warning("[ocuclaw] unknown control-link frame type %r", frame_type)
+        if private:
+            self._log.warning("[ocuclaw] unknown private control frame type")
+        else:
+            self._log.warning("[ocuclaw] unknown control-link frame type %r", frame_type)
 
     def _handle_response(self, frame: Dict[str, Any]) -> None:
         future = self._pending.pop(str(frame.get("id")), None)
@@ -582,21 +606,31 @@ class LinkProcess:
             future.set_result(frame.get("result"))
             return
         error = frame.get("error") or {}
+        private = str(frame.get("id")) in self._private_response_ids
         future.set_exception(
-            LinkRpcError(error.get("code"), error.get("message") or "link rpc failed")
+            LinkRpcError(-32000 if private else error.get("code"),
+                         "bot_screen_control_failed" if private else error.get("message") or "link rpc failed")
         )
 
     async def _handle_request(self, frame: Dict[str, Any]) -> None:
         if self._closed:
             return
         method = frame.get("method")
+        private = method in (PRIVATE_CONTROL_METHOD, "botScreen.snapshot")
         handler = self._request_handlers.get(method or "")
         response: Dict[str, Any] = {
             "v": LINK_PROTOCOL_VERSION,
             "type": FRAME_RPC_RESPONSE,
             "id": frame.get("id"),
         }
-        if handler is None:
+        if private:
+            # Keep classification on the wire even after a peer's bounded ID
+            # history has expired; a very late response is still private.
+            response["method"] = method
+        if private and frame.get("truncated") is True:
+            response["ok"] = False
+            response["error"] = {"code": -32000, "message": "link_frame_truncated"}
+        elif handler is None:
             response["ok"] = False
             response["error"] = {
                 "code": RPC_METHOD_NOT_FOUND_CODE,
@@ -609,9 +643,18 @@ class LinkProcess:
                 response["result"] = result
             except Exception as exc:  # noqa: BLE001 — surfaced to the peer
                 response["ok"] = False
-                response["error"] = {"code": -32000, "message": str(exc)}
+                response["error"] = {"code": -32000,
+                                     "message": "bot_screen_control_failed" if private else str(exc)}
+                # Additive (PROTOCOL.md): a handler's stable refusal code,
+                # e.g. ProfileCreateRefused. Never on a private response.
+                error_code = getattr(exc, "error_code", None)
+                if not private and isinstance(error_code, str) and error_code:
+                    response["error"]["errorCode"] = error_code
         try:
-            self._send_frame(response)
+            if private:
+                self._send_frame(response, private_response=True)
+            else:
+                self._send_frame(response)
         except (LinkClosedError, LinkOverloadedError):
             self._finish(self.returncode)
 
@@ -724,6 +767,14 @@ CHILD_ENV_ALLOWLIST: Tuple[str, ...] = (
     "PATHEXT",
     "APPDATA",
     "LOCALAPPDATA",
+    # Non-secret tool-schema flags, the Hermes counterparts of the OpenClaw
+    # tokenEfficiency keys: `full`/`flat` and `full`/`lean`. Unset keeps the
+    # child's defaults.
+    "OCUCLAW_GLASSES_UI_SCHEMA",
+    "OCUCLAW_LIVEUI_TEMPLATES_SCHEMA",
+    # Non-secret switch: the phone-code mailbox the pairing control service
+    # uses (#5219). Unset means pair.ocuclaw.com; `off` turns it off.
+    "OCUCLAW_PAIR_URL",
 )
 
 # Deliberately NOT allowlisted, recorded so a future edit has to argue with it:

@@ -55,6 +55,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, TextI
 from . import doctor as doctor_lane
 from .snapshot import (
     EVIDENCE_APP_PRESENCE,
+    EVIDENCE_CUSTOM_ROUTE_CONFIG,
+    EVIDENCE_CUSTOM_ROUTE_PROBE,
     EVIDENCE_FIRST_RUN_PROOF,
     EVIDENCE_GATEWAY_RECEIPT,
     EVIDENCE_HERMES_SOURCE_CERTIFIED,
@@ -69,6 +71,7 @@ from .snapshot import (
     HEALTH_UNKNOWN,
     LEG_HERMES_GATEWAY,
     LEG_OCUCLAW_RELAY,
+    LEG_CUSTOM_ROUTE,
     LEG_PHONE_APP,
     LEG_TAILNET_ROUTE,
     PROOF_NOT_PROVEN,
@@ -89,12 +92,14 @@ COMMAND_DESCRIPTION = (
     "\n"
     "  status   passive: local facts and cached receipts only; always exits 0\n"
     "  doctor   bounded active checks; exits non-zero on problems or bad state\n"
+    "  setup-start  right after install: OcuClaw's settings, then one restart\n"
     "  setup-preflight  what /ocuclaw-setup must settle before it writes\n"
     "  move-to-default  move the credential and pairing to the default profile\n"
     "  pair     pair a phone, approving it at this terminal; needs a real TTY\n"
     "  first-use  check the phone's first message and hand off the welcome\n"
     "  reset-relay-credential  locally confirm an all-device credential reset\n"
     "  uninstall  remove OcuClaw while preserving shared Hermes sessions\n"
+    "  bot-screen  Cloudways: install the Bot Screen without admin rights\n"
 )
 
 # -- exit codes (#1273 §10) ---------------------------------------------------
@@ -206,8 +211,10 @@ REPAIR_TEXT: Dict[str, str] = {
         "gating on for the OcuClaw platform; the wearer id is its only admin)."
     ),
     "install_node": (
-        "Install Node.js on this host, or point the OcuClaw runtime command at "
-        "an existing Node.js, then restart the Hermes gateway."
+        "Restart the Hermes gateway: Hermes 0.21.6 and newer install their own "
+        "Node.js for OcuClaw then, unless security.allow_lazy_installs is off. "
+        "On older Hermes, install Node.js on this host, or point the OcuClaw "
+        "runtime command at an existing Node.js, then restart the Hermes gateway."
     ),
     "reinstall_ocuclaw_bundle": (
         "Reinstall the OcuClaw plugin bundle for this profile, then restart the "
@@ -258,11 +265,60 @@ REPAIR_TEXT: Dict[str, str] = {
     "pair_phone_app": (
         "Pair the OcuClaw phone app with this host from the Setup Assistant."
     ),
+    # -- custom private route (#5209). OcuClaw never edits the user's VPN,
+    # proxy, DNS or certificates, so each of these names what to check there.
+    "fix_phone_address": (
+        "Set the phone address as wss://<name>:<port>, with a lowercase host "
+        "name or IPv4 address, an explicit port and no path: "
+        "hermes config set platforms.ocuclaw.extra.phoneAddress wss://<name>:<port> "
+        "— then run `hermes ocuclaw doctor` again."
+    ),
+    "clear_phone_address": (
+        "Clear the phone address and use Cloudways setup's Tailscale route: "
+        "hermes config set platforms.ocuclaw.extra.phoneAddress '' — then run "
+        "`hermes ocuclaw cloudways setup`."
+    ),
+    "check_phone_route": (
+        "Check that your phone is on the same private network as this host and "
+        "can open the phone address. Some VPNs do not route a host back to "
+        "itself, so this check can fail here while the phone connects fine; "
+        "pairing is the real test, and a wrong address fails safely."
+    ),
+    "use_private_phone_address": (
+        "Use a name that resolves only to a private address (10.x, 172.16-31.x, "
+        "192.168.x, 100.64-127.x or fc00::/7) on your own VPN or home network, "
+        "then run `hermes ocuclaw doctor` again. OcuClaw does not pair over "
+        "public routes such as port forwarding or public tunnels."
+    ),
+    "fix_phone_route_certificate": (
+        "Give your TLS front door a publicly trusted certificate for the phone "
+        "address's name (for example Let's Encrypt with a DNS challenge), then "
+        "run `hermes ocuclaw doctor` again. The phone cannot accept a "
+        "self-signed certificate."
+    ),
+    "fix_phone_route_forwarding": (
+        "Point your TLS front door at this host's relay on 127.0.0.1 and the "
+        "configured relay port, then run `hermes ocuclaw doctor` again."
+    ),
     "enable_ocuclaw_streaming": (
         "Run: hermes config set display.platforms.ocuclaw.streaming true "
         "(Hermes reads it on the next reply; no restart). Without it the "
         "glasses show only \"typing\" for the whole reply, then the whole "
         "reply at once."
+    ),
+    "queue_shared_chat_messages": (
+        "Run: hermes config set display.busy_input_mode queue — then restart "
+        "the Hermes gateway. Re-running /ocuclaw-setup or "
+        "`hermes ocuclaw cloudways setup` does it for you. The key applies to "
+        "all of this Hermes: Desktop, the TUI and the CLI as well as the "
+        "glasses. To keep interrupting, set it to interrupt instead."
+    ),
+    "enable_live_reasoning": (
+        "Run: hermes config set plugins.stream_reasoning_deltas true — then "
+        "restart the Hermes gateway (OcuClaw reads the key only when the "
+        "gateway starts). /ocuclaw-setup can also turn it on for you. The key "
+        "is gateway-wide: it changes how Hermes calls the model for every "
+        "surface on this gateway."
     ),
 }
 
@@ -289,6 +345,8 @@ _FRESHNESS_RULES: Dict[str, str] = {
     EVIDENCE_APP_PRESENCE: "written every 30s, expires after 120s",
     EVIDENCE_TAILNET_SERVE: "observed during collection, carries no expiry",
     EVIDENCE_TAILNET_PROBE: "bounded active probe, expires after 60s",
+    EVIDENCE_CUSTOM_ROUTE_CONFIG: "observed during collection, carries no expiry",
+    EVIDENCE_CUSTOM_ROUTE_PROBE: "bounded active probe, expires after 60s",
     EVIDENCE_FIRST_RUN_PROOF: "never expires",
     EVIDENCE_HERMES_SOURCE_STATE: "cached for at most 5m; source changes invalidate it",
     EVIDENCE_HERMES_SOURCE_CERTIFIED: "certified release identity; changes only on recertification",
@@ -301,6 +359,14 @@ _LEG_LABELS = (
     (LEG_HERMES_GATEWAY, "Hermes gateway"),
     (LEG_OCUCLAW_RELAY, "OcuClaw relay"),
     (LEG_TAILNET_ROUTE, "Tailnet route"),
+    (LEG_PHONE_APP, "Phone app"),
+)
+#: Custom route mode (#5209): the user's own private network takes the route
+#: slot, and nothing on this surface says Tailscale.
+_CUSTOM_LEG_LABELS = (
+    (LEG_HERMES_GATEWAY, "Hermes gateway"),
+    (LEG_OCUCLAW_RELAY, "OcuClaw relay"),
+    (LEG_CUSTOM_ROUTE, "Private route"),
     (LEG_PHONE_APP, "Phone app"),
 )
 
@@ -368,6 +434,43 @@ _PROBE_OUTCOME_GLOSS = {
     ),
     doctor_lane.OUTCOME_RELAY_NO_CREDENTIAL: (
         "the Relay Credential is not available from the managed configuration store"
+    ),
+    # -- custom private route (#5209) ---------------------------------------
+    doctor_lane.OUTCOME_CUSTOM_ROUTE_SKIPPED: (
+        "the configured phone address failed a config check, so nothing was "
+        "aimed at it"
+    ),
+    "custom_route_ok": (
+        "the phone address resolved privately, passed default certificate "
+        "checks, and answered the route probe as this host's relay"
+    ),
+    "custom_route_address_invalid": "the phone address is not a valid wss://name:port address",
+    "custom_route_cloudways_host": "a custom phone address is not supported on Cloudways",
+    "custom_route_relay_not_listening": "the relay did not answer on loopback",
+    "custom_route_name_unresolved": (
+        "this host could not resolve the phone address, so nothing was "
+        "learned about the route"
+    ),
+    "custom_route_address_not_private": (
+        "the phone address resolved to an address outside the private ranges"
+    ),
+    "custom_route_tcp_unreachable": (
+        "this host could not connect to its own phone address, so the route "
+        "is unverified"
+    ),
+    "custom_route_tls_failed": (
+        "the phone address did not complete a TLS handshake with default "
+        "certificate checks"
+    ),
+    "custom_route_probe_mismatch": (
+        "the phone address answered, but not as this host's OcuClaw relay"
+    ),
+    "custom_route_probe_no_answer": (
+        "the phone address completed TLS but the route probe got no answer in "
+        "time, so the route is unverified"
+    ),
+    "custom_route_not_checked": (
+        "the check could not complete, so it observed nothing"
     ),
 }
 
@@ -497,6 +600,27 @@ def _tailnet_detail(leg: Mapping[str, Any]) -> str:
     )
 
 
+def _custom_route_detail(leg: Mapping[str, Any]) -> str:
+    state = leg.get("state")
+    classification = leg.get("classification")
+    if state == HEALTH_HEALTHY:
+        return (
+            "the phone address resolves privately, presents a trusted "
+            "certificate, and leads to this host's OcuClaw relay"
+        )
+    if classification == "wrong" or state == HEALTH_UNHEALTHY:
+        return "the phone address failed a check the phone would fail too"
+    if classification == "unverified":
+        return (
+            "this host could not reach its own phone address, so the route is "
+            "unverified. This is not a claim that the phone cannot reach it"
+        )
+    return (
+        "nothing has checked the phone address yet; `hermes ocuclaw doctor` "
+        "runs the check. This is not a claim that the route is broken"
+    )
+
+
 def _phone_detail(leg: Mapping[str, Any]) -> str:
     state = leg.get("state")
     count = leg.get("authenticatedAppCount")
@@ -518,7 +642,7 @@ def _leg_extra(name: str, leg: Mapping[str, Any]) -> List[str]:
     """The leg's own preserved detail fields, which never collapse into state."""
     if name == LEG_OCUCLAW_RELAY:
         return [f"listening: {_yes_no(leg.get('listening'))}"]
-    if name == LEG_TAILNET_ROUTE:
+    if name in (LEG_TAILNET_ROUTE, LEG_CUSTOM_ROUTE):
         return [
             f"classification: {_safe(leg.get('classification'), fallback=TRISTATE_UNKNOWN)}",
             f"configured: {_safe(leg.get('configured'), fallback=TRISTATE_UNKNOWN)}",
@@ -717,6 +841,16 @@ def _render_agent_choice(facts: Mapping[str, Any], *, prescribe: bool) -> List[s
     return lines
 
 
+def _render_untested_hermes(snapshot: Mapping[str, Any]) -> List[str]:
+    """The warning row for a Hermes newer than the tested range, else nothing."""
+    if (snapshot.get("setup") or {}).get("hermesVersionUntested") is not True:
+        return []
+    from .health import hermes_untested_message
+
+    version = _safe((snapshot.get("producer") or {}).get("hermesPackageVersion"))
+    return [f"  warning                   {hermes_untested_message(version)}"]
+
+
 def _render_setup(
     snapshot: Mapping[str, Any],
     facts: Optional[Mapping[str, Any]] = None,
@@ -751,6 +885,7 @@ def _render_setup(
         "Hermes Setup State — durable installation and configuration",
         f"  state                     {state}  ({gloss})",
         f"  hermes version supported  {supported_text}",
+        *_render_untested_hermes(snapshot),
         f"  hermes CLI on PATH        {_yes_no(setup.get('hermesCliOnPath'))}",
         f"  plugin enabled            {_yes_no(setup.get('pluginEnabled'))}",
         f"  platform enabled          {_yes_no(setup.get('platformEnabled'))}",
@@ -1039,7 +1174,8 @@ def _render_health(snapshot: Mapping[str, Any]) -> List[str]:
         "Current Connection Health — point in time, four independent legs",
         f"  aggregate  {aggregate}  ({aggregate_gloss})",
     ]
-    for name, label in _LEG_LABELS:
+    labels = _CUSTOM_LEG_LABELS if LEG_CUSTOM_ROUTE in legs else _LEG_LABELS
+    for name, label in labels:
         leg = legs.get(name) or {}
         state = _safe(leg.get("state"))
         if name == LEG_HERMES_GATEWAY:
@@ -1048,6 +1184,8 @@ def _render_health(snapshot: Mapping[str, Any]) -> List[str]:
             detail = _relay_detail(leg, gateway_state)
         elif name == LEG_TAILNET_ROUTE:
             detail = _tailnet_detail(leg)
+        elif name == LEG_CUSTOM_ROUTE:
+            detail = _custom_route_detail(leg)
         else:
             detail = _phone_detail(leg)
         lines.append("")
@@ -1153,7 +1291,7 @@ def _render_findings(snapshot: Mapping[str, Any]) -> List[str]:
 
 _TAILNET_DAEMON_HINT = {
     "needs-authorization": "run `hermes ocuclaw cloudways retry` and open the printed link",
-    "stopped": "the cron watchdog restarts it within a minute; if not, run `hermes ocuclaw cloudways status --wait 90`",
+    "stopped": "OcuClaw restarts it within a minute; if not, run `hermes ocuclaw cloudways enable`",
     "starting": "wait a few seconds, then run this again",
     "absent": "run `hermes ocuclaw cloudways install`",
     "unknown": "run `hermes ocuclaw cloudways status` for the raw answer",
@@ -1169,7 +1307,7 @@ def _render_tailnet_daemon(summary: Optional[Mapping[str, Any]]) -> List[str]:
     if not isinstance(summary, Mapping):
         return []
     state = str(summary.get("state") or "unknown")
-    lines = ["", f"Tailscale daemon (userspace, cron-kept) — {state}"]
+    lines = ["", f"Tailscale daemon (userspace, kept alive by OcuClaw) — {state}"]
     if summary.get("nodeName"):
         online = summary.get("online")
         online_text = "yes" if online is True else "no" if online is False else "?"
@@ -1182,10 +1320,18 @@ def _render_tailnet_daemon(summary: Optional[Mapping[str, Any]]) -> List[str]:
     hint = _TAILNET_DAEMON_HINT.get(state)
     if hint and state != "running":
         lines.append(f"  {hint}")
-    if summary.get("watchdogJobPresent") is False:
+    supervisor = summary.get("supervisor")
+    if isinstance(supervisor, Mapping) and supervisor.get("present") is False:
         lines.append(
-            "  The cron watchdog job is missing: the daemon will not survive the next "
+            "  Nothing keeps the daemon alive: it will not survive the next "
             "`hermes gateway restart`. Run `hermes ocuclaw cloudways install`."
+        )
+    elif isinstance(supervisor, Mapping) and supervisor.get("enabled") is False:
+        lines.append("  Turned off with `disable`; run `hermes ocuclaw cloudways enable` to keep it alive.")
+    if summary.get("watchdogJobPresent") is True:
+        lines.append(
+            "  The old cron watchdog is still here. Run `hermes ocuclaw cloudways install` "
+            "to hand the daemon to OcuClaw."
         )
     return lines
 
@@ -1517,6 +1663,61 @@ def _render_phone_address(
     return lines
 
 
+def _render_custom_route(
+    snapshot: Mapping[str, Any], facts: Mapping[str, Any]
+) -> List[str]:
+    """The custom route section (#5209): the configured address, never a command.
+
+    OcuClaw never edits the user's VPN, proxy, DNS or certificates, so there
+    is nothing here to apply or tear down. The address is printed when the
+    check says ``ready`` or ``unverified`` and the gateway is running, because
+    that is exactly when pairing may use it; ``unverified`` says so plainly.
+    """
+    from . import custom_route as custom_route_mod
+
+    legs = ((snapshot.get("currentHealth") or {}).get("legs") or {})
+    leg = legs.get(LEG_CUSTOM_ROUTE) or {}
+    gateway_state = str((legs.get(LEG_HERMES_GATEWAY) or {}).get("state"))
+    classification = _safe(leg.get("classification"))
+    address = custom_route_mod.canonical_address(facts.get("customPhoneAddress"))
+    lines = ["", f"Your own private route — {classification}"]
+    if classification == "unknown":
+        lines.append(
+            "  Run `hermes ocuclaw doctor` to check the phone address from this host."
+        )
+    if address is None:
+        lines.append(
+            "  Phone address — withheld, because the configured value is not a "
+            "valid wss://name:port address."
+        )
+        return lines
+    usable = classification in {"ready", "unverified"} and gateway_state == HEALTH_HEALTHY
+    if not usable:
+        reasons: List[str] = []
+        if classification not in {"ready", "unverified"}:
+            reasons.append(f"the private route is {classification}")
+        if gateway_state != HEALTH_HEALTHY:
+            reasons.append("the Hermes gateway for this profile is not running")
+        lines.append(
+            "  Phone address — withheld, because " + "; and ".join(reasons) + "."
+        )
+        return lines
+    lines.extend(
+        [
+            "",
+            "  Phone address (this host only — never paste it into a bug "
+            "report or a shared document):",
+            f"    {address}",
+        ]
+    )
+    if classification == "unverified":
+        lines.append(
+            "  This host could not check it end to end. Pairing still works if "
+            "your phone can reach it, and a wrong address fails safely."
+        )
+    return lines
+
+
 def render_snapshot_text(
     snapshot: Mapping[str, Any],
     *,
@@ -1539,7 +1740,12 @@ def render_snapshot_text(
     lines.extend(_render_profiles(profiles))
     lines.extend(_render_health(snapshot))
     lines.extend(_render_tailnet_daemon(tailnet_daemon))
-    if facts is not None:
+    custom_mode = LEG_CUSTOM_ROUTE in (
+        (snapshot.get("currentHealth") or {}).get("legs") or {}
+    )
+    if facts is not None and custom_mode:
+        lines.extend(_render_custom_route(snapshot, facts))
+    elif facts is not None:
         lines.extend(
             _render_serve(
                 snapshot,
@@ -2234,6 +2440,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     register_optional_setup(subs)
     from .even_ai_cli import register_cli as register_even_ai
     register_even_ai(subs)
+    from .bot_screen_rootless import register_cli as register_bot_screen
+    register_bot_screen(subs)
 
     status_parser = subs.add_parser(
         "status",
@@ -2292,6 +2500,32 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
         dest="json_output",
         help="Emit the preflight report as JSON instead of the rendered text",
     )
+
+    # #7548: Hermes loads a new plugin only when it restarts, so an agent that
+    # installed OcuClaw from a chat has no setup tool yet. The post-install
+    # card names this command for that moment.
+    start_parser = subs.add_parser(
+        "setup-start",
+        help="Right after install: turn on OcuClaw's settings and restart Hermes once",
+        description=(
+            "Run once, right after `hermes plugins install`, when setup will "
+            "carry on in an agent's chat. Turns on OcuClaw's settings, then "
+            "restarts Hermes once so it loads OcuClaw and those settings "
+            "together. The restart starts a few seconds after this command "
+            "answers. Asks nothing. When OcuClaw is already loaded it changes "
+            "nothing and says so. Exits 0, or 1 when the settings could not be "
+            "turned on."
+        ),
+    )
+    start_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Emit the result as JSON instead of the rendered lines",
+    )
+    # Internal: the detached child that runs the restart after the reply is out.
+    start_parser.add_argument("--restart-after", dest="start_restart_after", type=float, default=None, help=argparse.SUPPRESS)
+    start_parser.add_argument("--restart-timeout", dest="start_restart_timeout", type=float, default=None, help=argparse.SUPPRESS)
 
     move_parser = subs.add_parser(
         "move-to-default",
@@ -2354,9 +2588,9 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
         "pair",
         help="Pair a phone with this computer, approving it here",
         description=(
-            "Start one pairing request and approve it at this terminal. Prints a "
-            "QR code and, for a phone that cannot scan it, the address and a "
-            "short-lived pairing code. The phone then shows four words; approve "
+            "Start one pairing request and approve it at this terminal. Type the "
+            "phone code OcuClaw shows; for manual pairing, type m to get the "
+            "address and a short-lived pairing code. The phone then shows four words; approve "
             "only if they match the four printed here. Requires an interactive "
             "terminal, and never displays or asks for any secret."
         ),
@@ -2418,6 +2652,20 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
         ),
     )
 
+    # Chat setup's step 9 waiter (step9_wake.py), run by `next` as a Hermes
+    # background process whose exit wakes the setup chat. Not for people:
+    # it prints one line for the agent. Reads only; arms nothing.
+    step9_parser = subs.add_parser(
+        "step9-wait",
+        description=(
+            "Internal: wait for the phone's first message and its glasses "
+            "receipt, then print one line that wakes the setup chat."
+        ),
+    )
+    step9_parser.add_argument("--home", dest="step9_home", default=None)
+    step9_parser.add_argument("--since", dest="step9_since", type=float, required=True)
+    step9_parser.add_argument("--deadline", dest="step9_deadline", type=float, required=True)
+
     # Like pairing approval, reset has no machine-readable or non-interactive
     # variant. The Setup Assistant owns the guided journey; this host-terminal
     # action is its locally confirmed mutation checkpoint.
@@ -2431,13 +2679,24 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
             "replacement acceptance are proved before success is reported."
         ),
     )
+    subs.add_parser(
+        "dev-a11y-screen",
+        help="Developer: restart the Bot Desktop with accessibility on",
+        description=(
+            "Restart this profile's Bot Desktop so its apps and dock Browser "
+            "publish accessibility, and computer-use captures carry elements "
+            "for the head pointer. A dev patch of the running Hermes, in this "
+            "command only; set OCUCLAW_DEV_BOT_DESKTOP_A11Y=1 in the gateway's "
+            "environment for the desktops the gateway starts."
+        ),
+    )
     uninstall_parser = subs.add_parser(
         "uninstall",
         help="Fully remove OcuClaw while preserving shared Hermes sessions",
         description=(
             "Remove OcuClaw code, setup, exact configuration and secret keys, "
             "pairing state, first-run state, and on Cloudways the Tailscale "
-            "watchdog, daemon and binaries it installed. Shared Hermes "
+            "daemon, its supervision state and the binaries it installed. Shared Hermes "
             "sessions and unrecognised files are preserved. If OcuClaw is "
             "running, the first run marks it for removal and exits with code "
             "3: run `hermes gateway restart`, then `hermes ocuclaw uninstall` "
@@ -2468,29 +2727,31 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
         ),
     )
     # Cloudways managed-Hermes path (#2979): user-owned userspace Tailscale
-    # kept alive by a Hermes cron watchdog. Registered lazily-implemented like
-    # `pair`; the verbs are deterministic and idempotent so the on-box agent
-    # can run them from its terminal tool.
+    # kept alive by the OcuClaw runtime (#6359). Registered lazily-implemented
+    # like `pair`; the verbs are deterministic and idempotent so the on-box
+    # agent can run them from its terminal tool.
     cloudways_parser = subs.add_parser(
         "cloudways",
-        help="Cloudways managed Hermes: userspace Tailscale + cron watchdog",
+        help="Cloudways managed Hermes: userspace Tailscale kept alive by OcuClaw",
         description=(
             "Set up and operate the Cloudways-approved private route: a "
-            "non-root userspace tailscaled under ~/bin and ~/.tailscale, kept "
-            "alive across container restarts by a Hermes cron job with no LLM "
-            "involvement. Every verb is safe to re-run."
+            "non-root userspace tailscaled (the server's own /usr/bin copy; a "
+            "server without it is told to restart from the Cloudways panel) "
+            "with state in ~/.tailscale, kept alive "
+            "across container restarts by the OcuClaw runtime on every gateway "
+            "start. Every verb is safe to re-run."
         ),
     )
     cloudways_subs = cloudways_parser.add_subparsers(dest="cloudways_verb", required=True)
     for verb, help_text in (
         ("detect", "Which Cloudways environment signals fired"),
-        ("install", "Install pinned binaries, receipt, watchdog script and cron job"),
+        ("install", "Set up binaries, receipt and supervision, then start the daemon"),
         ("enroll", "Run `tailscale up` and print the authorization URL"),
-        ("status", "Daemon, route, watchdog job, receipt and legacy inventory"),
+        ("status", "Daemon, route, supervision, receipt and legacy inventory"),
         ("retry", "Print a fresh authorization URL"),
-        ("enable", "Resume the watchdog job and fire it now"),
-        ("disable", "Pause the watchdog job and stop the daemon"),
-        ("rollback", "Remove job, daemon, binaries, script and receipt (identity kept)"),
+        ("enable", "Turn supervision on and start the daemon"),
+        ("disable", "Turn supervision off and stop the daemon"),
+        ("rollback", "Remove supervision, daemon, binaries and receipt (identity kept)"),
     ):
         verb_parser = cloudways_subs.add_parser(verb, help=help_text)
         verb_parser.add_argument(
@@ -2500,15 +2761,14 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
             verb_parser.add_argument(
                 "--hostname", default=None, help="Node name for a fresh identity (default ocuclaw-<host>)"
             )
-            verb_parser.add_argument(
-                "--qr", action="store_true", help="Also print the authorization URL as a QR code"
-            )
+            # #5427 removed the authorization QR. Accepted and ignored for
+            # one release so a saved `enroll --qr` / `retry --qr` still runs.
+            verb_parser.add_argument("--qr", action="store_true", help=argparse.SUPPRESS)
         if verb == "install":
-            verb_parser.add_argument(
-                "--force-download",
-                action="store_true",
-                help="Re-download the pinned archive even if the installed version matches",
-            )
+            # Nothing is downloaded any more: the server's own Tailscale is
+            # used. Accepted and ignored for one release so a saved
+            # `install --force-download` still runs.
+            verb_parser.add_argument("--force-download", action="store_true", help=argparse.SUPPRESS)
         if verb == "status":
             verb_parser.add_argument(
                 "--wait",
@@ -2590,7 +2850,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
         "--light-terminal",
         action="store_true",
         dest="light_terminal",
-        help="Render the pairing QR for a light-background terminal instead of a dark one",
+        help="Does nothing; kept so older commands still run",
     )
     setup_parser.add_argument(
         "--hostname",
@@ -2606,19 +2866,25 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
             "or what is asked"
         ),
     )
+    setup_parser.add_argument(
+        "--look",
+        choices=("plain", "speck"),
+        default=None,
+        help=(
+            "How setup draws itself in a terminal: speck (Speck guides you; the "
+            "default in the Hermes WebUI's /terminal) or plain (the default "
+            "elsewhere). Also OCUCLAW_SETUP_LOOK. Pipes and --json are always plain"
+        ),
+    )
     pair_parser.add_argument(
         "--light-terminal",
         action="store_true",
-        help="Render the QR for a light-background terminal instead of a dark one",
+        help="Does nothing; kept so older commands still run",
     )
     pair_parser.add_argument(
         "--show-payload-text",
         action="store_true",
-        help=(
-            "Also print the exact text the code encodes, for a terminal that "
-            "cannot render block characters (a screen reader, a pipe, a log). "
-            "It carries the same public fields as the code itself."
-        ),
+        help="Does nothing; kept so older commands still run",
     )
 
 
@@ -2764,6 +3030,16 @@ def dispatch(args: argparse.Namespace) -> int:
         return run_setup_preflight(
             json_output=bool(getattr(args, "json_output", False))
         )
+    if command == "setup-start":
+        from . import setup_start_cli
+
+        restart_after = getattr(args, "start_restart_after", None)
+        restart_timeout = getattr(args, "start_restart_timeout", None)
+        if restart_after is not None and restart_timeout is not None:
+            return setup_start_cli.run_delayed_restart(float(restart_after), float(restart_timeout))
+        return setup_start_cli.run_setup_start(
+            json_output=bool(getattr(args, "json_output", False))
+        )
     if command == "move-to-default":
         return run_move_to_default(
             str(getattr(args, "move_source", "") or ""),
@@ -2802,10 +3078,23 @@ def dispatch(args: argparse.Namespace) -> int:
                 **({} if wait is None else {"wait_seconds": float(wait)})
             )["exitCode"]
         )
+    if command == "step9-wait":
+        from .step9_wake import run_step9_wait
+
+        raw_home = getattr(args, "step9_home", None)
+        return run_step9_wait(
+            home=Path(raw_home) if raw_home else None,
+            since=float(args.step9_since),
+            deadline=float(args.step9_deadline),
+        )
     if command == "reset-relay-credential":
         from .pairing import run_reset_relay_credential
 
         return run_reset_relay_credential()
+    if command == "dev-a11y-screen":
+        from .dev_bot_desktop_a11y import restart_screen
+
+        return restart_screen()
     if command == "uninstall":
         from .uninstall import run_uninstall
 
@@ -2814,6 +3103,10 @@ def dispatch(args: argparse.Namespace) -> int:
             json_output=bool(getattr(args, "json_output", False)),
             cancel=bool(getattr(args, "cancel_pending", False)),
         )
+    if command == "bot-screen":
+        from .bot_screen_rootless import dispatch as dispatch_bot_screen
+
+        return dispatch_bot_screen(args)
     if command == "cloudways":
         from .cloudways_cli import run_cloudways
 

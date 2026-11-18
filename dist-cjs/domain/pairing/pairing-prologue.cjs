@@ -66,6 +66,16 @@ function isBelowFieldModulus(value            )          {
   return false;
 }
 
+function isCanonicalPublicKey(value            )          {
+  try {
+    requireCanonicalPublicKey(value, "the key");
+    return true;
+  } catch (error) {
+    if (error instanceof PairingPrologueError) return false;
+    throw error;
+  }
+}
+
 function requireCanonicalPublicKey(value            , label        )       {
   if (!(value instanceof Uint8Array) || value.length !== X25519_PUBLIC_KEY_BYTES) {
     throw new PairingPrologueError(
@@ -198,4 +208,4 @@ function assertPrologueSuiteMatches(protocolName        )       {
   }
 }
 
-module.exports = { PAIRING_PROLOGUE_MAGIC, PAIRING_PROTOCOL_VERSION, PAIRING_SUITE_ID, PAIRING_PHRASE_PROFILE_ID, PAIRING_EXCHANGE_ID_BYTES, X25519_PUBLIC_KEY_BYTES, PAIRING_ADDRESS_MIN_BYTES, PAIRING_ADDRESS_MAX_BYTES, PAIRING_PROLOGUE_TAGS, PAIRING_PROLOGUE_MIN_LENGTH, PAIRING_PROLOGUE_MAX_LENGTH, PairingPrologueError, buildPairingPrologue, assertPrologueSuiteMatches };
+module.exports = { PAIRING_PROLOGUE_MAGIC, PAIRING_PROTOCOL_VERSION, PAIRING_SUITE_ID, PAIRING_PHRASE_PROFILE_ID, PAIRING_EXCHANGE_ID_BYTES, X25519_PUBLIC_KEY_BYTES, PAIRING_ADDRESS_MIN_BYTES, PAIRING_ADDRESS_MAX_BYTES, PAIRING_PROLOGUE_TAGS, PAIRING_PROLOGUE_MIN_LENGTH, PAIRING_PROLOGUE_MAX_LENGTH, PairingPrologueError, isCanonicalPublicKey, buildPairingPrologue, assertPrologueSuiteMatches };

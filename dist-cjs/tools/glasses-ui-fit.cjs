@@ -87,9 +87,12 @@ function plural(count, unit) {
 function widthError(code, field, text, maxPx, advice) {
   const measured = getTextWidth(text);
   if (measured <= maxPx) return null;
+
   return {
     ok: false,
     code,
+    path: field,
+    budget: { maxPx },
     message:
       `${field} is ${measured} px wide; max ${maxPx} px ` +
       `(about ${approxCharsForWidth(text, maxPx)} chars at this size) — ${advice}`,
@@ -102,6 +105,8 @@ function linesError(code, field, text, width, maxLines, advice) {
   return {
     ok: false,
     code,
+    path: field,
+    budget: { width, maxLines },
     message:
       `${field} wraps to ${plural(measured, "line")} at ${width} px; ` +
       `max ${plural(maxLines, "line")} ` +
@@ -178,7 +183,7 @@ function pretextPadAtLeast(target) {
   }
 }
 
-let checklistMarks = null;
+let checklistMarks      = null;
 function checklistRow(label, checked) {
   if (!checklistMarks) {
     const candidates = ["[", "[̀x"].map((prefix) => {
@@ -197,13 +202,13 @@ function checklistRow(label, checked) {
   return checklistMarks[checked ? 1 : 0] + label;
 }
 
-function rowSuffixesFor(spec) {
+function rowSuffixesFor(spec     ) {
   const children = Array.isArray(spec && spec.children) ? spec.children : [];
-  return (i) => (children[i] ? B.childCueSuffix : "");
+  return (i     ) => (children[i] ? B.childCueSuffix : "");
 }
 
-function checkMeasuredList(labels, rowVariants, field, suffixAt = () => "") {
-  const variants = labels.map((label, i) => rowVariants(label, i));
+function checkMeasuredList(labels     , rowVariants     , field     , suffixAt      = () => "") {
+  const variants = labels.map((label     , i     ) => rowVariants(label, i));
   const width = Math.min(B.wideContentInnerW - getTextWidth("> "),
     Math.max(1, ...variants.flat().map(getTextWidth)) + B.cueOverlaySlack);
   const maxLines = labels.length <= B.focusListMaxItems ? B.focusListMaxLines : 1;
@@ -225,7 +230,7 @@ function checkMeasuredList(labels, rowVariants, field, suffixAt = () => "") {
   return null;
 }
 
-function detailsLayout(items, suffixAt = () => "") {
+function detailsLayout(items     , suffixAt      = () => "") {
   const bodyOf = (item) => (typeof item.body === "string" ? item.body : "");
   const labelInnerWidth = Math.min(B.wideContentInnerW - getTextWidth("> "),
     Math.max(1, ...items.map((item, i) => getTextWidth(item.label + suffixAt(i)))) + B.cueOverlaySlack);
@@ -239,7 +244,7 @@ function detailsLayout(items, suffixAt = () => "") {
   return { labelInnerWidth, labelLines, detailInnerWidth, detailCapacity, bodyOf };
 }
 
-function checkListWithDetails(items, suffixAt = () => "") {
+function checkListWithDetails(items     , suffixAt      = () => "") {
   const layout = detailsLayout(items, suffixAt);
   for (let i = 0; i < items.length; i += 1) {
 
@@ -278,14 +283,18 @@ function checkGlassesUiFit(spec) {
       if (!child) continue;
       const childErr = checkGlassesUiFit(child);
       if (childErr) {
-        return { ...childErr, message: `children[${i}]: ${childErr.message}` };
+        return {
+          ...childErr,
+          path: `children[${i}].${childErr.path || "body"}`,
+          message: `children[${i}]: ${childErr.message}`,
+        };
       }
     }
   }
   return null;
 }
 
-function checkOwnFit(spec) {
+function checkOwnFit(spec     ) {
   switch (spec.kind) {
     case "text_surface":
 
@@ -295,7 +304,7 @@ function checkOwnFit(spec) {
       return checkPages(spec);
     case "list_surface": {
       const suffixAt = rowSuffixesFor(spec);
-      return checkMeasuredList(spec.items, (label, i) => [label + suffixAt(i)], (i) => `items[${i}]`, suffixAt);
+      return checkMeasuredList(spec.items, (label     , i     ) => [label + suffixAt(i)], (i     ) => `items[${i}]`, suffixAt);
     }
     case "checklist_surface":
       return checkMeasuredList(

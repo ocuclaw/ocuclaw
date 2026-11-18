@@ -1,6 +1,6 @@
 # Troubleshooting OcuClaw on Hermes
 
-**Guide version:** 2026-09-29 (1.3.26-hermes)
+**Guide version:** 2026-10-28 (1.3.27-hermes)
 
 This guidance was loaded through the `ocuclaw_setup` tool. Keep using the
 loaded setup skill for command, secret, checkpoint, and restart rules, and use
@@ -8,14 +8,24 @@ another named tool operation for any next setup topic. Enter the narrowest case
 matching observed evidence. Diagnose read-only before a mutation. Never widen
 `wsBind`.
 
+## CARD-PART-NOT-WORKING
+
+A card's live part is not working (an MCP use, a Jev question or a model use)
+and its reason was brought to this host conversation. Load
+`{"operation":"card_fixes"}` and read only the case `CARD-<PART>-<REASON>`;
+never while you build or change a card. The phone/G2 chat's own "Not working"
+block already carries each reason's check, so that chat needs no reference.
+
 ## HERMES-GATE-REFUSED
 
-`hermes --version` must report a version in `>=0.21.1,<0.22.0`. When the host
-still exposes the certified platform-registration API, the recovery row remains
-registered outside that hard range, but its checks and adapter refuse startup.
-Treat that row as best-effort on an unsupported, ABI-drifted host; the version
-mismatch or plugin-load error remains visible in the Hermes gateway log.
-Do not work around the gate or say "0.21.1 or later". Updating Hermes is outside
+`hermes --version` must report 0.21.4 or newer. A Hermes past the tested range
+`>=0.21.4,<0.24.0` is not refused: it starts with one warning in status, the
+dashboard and the gateway log. When a host below 0.21.4 still exposes the
+certified platform-registration API, the recovery row remains registered, but
+its checks and adapter refuse startup. Treat that row as best-effort on an
+unsupported, ABI-drifted host; the version mismatch or plugin-load error
+remains visible in the Hermes gateway log.
+Do not work around the gate. Updating Hermes is outside
 the OcuClaw plugin update phase and needs the user's separate decision.
 
 ## RELAY-PORT-CLAIMED
@@ -47,13 +57,15 @@ have them tap Connect once. Read the newest gateway log before guessing.
 
 - recent `relay rejected connection: invalid token` -> if the host credential
   is present and a paired phone is suspected lost or compromised, load
-  `{"operation":"credential_reset"}`. Never ask the user to enter or reveal a
-  Relay Credential. Repeat rejects may collapse for 60 seconds.
+  `{"operation":"credential_reset"}`. A Relay Credential is a secret: never
+  request it, and do not have the user enter or reveal one. Repeat rejects may
+  collapse for 60 seconds.
 - recent `[ocuclaw] relay client connected` -> connectivity worked; inspect
   the app's compatibility message and Even Hub version.
 - neither -> run `hermes ocuclaw doctor`. Follow its Serve classification and
   exact substituted command, then repeat secure pairing from
-  `/ocuclaw-setup`. Never ask the user to assemble or read back an address.
+  `/ocuclaw-setup`. The doctor and pairing supply the address; the user never
+  has to build or read one back.
 
 Never use session listings as phone-connect evidence.
 
@@ -69,7 +81,7 @@ setup skill; the two cases people meet most:
 - the same failure twice, or a code the table does not name -> deterministic.
   Ask the person to run `hermes ocuclaw pair --address <verified-phoneAddress>`
   in their own terminal, a window they open themselves. Never run it through
-  an agent tool; its QR and pairing code must never reach the model.
+  an agent tool; its pairing code and the phone code must never reach the model.
 
 Never suggest quitting or relaunching the Hermes TUI to retry pairing while the
 gateway may be its child: quitting the TUI stops the gateway.
@@ -98,7 +110,7 @@ say the phone update is pending rather than weakening the host plugin.
 
 First run `hermes ocuclaw cloudways detect`. If it reports `cloudways` (or
 `likely` and the user confirms), do not use any installer below: the host has
-no root and no system Tailscale. Call `{"operation":"cloudways"}` instead.
+no root, and any Tailscale there is not this chat's to install. Call `{"operation":"cloudways"}` instead.
 
 Keep supported installation inside the current Hermes session. Detect the OS
 before selecting exactly one branch below. Every branch uses one `clarify`
@@ -106,6 +118,13 @@ checkpoint explaining that the commands download and run Tailscale's official
 stable installer, install its client and service, and change no OcuClaw or
 tailnet policy. Offer `Install Tailscale` and `Stop setup`, with the install
 choice recommended. Never mix commands from different OS branches.
+
+When the journey carries `customRouteOption`, the same checkpoint also shows
+its `say` line and its exact `command`, beside Install Tailscale, as a second
+option that is not recommended (for example `Use my own network`). Choosing it
+means the user sets the address with that command, runs their own TLS front
+door, then reruns `/ocuclaw-setup`. Continue in `CUSTOM-ROUTE`. Without
+`customRouteOption`, do not mention it.
 
 ### Linux
 
@@ -119,6 +138,11 @@ curl -fsSL https://tailscale.com/install.sh -o "$install_dir/install.sh" &&
 sh "$install_dir/install.sh"
 ```
 
+The script is Tailscale's own Linux installer, the one its download page
+(https://tailscale.com/download/linux) gives. It installs Tailscale on this
+Hermes host, not on Cloudways (see above), and runs only after the user picks
+Install Tailscale.
+
 `mktemp` creates an unpredictable user-private directory; never replace it with
 a fixed `/tmp` filename. The quoted variable carries the path from creation
 through execution, and `&&` prevents execution after a failed preparation or
@@ -129,8 +153,8 @@ the user may enter an OS password only in that native surface. Handing the block
 to a separate user terminal is the last resort after native execution is
 unavailable, cancelled, or refused.
 
-Verify `command -v tailscale`, the daemon state, and `tailscale --version`
-without asking the user to report success. A failed or unsupported installer
+Check `command -v tailscale`, the daemon state, and `tailscale --version`
+yourself; the user does not need to report success. A failed or unsupported installer
 stays in this case with its non-secret error. Success advances immediately to
 `TS-AUTH`.
 
@@ -201,9 +225,9 @@ WSL tailnet node; otherwise install on the Windows host. For an unsupported OS
 or a supported installer that rejects the host, explain the non-secret error
 and use the current official Tailscale instructions.
 
-Every successful branch proceeds automatically. Never ask the user to say
-"continue OcuClaw setup" unless Hermes itself had to restart, and never expose
-the relay through another public tunnel.
+After a successful branch, go straight on to the next step. The user only
+needs to say "continue OcuClaw setup" if Hermes itself had to restart. Never
+expose the relay through another public tunnel.
 
 ## TS-AUTH
 
@@ -225,7 +249,7 @@ in`; also offer `Cancel setup`. Never ask for their identity-provider password.
 After the selection, run the uncapped `tailscale status` and `tailscale ip -4`
 checks automatically. If the host still needs login, run the bounded command
 once more to obtain a current URL and repeat the same question. When both checks
-succeed, continue directly to the Serve checkpoint without asking the user to
+succeed, continue directly to the Serve checkpoint. The user does not need to
 say "continue" or run a command.
 
 ## TS-PORT-CLAIMED
@@ -256,6 +280,91 @@ again:
 
 A connection timeout or refusal is a different failure: that is the
 certificate, the route or the relay, not DNS.
+
+## CUSTOM-ROUTE
+
+Enter this lane only when `phoneAddress` is set (a custom private route), or
+when the user picked `Use my own network` at `TS-NOT-INSTALLED`. Tailscale is
+the default and stays the default; do not offer this lane to a Tailscale user.
+
+The user brings their own private network (WireGuard, UniFi Teleport,
+ZeroTier, NetBird, or a home LAN) and their own TLS front door (Caddy, nginx
+or similar) that forwards to the loopback relay port. They set one value; there
+is no environment variable for it:
+
+```bash
+hermes config set platforms.ocuclaw.extra.phoneAddress wss://<name>:<port>
+```
+
+Caddy front door, for example (relay port is
+`platforms.ocuclaw.extra.wsPort`, default 47801):
+
+```text
+ocuclaw.home.example.com:8446 {
+  reverse_proxy 127.0.0.1:<relay port>
+}
+```
+
+The name needs a publicly trusted certificate (a Let's Encrypt DNS challenge
+works even for private IPs). The phone cannot accept a self-signed one.
+
+In this mode the health route leg is `customRoute` (label "Private route").
+No `tailscale` command runs, no Serve command is printed, and uninstall does no
+Serve teardown. The setup journey skips `tailnet-route`. The `custom-route`
+checkpoint appears only when the address is invalid or the host is Cloudways;
+its `customRoute` field carries `setCommand` and `clearCommand`. Otherwise the
+journey goes straight to `secure-phone-pairing`, where `pair_phone` runs the
+full active check itself.
+
+`hermes ocuclaw doctor` checks in this order: the address is canonical
+`wss://name:port`; the host is not Cloudways; the relay answers on loopback;
+the name resolves on this host; every resolved address is private (10/8,
+172.16/12, 192.168/16, 100.64/10, fc00::/7; loopback and public are refused);
+TCP connects; TLS passes default certificate checks; a credential-free probe
+(`GET /_ocuclaw/route-probe/v1`) proves the front door leads to this host's
+relay. The credentialed relay check runs on loopback only. The Relay
+Credential never goes to the custom address.
+
+Answers:
+
+- **ready**: every check passed.
+- **unverified**: this host could not resolve or reach its own address, or the
+  probe got no answer. Pairing is still allowed, because the address is bound
+  into the safety phrase and a wrong address fails safely. Never call
+  unverified "working". Say the route is unchecked.
+- **wrong**: a check failed for certain. Pairing is blocked
+  (`custom_route_wrong`). Fix it, then run `doctor` again.
+
+Finding codes (scope `customRoute`) and the one fix each:
+
+| Code | Meaning | Fix |
+|---|---|---|
+| `custom_route_address_invalid` | Not canonical `wss://name:port` | `fix_phone_address`: set a valid address |
+| `custom_route_cloudways_host` | Cloudways is Tailscale-only | `clear_phone_address`: clear it and use `{"operation":"cloudways"}` |
+| `custom_route_relay_not_listening` | Relay does not answer on loopback | `restart_hermes_gateway` |
+| `custom_route_name_unresolved` (warning) | This host cannot resolve the name | `check_phone_route`: unverified, not wrong |
+| `custom_route_address_not_private` | A resolved address is public or loopback | `use_private_phone_address`: point the name at a private address |
+| `custom_route_unreachable` (warning) | TCP connect failed from this host | `check_phone_route`: unverified, not wrong |
+| `custom_route_tls_failed` | Certificate check failed | `fix_phone_route_certificate`: the user fixes the certificate |
+| `custom_route_probe_mismatch` | Front door leads somewhere else | `fix_phone_route_forwarding`: the user fixes the forwarding |
+| `custom_route_probe_no_answer` (warning) | Probe got no answer | `check_phone_route`: unverified, not wrong |
+| `custom_route_relay_credential_rejected` | Loopback relay rejected the credential | `run_setup_assistant` |
+
+Never edit the user's VPN, proxy, DNS or certificates, and never run commands
+for them. Name the finding, say what to check, and let them make the change.
+After their change, run `doctor` again, then `pair_phone`.
+
+Even AI uses this address too, with no `:8443` route: `hermes ocuclaw even-ai
+route` prints `agentUrl` as `https://<name>:<port>/v1/chat/completions`
+(no `:443`). The phone must be on that private network, and the front door
+must forward everything at that address to the relay, not only the WebSocket.
+
+To switch back to Tailscale, the user clears the address and reruns
+`/ocuclaw-setup`:
+
+```bash
+hermes config set platforms.ocuclaw.extra.phoneAddress ''
+```
 
 ## PROFILE-AUTHZ-DROP
 
@@ -311,6 +420,55 @@ give the user these host steps to run themselves.
 - Keep the agents and their conversations. Never copy `auth.json` between
   profiles as a repair.
 
+## CLAUDE-PLAN
+
+Enter when the agent runs, or should run, on a Claude Pro or Max plan. Hermes
+reaches the plan only through the official, experimental Claude Subscription
+DirectSDK plugin (provider `claude-subscription-directsdk-experimental`, Hermes
+0.21.4 or newer). It drives the unmodified Claude Code CLI, which owns the
+login; the plugin and Hermes never store or refresh it. Hermes's own Anthropic
+OAuth sign-in is not this route: it bills extra usage only and Pro plans fail,
+so never offer it. Give the user these steps to run in their own terminal
+(TERM-HELP); never ask for the sign-in code or any Claude token.
+
+- Set up: install Claude Code with Anthropic's installer
+  (`https://code.claude.com/docs/en/setup`), or with
+  `npm install -g @anthropic-ai/claude-code` where Node is installed. Then
+  `claude auth login` (open the link, sign in, paste back the code if asked),
+  then `hermes plugins install claude-subscription-directsdk --enable`. Choose it in
+  `hermes model` (or Hermes Desktop's model picker) as **Claude Subscription
+  DirectSDK (Experimental)**, with Sonnet 5.5 (`claude-sonnet-5-5[1m]`) on Pro
+  or Opus 5.5 (`claude-opus-5-5[1m]`) on Max. `claude auth status --json`
+  shows the plan as `subscriptionType`. Then restart the gateway through its
+  normal service controls.
+- Signed out, or a rejected sign-in: `claude auth status --text`, then
+  `claude auth login`. `hermes model` cannot renew this login.
+- Claude Code missing: the plugin looks on `PATH` and in the usual install
+  folders (`~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, npm's global
+  folder), so a gateway with a short service `PATH` still finds it. Anywhere
+  else, reinstall with the command above.
+- `does not support this model`: update Claude Code with `claude update`.
+- Usage: the plan's own limits apply, at the rate `claude -p` uses. Opus with
+  its 1M window, and Fable on Pro, can draw paid usage credits; the user can
+  turn off extra usage in their Claude settings to avoid overage.
+
+## VOICE-ERRORS
+
+The glasses show a voice notice. Read the words the user reports, then:
+
+| Glasses say | Meaning | Fix |
+| --- | --- | --- |
+| Voice isn't set up. / Set it up on your phone: Settings › Voice | No Soniox key loaded, or no Hermes speech provider picked | Soniox: save the key, then restart Hermes from the Home voice card. Hermes engine: pick a provider in **Set up voice** |
+| Soniox key invalid. / Fix it in phone Settings › Voice | Soniox rejected the key | New key at console.soniox.com, then **Change** > **Replace key** in voice setup |
+| Soniox is out of credits. / Top up, or switch on the phone | The Soniox account has no balance | Add billing in the Soniox console |
+| Transcription key invalid. or Transcription key missing. / Fix the key on your agent | The Hermes speech provider's own key | Fix it in Hermes (Desktop **Capabilities → Tools → Speech-to-Text**, or `hermes tools`) |
+| Transcription is out of credits. | The Hermes provider's account has no balance | Top up with that provider, or pick another |
+| … rate limited. / Wait a minute, then try again | Too many requests | Wait, then retry |
+| … unavailable. or … timed out. or Can't reach the voice service. | The service or network is down | Retry; text chat still works |
+
+A notice is not a reason for an extra restart. After a fix, run the spoken test
+again (**Try voice**).
+
 ## ESCALATE
 
 Open OcuClaw's built-in **Report a bug** feature and send the diagnostic
@@ -323,7 +481,7 @@ already recorded. Show it to the user and confirm it contains no secrets or
 network addresses:
 
 ```text
-OcuClaw Hermes beta report — guide 2026-09-29 (1.3.26-hermes)
+OcuClaw Hermes report — guide 2026-10-28 (1.3.27-hermes)
 Hermes version:
 OcuClaw bundle version (from plugin.yaml/list output):
 Backend: hermes

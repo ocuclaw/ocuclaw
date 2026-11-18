@@ -1,4 +1,5 @@
 const { computeCodeSpanRegions } = require("./code-span-regions.cjs");
+const { stripSpeckMarkers } = require("./speck-marker.cjs");
 
 const COMPLETE_NEURAL_TAG_SOURCE =
   String.raw`<\/?neural(?:(?::|\s)[^<>\r\n]*)?\s*\/?>`;
@@ -97,4 +98,12 @@ function stripAllTaggedSpans(text) {
   });
 }
 
-module.exports = { matchInvalidNeuralMarkupAt, matchTrailingInvalidNeuralMarkup, stripInvalidNeuralMarkup, stripAllTaggedSpans };
+function stripDisplayMarkup(text) {
+  const withoutSpans = stripAllTaggedSpans(text);
+  if (!withoutSpans.includes("<")) return withoutSpans;
+  return stripSpeckMarkers(withoutSpans)
+    .replace(/ ?<beat\/>(?= |$)/g, "")
+    .replaceAll("<beat/>", "");
+}
+
+module.exports = { matchInvalidNeuralMarkupAt, matchTrailingInvalidNeuralMarkup, stripInvalidNeuralMarkup, stripAllTaggedSpans, stripDisplayMarkup };

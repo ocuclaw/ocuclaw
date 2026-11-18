@@ -1,6 +1,6 @@
 const { totalmem, freemem, loadavg, cpus } = require("node:os");
 const dns = require("node:dns");
-const { Agent } = require("undici");
+const { Agent, fetch: undiciFetch } = require("undici");
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_OUTPUT_CAP_BYTES = 64 * 1024;
@@ -25,48 +25,113 @@ function parseJsonIfPossible(text) {
   }
 }
 
-function checkIpv4Tuple(a, b) {
+function checkIpv4Tuple(a        , b        , c        )                {
   if (a === 127) return "loopback IPv4 blocked";
   if (a === 10) return "RFC1918 IPv4 blocked";
   if (a === 172 && b >= 16 && b <= 31) return "RFC1918 IPv4 blocked";
   if (a === 192 && b === 168) return "RFC1918 IPv4 blocked";
   if (a === 169 && b === 254) return "link-local / cloud-metadata IPv4 blocked";
   if (a === 0) return "zero-network IPv4 blocked";
+
+  if (a === 100 && b >= 64 && b <= 127) return "shared-address 100.64/10 IPv4 blocked";
+
+  if (a === 198 && (b === 18 || b === 19)) return "benchmarking 198.18/15 IPv4 blocked";
+
+  if (a === 192 && b === 0 && c === 0) return "IETF-protocol 192.0.0/24 IPv4 blocked";
   if (a >= 224) return "multicast/reserved IPv4 blocked";
   return null;
 }
 
-function checkResolvedIp(address, family) {
-  if (typeof address !== "string") return null;
-  if (family === 4) {
-    const m = address.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-    if (!m) return null;
-    return checkIpv4Tuple(Number(m[1]), Number(m[2]));
+function checkIpv4Literal(address        )                {
+  const m = address.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return "unrecognised IPv4 address blocked";
+  const octets = [m[1], m[2], m[3], m[4]].map(Number);
+  if (octets.some((n) => n > 255)) return "unrecognised IPv4 address blocked";
+  return checkIpv4Tuple(octets[0], octets[1], octets[2]);
+}
+
+function parseIpv6Groups(text        )                  {
+  let addr = text.toLowerCase();
+  if (addr.startsWith("[") && addr.endsWith("]")) addr = addr.slice(1, -1);
+  const zone = addr.indexOf("%");
+  if (zone >= 0) addr = addr.slice(0, zone);
+  if (!addr.includes(":")) return null;
+  const halves = addr.split("::");
+  if (halves.length > 2) return null;
+  const parsePart = (part        , dottedTail         )                  => {
+    if (part === "") return [];
+    const out           = [];
+    const pieces = part.split(":");
+    for (let i = 0; i < pieces.length; i++) {
+      const piece = pieces[i];
+      if (dottedTail && i === pieces.length - 1 && piece.includes(".")) {
+        const m = piece.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+        if (!m) return null;
+        const o = [m[1], m[2], m[3], m[4]].map(Number);
+        if (o.some((n) => n > 255)) return null;
+        out.push((o[0] << 8) | o[1], (o[2] << 8) | o[3]);
+        continue;
+      }
+      if (!/^[0-9a-f]{1,4}$/.test(piece)) return null;
+      out.push(parseInt(piece, 16));
+    }
+    return out;
+  };
+  if (halves.length === 1) {
+    const all = parsePart(halves[0], true);
+    return all && all.length === 8 ? all : null;
   }
-  if (family !== 6) return null;
-  const addr = address.toLowerCase();
-  if (addr === "::" || addr === "::1") return "IPv6 loopback/unspecified blocked";
-  const mappedDotted = addr.match(/^::ffff:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (mappedDotted) {
-    const r = checkIpv4Tuple(Number(mappedDotted[1]), Number(mappedDotted[2]));
-    return r ? `IPv4-mapped IPv6 (${r})` : null;
-  }
-  const mappedHex = addr.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
-  if (mappedHex) {
-    const high = parseInt(mappedHex[1], 16);
-    const r = checkIpv4Tuple((high >> 8) & 0xff, high & 0xff);
-    return r ? `IPv4-mapped IPv6 (${r})` : null;
-  }
-  const compatHex = addr.match(/^::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
-  if (compatHex) {
-    const high = parseInt(compatHex[1], 16);
-    const r = checkIpv4Tuple((high >> 8) & 0xff, high & 0xff);
-    return r ? `IPv4-compatible IPv6 (${r})` : null;
+  const head = parsePart(halves[0], false);
+  const tail = parsePart(halves[1], true);
+  if (!head || !tail) return null;
+  const fill = 8 - head.length - tail.length;
+  if (fill < 1) return null;
+  return [...head, ...new Array(fill).fill(0), ...tail];
+}
+
+function checkIpv6Literal(address        )                {
+  const g = parseIpv6Groups(address);
+  if (!g) return "unrecognised IPv6 address blocked";
+  const zeroBefore = (n        ) => g.slice(0, n).every((x) => x === 0);
+  const embedded = () => checkIpv4Tuple(g[6] >> 8, g[6] & 0xff, g[7] >> 8);
+  if (zeroBefore(7) && (g[7] === 0 || g[7] === 1)) return "IPv6 loopback/unspecified blocked";
+
+  if (zeroBefore(5) && g[5] === 0xffff) {
+    const r = embedded();
+    return r ? `IPv4-mapped IPv6 blocked (${r})` : null;
   }
 
-  if (/^fe[89ab][0-9a-f]:/.test(addr)) return "IPv6 link-local blocked";
-  if (/^f[cd][0-9a-f]{2}:/.test(addr)) return "IPv6 ULA blocked";
+  if (zeroBefore(4) && g[4] === 0xffff && g[5] === 0) {
+    const r = embedded();
+    return r ? `IPv4-translated IPv6 blocked (${r})` : null;
+  }
+
+  if (zeroBefore(6)) {
+    const r = embedded();
+    return r ? `IPv4-compatible IPv6 blocked (${r})` : null;
+  }
+
+  if (g[0] === 0x64 && g[1] === 0xff9b) return "NAT64 IPv6 blocked";
+
+  if (g[0] === 0x2002) return "6to4 IPv6 blocked";
+
+  if ((g[0] & 0xffc0) === 0xfe80) return "IPv6 link-local blocked";
+
+  if ((g[0] & 0xffc0) === 0xfec0) return "IPv6 site-local blocked";
+
+  if ((g[0] & 0xfe00) === 0xfc00) return "IPv6 ULA blocked";
+  if ((g[0] & 0xff00) === 0xff00) return "IPv6 multicast blocked";
   return null;
+}
+
+function isForbiddenAddress(address        , family         )                {
+  if (typeof address !== "string" || address.length === 0) return "invalid address blocked";
+  const fam = family === 4 || family === 6 ? family : address.includes(":") ? 6 : 4;
+  return fam === 6 ? checkIpv6Literal(address) : checkIpv4Literal(address);
+}
+
+function checkResolvedIp(address        , family        )                {
+  return isForbiddenAddress(address, family);
 }
 
 function makeSafeLookup(dnsLookup) {
@@ -107,11 +172,15 @@ function makeSafeLookup(dnsLookup) {
   };
 }
 
-const ssrfSafeDispatcher = new Agent({
-  connect: { lookup: makeSafeLookup(dns.promises.lookup) },
-});
+function createSsrfSafeDispatcher(dnsLookup                                                                              ) {
+  return new Agent({
+    connect: { lookup: makeSafeLookup(dnsLookup || dns.promises.lookup) },
+  });
+}
 
-function isForbiddenHttpDestination(urlString) {
+const ssrfSafeDispatcher = createSsrfSafeDispatcher();
+
+function isForbiddenHttpDestination(urlString        )                {
   let parsed;
   try {
     parsed = new URL(urlString);
@@ -132,9 +201,8 @@ function isForbiddenHttpDestination(urlString) {
     return "loopback hostname blocked";
   }
 
-  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (v4) {
-    return checkIpv4Tuple(Number(v4[1]), Number(v4[2]));
+  if (/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(host)) {
+    return checkIpv4Literal(host);
   }
 
   if (/^[0-9a-f.x]+$/.test(host) && /^\d/.test(host) && !host.includes(":")) {
@@ -142,37 +210,7 @@ function isForbiddenHttpDestination(urlString) {
   }
 
   if (host.includes(":")) {
-    if (host === "::" || host === "::1") return "IPv6 loopback/unspecified blocked";
-
-    const mappedDotted = host.match(/^::(?:ffff:)?(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-    if (mappedDotted) {
-      const reason = checkIpv4Tuple(Number(mappedDotted[1]), Number(mappedDotted[2]));
-      if (reason) return `IPv4-mapped IPv6 blocked (${reason})`;
-      return null;
-    }
-    const mappedHex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
-    if (mappedHex) {
-      const high = parseInt(mappedHex[1], 16);
-      const a = (high >> 8) & 0xff;
-      const b = high & 0xff;
-      const reason = checkIpv4Tuple(a, b);
-      if (reason) return `IPv4-mapped IPv6 blocked (${reason})`;
-      return null;
-    }
-
-    const compatHex = host.match(/^::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
-    if (compatHex) {
-      const high = parseInt(compatHex[1], 16);
-      const a = (high >> 8) & 0xff;
-      const b = high & 0xff;
-      const reason = checkIpv4Tuple(a, b);
-      if (reason) return `IPv4-compatible IPv6 blocked (${reason})`;
-      return null;
-    }
-
-    if (/^fe[89ab][0-9a-f]:/.test(host)) return "IPv6 link-local blocked";
-    if (/^f[cd][0-9a-f]{2}:/.test(host)) return "IPv6 ULA blocked";
-    return null;
+    return checkIpv6Literal(host);
   }
   return null;
 }
@@ -217,24 +255,18 @@ function isHttpHostAllowed(hostname, allowList) {
   );
 }
 
-const CROSS_ORIGIN_STRIP_HEADERS = new Set([
-  "authorization",
-  "cookie",
-  "proxy-authorization",
-  "x-api-key",
-  "api-key",
-  "x-auth-token",
-  "x-access-token",
-  "x-amz-security-token",
+const CROSS_ORIGIN_SAFE_HEADERS = new Set([
+  "accept", "accept-encoding", "accept-language", "content-type", "content-language",
+  "cache-control", "pragma", "user-agent", "range", "if-range", "if-match",
+  "if-none-match", "if-modified-since", "if-unmodified-since",
+  "x-trace", "x-request-id", "x-correlation-id",
 ]);
-const CREDENTIALISH_HEADER_RE = /(^|-)(api|auth|access|secret|session)(-|key|token|$)/i;
 
 function stripCrossOriginHeaders(headers) {
   const out = {};
   for (const key of Object.keys(headers || {})) {
     const lower = key.toLowerCase();
-    if (CROSS_ORIGIN_STRIP_HEADERS.has(lower)) continue;
-    if (CREDENTIALISH_HEADER_RE.test(lower)) continue;
+    if (!CROSS_ORIGIN_SAFE_HEADERS.has(lower)) continue;
     out[key] = headers[key];
   }
   return out;
@@ -263,7 +295,7 @@ async function executeHttpRecipe(params, opts) {
   const hostCheck = opts && typeof opts.hostCheck === "function"
     ? opts.hostCheck
     : allowHosts
-      ? (host) => isHttpHostAllowed(host, allowHosts) ? "listed" : "not_allowed"
+      ? (host     ) => isHttpHostAllowed(host, allowHosts) ? "listed" : "not_allowed"
       : null;
   if (hostCheck) {
     let initialHost = "";
@@ -286,7 +318,7 @@ async function executeHttpRecipe(params, opts) {
     : DEFAULT_OUTPUT_CAP_BYTES;
   const jsonPath = params && typeof params.jsonPath === "string" ? params.jsonPath : "";
 
-  const fetchFn = opts && typeof opts.fetch === "function" ? opts.fetch : fetch;
+  const fetchFn = opts && typeof opts.fetch === "function" ? opts.fetch : undiciFetch;
 
   const dispatcher =
     opts && opts.dispatcher !== undefined ? opts.dispatcher : ssrfSafeDispatcher;
@@ -310,6 +342,10 @@ async function executeHttpRecipe(params, opts) {
 
       if (dispatcher) fetchInit.dispatcher = dispatcher;
       response = await fetchFn(currentUrl, fetchInit);
+      if (response.status < 200 || response.status >= 300) {
+
+        try { await response.body?.cancel(); } catch (_) {}
+      }
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get("location");
         if (!location) {
@@ -343,8 +379,6 @@ async function executeHttpRecipe(params, opts) {
           requestHeaders = stripCrossOriginHeaders(requestHeaders);
           requestBody = undefined;
         }
-
-        try { await response.arrayBuffer(); } catch (_) {}
         currentUrl = nextUrl;
         hop += 1;
         continue;
@@ -408,7 +442,7 @@ async function executeHttpRecipe(params, opts) {
 const DISPLAY_FRAMING_PROMPT = (maxChars, previousBody) =>
   `You are a tick worker producing a single short line of text for a head-mounted display surface. Reply with ONLY the new value to display, no preamble, no quotes, no JSON. Maximum ${maxChars} characters. Previous value: ${JSON.stringify(previousBody || "")}.`;
 
-function composeSystemPrompt(agentPrompt, maxChars, previousBody) {
+function composeSystemPrompt(agentPrompt     , maxChars     , previousBody     ) {
   const framing = DISPLAY_FRAMING_PROMPT(maxChars, previousBody);
   return typeof agentPrompt === "string" && agentPrompt.trim()
     ? `${agentPrompt.trim()}\n\n${framing}`
@@ -421,6 +455,15 @@ function stripModelProviderPrefix(modelRef) {
   return idx === -1 ? modelRef : modelRef.slice(idx + 1);
 }
 
+const ANTHROPIC_THINKING_ROOM_TOKENS = 1024;
+const ANTHROPIC_MODELS_THAT_THINK = new Set        ();
+
+function anthropicReplyText(json                )         {
+  return Array.isArray(json?.content)
+    ? json.content.filter((b) => b && b.type === "text").map((b) => b.text).join("")
+    : "";
+}
+
 async function runAnthropicApi(params, deps) {
   const fetchFn = deps && deps.fetch ? deps.fetch : fetch;
   if (!params.apiKey) return { error: "anthropic-api: missing api key" };
@@ -429,36 +472,57 @@ async function runAnthropicApi(params, deps) {
   const systemPrompt = composeSystemPrompt(params.systemPrompt, max_tokens * 4, params.previousBody);
   const timeoutMs = Number.isFinite(params.timeoutMs) ? params.timeoutMs : 30_000;
   const controller = new AbortController();
+  const cancel = () => controller.abort();
+  params.signal?.addEventListener("abort", cancel, { once: true });
+  if (params.signal?.aborted) controller.abort();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetchFn("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": params.apiKey,
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens,
-        system: systemPrompt,
-        messages: [{ role: "user", content: params.prompt }],
-      }),
-      signal: controller.signal,
-    });
-    if (response.status < 200 || response.status >= 300) {
-      return { error: `anthropic-api status ${response.status}` };
+    const ask = async (roomTokens        )                                                      => {
+      const response = await fetchFn("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        redirect: "error",
+        headers: {
+          "x-api-key": params.apiKey,
+          "anthropic-version": "2023-06-01",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: max_tokens + roomTokens,
+          system: systemPrompt,
+          messages: [{ role: "user", content: params.prompt }],
+        }),
+        signal: controller.signal,
+      });
+      if (response.status < 200 || response.status >= 300) return { status: response.status };
+      return { json: (await response.json())                   };
+    };
+    let thinks = ANTHROPIC_MODELS_THAT_THINK.has(model);
+    let reply = await ask(thinks ? ANTHROPIC_THINKING_ROOM_TOKENS : 0);
+    if (reply.json && !thinks) {
+      const ranOut = reply.json.stop_reason === "max_tokens";
+      const blocks = Array.isArray(reply.json.content) ? reply.json.content : [];
+      thinks = blocks.some((b) => b && (b.type === "thinking" || b.type === "redacted_thinking"))
+        || (ranOut && !anthropicReplyText(reply.json));
+      if (thinks) {
+        ANTHROPIC_MODELS_THAT_THINK.add(model);
+
+        if (ranOut) reply = await ask(ANTHROPIC_THINKING_ROOM_TOKENS);
+      }
     }
-    const json = await response.json();
-    const text = Array.isArray(json.content)
-      ? json.content.filter((b) => b && b.type === "text").map((b) => b.text).join("")
-      : "";
-    return { output: text };
+    if (!reply.json) {
+      return { error: `anthropic-api status ${reply.status}` };
+    }
+    const text = anthropicReplyText(reply.json);
+
+    return { output: thinks ? Array.from(text).slice(0, max_tokens * 4).join("") : text };
   } catch (err) {
+    if (params.signal?.aborted) return { error: "anthropic-api: cancelled" };
     if (err && err.name === "AbortError") return { error: `anthropic-api timeout after ${timeoutMs}ms` };
     return { error: `anthropic-api error: ${err && err.message ? err.message : String(err)}` };
   } finally {
     clearTimeout(timer);
+    params.signal?.removeEventListener("abort", cancel);
   }
 }
 
@@ -471,10 +535,15 @@ async function runOpenAiCompat(params, deps) {
   const systemPrompt = composeSystemPrompt(params.systemPrompt, max_tokens * 4, params.previousBody);
   const timeoutMs = Number.isFinite(params.timeoutMs) ? params.timeoutMs : 30_000;
   const controller = new AbortController();
+  const cancel = () => controller.abort();
+  params.signal?.addEventListener("abort", cancel, { once: true });
+  if (params.signal?.aborted) controller.abort();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetchFn(`${params.baseUrl}/v1/chat/completions`, {
+    const baseUrl = params.baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "");
+    const response = await fetchFn(`${baseUrl}/v1/chat/completions`, {
       method: "POST",
+      redirect: "error",
       headers: {
         Authorization: `Bearer ${params.apiKey}`,
         "Content-Type": "application/json",
@@ -499,10 +568,12 @@ async function runOpenAiCompat(params, deps) {
         : "";
     return { output: text };
   } catch (err) {
+    if (params.signal?.aborted) return { error: "openai-compat: cancelled" };
     if (err && err.name === "AbortError") return { error: `openai-compat timeout after ${timeoutMs}ms` };
     return { error: `openai-compat error: ${err && err.message ? err.message : String(err)}` };
   } finally {
     clearTimeout(timer);
+    params.signal?.removeEventListener("abort", cancel);
   }
 }
 
@@ -518,6 +589,7 @@ async function executeLlmRecipeWithDeps(recipe, ctx, deps) {
     baseUrl: ctx && typeof ctx.baseUrl === "string" ? ctx.baseUrl : "",
     previousBody: ctx && typeof ctx.previousBody === "string" ? ctx.previousBody : "",
     timeoutMs: ctx && Number.isFinite(ctx.timeoutMs) ? ctx.timeoutMs : undefined,
+    signal: ctx?.signal,
   };
   if (!baseParams.prompt) return { error: "llm recipe missing prompt" };
   switch (backend) {
@@ -577,14 +649,24 @@ async function executeSystemStatsRecipe(params, opts) {
     const load = loadavgFn();
     const toMb = (b) => Math.round(b / (1024 * 1024));
     const round1 = (x) => Math.round(x * 10) / 10;
+    const stats = {
+      memTotalMb: toMb(total),
+      memUsedMb: toMb(used),
+      memFreeMb: toMb(free),
+      memUsedPct: total > 0 ? round1((used / total) * 100) : 0,
+      cpuPct: round1(cpuPct),
+      loadAvg1: Array.isArray(load) && load.length > 0 ? Math.round(load[0] * 100) / 100 : 0,
+    };
+
     return {
       output: {
-        memTotalMb: toMb(total),
-        memUsedMb: toMb(used),
-        memFreeMb: toMb(free),
-        memUsedPct: total > 0 ? round1((used / total) * 100) : 0,
-        cpuPct: round1(cpuPct),
-        loadAvg1: Array.isArray(load) && load.length > 0 ? Math.round(load[0] * 100) / 100 : 0,
+        ...stats,
+        mem_total_mb: stats.memTotalMb,
+        mem_used_mb: stats.memUsedMb,
+        mem_free_mb: stats.memFreeMb,
+        mem_used_pct: stats.memUsedPct,
+        cpu_pct: stats.cpuPct,
+        load_avg_1: stats.loadAvg1,
       },
     };
   } catch (err) {
@@ -592,4 +674,4 @@ async function executeSystemStatsRecipe(params, opts) {
   }
 }
 
-module.exports = { executeHttpRecipe, executeLlmRecipe, executeLlmRecipeWithDeps, makeSafeLookup, executeSystemStatsRecipe, computeCpuPct, normalizeHttpAllowHosts, isHttpHostAllowed };
+module.exports = { isForbiddenAddress, makeSafeLookup, createSsrfSafeDispatcher, isForbiddenHttpDestination, normalizeHttpAllowHosts, isHttpHostAllowed, executeHttpRecipe, executeLlmRecipeWithDeps, executeLlmRecipe, computeCpuPct, executeSystemStatsRecipe };

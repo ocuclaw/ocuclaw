@@ -125,7 +125,7 @@ INPUT_PREDICTION_LIMITS: Dict[str, int] = {
 # constant is the parity anchor: the cross-language test reads
 # SILENT_INPUT_OPEN_PROMPT_VERSION out of silent-input-open-reply.ts and
 # refuses a prompt change on either side that does not bump BOTH.
-SILENT_INPUT_OPEN_PROMPT_VERSION = "sio-3"
+SILENT_INPUT_OPEN_PROMPT_VERSION = "sio-4"
 
 # Byte-for-byte the Node adapter's SILENT_INPUT_OPEN_LIMITS. A divergence in
 # any of these would make the two hosts answer differently.
@@ -238,6 +238,25 @@ _LETTER_RE = re.compile(r"^[A-Za-z]{1,31}$")
 # missing firmware glyph. Kept in lockstep with the Node and phone twins.
 _WHOLE_REPLY_RE = re.compile(r"[A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF0-9 ,.'!?:-]+")
 _ANY_REPLY_LETTER_RE = re.compile(r"[A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF]")
+# #4989: Korean and Japanese replies keep the whole en alphabet and add their
+# own script; each must contain at least one letter of that script. Kept
+# identical to the Node twin's KO_/JA_REPLY_RE and the phone's check; the
+# shared vectors are tests/fixtures/silent-input-open-reply-locales.json.
+_KO_WHOLE_REPLY_RE = re.compile(r"[A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF0-9 ,.'!?:~\u3131-\u318E\uAC00-\uD7A3-]+")
+_KO_REPLY_LETTER_RE = re.compile(r"[\u3131-\u318E\uAC00-\uD7A3]")
+_JA_WHOLE_REPLY_RE = re.compile(
+    r"[A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF0-9 ,.'!?:\u3001\u3002\u3005\u300C\u300D"
+    r"\u3041-\u3096\u30A1-\u30FA\u30FB\u30FC\u4E00-\u9FFF\uFF01\uFF1F\uFF10-\uFF19-]+"
+)
+_JA_REPLY_LETTER_RE = re.compile(r"[\u3005\u3041-\u3096\u30A1-\u30FA\u4E00-\u9FFF]")
+_REPLY_ALPHABETS = {
+    "en": (_WHOLE_REPLY_RE, _ANY_REPLY_LETTER_RE),
+    "ko": (_KO_WHOLE_REPLY_RE, _KO_REPLY_LETTER_RE),
+    "ja": (_JA_WHOLE_REPLY_RE, _JA_REPLY_LETTER_RE),
+}
+# The reply-language display names the prompt uses, byte-for-byte the Node
+# twin's REPLY_LANGUAGE_NAMES (extensions/ocuclaw/src/domain/reply-language.ts).
+_REPLY_LANGUAGE_NAMES = {"ko": "Korean (\uD55C\uAD6D\uC5B4)", "ja": "Japanese (\u65E5\u672C\u8A9E)"}
 _ASCII_SPACE_RUN_RE = re.compile(r" +")
 _MODEL_CHOICE_RE = re.compile(r"^[A-Za-z0-9._:@/-]{1,128}$")
 # Same grammar as the Node service's REQUEST_ID_RE.
@@ -423,6 +442,23 @@ OPEN_ASK_EXAMPLE = (
     '"words":["yes","sure","sorry","later","tomorrow","meeting"]}'
 )
 SMALL_ASK_EXAMPLE = '{"replies":["On my way","Give me ten minutes"]}'
+# #4989: the example a ko or ja ask shows instead, byte-for-byte the Node
+# twin's KO_ASK_EXAMPLE / JA_ASK_EXAMPLE. These asks never carry words.
+KO_ASK_EXAMPLE = '{"replies":["지금 가는 중이에요","10분만 기다려 주세요"]}'
+JA_ASK_EXAMPLE = '{"replies":["今向かっています","10分待ってください"]}'
+
+
+def reply_script(locale: Any) -> str:
+    """"ko" or "ja" for a locale of that language ("ko", "ko-KR"), else "en".
+
+    Mirrors the Node twin's ``replyScript``: it picks the reply alphabet and
+    whether the prompt names Korean or Japanese."""
+    tag = locale if isinstance(locale, str) else ""
+    if tag == "ko" or tag.startswith("ko-"):
+        return "ko"
+    if tag == "ja" or tag.startswith("ja-"):
+        return "ja"
+    return "en"
 
 
 def _ask_shape(ask: Any) -> Tuple[int, int]:
@@ -452,19 +488,29 @@ def build_open_reply_messages(req: Dict[str, Any], ask: Any = None) -> Tuple[str
     locale_raw = req.get("locale") if isinstance(req, dict) else None
     locale = locale_raw if isinstance(locale_raw, str) and locale_raw else "en"
     english = "English " if locale == "en" else ""
-    max_replies, prompt_words = _ask_shape(ask if ask is not None else SILENT_INPUT_OPEN_LIMITS)
+    # #4989: ko and ja name their language and show an example in it. Any
+    # other non-en locale keeps the old prompt that only drops "English ".
+    script = reply_script(locale)
+    language = english if script == "en" else f"{_REPLY_LANGUAGE_NAMES[script]} "
+    max_replies, asked_words = _ask_shape(ask if ask is not None else SILENT_INPUT_OPEN_LIMITS)
+    prompt_words = asked_words if script == "en" else 0
     keys = OPEN_ASK_KEYS if prompt_words > 0 else SMALL_ASK_KEYS
     words_clause = (
         OPEN_ASK_WORDS_CLAUSE.replace("{n}", str(prompt_words)).replace("{english}", english)
         if prompt_words > 0
         else ""
     )
-    example = OPEN_ASK_EXAMPLE if prompt_words > 0 else SMALL_ASK_EXAMPLE
+    if script == "ko":
+        example = KO_ASK_EXAMPLE
+    elif script == "ja":
+        example = JA_ASK_EXAMPLE
+    else:
+        example = OPEN_ASK_EXAMPLE if prompt_words > 0 else SMALL_ASK_EXAMPLE
     system = (
         "Someone wearing smart glasses is about to answer a short chat message. Typing is slow "
         "for them: every word costs several gestures. Reply with ONLY a JSON object with "
         f"{keys}.\n"
-        f'"replies": at most {max_replies} different short whole {english}replies they might send, '
+        f'"replies": at most {max_replies} different short whole {language}replies they might send, '
         "most likely first. Each is one plain sentence of at most eight words, no emoji, no "
         "markdown, no names they have not been given.\n"
         f"{words_clause}"
@@ -505,11 +551,13 @@ def parse_object_text(text: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
-def normalize_whole_reply(raw: Any) -> Optional[str]:
+def normalize_whole_reply(raw: Any, locale: Any = "en") -> Optional[str]:
     """One whole reply, or None.
 
     Refuses raw controls/format characters before NFC, collapses ASCII spaces,
-    bounds the length, and accepts only the documented Latin-1 reply alphabet.
+    bounds the length (in code points), and accepts only the reply alphabet of
+    ``locale`` (#4989): the documented Latin-1 alphabet for en and every other
+    locale, plus Hangul for ko or kana and kanji for ja.
     """
     if not isinstance(raw, str):
         return None
@@ -518,14 +566,15 @@ def normalize_whole_reply(raw: Any) -> Optional[str]:
     collapsed = _ASCII_SPACE_RUN_RE.sub(" ", unicodedata.normalize("NFC", raw)).strip(" ")
     if not collapsed or len(collapsed) > SILENT_INPUT_OPEN_LIMITS["maxReplyChars"]:
         return None
-    if not _WHOLE_REPLY_RE.fullmatch(collapsed):
+    whole_re, letter_re = _REPLY_ALPHABETS[reply_script(locale)]
+    if not whole_re.fullmatch(collapsed):
         return None
-    if not _ANY_REPLY_LETTER_RE.search(collapsed):
+    if not letter_re.search(collapsed):
         return None
     return collapsed
 
 
-def parse_open_reply_object(parsed: Any, ask: Any = None) -> Optional[Dict[str, Any]]:
+def parse_open_reply_object(parsed: Any, ask: Any = None, locale: Any = "en") -> Optional[Dict[str, Any]]:
     """``{replies, words, rejected*, received*}`` from an already-decoded
     object, or None when it is not object-shaped at all (the caller reports
     ``invalid-output``, never retries).
@@ -536,17 +585,19 @@ def parse_open_reply_object(parsed: Any, ask: Any = None) -> Optional[Dict[str, 
 
     ``ask`` caps the REPLIES at whatever this call asked for (#3190), so a Test
     that asked for two and was sent four still reports two. Words keep the full
-    cap either way.
+    cap either way. ``locale`` picks the reply alphabet (#4989); reply words
+    are English-only, so a ko or ja answer returns none.
     """
     if not isinstance(parsed, dict):
         return None
     max_replies, _prompt_words = _ask_shape(ask if ask is not None else SILENT_INPUT_OPEN_LIMITS)
+    words_allowed = reply_script(locale) == "en"
     replies: List[str] = []
     seen_replies: set = set()
     rejected_replies = 0
     raw_replies = parsed.get("replies") if isinstance(parsed.get("replies"), list) else []
     for raw in raw_replies:
-        reply = normalize_whole_reply(raw)
+        reply = normalize_whole_reply(raw, locale)
         if reply is None:
             rejected_replies += 1
             continue
@@ -563,7 +614,7 @@ def parse_open_reply_object(parsed: Any, ask: Any = None) -> Optional[Dict[str, 
     rejected_words = 0
     raw_words = parsed.get("words") if isinstance(parsed.get("words"), list) else []
     for raw in raw_words:
-        word = normalize_candidate_word(raw)
+        word = normalize_candidate_word(raw) if words_allowed else None
         if word is None:
             rejected_words += 1
             continue
@@ -585,12 +636,12 @@ def parse_open_reply_object(parsed: Any, ask: Any = None) -> Optional[Dict[str, 
     }
 
 
-def parse_open_reply_text(text: Any, ask: Any = None) -> Optional[Dict[str, Any]]:
+def parse_open_reply_text(text: Any, ask: Any = None, locale: Any = "en") -> Optional[Dict[str, Any]]:
     """Model output text → the parsed open answer, or None."""
-    return parse_open_reply_object(parse_object_text(text), ask)
+    return parse_open_reply_object(parse_object_text(text), ask, locale)
 
 
-def _coerce_open_parsed(parsed: Any, ask: Any = None) -> Optional[Dict[str, Any]]:
+def _coerce_open_parsed(parsed: Any, ask: Any = None, locale: Any = "en") -> Optional[Dict[str, Any]]:
     """A structured-output host hands back a decoded object; a plain one hands
     back text. Both land in the same strict parser.
 
@@ -600,18 +651,18 @@ def _coerce_open_parsed(parsed: Any, ask: Any = None) -> Optional[Dict[str, Any]
     fills ``parsed`` with its own envelope and the real JSON in ``text`` lost
     the answer. One wrapper level is unwrapped too."""
     if isinstance(parsed, dict):
-        direct = parse_open_reply_object(parsed, ask)
+        direct = parse_open_reply_object(parsed, ask, locale)
         if direct and (direct["replies"] or direct["words"]):
             return direct
         for value in parsed.values():
             if not isinstance(value, dict):
                 continue
-            inner = parse_open_reply_object(value, ask)
+            inner = parse_open_reply_object(value, ask, locale)
             if inner and (inner["replies"] or inner["words"]):
                 return inner
         return None
     if isinstance(parsed, str):
-        return parse_open_reply_text(parsed, ask)
+        return parse_open_reply_text(parsed, ask, locale)
     return None
 
 
@@ -1655,20 +1706,22 @@ class InputPredictionRpc:
 
     # -- reading one completion's output ------------------------------------
 
-    def _read_open_output(self, result: Any, base: Dict[str, Any], _req: Dict[str, Any], ask: Any = None) -> Dict[str, Any]:
+    def _read_open_output(self, result: Any, base: Dict[str, Any], req: Dict[str, Any], ask: Any = None) -> Dict[str, Any]:
         """Editor-open path: a JSON object of whole replies + reply words.
 
         Nothing usable after filtering is ``invalid-output``, never a partial
-        guess; the counts in the reason are counts only, never the content."""
+        guess; the counts in the reason are counts only, never the content.
+        The request's locale picks the reply alphabet (#4989)."""
+        locale = req.get("locale") if isinstance(req, dict) else "en"
         decoded = getattr(result, "parsed", None)
-        parsed = _coerce_open_parsed(decoded, ask)
+        parsed = _coerce_open_parsed(decoded, ask, locale)
         if parsed is None:
-            parsed = parse_open_reply_text(getattr(result, "text", ""), ask)
+            parsed = parse_open_reply_text(getattr(result, "text", ""), ask, locale)
         if parsed is None and isinstance(decoded, dict):
             # A decoded object that survived neither filter: the text fallback
             # had nothing either, so report the object's own counts rather than
             # claim the host answered with something that was not an object.
-            parsed = parse_open_reply_object(decoded, ask)
+            parsed = parse_open_reply_object(decoded, ask, locale)
         if parsed is None:
             return open_reply_result("invalid-output", reason="output is not a JSON object", **base)
         if not parsed["replies"] and not parsed["words"]:

@@ -32,4 +32,4 @@ function isPairingControlPath(pathname        )          {
   return pathname === PAIRING_CONTROL_PATH;
 }
 
-module.exports = { PAIRING_ENDPOINT_PATH, PAIRING_ENDPOINT_CONTENT_TYPE, PAIRING_MAX_REQUEST_BODY_BYTES, PAIRING_CONTROL_PATH, PAIRING_CONTROL_MAX_REQUEST_BODY_BYTES, pairingEndpointUrlForRelayAddress, isPairingEndpointPath, isPairingControlPath };
+module.exports = { PAIRING_ENDPOINT_PATH, PAIRING_ENDPOINT_CONTENT_TYPE, PAIRING_MAX_REQUEST_BODY_BYTES, PAIRING_CONTROL_MAX_REQUEST_BODY_BYTES, pairingEndpointUrlForRelayAddress, isPairingEndpointPath, PAIRING_CONTROL_PATH, isPairingControlPath };

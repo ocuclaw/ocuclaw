@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from contextlib import contextmanager
 import logging
 import os
@@ -300,3 +301,151 @@ def reconcile_setup_bundle() -> Dict[str, Any]:
             report["status"],
         )
     return report
+
+
+def _retire_setup_bundle() -> Dict[str, Any]:
+    from agent import skill_bundles as bundle_api
+
+    path_for = getattr(bundle_api, "bundle_path_for", None)
+    if not callable(path_for):
+        raise RuntimeError("Hermes bundle helper unavailable: bundle_path_for")
+    canonical = Path(path_for(SETUP_BUNDLE_NAME))
+    if not canonical.exists():
+        # Never create the bundles folder just to find it empty.
+        return {"status": "absent", "path": str(canonical)}
+    with _registration_lock(canonical):
+        if not canonical.exists():
+            return {"status": "absent", "path": str(canonical)}
+        data, problem = _read_bundle_mapping(canonical)
+        if problem is not None or data is None or _semantic_tuple(data) != _DESIRED_TUPLE:
+            # A user's own /ocuclaw-setup bundle, or one OcuClaw never wrote:
+            # theirs to keep. Where Hermes expands bundles it wins over the
+            # setup skill, as they chose by naming it.
+            return {
+                "status": "preserved",
+                "reason": "foreign-bundle" if problem is None else f"bundle-{problem}",
+                "path": str(canonical),
+            }
+        canonical.unlink()
+    try:
+        canonical.with_name(f".{SETUP_BUNDLE_NAME}.lock").unlink()
+    except OSError:
+        pass
+    return {"status": "retired", "path": str(canonical)}
+
+
+def retire_setup_bundle() -> Dict[str, Any]:
+    """Remove the ``/ocuclaw-setup`` bundle earlier OcuClaw builds wrote.
+
+    The ``ocuclaw-setup`` skill (``setup_command_skill.py``) now answers
+    ``/ocuclaw-setup`` on every surface. A bundle of the same name next to it
+    would list the command twice in Hermes's slash menus (its completer emits
+    bundles and skills separately), so OcuClaw's own bundle goes. Only the
+    file whose fields still match the one OcuClaw wrote is removed. Fail-soft.
+    """
+    try:
+        report = _retire_setup_bundle()
+    except Exception as exc:  # noqa: BLE001 - plugin registration is fail-soft
+        logger.warning("[ocuclaw] /%s bundle retirement failed: %s", SETUP_BUNDLE_NAME, exc)
+        return {"status": "error", "error": str(exc)}
+    if report["status"] == "preserved":
+        logger.warning(
+            "[ocuclaw] /%s bundle kept (%s): %s",
+            SETUP_BUNDLE_NAME,
+            report.get("reason"),
+            report.get("path"),
+        )
+    else:
+        logger.info("[ocuclaw] /%s bundle retirement: %s", SETUP_BUNDLE_NAME, report["status"])
+    return report
+
+
+# The chat the Desktop card starts setup in. For a Desktop chat, Hermes's own
+# slash worker passed this platform to the bundle expansion
+# (`_resolve_session_platform()`), so `skills.platform_disabled.desktop`
+# applies here as it did there.
+DESKTOP_SETUP_PLATFORM = "desktop"
+
+
+def build_setup_invocation(platform: str = DESKTOP_SETUP_PLATFORM) -> Dict[str, Any]:
+    """Expand ``/ocuclaw-setup`` with Hermes's own bundle expansion. Read-only.
+
+    Hermes Desktop resolves a skill command with ``slash.exec``, then
+    ``command.dispatch``. Through 0.22.0 both reached the TUI slash worker,
+    whose ``_dispatch_bundle`` expanded a skill bundle. Hermes 0.22.1 sends
+    both through ``gateway/session_commands.py``, which looks only in
+    ``get_skill_commands()`` (filesystem skills), so this bundle answers
+    ``unsupported_command`` there. The Desktop card asks for this only after
+    both of those failed.
+
+    The message is Hermes's own: the bundle that wins ``/ocuclaw-setup`` in
+    the active profile, expanded by ``build_bundle_invocation_message`` with
+    the arguments that worker passed (no user instruction, the Desktop
+    platform). The session's task id is not known here; it only fills a
+    ``${HERMES_SESSION_ID}`` template, which the setup skill does not use.
+    Nothing here writes a bundle or reads a secret. Every failure is a reason,
+    never a message built by hand.
+    """
+    try:
+        from agent.skill_bundles import (
+            build_bundle_invocation_message,
+            resolve_bundle_command_key,
+        )
+    except ImportError:
+        return {"ok": False, "reason": "bundle_api_unavailable"}
+    try:
+        key = resolve_bundle_command_key(SETUP_BUNDLE_NAME)
+        if not key:
+            return {"ok": False, "reason": "bundle_missing"}
+        built = build_bundle_invocation_message(key, "", task_id=None, platform=platform)
+    except Exception as exc:  # noqa: BLE001 - one reason, never a traceback
+        logger.warning("[ocuclaw] /%s expansion failed: %s", SETUP_BUNDLE_NAME, exc)
+        return {"ok": False, "reason": "bundle_expansion_failed"}
+    message = built[0] if isinstance(built, tuple) and built else None
+    if not isinstance(message, str) or not message.strip():
+        # Hermes returns nothing when no member skill loads (missing,
+        # disabled for this platform, or a safe worker).
+        return {"ok": False, "reason": "bundle_unloadable"}
+    return {"ok": True, "type": "send", "message": message}
+
+
+def _load_hermes_config() -> Dict[str, Any]:
+    from hermes_cli.config import load_config
+
+    config = load_config()
+    return config if isinstance(config, dict) else {}
+
+
+def setup_skill_switches(platform: str = DESKTOP_SETUP_PLATFORM) -> Dict[str, bool]:
+    """Is the setup skill switched off for the Desktop setup chat? Read-only.
+
+    Hermes refuses a plugin skill named in the global ``skills.disabled`` or
+    in ``skills.platform_disabled.<platform>``. Desktop's capabilities bridge
+    cannot see either for this skill: ``GET /api/skills`` lists filesystem
+    skills only, never plugin skills. Its ``skills.setEnabled`` does clear the
+    global entry; nothing in Desktop clears a per-platform one.
+    """
+    skills = _load_hermes_config().get("skills")
+    skills = skills if isinstance(skills, dict) else {}
+    per_platform = skills.get("platform_disabled")
+    per_platform = per_platform if isinstance(per_platform, dict) else {}
+
+    # Read lists the way Hermes does (agent.skill_utils.parse_config_string_list):
+    # ``hermes config set`` can store a list as a "[...]" string, and a plain
+    # string is one name.
+    def listed(value: Any) -> bool:
+        if isinstance(value, str) and value.strip().startswith("["):
+            try:
+                value = ast.literal_eval(value.strip())
+            except (ValueError, SyntaxError):
+                pass
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, (list, tuple)):
+            return False
+        return SETUP_BUNDLE_SKILL in {str(item).strip() for item in value}
+
+    return {
+        "skillDisabled": listed(skills.get("disabled")),
+        "skillDisabledForPlatform": listed(per_platform.get(platform)),
+    }

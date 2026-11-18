@@ -5,11 +5,12 @@ const { APP_PROTOCOL, DEFAULT_NUDGE_THRESHOLDS, DEFAULT_WORKER_HEALTH_THRESHOLDS
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
 const { runOutsideRetiredPluginCache } = require("./openclaw-plugin-cache-scope.cjs");
 const { PAIRING_CONTROL_PATH, PAIRING_ENDPOINT_PATH } = require("../domain/pairing/pairing-endpoint-address.cjs");
+const { LIVEUI_AUDIO_PATH, LIVEUI_SUBTITLES_PATH } = require("../tools/liveui-video/video-service.cjs");
 
 const DEFAULT_WORKER_TYPE = "commonjs";
 const WORKER_ENTRY_BASENAME = "relay-worker-entry";
 
-function isMissingWorkerEntry(err) {
+function isMissingWorkerEntry(err     ) {
   if (!err || (err.code !== "MODULE_NOT_FOUND" && err.code !== "ERR_MODULE_NOT_FOUND")) {
     return false;
   }
@@ -24,8 +25,8 @@ const APP_DISCONNECT_GRACE_MAX_MS = 60_000;
 
 const APP_DISCONNECT_RESUME_SETTLE_MS = 750;
 
-function resolveAppDisconnectGraceMs(options) {
-  const host = globalThis;
+function resolveAppDisconnectGraceMs(options     ) {
+  const host      = globalThis;
   const fromEnv = host.process?.env?.[APP_DISCONNECT_GRACE_ENV];
   const raw = fromEnv !== undefined && fromEnv !== ""
     ? fromEnv
@@ -102,7 +103,7 @@ function parseRequestIdFromRaw(raw) {
   return normalizeRequestId((parseFrame(raw) || {}).requestId);
 }
 
-function createRelayWorkerSupervisor(options = {}) {
+function createRelayWorkerSupervisor(options      = {}) {
   const logger = normalizeLogger(options.logger);
   const handler = options.handler || options.downstreamHandler || null;
   const operationRegistry = options.operationRegistry || null;
@@ -111,7 +112,7 @@ function createRelayWorkerSupervisor(options = {}) {
   const wssEvents = new EventEmitter();
   let worker = null;
   let workerEpoch = 0;
-  let addressValue = null;
+  let addressValue      = null;
 
   let lastAppPresenceTransitionAtMs = 0;
   const APP_PRESENCE_VERSION_MAX_CHARS = 32;
@@ -129,7 +130,7 @@ function createRelayWorkerSupervisor(options = {}) {
   let workerReadyWatchdog = null;
 
   let everReady = false;
-  let terminalStartError = null;
+  let terminalStartError      = null;
   let workerEntryMissing = false;
   const clients = new Map();
   const appDisconnectGraceMs = resolveAppDisconnectGraceMs(options);
@@ -137,10 +138,10 @@ function createRelayWorkerSupervisor(options = {}) {
     ? Math.max(0, Math.floor(options.appDisconnectResumeSettleMs))
     : APP_DISCONNECT_RESUME_SETTLE_MS;
 
-  const pendingAppDisconnectDrains = new Map();
-  const appResumeSettleTimers = new Set();
+  const pendingAppDisconnectDrains      = new Map();
+  const appResumeSettleTimers      = new Set();
 
-  const goingAwayClientIds = new Set();
+  const goingAwayClientIds      = new Set();
   const pendingReadinessProbeRequests = new Map();
   const pendingAutomationStateRequests = new Map();
   const pendingAutomationRegistryRequests = new Map();
@@ -311,6 +312,10 @@ function createRelayWorkerSupervisor(options = {}) {
           PAIRING_ENDPOINT_PATH,
 
           PAIRING_CONTROL_PATH,
+
+          LIVEUI_AUDIO_PATH,
+
+          LIVEUI_SUBTITLES_PATH,
         ],
       },
       externalDebugToolsEnabled: options.externalDebugToolsEnabled === true,
@@ -712,7 +717,7 @@ function createRelayWorkerSupervisor(options = {}) {
       return;
     }
     if (message.kind === "app.message") {
-      if (message.operation === "ocuclaw.optional.setup.request" && message.workerEpoch !== workerEpoch) return;
+      if (["ocuclaw.optional.setup.request", "ocuclaw.model_sites.request", "ocuclaw.secret.answer"].includes(message.operation) && message.workerEpoch !== workerEpoch) return;
       if (!handler || typeof handler.handleMessage !== "function") return;
       const processOptions = {};
       if (message.operation === "message.send" && message.requestId) {
@@ -738,7 +743,11 @@ function createRelayWorkerSupervisor(options = {}) {
             handler.handleMessage(
               message.clientId,
               message.raw,
-              { liveuiRenderErrorAuthority: message.liveuiRenderErrorAuthority, workerEpoch: message.workerEpoch },
+              {
+                liveuiRenderErrorAuthority: message.liveuiRenderErrorAuthority,
+                liveuiStateReportAuthority: message.liveuiStateReportAuthority,
+                workerEpoch: message.workerEpoch,
+              },
             ),
             processOptions,
           );
@@ -790,7 +799,7 @@ function createRelayWorkerSupervisor(options = {}) {
             exchangeId: message.pairingExchangeId,
             confirmation: message.pairingConfirmation,
           });
-        } catch (err) {
+        } catch (err     ) {
           logger.warn(
             `[relay-worker] pairing hello correlation failed: ${err && err.message ? err.message : err}`,
           );
@@ -812,6 +821,8 @@ function createRelayWorkerSupervisor(options = {}) {
           ? message.connectedAtMs
           : Date.now(),
         updatedAtMs: Date.now(),
+        remoteAddress: typeof message.remoteAddress === "string" ? message.remoteAddress : null,
+        remotePort: Number.isInteger(message.remotePort) ? message.remotePort : null,
       });
       const connectedEntry = clients.get(message.clientId) || null;
       emitRelaySession("downstream_client_connected", getActiveSessionKey(), () => ({
@@ -914,8 +925,9 @@ function createRelayWorkerSupervisor(options = {}) {
 
         if (typeof options.onAppClientClosed === "function") {
           try {
-            options.onAppClientClosed(message.clientId);
-          } catch (err) {
+
+            options.onAppClientClosed(message.clientId, { closeCode: Number.isFinite(message.closeCode) ? message.closeCode : null });
+          } catch (err     ) {
             logger.warn(`[relay-worker] onAppClientClosed threw: ${err && err.message ? err.message : err}`);
           }
         }
@@ -1158,7 +1170,15 @@ function createRelayWorkerSupervisor(options = {}) {
     const nextWorker = workerFactory();
     worker = nextWorker;
 
-    nextWorker.on("message", (message) => runOutsideRetiredPluginCache(() => handleMessage(message)));
+    nextWorker.on("message", (message     ) => runOutsideRetiredPluginCache(() => handleMessage(message)));
+
+    nextWorker.on("messageerror", (err     ) => {
+      logger.warn(
+        `[relay-worker] dropped a worker message that could not be deserialized: ${
+          err && err.message ? err.message : err
+        }`,
+      );
+    });
     nextWorker.on("error", (err) => {
       logger.error(`[relay-worker] worker error: ${err && err.message ? err.message : err}`);
 
@@ -1222,9 +1242,9 @@ function createRelayWorkerSupervisor(options = {}) {
     return nextWorker;
   }
 
-  function armWorkerReadyWatchdog(startedWorker, delayMs) {
+  function armWorkerReadyWatchdog(startedWorker     , delayMs     ) {
     clearWorkerReadyWatchdog();
-    const watchdog = setTimeout(() => {
+    const watchdog      = setTimeout(() => {
       workerReadyWatchdog = null;
       if (closing || worker !== startedWorker) return;
       logger.warn(
@@ -1317,7 +1337,7 @@ function createRelayWorkerSupervisor(options = {}) {
     return entry && entry.clientKind === "app";
   }
 
-  function drainAppSessionAfterGrace(sessionKey, clientId, wentAway, departedKeys = []) {
+  function drainAppSessionAfterGrace(sessionKey     , clientId     , wentAway     , departedKeys      = []) {
     if (typeof options.onAppClientDisconnect !== "function") return;
     const graceKey = sessionKey || "";
     const armed = pendingAppDisconnectDrains.get(graceKey);
@@ -1337,7 +1357,7 @@ function createRelayWorkerSupervisor(options = {}) {
     }
     const armedAtMs = Date.now();
     const matchKeys = [...new Set([sessionKey, ...departedKeys].filter(Boolean))];
-    const timer = setTimeout(() => {
+    const timer      = setTimeout(() => {
       if (pendingAppDisconnectDrains.get(graceKey)?.timer !== timer) return;
       pendingAppDisconnectDrains.delete(graceKey);
       const stillGone = !getConnectedAppEntries().some((entry) => answersAppGrace(graceKey, matchKeys, entry));
@@ -1357,9 +1377,9 @@ function createRelayWorkerSupervisor(options = {}) {
     }));
   }
 
-  function appClientSessionKeys(entry) {
+  function appClientSessionKeys(entry     ) {
     if (!entry) return [];
-    const keys = [];
+    const keys      = [];
     for (const key of [entry.selectedSessionKey, entry.sessionKey]) {
       const trimmed = typeof key === "string" ? key.trim() : "";
       if (trimmed && !keys.includes(trimmed)) keys.push(trimmed);
@@ -1367,13 +1387,13 @@ function createRelayWorkerSupervisor(options = {}) {
     return keys;
   }
 
-  function answersAppGrace(graceKey, matchKeys, entry) {
+  function answersAppGrace(graceKey     , matchKeys     , entry     ) {
     if (!entry || entry.clientKind !== "app") return false;
     if (!graceKey) return true;
-    return appClientSessionKeys(entry).some((key) => matchKeys.includes(key));
+    return appClientSessionKeys(entry).some((key     ) => matchKeys.includes(key));
   }
 
-  function cancelAppDisconnectGrace(entry) {
+  function cancelAppDisconnectGrace(entry     ) {
     if (pendingAppDisconnectDrains.size === 0) return;
     if (!entry || !clients.has(entry.clientId)) return;
     let resumed = false;
@@ -1390,12 +1410,12 @@ function createRelayWorkerSupervisor(options = {}) {
     }
     if (!resumed || typeof options.onAppPresenceChanged !== "function") return;
 
-    const settle = setTimeout(() => {
+    const settle      = setTimeout(() => {
       appResumeSettleTimers.delete(settle);
       if (closing) return;
       try {
         options.onAppPresenceChanged("grace_resumed");
-      } catch (err) {
+      } catch (err     ) {
         logger.warn(
           `[relay-worker] app presence hook failed: ${err && err.message ? err.message : err}`,
         );
@@ -1413,20 +1433,20 @@ function createRelayWorkerSupervisor(options = {}) {
     goingAwayClientIds.clear();
   }
 
-  function notifyAppPresenceChanged(reason) {
+  function notifyAppPresenceChanged(reason     ) {
     if (reason !== "readiness") lastAppPresenceTransitionAtMs = Date.now();
 
     if (typeof options.onAppPresenceChanged !== "function") return;
     try {
       options.onAppPresenceChanged(reason);
-    } catch (err) {
+    } catch (err     ) {
       logger.warn(
         `[relay-worker] app presence hook failed: ${err && err.message ? err.message : err}`,
       );
     }
   }
 
-  function deviceProjectionFromReadiness(snapshot) {
+  function deviceProjectionFromReadiness(snapshot     ) {
     const glasses = snapshot && typeof snapshot === "object" ? snapshot.glasses : null;
     if (!glasses || typeof glasses !== "object" || Array.isArray(glasses)) return null;
     if (typeof glasses.connected !== "boolean") return null;
@@ -1453,7 +1473,7 @@ function createRelayWorkerSupervisor(options = {}) {
   }
 
   function getDeviceProjection(entries = getConnectedAppEntries()) {
-    let latest = null;
+    let latest      = null;
     for (const entry of entries) {
       const candidate = entry && entry.deviceProjection;
       if (!candidate) continue;
@@ -1464,7 +1484,7 @@ function createRelayWorkerSupervisor(options = {}) {
       : { connected: null, batteryPercent: null, charging: null, inCase: null, observedAt: null };
   }
 
-  function applyReportedSessionKey(entry, sessionKey) {
+  function applyReportedSessionKey(entry     , sessionKey     ) {
     const reported = typeof sessionKey === "string" ? sessionKey.trim() : "";
     if (!reported) return;
     const replacedGuardActive =
@@ -1484,7 +1504,7 @@ function createRelayWorkerSupervisor(options = {}) {
     if (entry.clientKind === "app") cancelAppDisconnectGrace(entry);
   }
 
-  function deviceFactsKey(device) {
+  function deviceFactsKey(device     ) {
     return JSON.stringify({
       connected: device?.connected ?? null,
       batteryPercent: device?.batteryPercent ?? null,
@@ -1497,7 +1517,7 @@ function createRelayWorkerSupervisor(options = {}) {
 
     const entries = getConnectedAppEntries();
 
-    const versions = [];
+    const versions      = [];
     for (const entry of entries) {
       if (versions.length >= APP_PRESENCE_VERSION_MAX_COUNT) break;
       const version =
@@ -1602,14 +1622,14 @@ function createRelayWorkerSupervisor(options = {}) {
       return Array.from(clients.keys());
     },
 
-    getClientSessionKey(clientId) {
+    getClientSessionKey(clientId     ) {
       const entry = clients.get(clientId);
       if (!entry) return null;
       if (typeof entry.selectedSessionKey === "string" && entry.selectedSessionKey) return entry.selectedSessionKey;
       return typeof entry.sessionKey === "string" && entry.sessionKey ? entry.sessionKey : null;
     },
 
-    setClientSessionKey(clientId, sessionKey) {
+    setClientSessionKey(clientId     , sessionKey     ) {
       const entry = clients.get(clientId);
       if (!entry || typeof sessionKey !== "string" || !sessionKey.trim()) return false;
       const next = sessionKey.trim();
@@ -1625,7 +1645,7 @@ function createRelayWorkerSupervisor(options = {}) {
       return true;
     },
 
-    getAppClientCountOnSession(sessionKey, excludeClientId = null) {
+    getAppClientCountOnSession(sessionKey     , excludeClientId      = null) {
       const wanted = typeof sessionKey === "string" ? sessionKey.trim() : "";
       if (!wanted) return 0;
       let count = 0;
@@ -1637,8 +1657,8 @@ function createRelayWorkerSupervisor(options = {}) {
       return count;
     },
 
-    getAppClientSessionKeys(excludeClientId = null) {
-      const keys = [];
+    getAppClientSessionKeys(excludeClientId      = null) {
+      const keys      = [];
       for (const entry of getConnectedAppEntries(excludeClientId)) {
         const selected = typeof entry.selectedSessionKey === "string" ? entry.selectedSessionKey : "";
         const own = typeof entry.sessionKey === "string" ? entry.sessionKey.trim() : "";
@@ -1647,11 +1667,23 @@ function createRelayWorkerSupervisor(options = {}) {
       return keys;
     },
 
-    getAppClientIds(excludeClientId = null) {
-      return getConnectedAppEntries(excludeClientId).map((entry) => entry.clientId);
+    getAppClientIds(excludeClientId      = null) {
+      return getConnectedAppEntries(excludeClientId).map((entry     ) => entry.clientId);
+    },
+
+    getClientRemote(clientId     ) {
+      const entry = clients.get(clientId);
+      if (!entry || !entry.remoteAddress) return null;
+      return { address: entry.remoteAddress, port: entry.remotePort };
     },
     getConnectedAppCount(excludeClientId = null, sessionKey = null) {
       return getConnectedAppEntries(excludeClientId, sessionKey).length;
+    },
+
+    getGlassesSurfaceAppCount() {
+      return getConnectedAppEntries().filter(
+        (entry     ) => entry.readinessSnapshot?.glassesSurfaceOpen !== false,
+      ).length;
     },
     getReadinessSnapshot,
     getAppPresenceProjection,

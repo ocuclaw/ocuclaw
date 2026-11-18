@@ -7,15 +7,15 @@ function normalizeSessionKey(value) {
   return trimmed ? trimmed : null;
 }
 
-function defaultDedicatedSessionKeyValidator(value) {
+function defaultDedicatedSessionKeyValidator(value     ) {
   return typeof value === "string" &&
     value.toLowerCase().startsWith("ocuclaw:");
 }
 
 function normalizeDedicatedSessionKey(
-  value,
-  defaultSessionKey,
-  validator,
+  value     ,
+  defaultSessionKey     ,
+  validator     ,
 ) {
   const normalized = normalizeSessionKey(value);
   return normalized && validator(normalized) ? normalized : defaultSessionKey;
@@ -150,4 +150,4 @@ function createEvenAiRouter(opts = {}) {
   };
 }
 
-module.exports = { createEvenAiRouter };
+module.exports = { DEFAULT_EVEN_AI_DEDICATED_SESSION_KEY, createEvenAiRouter };

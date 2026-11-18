@@ -1,8 +1,51 @@
 const { substituteTemplate } = require("./glasses-ui-template.cjs");
 const { mapArrayItems } = require("./glasses-ui-array-mapping.cjs");
 const { LIVEUI_TEMPLATE_ERROR_PREFIX, fillLiveuiTemplate, liveuiTemplateHasErrorPresentation, readLiveuiTemplateRefreshPath } = require("./glasses-ui-template-slots.cjs");
+const { LIVEUI_ERROR_INPUT_MAX_BYTES, checkLiveUiInputValue, coerceLiveUiInputValue } = require("./liveui-compiler/template-inputs.cjs");
 
 const DEFAULT_FAILURE_BODY_PREFIX = LIVEUI_TEMPLATE_ERROR_PREFIX;
+
+const JSON_POINTER_RE = /^(\/([^~]|~[01])*)*$/;
+
+const PICTURE_CODE_RE = /^[a-z][a-z0-9_]{0,63}$/;
+
+function isLiveUiJsonPointer(pointer     ) {
+  return typeof pointer === "string" && JSON_POINTER_RE.test(pointer);
+}
+
+function readLiveUiJsonPointer(doc     , pointer     ) {
+  if (!isLiveUiJsonPointer(pointer)) return { ok: false };
+  if (pointer === "") return { ok: true, value: doc };
+  let current = doc;
+  for (const raw of pointer.slice(1).split("/")) {
+    const token = raw.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (Array.isArray(current)) {
+      if (!/^(0|[1-9][0-9]*)$/.test(token) || Number(token) >= current.length) return { ok: false };
+      current = current[Number(token)];
+    } else if (current && typeof current === "object" && Object.prototype.hasOwnProperty.call(current, token)) {
+      current = current[token];
+    } else {
+      return { ok: false };
+    }
+  }
+  return { ok: true, value: current };
+}
+
+const ERROR_UTF8 = new TextEncoder();
+
+function cutLiveUiErrorText(text     ) {
+  const value = typeof text === "string" ? text : String(text);
+  if (ERROR_UTF8.encode(value).length <= LIVEUI_ERROR_INPUT_MAX_BYTES) return value;
+  let out = "";
+  let bytes = 0;
+  for (const ch of value) {
+    const size = ERROR_UTF8.encode(ch).length;
+    if (bytes + size > LIVEUI_ERROR_INPUT_MAX_BYTES) break;
+    out += ch;
+    bytes += size;
+  }
+  return out;
+}
 
 const DEFAULT_GLASSES_UI_LIMITS = {
   bodyMax: 1000,
@@ -23,15 +66,15 @@ const GLASSES_PRESENCE_STATES = Object.freeze([
 
 const HTTP_ABSENT_MIN_INTERVAL_MS = 5 * 60_000;
 
-function normalizePresence(value) {
+function normalizePresence(value     ) {
   return GLASSES_PRESENCE_STATES.includes(value) ? value : "unknown";
 }
 
-function presenceIsExplicitlyAbsent(value) {
+function presenceIsExplicitlyAbsent(value     ) {
   return value === "absent" || value === "in_case";
 }
 
-function refreshTier(recipe) {
+function refreshTier(recipe     ) {
   if (recipe && recipe.kind === "llm") return "llm-api";
   if (recipe && recipe.kind === "http") return "http";
   return "local";
@@ -59,35 +102,41 @@ function createGlassesUiCronEngine(deps) {
       : () => deps.includeLastRender === true;
   const validateTemplateSpec = typeof deps.validateTemplateSpec === "function"
     ? deps.validateTemplateSpec
-    : ({ spec }) => ({ ok: true, spec });
+    : ({ spec }     ) => ({ ok: true, spec });
 
   const isRefreshPaused = typeof deps.isRefreshPaused === "function"
     ? () => deps.isRefreshPaused() === true
     : () => false;
 
+  const writeSurfaceData = typeof deps.writeSurfaceData === "function" ? deps.writeSurfaceData : null;
+  const isSurfaceLive = typeof deps.isSurfaceLive === "function" ? deps.isSurfaceLive : null;
+
+  const prefetchSurfacePicture =
+    typeof deps.prefetchSurfacePicture === "function" ? deps.prefetchSurfacePicture : null;
+
   const active = new Map();
   let currentPresence = "unknown";
   const onStateChanged = typeof deps.onStateChanged === "function" ? deps.onStateChanged : () => {};
 
-  function notifyHttpRefreshState(state) {
+  function notifyHttpRefreshState(state     ) {
     if (state.tier === "http") onStateChanged(state.sessionKey, state.surfaceId);
   }
 
-  function isPaused(state) {
+  function isPaused(state     ) {
     return !!(isRefreshPaused() || state.ownerPaused || state.presencePaused);
   }
 
-  function syncPausedFlag(state) {
+  function syncPausedFlag(state     ) {
     state.paused = isPaused(state);
     notifyHttpRefreshState(state);
   }
 
-  function clearNextTick(state) {
+  function clearNextTick(state     ) {
     if (state.nextTickTimer) clearTimeoutFn(state.nextTickTimer);
     state.nextTickTimer = null;
   }
 
-  function scheduleNextTick(state, delayMs) {
+  function scheduleNextTick(state     , delayMs     ) {
     clearNextTick(state);
     if (state.resolved || isPaused(state)) return;
     const delay = Math.max(0, Number.isFinite(delayMs) ? delayMs : state.refresh.intervalMs);
@@ -97,7 +146,7 @@ function createGlassesUiCronEngine(deps) {
     }, delay);
   }
 
-  function pauseActiveDuration(state) {
+  function pauseActiveDuration(state     ) {
     if (!state.maxDurationTimer) return;
     clearTimeoutFn(state.maxDurationTimer);
     state.maxDurationTimer = null;
@@ -108,7 +157,7 @@ function createGlassesUiCronEngine(deps) {
     state.maxDurationArmedAtMs = null;
   }
 
-  function armActiveDuration(state) {
+  function armActiveDuration(state     ) {
     if (state.resolved || isPaused(state) || state.maxDurationTimer) return true;
     if (state.maxDurationRemainingMs <= 0) {
       emitLifecycle("cron_max_duration_reached", "debug", {
@@ -129,7 +178,7 @@ function createGlassesUiCronEngine(deps) {
     return true;
   }
 
-  function gapOutcome(state) {
+  function gapOutcome(state     ) {
     const gapMs = Number.isFinite(state.presenceGapStartedAtMs)
       ? Math.max(0, monotonicNowMs() - state.presenceGapStartedAtMs)
       : 0;
@@ -138,7 +187,7 @@ function createGlassesUiCronEngine(deps) {
       : "queued_with_expiry";
   }
 
-  function effectiveCadenceDelay(state, delayMs) {
+  function effectiveCadenceDelay(state     , delayMs     ) {
 
     if (state.tier === "http" && state.presenceGapStartedAtMs !== null) {
       return Math.max(delayMs, HTTP_ABSENT_MIN_INTERVAL_MS);
@@ -164,9 +213,9 @@ function createGlassesUiCronEngine(deps) {
     }
   }
 
-  function staticValuesCopy(raw) {
+  function staticValuesCopy(raw     )      {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
-    const output = {};
+    const output      = {};
     const descriptors = Object.getOwnPropertyDescriptors(raw);
     for (const key of Object.keys(descriptors)) {
       const descriptor = descriptors[key];
@@ -177,8 +226,8 @@ function createGlassesUiCronEngine(deps) {
     return output;
   }
 
-  function prepareTemplateSpec(state, values, error, overrides = {}) {
-    const filled = fillLiveuiTemplate(
+  function prepareTemplateSpec(state     , values     , error     , overrides      = {})      {
+    const filled      = fillLiveuiTemplate(
       state.templateRuntime.template,
       values,
       error === undefined ? {} : { error },
@@ -187,7 +236,7 @@ function createGlassesUiCronEngine(deps) {
       return {
         ok: false,
         code: "slot_value_invalid",
-        message: filled.invalid.map((entry) => entry.key).join(", "),
+        message: filled.invalid.map((entry     ) => entry.key).join(", "),
       };
     }
     const validation = validateTemplateSpec({
@@ -207,11 +256,11 @@ function createGlassesUiCronEngine(deps) {
     return { ok: true, status: filled.status, spec: validation.spec };
   }
 
-  function specsEqual(a, b) {
+  function specsEqual(a     , b     )      {
     return JSON.stringify(a) === JSON.stringify(b);
   }
 
-  function emitTemplateSpec(state, prepared) {
+  function emitTemplateSpec(state     , prepared     )      {
     if (specsEqual(state.lastSpec, prepared.spec)) return;
     state.lastSpec = prepared.spec;
     state.lastBody = prepared.spec.body;
@@ -230,7 +279,7 @@ function createGlassesUiCronEngine(deps) {
         paused: !!state.paused,
         templateStatus: prepared.status,
       });
-    } catch (err) {
+    } catch (err     ) {
       state.tickFailed += 1;
       state.lastFailureAt = Date.now();
       state.failureReason = `relay send failed: ${err && err.message ? err.message : err}`;
@@ -238,7 +287,7 @@ function createGlassesUiCronEngine(deps) {
     }
   }
 
-  function emitTemplateErrorPresentation(state, error) {
+  function emitTemplateErrorPresentation(state     , error     )      {
     if (!state.templateRuntime ||
         !liveuiTemplateHasErrorPresentation(state.templateRuntime.template) ||
         typeof deps.sendSurfaceRender !== "function") return false;
@@ -248,12 +297,12 @@ function createGlassesUiCronEngine(deps) {
     return true;
   }
 
-  function describeLastRender(state) {
+  function describeLastRender(state     ) {
     const hasBody = typeof state.lastBody === "string";
     const items = Array.isArray(state.lastItems) ? state.lastItems : null;
     const hasDetail =
-      !!items && items.some((i) => i && typeof i === "object" && typeof i.body === "string");
-    const desc = {
+      !!items && items.some((i     ) => i && typeof i === "object" && typeof i.body === "string");
+    const desc      = {
       kind: items ? (hasDetail ? "list_with_details" : "list") : hasBody ? "text" : "unknown",
     };
     if (hasBody) desc.body_chars = state.lastBody.length;
@@ -269,7 +318,7 @@ function createGlassesUiCronEngine(deps) {
       lastSuccessAt: state.lastSuccessAt,
     };
     if (state.tickFailed > 0) ticks.lastFailureAt = state.lastFailureAt;
-    const outcome = { ticks, last_render: describeLastRender(state) };
+    const outcome      = { ticks, last_render: describeLastRender(state) };
 
     if (includeLastRender()) {
       outcome.lastBody = state.lastBody;
@@ -282,11 +331,12 @@ function createGlassesUiCronEngine(deps) {
   function resolveAndClean(state, extra, opts) {
     if (state.resolved) return;
     state.resolved = true;
+    state.tickAbort?.abort();
     if (state.nextTickTimer) clearTimeoutFn(state.nextTickTimer);
     if (state.maxDurationTimer) clearTimeoutFn(state.maxDurationTimer);
     state.nextTickTimer = null;
     state.maxDurationTimer = null;
-    active.delete(state.surfaceId);
+    active.delete(state.key);
     notifyHttpRefreshState(state);
 
     if (opts && opts.silent === true) return;
@@ -341,7 +391,7 @@ function createGlassesUiCronEngine(deps) {
     const opts =
       previousOutput !== undefined ? { previous: wrapForTemplate(previousOutput) } : undefined;
     const dataForTemplate = wrapForTemplate(output);
-    const result = {};
+    const result      = {};
     if (typeof targets.body === "string") {
       const body = substituteTemplate(targets.body, dataForTemplate, opts);
 
@@ -354,7 +404,7 @@ function createGlassesUiCronEngine(deps) {
         .map((tpl) => substituteOneItemTemplate(tpl, dataForTemplate, opts));
     }
     if (typeof targets.itemsFromPath === "string" && targets.itemTemplate) {
-      const mapped = mapArrayItems({
+      const mapped      = mapArrayItems({
         output,
         previousOutput,
         itemsFromPath: targets.itemsFromPath,
@@ -369,18 +419,243 @@ function createGlassesUiCronEngine(deps) {
     return { ok: true, ...result };
   }
 
+  function dataSurfaceLive(state     ) {
+    if (!isSurfaceLive) return true;
+    try {
+      return isSurfaceLive(state.data.sessionKey, state.surfaceId) !== false;
+    } catch (_) {
+
+      return true;
+    }
+  }
+
+  function stopForGoneSurface(state     ) {
+    emitLifecycle("cron_surface_gone", "debug", { surfaceId: state.surfaceId, sessionKey: state.sessionKey });
+    resolveAndClean(state, { result: "surface_gone" }, {});
+  }
+
+  function writeDataPatch(state     , patch     ) {
+    if (!writeSurfaceData) return { status: "failed", reason: "relay write failed: no data channel" };
+    let out     ;
+    try {
+      out = writeSurfaceData(state.data.sessionKey, state.surfaceId, patch);
+    } catch (err     ) {
+      return { status: "failed", reason: `relay write failed: ${err && err.message ? err.message : err}` };
+    }
+    if (out && out.ok === true) {
+      emitLifecycle("cron_tick_emit", "debug", {
+        surfaceId: state.surfaceId,
+        sessionKey: state.sessionKey,
+        generationToken: state.generationToken,
+        paused: !!state.paused,
+        data: true,
+        changed: out.changed !== false,
+      });
+      return { status: "ok" };
+    }
+    if (out && out.reason === "surface_gone") return { status: "gone" };
+    return { status: "failed", reason: `relay write failed: ${out && out.reason ? out.reason : "no answer"}` };
+  }
+
+  function dataPreviousBody(state     ) {
+    const data = state.data;
+    if (typeof data.lastText === "string") return data.lastText;
+    const seed = data.llmKey ? data.seed[data.llmKey] : undefined;
+    return typeof seed === "string" ? seed : "";
+  }
+
+  function countDataTickFailure(state     , reason     , retryAfterMs     ) {
+    state.tickFailed += 1;
+    state.lastFailureAt = Date.now();
+    state.failureReason = reason;
+    state.consecutiveFailures += 1;
+    state.pendingRetryAfterMs = Number.isFinite(retryAfterMs) ? retryAfterMs : null;
+    emitLifecycle("cron_data_tick_failed", "debug", {
+      surfaceId: state.surfaceId,
+      sessionKey: state.sessionKey,
+      code: String(reason).split(":")[0].slice(0, 64),
+      consecutiveFailures: state.consecutiveFailures,
+    });
+  }
+
+  function stopAfterDataTickFailure(state     ) {
+    if (state.refresh.onError === "stop" || state.consecutiveFailures >= state.refresh.maxConsecutiveFailures) {
+      resolveAndClean(state, { result: "recipe_failed" }, {});
+    }
+  }
+
+  function failDataTick(state     , reason     , retryAfterMs     ) {
+    countDataTickFailure(state, reason, retryAfterMs);
+    if (state.refresh.onError === "show_error") {
+      const patch      = { error: cutLiveUiErrorText(reason) };
+      for (const key of Object.keys(state.data.targets)) patch[key] = null;
+      const wrote = writeDataPatch(state, patch);
+      if (wrote.status === "gone") {
+        stopForGoneSurface(state);
+        return;
+      }
+      if (wrote.status === "ok") state.data.errorShown = true;
+    }
+    stopAfterDataTickFailure(state);
+  }
+
+  async function prefetchDataPicture(state     , key        , src        ) {
+    let out      = null;
+    try {
+      out = await prefetchSurfacePicture(state.data.sessionKey, state.surfaceId, src, key);
+    } catch (_) {
+      out = null;
+    }
+    const ok = !!(out && out.ok === true);
+    const code = ok
+      ? null
+      : out && typeof out.code === "string" && PICTURE_CODE_RE.test(out.code)
+        ? out.code
+        : "picture_fetch_failed";
+    emitLifecycle("cron_data_tick_picture", "debug", {
+      surfaceId: state.surfaceId,
+      sessionKey: state.sessionKey,
+      key,
+      ok,
+      code,
+    });
+    return { ok, code };
+  }
+
+  async function applyDataTick(state     , result     , tickGeneration     ) {
+    if (result && typeof result.error === "string") {
+      failDataTick(state, result.error, result.retryAfterMs);
+      return false;
+    }
+    if (!result || !Object.prototype.hasOwnProperty.call(result, "output")) {
+      failDataTick(state, "recipe returned no output", null);
+      return false;
+    }
+    const patch      = {};
+    for (const [key, pointer] of Object.entries(state.data.targets)) {
+      const read      = readLiveUiJsonPointer(result.output, pointer);
+      if (!read.ok) {
+        failDataTick(state, `refresh_target_missing: ${key} reads ${pointer === "" ? "the whole output" : pointer}`, null);
+        return false;
+      }
+      const input = state.data.inputs[key];
+      const checked      = checkLiveUiInputValue(input, coerceLiveUiInputValue(input, read.value));
+      if (!checked.ok) {
+        failDataTick(state, `${checked.code}: ${checked.detail}`, null);
+        return false;
+      }
+      patch[key] = checked.value;
+    }
+
+    const failedPictures           = [];
+    let pictureReason                = null;
+    if (prefetchSurfacePicture) {
+      for (const key of Object.keys(patch)) {
+        const input = state.data.inputs[key];
+        if (!input || input.type !== "image" || typeof patch[key] !== "string") continue;
+        const got = await prefetchDataPicture(state, key, patch[key]);
+
+        if (state.resolved || tickGeneration !== state.generationToken) return true;
+        if (got.ok) continue;
+        failedPictures.push(key);
+        if (pictureReason === null) pictureReason = `${got.code}: ${key} picture not shown`;
+      }
+    }
+    if (pictureReason !== null) {
+
+      const showError = state.refresh.onError === "show_error";
+      for (const key of failedPictures) {
+        if (showError) patch[key] = null;
+        else delete patch[key];
+      }
+      if (showError) patch.error = cutLiveUiErrorText(pictureReason);
+      if (Object.keys(patch).length > 0) {
+        const wrote = writeDataPatch(state, patch);
+        if (wrote.status === "gone") {
+          stopForGoneSurface(state);
+          return false;
+        }
+        if (wrote.status !== "ok") {
+          failDataTick(state, wrote.reason, null);
+          return false;
+        }
+        if (showError) state.data.errorShown = true;
+      }
+      countDataTickFailure(state, pictureReason, null);
+      stopAfterDataTickFailure(state);
+      return false;
+    }
+    if (state.data.errorShown) patch.error = null;
+    const wrote = writeDataPatch(state, patch);
+    if (wrote.status === "gone") {
+      stopForGoneSurface(state);
+      return false;
+    }
+    if (wrote.status !== "ok") {
+      failDataTick(state, wrote.reason, null);
+      return false;
+    }
+    state.tickSucceeded += 1;
+    state.lastSuccessAt = Date.now();
+    state.consecutiveFailures = 0;
+    state.failureReason = undefined;
+    state.pendingRetryAfterMs = null;
+    state.lastRecipeOutput = result.output;
+    state.data.errorShown = false;
+    if (state.data.llmKey && typeof patch[state.data.llmKey] === "string") {
+      state.data.lastText = patch[state.data.llmKey];
+    }
+    return false;
+  }
+
+  function dataJobOf(raw     , recipe     , jobSessionKey     ) {
+    if (!raw || typeof raw !== "object") return null;
+    const inputs      = {};
+    for (const input of Array.isArray(raw.inputs) ? raw.inputs : []) {
+      if (input && typeof input.key === "string") inputs[input.key] = input;
+    }
+    const targets      = { ...(raw.targets || {}) };
+    const seed = staticValuesCopy(raw.seed);
+    return {
+      sessionKey: typeof raw.sessionKey === "string" && raw.sessionKey ? raw.sessionKey : jobSessionKey,
+      inputs,
+      targets,
+      seed,
+      llmKey: recipe && recipe.kind === "llm" ? Object.keys(targets)[0] || null : null,
+      lastText: undefined,
+      errorShown: typeof seed.error === "string" && seed.error !== "",
+
+      first:
+        raw.first && typeof raw.first === "object" && Object.prototype.hasOwnProperty.call(raw.first, "output")
+          ? { output: raw.first.output }
+          : null,
+    };
+  }
+
   async function runOneTick(state) {
     if (state.resolved || isPaused(state)) return;
+
+    if (state.data && !dataSurfaceLive(state)) {
+      stopForGoneSurface(state);
+      return;
+    }
     state.lastTickAt = monotonicNowMs();
     const tickGeneration = state.generationToken;
     state.tickCount += 1;
+    const first = state.data ? state.data.first : null;
+    if (state.data) state.data.first = null;
     let result;
+    const tickAbort = new AbortController();
+    state.tickAbort = tickAbort;
     try {
-      const ctx =
-        state.recipe.kind === "llm" ? resolveLlmCtx(state) : null;
-      result = await executeRecipe(state.recipe, ctx);
+      let ctx = state.recipe.kind === "llm" ? resolveLlmCtx(state) : null;
+      if (ctx) ctx = { ...ctx, signal: tickAbort.signal };
+      if (ctx && state.data) ctx = { ...ctx, previousBody: dataPreviousBody(state) };
+      result = first || (await executeRecipe(state.recipe, ctx));
     } catch (err) {
       result = { error: `recipe threw: ${err && err.message ? err.message : err}` };
+    } finally {
+      if (state.tickAbort === tickAbort) state.tickAbort = null;
     }
 
     if (state.resolved) return;
@@ -389,7 +664,11 @@ function createGlassesUiCronEngine(deps) {
       return;
     }
 
-    if (result && typeof result.error === "string") {
+    if (state.data) {
+
+      if (await applyDataTick(state, result, tickGeneration)) return;
+      if (state.resolved) return;
+    } else if (result && typeof result.error === "string") {
       state.tickFailed += 1;
       state.lastFailureAt = Date.now();
       state.failureReason = result.error;
@@ -417,7 +696,7 @@ function createGlassesUiCronEngine(deps) {
       }
 
     } else if (result && Object.prototype.hasOwnProperty.call(result, "output")) {
-      const substituted = substituteIntoTargets(
+      const substituted      = substituteIntoTargets(
         { ...state.refresh.targets, surfaceKind: state.surfaceKind },
         result.output,
         state.lastRecipeOutput,
@@ -432,7 +711,7 @@ function createGlassesUiCronEngine(deps) {
           ...staticValuesCopy(state.templateValues),
           [state.refresh.targets.slot]: slotValue,
         };
-        const overrides = {};
+        const overrides      = {};
         if (substituted.body !== undefined) overrides.body = substituted.body;
         if (substituted.items !== undefined) overrides.items = substituted.items;
         const prepared = prepareTemplateSpec(state, nextValues, undefined, overrides);
@@ -479,7 +758,7 @@ function createGlassesUiCronEngine(deps) {
           state.templateValues = substituted.templateValues;
           emitTemplateSpec(state, substituted.templatePrepared);
         }
-        const patch = {};
+        const patch      = {};
         let changed = false;
         if (substituted.body !== undefined && substituted.body !== state.lastBody) {
           patch.body = substituted.body;
@@ -528,6 +807,11 @@ function createGlassesUiCronEngine(deps) {
   }
 
   async function runSmokeTest(state) {
+
+    if (state.data) {
+      await runOneTick(state);
+      return;
+    }
     state.isSmokeTest = true;
     await runOneTick(state);
     state.isSmokeTest = false;
@@ -541,7 +825,7 @@ function createGlassesUiCronEngine(deps) {
     scheduleNextTick(state, effectiveCadenceDelay(state, state.refresh.intervalMs));
   }
 
-  function runImmediateRefresh(state) {
+  function runImmediateRefresh(state     ) {
 
     if (state.tickCount === 0) {
       runSmokeTest(state).catch((err) => {
@@ -599,8 +883,11 @@ function createGlassesUiCronEngine(deps) {
         presenceGapStartedAtMs: null,
         presenceGapOutcome: null,
         presenceCatchUpPending: false,
+
+        key: typeof params.jobKey === "string" && params.jobKey ? params.jobKey : params.surfaceId,
+        data: dataJobOf(params.data, params.refresh.recipe, params.sessionKey),
       };
-      active.set(state.surfaceId, state);
+      active.set(state.key, state);
 
       syncPausedFlag(state);
       if (presenceIsExplicitlyAbsent(currentPresence) && state.tier !== "local") {
@@ -628,6 +915,9 @@ function createGlassesUiCronEngine(deps) {
             failureReason: `smoke test threw: ${err && err.message ? err.message : err}`,
           });
         });
+      } else if (state.data) {
+
+        state.data.first = null;
       }
     },
     stop(surfaceId, outcome, opts) {
@@ -655,7 +945,7 @@ function createGlassesUiCronEngine(deps) {
     isActive(surfaceId) {
       return active.has(surfaceId);
     },
-    sessionKeysForHttpHost(host) {
+    sessionKeysForHttpHost(host     ) {
       const keys = new Set();
       for (const state of active.values()) {
         if (!state.recipe || state.recipe.kind !== "http") continue;
@@ -669,12 +959,12 @@ function createGlassesUiCronEngine(deps) {
       return active.get(surfaceId);
     },
 
-    snapshotOf(surfaceId) {
+    snapshotOf(surfaceId     ) {
       const state = active.get(surfaceId);
       if (!state) {
         return { active: false, paused: false, ticks: null, lastRender: null };
       }
-      const ticks = {
+      const ticks      = {
         count: state.tickCount,
         succeeded: state.tickSucceeded,
         failed: state.tickFailed,
@@ -723,7 +1013,7 @@ function createGlassesUiCronEngine(deps) {
       return true;
     },
 
-    takeValuesForFullResend(surfaceId) {
+    takeValuesForFullResend(surfaceId     ) {
       const state = active.get(surfaceId);
       if (!state || state.resolved || state.tickCount === 0) return null;
       const sent = { body: state.lastBody, items: state.lastItems, templated: !!state.lastSpec };
@@ -806,7 +1096,7 @@ function createGlassesUiCronEngine(deps) {
       }
       return true;
     },
-    setPresence(value) {
+    setPresence(value     ) {
       const next = normalizePresence(value);
       const prior = currentPresence;
       currentPresence = next;
@@ -876,4 +1166,4 @@ function createGlassesUiCronEngine(deps) {
   };
 }
 
-module.exports = { createGlassesUiCronEngine };
+module.exports = { isLiveUiJsonPointer, readLiveUiJsonPointer, cutLiveUiErrorText, GLASSES_PRESENCE_STATES, HTTP_ABSENT_MIN_INTERVAL_MS, createGlassesUiCronEngine };

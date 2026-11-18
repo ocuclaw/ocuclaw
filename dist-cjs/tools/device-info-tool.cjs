@@ -224,4 +224,4 @@ function registerDeviceInfoTool(api, service) {
   };
 }
 
-module.exports = { deviceInfoParametersSchema, validateDeviceInfoInput, createPendingDeviceInfoMap, DEFAULT_DEVICE_INFO_TIMEOUT_MS, DEVICE_INFO_TOOL_DESCRIPTION, createDeviceInfoToolHandler, registerDeviceInfoTool };
+module.exports = { deviceInfoParametersSchema, validateDeviceInfoInput, createPendingDeviceInfoMap, DEFAULT_DEVICE_INFO_TIMEOUT_MS, createDeviceInfoToolHandler, DEVICE_INFO_TOOL_DESCRIPTION, registerDeviceInfoTool };

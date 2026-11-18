@@ -8,6 +8,10 @@ const MIRROR_AUTHOR = "Desktop";
 const DEFAULT_DEBOUNCE_MS = 150;
 const DEFAULT_OWN_TURN_QUIET_MS = 1500;
 const DEFAULT_TAIL_LIMIT = 50;
+
+const TAIL_ORDER = "oldest";
+
+const MAX_TAIL_PAGES = 20;
 const REARM_BACKOFF_MS = 1000;
 const MAX_REARM_ATTEMPTS = 5;
 const DEFAULT_OWN_PLATFORM = "ocuclaw";
@@ -291,50 +295,70 @@ function createSessionMirrorWatch(opts = {}) {
         debug("silent_advance", { reason, why: own || "tail_unsupported", from: previous, to: watermark });
         return { sessionId, watermark, mirrored: 0, silent: true };
       }
-      const afterId = watermark === null ? 0 : watermark;
-      let tail = null;
-      counters.tails += 1;
-      try {
-        tail = await readTail(key, afterId, tailLimit);
-      } catch (err) {
-        logger.warn(`[session-mirror] tail read failed for ${key}: ${err && err.message}`);
-        debug("tail_read_failed", { reason, afterId, error: err && err.message });
-        return { sessionId, watermark, mirrored: 0 };
+
+      let mirrored = 0;
+      for (let page = 1; ; page += 1) {
+        const afterId = watermark === null ? 0 : watermark;
+        let tail = null;
+        counters.tails += 1;
+        try {
+          tail = await readTail(key, afterId, tailLimit, TAIL_ORDER);
+        } catch (err) {
+
+          logger.warn(`[session-mirror] tail read failed for ${key}: ${err && err.message}`);
+          debug("tail_read_failed", { reason, afterId, page, error: err && err.message });
+          return { sessionId, watermark, mirrored };
+        }
+        if (myGeneration !== generation || armedKey !== key) return null;
+        if (tail && tail.rowIdsUnavailable === true) {
+          tailUnsupported = true;
+          watermark = nextWatermark;
+          logger.warn(`[session-mirror] ${key}: hermes reports no row ids; Desktop rows will not mirror live`);
+          debug("tail_unsupported", { reason });
+          return { sessionId, watermark, mirrored, silent: true };
+        }
+        const rows = shapeMirrorRows(tail && tail.messages, afterId);
+        const nextAfterId = toRowId(tail && tail.nextAfterId);
+        const more = nextAfterId !== null && nextAfterId > afterId;
+        const previous = watermark;
+        if (more) {
+          watermark = nextAfterId;
+        } else {
+          let highest = nextWatermark;
+          for (const row of rows) if (row.id > highest) highest = row.id;
+          watermark = highest;
+        }
+        if (rows.length === 0) {
+          debug("moved_without_rows", { reason, from: previous, to: watermark, page });
+        } else {
+          mirrored += rows.length;
+          counters.rowsMirrored += rows.length;
+          lastMirrorAtMs = now();
+          lastMirrorLatencyMs = eventAt !== null ? Math.max(0, lastMirrorAtMs - eventAt) : null;
+          debug("rows_mirrored", {
+            reason,
+            from: previous,
+            to: watermark,
+            page,
+            rows: rows.length,
+            roles: rows.map((row) => row.role),
+            latencyMs: lastMirrorLatencyMs,
+          });
+          try {
+            onRows(rows, { sessionKey: key, sessionId, watermark, reason });
+          } catch (err) {
+            logger.warn(`[session-mirror] onRows failed: ${err && err.message}`);
+          }
+        }
+        if (!more) break;
+        if (page >= MAX_TAIL_PAGES) {
+
+          refreshQueued = true;
+          debug("tail_pages_capped", { reason, pages: page, watermark });
+          break;
+        }
       }
-      if (myGeneration !== generation || armedKey !== key) return null;
-      if (tail && tail.rowIdsUnavailable === true) {
-        tailUnsupported = true;
-        watermark = nextWatermark;
-        logger.warn(`[session-mirror] ${key}: hermes reports no row ids; Desktop rows will not mirror live`);
-        debug("tail_unsupported", { reason });
-        return { sessionId, watermark, mirrored: 0, silent: true };
-      }
-      const rows = shapeMirrorRows(tail && tail.messages, afterId);
-      let highest = nextWatermark;
-      for (const row of rows) if (row.id > highest) highest = row.id;
-      const previous = watermark;
-      watermark = highest;
-      if (rows.length === 0) {
-        debug("moved_without_rows", { reason, from: previous, to: watermark });
-        return { sessionId, watermark, mirrored: 0 };
-      }
-      counters.rowsMirrored += rows.length;
-      lastMirrorAtMs = now();
-      lastMirrorLatencyMs = eventAt !== null ? Math.max(0, lastMirrorAtMs - eventAt) : null;
-      debug("rows_mirrored", {
-        reason,
-        from: previous,
-        to: watermark,
-        rows: rows.length,
-        roles: rows.map((row) => row.role),
-        latencyMs: lastMirrorLatencyMs,
-      });
-      try {
-        onRows(rows, { sessionKey: key, sessionId, watermark, reason });
-      } catch (err) {
-        logger.warn(`[session-mirror] onRows failed: ${err && err.message}`);
-      }
-      return { sessionId, watermark, mirrored: rows.length };
+      return { sessionId, watermark, mirrored };
     })();
     try {
       return await refreshInFlight;

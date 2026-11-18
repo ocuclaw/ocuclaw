@@ -8,7 +8,7 @@ const SPILL_DECODE_CHUNK_CHARS = 1 << 20;
 
 const STRICT_BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 
-async function writeDecodedBase64(handle, base64) {
+async function writeDecodedBase64(handle     , base64     ) {
   const chunked =
     base64.length > SPILL_DECODE_CHUNK_CHARS && STRICT_BASE64.test(base64);
   const step = chunked ? SPILL_DECODE_CHUNK_CHARS : base64.length || 1;
@@ -25,7 +25,7 @@ async function writeDecodedBase64(handle, base64) {
   }
 }
 
-async function writeLinkSpillFile(base64Content, opts = {}) {
+async function writeLinkSpillFile(base64Content     , opts      = {}) {
   const prefix =
     opts && typeof opts.prefix === "string" && opts.prefix
       ? opts.prefix
@@ -52,7 +52,7 @@ async function writeLinkSpillFile(base64Content, opts = {}) {
   return spillPath;
 }
 
-function discardLinkSpillFile(spillPath) {
+function discardLinkSpillFile(spillPath     ) {
   if (typeof spillPath !== "string" || !spillPath) return false;
   try {
     fs.unlinkSync(spillPath);
@@ -62,7 +62,7 @@ function discardLinkSpillFile(spillPath) {
   }
 }
 
-async function discardLinkSpillFileAsync(spillPath) {
+async function discardLinkSpillFileAsync(spillPath     ) {
   if (typeof spillPath !== "string" || !spillPath) return false;
   try {
     await fs.promises.unlink(spillPath);

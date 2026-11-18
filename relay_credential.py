@@ -28,6 +28,7 @@ import time
 from typing import Any, Iterator, Optional
 
 from . import receipts
+from . import secret_access
 
 
 RELAY_CREDENTIAL_MARKER_FILENAME = "ocuclaw.relay-credential.json"
@@ -176,16 +177,13 @@ def new_generation_id() -> str:
 
 
 def read_relay_credential() -> str:
-    """Read the managed credential without exposing it beyond this process."""
-    try:
-        from hermes_cli.config import get_env_value  # type: ignore
+    """Read the managed credential without exposing it beyond this process.
 
-        value = get_env_value(RELAY_CREDENTIAL_ENV)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    except Exception:  # noqa: BLE001 - the supervised process env is the fallback
-        pass
-    return str(os.environ.get(RELAY_CREDENTIAL_ENV, "") or "").strip()
+    Only through Hermes (catalogue rule 11): ``get_secret`` reads the profile's
+    ``.env`` scope and, on a single-profile gateway, falls through to the
+    supervised process environment itself.
+    """
+    return secret_access.read_secret(RELAY_CREDENTIAL_ENV)
 
 
 def is_managed_profile() -> bool:
@@ -222,11 +220,15 @@ def is_profile_established(home: Optional[Path] = None) -> bool:
 
 def persist_relay_credential(credential: str, previous_credential: str) -> str:
     """Use Hermes's atomic writer and restore the prior value on uncertainty."""
-    from hermes_cli.config import get_env_value, save_env_value  # type: ignore
+    from hermes_cli.config import save_env_value  # type: ignore
 
+    # The read-back goes through the same Hermes route every reader uses. With
+    # no scope installed it builds the profile's scope from the ``.env`` just
+    # written; inside a turn ``save_env_value`` publishes into the installed
+    # scope. Either way it proves what the next reader will see.
     try:
         save_env_value(RELAY_CREDENTIAL_ENV, credential)
-        stored = get_env_value(RELAY_CREDENTIAL_ENV)
+        stored = secret_access.read_secret(RELAY_CREDENTIAL_ENV)
         if isinstance(stored, str) and hmac.compare_digest(stored, credential):
             return PERSISTENCE_COMMITTED
     except BaseException:  # noqa: BLE001 - includes Ctrl-C in mutation window
@@ -234,7 +236,7 @@ def persist_relay_credential(credential: str, previous_credential: str) -> str:
 
     try:
         save_env_value(RELAY_CREDENTIAL_ENV, previous_credential)
-        restored = get_env_value(RELAY_CREDENTIAL_ENV)
+        restored = secret_access.read_secret(RELAY_CREDENTIAL_ENV)
     except BaseException:  # noqa: BLE001 - includes Ctrl-C in rollback window
         return PERSISTENCE_AMBIGUOUS
     if isinstance(restored, str) and hmac.compare_digest(

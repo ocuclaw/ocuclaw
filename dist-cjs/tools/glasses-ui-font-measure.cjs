@@ -26887,7 +26887,16 @@ function isBreakable(cp) {
         return true;
     if (cp === 44 || cp === 46 || cp === 59 || cp === 58 || cp === 95 || cp === 41 || cp === 93 || cp === 125)
         return true;
-    return isCJK(cp);
+
+    if ((cp >= 0x3130 && cp <= 0x318F) || (cp >= 0xAC00 && cp <= 0xD7AF))
+        return false;
+    return isLvglWord(cp);
+}
+
+function isLvglWord(cp) {
+    return (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xFF01 && cp <= 0xFF5E) ||
+        (cp >= 0x3000 && cp <= 0x303F) || (cp >= 0x2E80 && cp <= 0x2EFF) || (cp >= 0x31C0 && cp <= 0x31EF) ||
+        (cp >= 0x3040 && cp <= 0x30FF) || (cp >= 0xFE10 && cp <= 0xFE1F) || (cp >= 0xFE30 && cp <= 0xFE4F);
 }
 
 function getTextWidth(text) {
@@ -26964,7 +26973,8 @@ function measureTextWrap(text, maxWidth) {
         }
         else {
             currentLine += adv;
-            if (isBreakable(cp)) {
+
+            if (isBreakable(cp) || (i + 1 < cps.length && isLvglWord(cps[i + 1]))) {
                 lastBreakIdx = i;
                 lastBreakWidth = cp === 32 ? currentLine - adv : currentLine;
             }

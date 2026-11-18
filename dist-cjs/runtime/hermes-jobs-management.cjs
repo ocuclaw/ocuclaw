@@ -1,7 +1,7 @@
 const HERMES_JOB_OPERATIONS = new Set(["jobs.list", "jobs.history", "jobs.receipt", "jobs.pause", "jobs.resume", "jobs.run", "jobs.cancel"]);
 const HERMES_JOB_READS = new Set(["jobs.list", "jobs.history", "jobs.receipt"]);
-const token = (v) => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);
-function jobsRequest(operation, raw) {
+const token = (v     ) => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);
+function jobsRequest(operation     , raw     ) {
   if (!HERMES_JOB_OPERATIONS.has(operation)) return undefined;
   const p = raw ?? {};
   if (typeof p !== "object" || Array.isArray(p)) return undefined;
@@ -16,19 +16,19 @@ function jobsRequest(operation, raw) {
   }
   return { ...p };
 }
-const text = (v) => typeof v === "string" && v.length <= 256 && !/[\u0000-\u001f]/.test(v) ? v : "";
-const execution = (r) => r && typeof r === "object" ? {
+const text = (v     ) => typeof v === "string" && v.length <= 256 && !/[\u0000-\u001f]/.test(v) ? v : "";
+const execution = (r     )      => r && typeof r === "object" ? {
   id: text(r.id), jobId: text(r.jobId), status: ["claimed", "running", "completed", "failed", "unknown"].includes(r.status) ? r.status : "unknown",
   delivery: ["failed", "delivered", "not_configured", "suppressed", "suppressed_acked"].includes(r.delivery) ? r.delivery : "unknown",
   startedAt: text(r.startedAt), finishedAt: text(r.finishedAt),
 } : null;
-const job = (r) => r && typeof r === "object" && token(r.id) ? {
+const job = (r     )      => r && typeof r === "object" && token(r.id) ? {
   id: r.id, name: text(r.name), state: text(r.state), paused: r.paused === true,
   schedule: text(r.schedule), nextRunAt: text(r.nextRunAt), lastExecution: execution(r.lastExecution),
 } : null;
-function jobsResult(raw) {
+function jobsResult(raw     ) {
   if (!raw || typeof raw !== "object") return undefined;
-  const out = {};
+  const out      = {};
   if (Array.isArray(raw.jobs)) out.jobs = raw.jobs.slice(0, 100).map(job).filter(Boolean);
   if (Array.isArray(raw.history)) out.history = raw.history.slice(0, 50).map(execution).filter(Boolean);
   if (raw.provider) out.provider = text(raw.provider);

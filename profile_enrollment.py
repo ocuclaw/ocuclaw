@@ -92,8 +92,10 @@ preference to a later key alongside this one.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
+import sys
 import threading
 import time
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
@@ -294,6 +296,22 @@ def _config_stamp(home: Path) -> Optional[Tuple[int, int]]:
 # -- writing ------------------------------------------------------------------
 
 
+def _native_config_mutation_lock() -> Any:
+    """The lock Hermes' own config writers hold across a read/modify/write, or None.
+
+    Hermes 0.23.2 moved it to ``hermes_cli.config_backend.CONFIG_MUTATION_LOCK``,
+    which the dashboard and profile writers take; ``hermes_cli.config`` loads
+    that module, and the caller has imported ``hermes_cli.config``. Before that
+    it was ``hermes_cli.web_server._CONFIG_MUTATION_LOCK``, present only once
+    the web server module is loaded. Read loaded modules only, never import:
+    no new platform import, and no web server started.
+    """
+    lock = getattr(sys.modules.get("hermes_cli.config_backend"), "CONFIG_MUTATION_LOCK", None)
+    if lock is None:
+        lock = getattr(sys.modules.get("hermes_cli.web_server"), "_CONFIG_MUTATION_LOCK", None)
+    return lock
+
+
 def _write_names(
     home: Path, names: Sequence[str], *, mirror: bool
 ) -> None:
@@ -317,30 +335,37 @@ def _write_names(
     from hermes_cli.config import atomic_config_write, read_user_config_raw
 
     path = Path(home) / CONFIG_FILENAME
-    config = read_user_config_raw(path)
-    if not isinstance(config, dict):
-        raise ValueError("Hermes configuration is invalid")
-    ordered = sorted(dict.fromkeys(names))
+    # A native dashboard save in this process owns its whole read/modify/write
+    # span with this lock. Join that owner before reading, or a successful
+    # settings save can be reverted by enrollment's stale whole-file write.
+    # Do not import/start a web server for CLI-only hosts; this coordinates
+    # threads in an already-running host, not independent writer processes.
+    native_lock = _native_config_mutation_lock()
+    with native_lock if native_lock is not None else nullcontext():
+        config = read_user_config_raw(path)
+        if not isinstance(config, dict):
+            raise ValueError("Hermes configuration is invalid")
+        ordered = sorted(dict.fromkeys(names))
 
-    platforms = config.setdefault("platforms", {})
-    if not isinstance(platforms, dict):
-        raise ValueError("Platform configuration is invalid")
-    ocuclaw = platforms.setdefault(ENROLLMENT_CONFIG_PATH[1], {})
-    if not isinstance(ocuclaw, dict):
-        raise ValueError("OcuClaw platform configuration is invalid")
-    extra = ocuclaw.setdefault(ENROLLMENT_CONFIG_PATH[2], {})
-    if not isinstance(extra, dict):
-        raise ValueError("OcuClaw platform settings are invalid")
-    extra[ENROLLMENT_CONFIG_PATH[3]] = list(ordered)
+        platforms = config.setdefault("platforms", {})
+        if not isinstance(platforms, dict):
+            raise ValueError("Platform configuration is invalid")
+        ocuclaw = platforms.setdefault(ENROLLMENT_CONFIG_PATH[1], {})
+        if not isinstance(ocuclaw, dict):
+            raise ValueError("OcuClaw platform configuration is invalid")
+        extra = ocuclaw.setdefault(ENROLLMENT_CONFIG_PATH[2], {})
+        if not isinstance(extra, dict):
+            raise ValueError("OcuClaw platform settings are invalid")
+        extra[ENROLLMENT_CONFIG_PATH[3]] = list(ordered)
 
-    # Update an allowlist the operator already set; never bring one into being.
-    if mirror and _dig(config, ALLOWLIST_CONFIG_PATH) is not None:
-        gateway = config.setdefault(ALLOWLIST_CONFIG_PATH[0], {})
-        if not isinstance(gateway, dict):
-            raise ValueError("Gateway configuration is invalid")
-        gateway[ALLOWLIST_CONFIG_PATH[1]] = list(ordered)
+        # Update an allowlist the operator already set; never bring one into being.
+        if mirror and _dig(config, ALLOWLIST_CONFIG_PATH) is not None:
+            gateway = config.setdefault(ALLOWLIST_CONFIG_PATH[0], {})
+            if not isinstance(gateway, dict):
+                raise ValueError("Gateway configuration is invalid")
+            gateway[ALLOWLIST_CONFIG_PATH[1]] = list(ordered)
 
-    atomic_config_write(path, config)
+        atomic_config_write(path, config)
 
 
 def mirror_is_required(capabilities: Optional[EngineCapabilities] = None) -> bool:

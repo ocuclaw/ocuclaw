@@ -21,9 +21,9 @@ const RELAY_CLIENT_NAME_KINDS = Object.freeze({
   "ocuclaw-adhoc-debug": "app",
 });
 
-function relayClientKindForName(clientName) {
+function relayClientKindForName(clientName     ) {
   if (typeof clientName !== "string") return "app";
-  const kinds = RELAY_CLIENT_NAME_KINDS;
+  const kinds      = RELAY_CLIENT_NAME_KINDS;
   if (!Object.prototype.hasOwnProperty.call(kinds, clientName)) return "app";
   return kinds[clientName] === "debug" ? "debug" : "app";
 }

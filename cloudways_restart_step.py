@@ -112,10 +112,17 @@ is the difference:
   now walks on, the pending marker stays standing so the owed restart is still
   recorded, and the ladder's completion output says in one line that "Continue
   here" switches on at the next restart.
+* **The gateway runs older OcuClaw than the files on disk** (#6353) — an
+  upgrade replaced the files and nothing restarted the gateway since. The old
+  code is what the phone reaches, so this blocks like "not loaded": the step
+  never says "loaded and ready", leads with :func:`runtime_older_message`
+  instead, and offers the same one restart. :func:`runtime_age` is the check,
+  a standalone fact the setup step machine (#6377) can ask too.
 """
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -176,6 +183,9 @@ DETAIL_RESTART_DECLINED = "restart-declined"
 DETAIL_RESTARTED = "restarted"
 DETAIL_RESTART_FAILED = "restart-failed"
 DETAIL_RESTART_UNHEALTHY = "restart-unhealthy"
+#: The running gateway serves older OcuClaw code than the files on disk, and
+#: only a restart this host cannot make from here loads the new code (#6353).
+DETAIL_RUNTIME_OLDER = "runtime-older"
 
 JOURNAL_DETAILS = frozenset(
     {
@@ -190,6 +200,7 @@ JOURNAL_DETAILS = frozenset(
         DETAIL_RESTARTED,
         DETAIL_RESTART_FAILED,
         DETAIL_RESTART_UNHEALTHY,
+        DETAIL_RUNTIME_OLDER,
     }
 )
 
@@ -231,26 +242,85 @@ LOADED_MESSAGE = "OcuClaw is loaded and ready."
 #: Cloudways restart. The phone's Home card ("Restart Hermes") and
 #: `hermes ocuclaw optional-setup activate` now use it, after a warning that SSH
 #: drops: `restart_rpc._host_restart_mode` and
-#: `optional_setup._cloudways_container_restart`. This ladder step still does
-#: not execute it: it only names it, as before. Making the ladder restart on its
-#: own is a separate decision, not part of that ruling.
+#: `optional_setup._cloudways_container_restart`. Over SSH this ladder step
+#: still does not execute it: it only names it, as before.
+#:
+#: Ruling (Matt, 2026-10-01): in the Hermes WebUI's `/terminal` the ladder runs
+#: that same restart itself, after a yes (:func:`offer_webui_restart`). There
+#: the page dies with the container, so typing the command by hand gains
+#: nothing, and setup writes its own command into the shell history first, so
+#: carrying on after the reload is the Up arrow and Enter.
+#:
+#: Ruling (Matt, 2026-10-02): no Up arrow. Setup also leaves one guarded line
+#: in ``~/.bashrc`` (``webui_terminal.add_carry_on``), so after the reload and
+#: ``/terminal`` the run carries on by itself. The history line stays as the
+#: fallback, and the restart words are three numbered steps. The line is armed
+#: when the run starts (``cloudways_setup.run_setup``) and lives a day, so a
+#: run cut off at any step carries on too, not only after this restart.
+#: A phone's keyboard has no Up arrow, so a narrow terminal never gets that way.
 NOT_LOADED_MESSAGE = "OcuClaw is installed but your agent has not loaded it yet."
 RESTART_AND_RERUN_MESSAGE = "Restart the agent, then run this command again."
+
+#: #6353 · the running gateway loaded OcuClaw, but older code than the files on
+#: disk: an upgrade (`hermes plugins install ... --force`, `hermes plugins
+#: update ocuclaw`, the install script) replaced the files and nothing has
+#: restarted the gateway since. Said in place of :data:`NOT_LOADED_MESSAGE`,
+#: and the same restart follows. The template is the OpenClaw ladder's
+#: `ocuclawOldVersionMessage` (#3480) byte for byte; keep the twins in sync.
+RUNTIME_OLDER_TEMPLATE = (
+    "Your agent is still running OcuClaw {running}. OcuClaw {installed} is installed."
+)
+#: The same fact when the two versions cannot both be named, or are equal:
+#: a running gateway that predates the serving receipt (2.1.2 and older), or a
+#: new build that kept the version number.
+RUNTIME_OLDER_MESSAGE = (
+    "Your agent is still running an older OcuClaw than the one installed."
+)
+
+
+def runtime_older_message(running: Optional[str], installed: Optional[str]) -> str:
+    """Step 3's lead line when the running OcuClaw is older than the installed one."""
+    if running and installed and running != installed:
+        return RUNTIME_OLDER_TEMPLATE.format(running=running, installed=installed)
+    return RUNTIME_OLDER_MESSAGE
 
 #: The command that restarts the agent, and the command to type after it.
 RESTART_COMMAND = "hermes gateway restart"
 RERUN_COMMAND = "hermes ocuclaw cloudways setup"
 
-def not_loaded_lines(*, phone_paired: bool = False) -> Tuple[str, ...]:
+def not_loaded_lines(
+    *, phone_paired: bool = False, webui: bool = False, lead: Optional[str] = None
+) -> Tuple[str, ...]:
     """The step 3 restart block. The phone line only once a phone is paired.
 
     Before pairing there is no phone to reconnect, so "Your phone reconnects"
     only confuses (Matty's Hermes Cloudways run, 2026-09-28). OpenClaw's step 3
     drops the same line the same way (#3975). One line each, like OpenClaw's:
     both stay under 86 columns, so neither wraps mid-word on the real box.
+
+    ``webui`` is the WebUI terminal's wording, for when setup cannot run the
+    restart there itself: no SSH, and the page to reload.
+
+    ``lead`` replaces the first line when the reason is not "not loaded":
+    an older OcuClaw still running (:func:`runtime_older_message`, #6353).
     """
+    first = lead or NOT_LOADED_MESSAGE
+    if webui:
+        return (
+            f"  {first}",
+            "  One restart loads OcuClaw and the settings above. Type:",
+            f"    {RESTART_COMMAND}",
+            "",
+            f"  {WEBUI_DISCONNECT_LINE}",
+            f"  {WEBUI_REOPEN_LINE}",
+            *((f"  {CLOUDWAYS_RESTART_PHONE_LINE}",) if phone_paired else ()),
+            "  Then type this again:",
+            f"    {RERUN_COMMAND}",
+            "",
+            "  Or restart the agent from your Cloudways dashboard.",
+        )
     return (
-        f"  {NOT_LOADED_MESSAGE}",
+        f"  {first}",
         "  One restart loads OcuClaw and the settings above. Type:",
         f"    {RESTART_COMMAND}",
         "",
@@ -262,6 +332,98 @@ def not_loaded_lines(*, phone_paired: bool = False) -> Tuple[str, ...]:
         "",
         "  Or restart the agent from your Cloudways dashboard.",
     )
+
+
+#: The WebUI terminal's restart words. The panel is about 88 columns, so each
+#: line stays under 86 with its indent. The page runs in the agent's own
+#: container, so it goes down with it.
+WEBUI_DISCONNECT_LINE = "This page disconnects for about a minute while your agent restarts."
+WEBUI_REOPEN_LINE = "When it is back, reload the page and send /terminal."
+#: The Cloudways box sometimes restarts a second time by itself about 20
+#: seconds after the first (seen in the e2e runs, #4140), which drops the page
+#: again just after it came back.
+WEBUI_SECOND_DROP_LINE = "If it drops again soon after, do 2 and 3 again."
+
+#: How the run carries on after the reload, best first: by itself (a guarded
+#: line in ``~/.bashrc``), the Up arrow and Enter (the shell history), or the
+#: command typed. Matt chose "by itself" on 2026-10-02.
+CARRY_ON_ITSELF = "itself"
+CARRY_ON_UP_ARROW = "up-arrow"
+CARRY_ON_TYPED = "typed"
+
+#: What the person does about it, without the step number. Words, not "↑":
+#: the panel's font draws the arrow too small to read.
+WEBUI_CARRY_ON_WORDS = {
+    CARRY_ON_ITSELF: "Setup carries on by itself.",
+    CARRY_ON_UP_ARROW: "Press the Up arrow, then Enter, to carry on.",
+    CARRY_ON_TYPED: f"Type {RERUN_COMMAND} to carry on.",
+}
+
+#: Said after the yes when the way back promised above could not be written:
+#: the next best one replaces step 3.
+WEBUI_CARRY_ON_CHANGED_TEMPLATE = "Setup could not save that. Instead, for 3: {words}"
+
+#: When setup can read the WebUI's address, step 2 is a link instead of the
+#: reload (Matt picked these words, "B", on 2026-10-02). The WebUI's ``?q=``
+#: puts /terminal in its message box and never sends it, so sending it opens
+#: the terminal; clicked too soon, the page is Cloudways' 502 until a refresh.
+#: "Send", never "press Enter" or "type": on a phone it is the Send button.
+WEBUI_LINK_REOPEN_LINE = "Then open the link shown below and send /terminal."
+WEBUI_LINK_SECOND_DROP_LINE = "If it drops again soon after, open the link again."
+#: The link block, the last three lines before the page drops. Three on
+#: purpose: the WebUI's own "connection lost" and "disconnected" lines
+#: (static/terminal.js) push the panel's 10 rows up by six, and setup's last
+#: line ends with a newline, so only these three stay in view. The page fills
+#: its box with /terminal a moment after it loads; sent sooner, what is sent is
+#: garbage, so the last line says to wait for it (Matt, 2026-10-13). The
+#: refresh moved up to the link's own line to keep each within 84 columns.
+WEBUI_LINK_OPEN_LINE = "In about a minute, open this link. Not loaded yet? Refresh it."
+WEBUI_LINK_ENTER_LINES = {
+    CARRY_ON_ITSELF: "Wait until /terminal shows in the box, then send it. Setup carries on by itself.",
+    CARRY_ON_UP_ARROW: "Wait until /terminal shows in the box, then send it. Then the Up arrow and Enter.",
+    CARRY_ON_TYPED: f"Wait until /terminal shows, send it, then type {RERUN_COMMAND}.",
+}
+
+#: What the WebUI terminal shows before it asks to restart (Matt, 2026-10-01;
+#: numbered steps, 2026-10-02). Short on purpose: the panel shows 10 rows, and
+#: the question sits under these.
+WEBUI_LOADS_WITH_RESTART_MESSAGE = "OcuClaw is installed. One restart of your agent loads it."
+WEBUI_RESTART_QUESTION = "Restart now? Type yes to continue, anything else stops: "
+WEBUI_RESTARTING_MESSAGE = "Restarting your agent. This page disconnects in a few seconds."
+WEBUI_RESTART_FAILED_MESSAGE = (
+    "The restart did not happen.\n"
+    "Restart the agent from your Cloudways dashboard, then run this command again."
+)
+
+
+def webui_restart_lines(
+    *,
+    way_back: str,
+    phone_paired: bool = False,
+    link: Optional[str] = None,
+    lead: Optional[str] = None,
+) -> Tuple[str, ...]:
+    """The consent block for the restart setup runs itself in the WebUI.
+
+    Three numbered steps: the page drops, the person opens ``/terminal`` again
+    (by the ``link`` setup prints after the yes, or by a reload when there is
+    none), and the run carries on the ``way_back`` this host allows (one of the
+    ``CARRY_ON_*`` values). ``lead`` replaces the first line, as in
+    :func:`not_loaded_lines`.
+    """
+    return (
+        f"  {lead or WEBUI_LOADS_WITH_RESTART_MESSAGE}",
+        f"  1  {WEBUI_DISCONNECT_LINE}",
+        f"  2  {WEBUI_LINK_REOPEN_LINE if link else WEBUI_REOPEN_LINE}",
+        f"  3  {WEBUI_CARRY_ON_WORDS[way_back]}",
+        f"  {WEBUI_LINK_SECOND_DROP_LINE if link else WEBUI_SECOND_DROP_LINE}",
+        *((f"  {CLOUDWAYS_RESTART_PHONE_LINE}",) if phone_paired else ()),
+    )
+
+
+def webui_link_lines(link: str, way_back: str) -> Tuple[str, ...]:
+    """The link block, printed after the yes as the last lines before the drop."""
+    return (f"  {WEBUI_LINK_OPEN_LINE}", f"  {link}", f"  {WEBUI_LINK_ENTER_LINES[way_back]}")
 
 
 #: The block as a fresh box sees it: no phone paired yet.
@@ -398,6 +560,75 @@ def gateway_state(home: Optional[Path]) -> Tuple[Optional[dict], str, Optional[b
     return receipts.read_gateway_state(home=home)
 
 
+def serving_state(home: Optional[Path]) -> Tuple[Optional[dict], str]:
+    """The serving receipt: the OcuClaw version the gateway says it runs.
+
+    The adapter writes it as it connects (``adapter._publish_serving_version``,
+    since #5998). A gateway running 2.1.2 or older writes none, so a missing
+    receipt is an unknown, never a verdict.
+    """
+    return receipts.read_serving(receipts.fingerprint_home(home), home=home)
+
+
+def installed_version() -> Optional[str]:
+    """The version in the installed ``plugin.yaml`` now, which an upgrade replaces."""
+    return health.installed_ocuclaw_version()
+
+
+#: Where the gateway runs OcuClaw from, under the bundle: the manifest, the
+#: top-level Python modules the gateway imports, and the Node runtime it
+#: spawns. Everything else in the bundle (skills, the dashboard, vendored
+#: ``node_modules``) is left out: it is not what the gateway runs, and a smaller
+#: set leaves fewer files a stray writer can touch.
+BUNDLE_MANIFEST = "plugin.yaml"
+BUNDLE_RUNTIME_DIR = "dist-cjs"
+_SKIPPED_DIRS = frozenset({"__pycache__", "node_modules"})
+
+
+def bundle_landed_at(bundle_dir: Optional[Path] = None) -> Optional[float]:
+    """When the installed OcuClaw files last landed on disk, as UNIX seconds.
+
+    The latest change time (``st_ctime``, with ``st_mtime`` as a floor) among
+    :data:`BUNDLE_MANIFEST`, the bundle's top-level ``*.py`` and the files under
+    :data:`BUNDLE_RUNTIME_DIR`. The change time and not only the modification
+    time: an install that copies files keeps their old modification times, but
+    the kernel stamps the change time when the file is written here. Compiled
+    ``__pycache__`` files are never read: the CLI writes those as it imports.
+
+    ``bundle_dir`` defaults to the bundle this process imported, which is the
+    one the profile's gateway loads. None when the manifest cannot be read.
+    """
+    root = Path(bundle_dir) if bundle_dir is not None else health.BUNDLE_DIR
+
+    def landed(path: Path) -> Optional[float]:
+        try:
+            info = path.stat()
+        except OSError:
+            return None
+        return max(info.st_ctime, info.st_mtime)
+
+    latest = landed(root / BUNDLE_MANIFEST)
+    if latest is None:
+        return None
+    try:
+        files = list(root.glob("*.py"))
+    except OSError:
+        files = []
+    runtime = root / BUNDLE_RUNTIME_DIR
+    for directory, dirnames, filenames in os.walk(runtime):
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if name not in _SKIPPED_DIRS and not name.startswith(".")
+        ]
+        files.extend(Path(directory) / name for name in filenames)
+    for path in files:
+        moment = landed(path)
+        if moment is not None and moment > latest:
+            latest = moment
+    return latest
+
+
 def boot_epoch() -> Optional[float]:
     """This host's boot moment as UNIX seconds, from ``/proc/stat``'s ``btime``.
 
@@ -437,6 +668,121 @@ def restart_gateway(timeout_s: Optional[float]) -> bool:
     return pairing._restart_hermes_gateway(timeout_s=timeout_s)
 
 
+def webui_active(env: Optional[Mapping[str, str]]) -> bool:
+    """Is setup running in the Hermes WebUI's `/terminal` panel?"""
+    from . import webui_terminal
+
+    return webui_terminal.active(env)
+
+
+def container_restart_timeout(home: Optional[Path]) -> Optional[float]:
+    """The bound for the Cloudways container restart, or None when there is none.
+
+    The same three checks the phone's restart and `optional-setup activate`
+    make (#3357): a decisive Cloudways verdict, PID 1 is `/entrypoint.sh`, and
+    the running gateway is its direct child. Then the bound `restart_gateway`
+    needs, or None when Hermes will not say how long a restart may take.
+    """
+    from . import pairing
+    from .optional_setup import _cloudways_container_restart
+
+    gateway, _, live = gateway_state(home)
+    if live is not True or not _cloudways_container_restart(gateway):
+        return None
+    return pairing._gateway_restart_timeout_s()
+
+
+def history_available(env: Optional[Mapping[str, str]]) -> bool:
+    from . import webui_terminal
+
+    return webui_terminal.can_add_to_history(env)
+
+
+def add_rerun_to_history(env: Optional[Mapping[str, str]], look: Optional[str] = None) -> bool:
+    """Put the setup command in the shell history, for Up and Enter after the reload.
+
+    With a look other than the default the command carries ``--look``, so the
+    run after the reload draws the same way.
+    """
+    from . import setup_look, webui_terminal
+
+    return webui_terminal.add_to_history(setup_look.rerun_command(look, env), env)
+
+
+def planned_way_back(env: Optional[Mapping[str, str]], *, narrow: bool = False) -> str:
+    """The best way this host lets the run carry on after the reload. Writes nothing.
+
+    ``narrow`` is a phone-size terminal: a phone's keyboard has no Up arrow, so
+    the command to type stands in for it.
+    """
+    from . import webui_terminal
+
+    try:
+        if webui_terminal.can_carry_on(env):
+            return CARRY_ON_ITSELF
+        if history_available(env) and not narrow:
+            return CARRY_ON_UP_ARROW
+    except Exception:  # noqa: BLE001 - nothing readable: the command to type
+        pass
+    return CARRY_ON_TYPED
+
+
+def set_up_way_back(
+    env: Optional[Mapping[str, str]],
+    planned: str,
+    look: Optional[str] = None,
+    *,
+    narrow: bool = False,
+) -> str:
+    """Write what carries the run on after the reload. The way that holds now.
+
+    The history line goes in too when the ``~/.bashrc`` line does: if the
+    shell starts without running it, Up and Enter still bring the command back.
+    Both carry ``--look`` when the run was given one other than the default.
+    A ``narrow`` terminal is never told to use the Up arrow (:func:`planned_way_back`).
+    """
+    from . import setup_look, webui_terminal
+
+    if planned == CARRY_ON_TYPED:
+        return CARRY_ON_TYPED
+    try:
+        up_arrow = add_rerun_to_history(env, look)
+    except Exception:  # noqa: BLE001 - the command to type still works
+        up_arrow = False
+    if planned == CARRY_ON_ITSELF:
+        try:
+            if webui_terminal.add_carry_on(setup_look.rerun_command(look, env), env):
+                return CARRY_ON_ITSELF
+        except Exception:  # noqa: BLE001 - the next best way is said instead
+            pass
+    return CARRY_ON_UP_ARROW if up_arrow and not narrow else CARRY_ON_TYPED
+
+
+def reopen_link(hermes_home: Optional[Path]) -> Optional[str]:
+    """The link that opens the WebUI with /terminal typed in, or None.
+
+    None when the WebUI's address cannot be read: the words then say to
+    reload the page and send /terminal, as before.
+    """
+    from . import webui_terminal
+
+    try:
+        origin = webui_terminal.find_origin(hermes_home=hermes_home)
+    except Exception:  # noqa: BLE001 - no address, no link: the reload still works
+        return None
+    return webui_terminal.terminal_link(origin) if origin else None
+
+
+def forget_way_back(env: Optional[Mapping[str, str]]) -> None:
+    """Take setup's line out of ``~/.bashrc``: this run is still here. Never raises."""
+    from . import webui_terminal
+
+    try:
+        webui_terminal.remove_carry_on(env)
+    except Exception:  # noqa: BLE001 - the line runs out within the day anyway
+        pass
+
+
 # -- reading the host ---------------------------------------------------------
 
 
@@ -454,6 +800,11 @@ class GatewayHealth:
     #: or not. The question is whether the plugin loaded, not whether the relay
     #: is up.
     plugin_loaded: bool = False
+    #: The live gateway's identity as its receipt records it (``pid`` and the
+    #: raw ``start_time`` ticks), so a receipt another writer left can be
+    #: matched to this process exactly. None when not live.
+    pid: Optional[int] = None
+    start_ticks: Optional[int] = None
 
     @property
     def healthy(self) -> bool:
@@ -464,11 +815,16 @@ def read_gateway_health(home: Optional[Path]) -> GatewayHealth:
     record, status, live = gateway_state(home)
     facts = health.gateway_facts_from_receipt(record, status, live)
     is_live = facts["gatewayLive"] is True
+    identity = record if is_live and isinstance(record, Mapping) else {}
+    pid = identity.get("pid")
+    ticks = identity.get("start_time")
     return GatewayHealth(
         live=is_live,
         relay_connected=is_live and _relay_is_connected_now(record),
         started_at=_started_at(record) if is_live else None,
         plugin_loaded=is_live and _plugin_loaded_by_this_process(record),
+        pid=pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
+        start_ticks=ticks if isinstance(ticks, int) and not isinstance(ticks, bool) else None,
     )
 
 
@@ -690,6 +1046,142 @@ def credential_predates_start(
     )
 
 
+# -- is the running OcuClaw older than the installed one? (#6353) -------------
+
+RUNTIME_CURRENT = "current"
+RUNTIME_OLDER = "older"
+RUNTIME_UNKNOWN = "unknown"
+
+#: Which evidence said "older".
+EVIDENCE_VERSION = "version"
+EVIDENCE_FILES = "files"
+
+#: The version shape `health.restart_to_finish` accepts, the same pattern.
+_VERSION_PATTERN = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$")
+
+
+def _version_token(value: Any) -> Optional[str]:
+    return value if isinstance(value, str) and _VERSION_PATTERN.match(value) else None
+
+
+def live_serving_version(
+    serving: Optional[Mapping[str, Any]], pid: Optional[int], start_ticks: Optional[int]
+) -> Optional[str]:
+    """The version the serving receipt names, when the live gateway wrote it.
+
+    The same match `health.restart_to_finish` makes for the Desktop card: the
+    receipt's ``pid`` and ``start_time`` must be the live gateway's, so a
+    receipt left by a stopped or restarted gateway, or a recycled PID, says
+    nothing about the code running now.
+    """
+    if not isinstance(serving, Mapping) or pid is None or start_ticks is None:
+        return None
+    written_by = serving.get("pid")
+    if isinstance(written_by, bool) or written_by != pid:
+        return None
+    if serving.get("start_time") != start_ticks:
+        return None
+    return _version_token(serving.get("version"))
+
+
+@dataclass(frozen=True)
+class RuntimeAge:
+    """Whether the OcuClaw the gateway runs now is the OcuClaw on disk.
+
+    ``verdict`` is :data:`RUNTIME_CURRENT`, :data:`RUNTIME_OLDER` or
+    :data:`RUNTIME_UNKNOWN`. Unknown is never "older": a restart is offered
+    only on positive evidence.
+    """
+
+    verdict: str
+    #: The version the live gateway says it serves, when it says so.
+    running_version: Optional[str] = None
+    #: The version in the installed ``plugin.yaml``.
+    installed_version: Optional[str] = None
+    #: :data:`EVIDENCE_VERSION` or :data:`EVIDENCE_FILES` when older.
+    evidence: Optional[str] = None
+
+    @property
+    def older(self) -> bool:
+        return self.verdict == RUNTIME_OLDER
+
+    @property
+    def message(self) -> str:
+        return runtime_older_message(self.running_version, self.installed_version)
+
+
+def runtime_age(
+    hermes_home: Optional[Path],
+    *,
+    state: Optional[GatewayHealth] = None,
+    bundle_dir: Optional[Path] = None,
+) -> RuntimeAge:
+    """Is the gateway running older OcuClaw code than the files on disk?
+
+    A fact about the box, kept out of the step's print code so any front end
+    can ask it (the Cloudways ladder today, the setup step machine of #6377
+    next). ``state`` is one read of the gateway receipt; it is read here when
+    not given.
+
+    #6353: ``hermes plugins install ... --force`` (and ``plugins update``, and
+    the install script) replaces the files while the gateway keeps running,
+    and on Cloudways only a container restart loads them. Two signals, either
+    of which proves "older":
+
+    1. **The version the gateway serves.** The adapter publishes it in the
+       serving receipt as it connects (#5998), and the receipt counts only when
+       its ``pid`` and ``start_time`` are the live gateway's. A different
+       version from ``plugin.yaml`` is older code still running. This is the
+       OpenClaw lane's check (#3480, ``installedVersion`` against
+       ``readLoadedPlugin``). Gateways on 2.1.2 and older write no receipt, and
+       a new build may keep the version number, so it cannot be the only one.
+    2. **When the files landed.** :func:`bundle_landed_at` after the gateway
+       process started (:data:`START_MARGIN_S` either way counts as after, the
+       same bias as the pending marker) means this gateway imported the files
+       that were there before. That catches both cases above.
+
+    Never "older" without one of those. No live gateway, a gateway that never
+    loaded OcuClaw (that is "not loaded", the step's other question), no boot
+    clock, an unreadable bundle, or a landing time in the future (a clock that
+    stepped backwards, which no restart could ever answer) all give
+    :data:`RUNTIME_UNKNOWN` unless the version alone settles it.
+    """
+    if state is None:
+        state = read_gateway_health(hermes_home)
+    if not (state.live and state.plugin_loaded):
+        return RuntimeAge(RUNTIME_UNKNOWN)
+
+    try:
+        installed = _version_token(installed_version())
+    except Exception:  # noqa: BLE001 - an unreadable manifest is an unknown
+        installed = None
+    try:
+        serving, _status = serving_state(hermes_home)
+    except Exception:  # noqa: BLE001 - a missing receipt is an unknown
+        serving = None
+    running = live_serving_version(serving, state.pid, state.start_ticks)
+
+    if running and installed and running != installed:
+        return RuntimeAge(RUNTIME_OLDER, running, installed, EVIDENCE_VERSION)
+
+    files_current: Optional[bool] = None
+    try:
+        landed = bundle_landed_at(bundle_dir)
+    except Exception:  # noqa: BLE001 - an unreadable bundle is an unknown
+        landed = None
+    if (
+        landed is not None
+        and state.started_at is not None
+        and landed <= marker_clock() + START_MARGIN_S
+    ):
+        files_current = state.started_at > landed + START_MARGIN_S
+    if files_current is False:
+        return RuntimeAge(RUNTIME_OLDER, running, installed, EVIDENCE_FILES)
+    if files_current is True or (running and installed and running == installed):
+        return RuntimeAge(RUNTIME_CURRENT, running, installed)
+    return RuntimeAge(RUNTIME_UNKNOWN, running, installed)
+
+
 # -- is a restart pending? ----------------------------------------------------
 
 
@@ -716,6 +1208,14 @@ class Pending:
     dead_end: bool = False
     #: The journal word for a settled outcome, when it is not the plain one.
     settled_detail: str = DETAIL_NOTHING_PENDING
+    #: True when the gateway loaded OcuClaw but runs older code than the files
+    #: on disk (#6353). The step then never says "loaded and ready".
+    runtime_older: bool = False
+    #: The first line of the restart block on a host where the person makes
+    #: the restart, in place of :data:`NOT_LOADED_MESSAGE`.
+    lead: Optional[str] = None
+    #: The journal word when this host's restart is left to the person.
+    manual_detail: str = DETAIL_RESTART_MANUAL
 
     @property
     def needed(self) -> bool:
@@ -751,6 +1251,19 @@ def assess_pending(
             # two lines (:data:`CREDENTIAL_STUCK_LINES`) and stops.
             return Pending(STILL_NOT_RUNNING_MESSAGE, dead_end=True)
         return Pending(PENDING_CREDENTIAL_NOT_ADOPTED)
+
+    # #6353: loaded, but older code than the files on disk. Blocking, like
+    # "not loaded": the old code is what the phone reaches in steps 4 to 8.
+    # Checked before the settings reasons because one restart answers those
+    # too, and this is the reason the person needs to hear.
+    age = runtime_age(hermes_home, state=state)
+    if age.older:
+        return Pending(
+            age.message,
+            runtime_older=True,
+            lead=age.message,
+            manual_detail=DETAIL_RUNTIME_OLDER,
+        )
 
     if bool(ctx.state.get("settings_changed")):
         return Pending(PENDING_SETTINGS_CHANGED, blocking=False)
@@ -802,14 +1315,7 @@ def run_relay_credential(ctx: Any) -> Any:
     if not credential_present():
         # No credential at all means the plugin has never registered: the
         # gateway mints it as OcuClaw loads.
-        for line in not_loaded_lines(phone_paired=_phone_paired(hermes_home)):
-            ctx.say(line)
-        return ladder.StepRecord(
-            "relay-credential",
-            ladder.STATUS_REFUSED,
-            DETAIL_CREDENTIAL_MISSING,
-            exit_code=ladder.SETUP_EXIT_STOPPED,
-        )
+        return _not_loaded(ctx, hermes_home, DETAIL_CREDENTIAL_MISSING)
 
     state = read_gateway_health(hermes_home)
     # "Loaded" needs evidence from the gateway running NOW (#3480). The marker
@@ -832,8 +1338,9 @@ def run_relay_credential(ctx: Any) -> Any:
         )
 
     # The step's one line, and only where it is true: the running gateway built
-    # an OcuClaw adapter itself, and the credential marker is published.
-    if adopted and state.live:
+    # an OcuClaw adapter itself, the credential marker is published, and the
+    # code it runs is not older than the files on disk (#6353).
+    if adopted and state.live and not pending.runtime_older:
         ctx.say(f"  {LOADED_MESSAGE}")
 
     if not pending.needed:
@@ -864,14 +1371,7 @@ def run_relay_credential(ctx: Any) -> Any:
             return ladder.StepRecord(
                 "relay-credential", ladder.STATUS_SKIPPED, DETAIL_RESTART_DEFERRED
             )
-        for line in not_loaded_lines(phone_paired=_phone_paired(hermes_home)):
-            ctx.say(line)
-        return ladder.StepRecord(
-            "relay-credential",
-            ladder.STATUS_REFUSED,
-            DETAIL_RESTART_MANUAL,
-            exit_code=ladder.SETUP_EXIT_STOPPED,
-        )
+        return _not_loaded(ctx, hermes_home, pending.manual_detail, lead=pending.lead)
 
     ctx.say(f"  {pending.message}")
 
@@ -920,6 +1420,132 @@ def run_relay_credential(ctx: Any) -> Any:
     return ladder.StepRecord("relay-credential", ladder.STATUS_DONE, DETAIL_RESTARTED)
 
 
+def _not_loaded(
+    ctx: Any, hermes_home: Optional[Path], detail: str, *, lead: Optional[str] = None
+) -> Any:
+    """OcuClaw is not loaded (or runs older code) and only a restart loads it.
+
+    In the WebUI terminal, on a host whose container restart setup can run,
+    setup offers to run it (:func:`offer_webui_restart`). Everywhere else it
+    names the restart and stops, as it always has. ``lead`` is the first line
+    when the reason is not "not loaded" (#6353).
+    """
+    from . import cloudways_setup as ladder
+
+    env = getattr(ctx, "env", None)
+    webui = webui_active(env)
+    if webui:
+        offered = offer_webui_restart(ctx, hermes_home, lead=lead)
+        if offered is not None:
+            return offered
+    for line in not_loaded_lines(
+        phone_paired=_phone_paired(hermes_home), webui=webui, lead=lead
+    ):
+        ctx.say(line)
+    return ladder.StepRecord(
+        "relay-credential",
+        ladder.STATUS_REFUSED,
+        detail,
+        exit_code=ladder.SETUP_EXIT_STOPPED,
+    )
+
+
+def offer_webui_restart(
+    ctx: Any, hermes_home: Optional[Path], *, lead: Optional[str] = None
+) -> Optional[Any]:
+    """Ask, then run the one container restart, in the WebUI terminal.
+
+    ``None`` when this host has no container restart setup can run: the caller
+    then prints the restart to do by hand. Otherwise the step's record.
+
+    On a yes the page goes down with the container, this process with it, and
+    the person carries on from the link setup prints last (or a reload, when
+    the WebUI's address cannot be read); setup does not see the restart
+    finish. The way back is written first: a guarded line in ``~/.bashrc``
+    that runs setup again, and the command in the shell history. A restart
+    command that comes back failed is said plainly, and the ``~/.bashrc`` line
+    goes. One that comes back done without taking this process with it is
+    waited on like any other restart; the line then goes when the run ends.
+    """
+    from . import cloudways_setup as ladder
+
+    try:
+        timeout_s = container_restart_timeout(hermes_home)
+    except Exception:  # noqa: BLE001 - an unreadable host has no restart to offer
+        timeout_s = None
+    if timeout_s is None:
+        return None
+    env = getattr(ctx, "env", None)
+    # A phone-size terminal: no Up arrow on its keyboard. 0 is "not known".
+    try:
+        columns = int(ctx.columns())
+    except Exception:  # noqa: BLE001 - an unmeasurable window is not known narrow
+        columns = 0
+    narrow = 0 < columns < 80
+    planned = planned_way_back(env, narrow=narrow)
+    link = reopen_link(hermes_home)
+    lines = webui_restart_lines(
+        way_back=planned, phone_paired=_phone_paired(hermes_home), link=link, lead=lead
+    )
+    if not ctx.ask(
+        list(lines),
+        question=WEBUI_RESTART_QUESTION,
+        answers=ladder.SHORT_YES_CONSENT_ANSWERS,
+    ):
+        ctx.say(f"  {ladder.RESUME_MESSAGE}")
+        return ladder.StepRecord(
+            "relay-credential",
+            ladder.STATUS_DECLINED,
+            DETAIL_RESTART_DECLINED,
+            exit_code=ladder.SETUP_EXIT_STOPPED,
+        )
+
+    # One restart per run, recorded before it is attempted.
+    ctx.state["gateway_restarted"] = True
+    look = getattr(getattr(ctx, "options", None), "look", None)
+    way_back = set_up_way_back(env, planned, look, narrow=narrow)
+    if way_back != planned:
+        words = WEBUI_CARRY_ON_WORDS[way_back]
+        ctx.say(f"  {WEBUI_CARRY_ON_CHANGED_TEMPLATE.format(words=words[:1].lower() + words[1:])}")
+    ctx.say(f"  {WEBUI_RESTARTING_MESSAGE}")
+    if link:
+        for line in webui_link_lines(link, way_back):
+            ctx.say(line)
+    try:
+        # The page may not outlive the restart: what it should show, it shows now.
+        ctx.stream_out.flush()
+    except Exception:  # noqa: BLE001 - no stream, nothing to flush
+        pass
+    try:
+        restarted = bool(restart_gateway(timeout_s))
+    except Exception:  # noqa: BLE001 - a failed restart is a stable outcome
+        restarted = False
+    if not restarted:
+        forget_way_back(env)
+        for line in WEBUI_RESTART_FAILED_MESSAGE.split("\n"):
+            ctx.say(f"  {line}")
+        return ladder.StepRecord(
+            "relay-credential",
+            ladder.STATUS_FAILED,
+            DETAIL_RESTART_FAILED,
+            exit_code=ladder.SETUP_EXIT_PROBLEM,
+        )
+    # The ~/.bashrc line stays until this run ends (`run_setup`): the restart
+    # command can come back, and the health check pass on the old gateway,
+    # before the container goes down and takes this run with it.
+    if not wait_for_healthy(ctx, hermes_home):
+        ctx.say(f"  {RESTART_UNHEALTHY_MESSAGE}")
+        return ladder.StepRecord(
+            "relay-credential",
+            ladder.STATUS_FAILED,
+            DETAIL_RESTART_UNHEALTHY,
+            exit_code=ladder.SETUP_EXIT_PROBLEM,
+        )
+    forget_pending_marker(hermes_home)
+    ctx.say(f"  {RESTART_HEALTHY_MESSAGE}")
+    return ladder.StepRecord("relay-credential", ladder.STATUS_DONE, DETAIL_RESTARTED)
+
+
 def wait_for_healthy(ctx: Any, hermes_home: Optional[Path]) -> bool:
     """Bounded wait for the gateway AND the relay, on positive evidence only.
 
@@ -941,6 +1567,9 @@ def wait_for_healthy(ctx: Any, hermes_home: Optional[Path]) -> bool:
 
 __all__ = [
     "ALREADY_RESTARTED_MESSAGE",
+    "CARRY_ON_ITSELF",
+    "CARRY_ON_TYPED",
+    "CARRY_ON_UP_ARROW",
     "CREDENTIAL_STUCK_LINES",
     "DETAIL_ALREADY_RESTARTED",
     "DETAIL_CREDENTIAL_MISSING",
@@ -980,24 +1609,48 @@ __all__ = [
     "RESTART_HEALTH_WAIT_S",
     "RESTART_UNHEALTHY_MESSAGE",
     "WAIT_NOTICE_MESSAGE",
+    "WEBUI_CARRY_ON_CHANGED_TEMPLATE",
+    "WEBUI_CARRY_ON_WORDS",
+    "WEBUI_DISCONNECT_LINE",
+    "WEBUI_LINK_ENTER_LINES",
+    "WEBUI_LINK_OPEN_LINE",
+    "WEBUI_LINK_REOPEN_LINE",
+    "WEBUI_LINK_SECOND_DROP_LINE",
+    "WEBUI_LOADS_WITH_RESTART_MESSAGE",
+    "WEBUI_REOPEN_LINE",
+    "WEBUI_RESTARTING_MESSAGE",
+    "WEBUI_RESTART_FAILED_MESSAGE",
+    "WEBUI_RESTART_QUESTION",
+    "WEBUI_SECOND_DROP_LINE",
     "START_MARGIN_S",
+    "add_rerun_to_history",
     "assess_pending",
     "boot_epoch",
     "clock_ticks_per_second",
+    "container_restart_timeout",
     "credential_adopted",
     "credential_predates_start",
     "credential_present",
     "env_write_time",
     "forget_pending_marker",
+    "forget_way_back",
     "gateway_state",
+    "history_available",
     "mark_restart_pending",
     "marker_clock",
     "marker_settled",
     "not_loaded_lines",
+    "offer_webui_restart",
+    "planned_way_back",
     "read_gateway_health",
     "read_pending_marker",
+    "reopen_link",
     "restart_gateway",
     "restart_plan",
     "run_relay_credential",
+    "set_up_way_back",
     "wait_for_healthy",
+    "webui_active",
+    "webui_link_lines",
+    "webui_restart_lines",
 ]

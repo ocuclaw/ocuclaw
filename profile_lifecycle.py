@@ -2,18 +2,20 @@
 
 Use native profile creation and config writers. Desktop's profiles.create RPC
 is not a gateway API. Match its shared-auth semantics without copying channel
-tokens or calling save_env_value (0.21 mutates process-wide os.environ).
+tokens. Secrets move through Hermes's own reader and save_env_value, aimed at
+the new profile; a write to a routed home stays out of the shared os.environ
+from 0.21.4 on.
 Upstream adoption checks: docs/hermes/multiplex-beta-contract.md.
 """
 from __future__ import annotations
 
 import copy
-import json
 import os
 from pathlib import Path
 import re
 import tempfile
 import threading
+from typing import List
 
 # Reentrant: profile creation holds this for the whole create-and-set-up
 # sequence (``models_rpc._sync_profiles_create``) and ``admit_profile`` writes
@@ -50,18 +52,20 @@ def write_private(path: Path, content: str) -> None:
             os.unlink(temporary)
 
 
-def bootstrap_profile(source: Path, target: Path) -> None:
+def bootstrap_profile(source: Path, target: Path) -> List[str]:
     """Initialize only our receipt-owned fresh profile; never fork OAuth state.
 
     Hermes resolves inherited OAuth when the child has no auth.json. Its
     shared-grant refresh ownership has known limitations on the certified
     beta baseline; this bootstrap does not repair or duplicate that state.
-    Inference .env keys are copied as snapshots; platform tokens and ambient
-    process environment are excluded.
+    Inference keys are copied as snapshots, through Hermes; platform tokens
+    and ambient process environment are excluded. Returns the key names that
+    could not be carried unchanged.
     """
-    from agent.secret_scope import load_env_file
     from hermes_cli.auth import PROVIDER_REGISTRY
-    from hermes_cli.config import atomic_config_write, read_user_config_raw
+    from hermes_cli.config import read_user_config_raw
+    from .config_writer import replace_config
+    from .secret_access import copy_stored_secrets
 
     source_cfg = read_user_config_raw(source / "config.yaml")
     target_cfg = read_user_config_raw(target / "config.yaml")
@@ -97,13 +101,14 @@ def bootstrap_profile(source: Path, target: Path) -> None:
         elif isinstance(value, str):
             allowed.update(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", value))
     collect(inference)
-    env = load_env_file(source / ".env")
-    # json string quoting is compatible with dotenv, including newline escapes.
-    content = "# Inference access inherited from the default Hermes profile.\n"
-    content += "".join(f"{key}={json.dumps(env[key], ensure_ascii=False)}\n" for key in sorted(allowed) if key in env)
-    write_private(target / ".env", content)
-    # No auth.json copy: single-use OAuth refresh state must retain one owner.
-    atomic_config_write(target / "config.yaml", target_cfg)
+    # Hermes reads the default profile's store and writes the new one's
+    # (catalogue rule 11, #6402); the plugin never holds the values. A replay
+    # over a profile an earlier attempt wrote drops whatever the source no
+    # longer has. No auth.json copy: single-use OAuth refresh state must
+    # retain one owner, and Hermes already shares root OAuth logins.
+    not_carried = copy_stored_secrets(allowed, source, target)
+    replace_config(target / "config.yaml", target_cfg)
+    return not_carried
 
 
 def admit_profile(source: Path, name: str) -> None:

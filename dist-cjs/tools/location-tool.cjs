@@ -165,7 +165,7 @@ function createLocationToolHandler(deps) {
     );
     if (!locationAccessEnabled) {
       const err = new Error(
-        "location_access_disabled: enable Location access in WebUI settings",
+        "location_access_disabled: turn on Location access in the OcuClaw phone app (Settings › New chats)",
       );
       err.code = "location_access_disabled";
       throw err;
@@ -276,7 +276,7 @@ function createLocationToolHandler(deps) {
 }
 
 const LOCATION_TOOL_DESCRIPTION = [
-  "Read the user's current phone GPS coordinates when Location access is enabled in WebUI settings.",
+  "Read the user's current phone GPS coordinates when Location access is on in the OcuClaw phone app (Settings › New chats).",
   "Returns latitude, longitude, and any available accuracy, altitude, speed, heading, timestamp fields.",
   "Errors: location_access_disabled, app_not_connected, location_timeout, location_unavailable.",
 ].join("\n");
@@ -294,43 +294,29 @@ function resolveToolSessionKey(ctx, service) {
   return "main";
 }
 
-function registerLocationTool(api, service) {
+const HANDLER_SCOPE_SYMBOL = Symbol.for("ocuclaw.location.sharedHandler");
+
+function registerLocationTool(api, service, opts      = {}) {
   if (!api || typeof api.registerTool !== "function") {
     throw new Error("registerLocationTool requires api.registerTool");
   }
   if (!service) {
     throw new Error("registerLocationTool requires the OcuClaw relay service");
   }
-
-  const handler = createLocationToolHandler({
-    relay: {
-      sendLocationRequest: (msg) => service.sendLocationRequest(msg),
-      onLocationResponse: (cb) => service.onLocationResponse(cb),
-    },
-    isSessionConnected: (_sessionKey) => {
-      if (typeof service.hasConnectedAppClient === "function") {
-        return service.hasConnectedAppClient();
-      }
-      return false;
-    },
-    isLocationAccessEnabled: () => {
-      if (typeof service.isLocationAccessEnabled === "function") {
-        return service.isLocationAccessEnabled();
-      }
-      return false;
-    },
-    emitDebug: (event, severity, data, context = {}) => {
-      if (typeof service.emitDebug === "function") {
-        service.emitDebug(
-          "relay.session",
-          event,
-          severity,
-          { sessionKey: context.sessionKey || undefined },
-          () => data || {},
-        );
-      }
-    },
-  });
+  const scopeHost =
+    opts && opts.scopeHost && typeof opts.scopeHost === "object" ? opts.scopeHost : globalThis;
+  let record = scopeHost[HANDLER_SCOPE_SYMBOL];
+  if (record) {
+    if (record.onResponse) service.onLocationResponse(record.onResponse);
+  } else {
+    record = { handler: null, onResponse: null, refs: 0 };
+    record.handler = createLocationHandlerFor(service, (cb     ) => {
+      record.onResponse = cb;
+    });
+    scopeHost[HANDLER_SCOPE_SYMBOL] = record;
+  }
+  const handler = record.handler;
+  record.refs += 1;
 
   api.registerTool(
     (ctx) => {
@@ -359,10 +345,51 @@ function registerLocationTool(api, service) {
     });
   }
 
+  let disposed = false;
   return function dispose() {
+    if (disposed) return;
+    disposed = true;
+    record.refs -= 1;
+    if (record.refs > 0) return;
     handler.dispose();
     handler.drainAll({ ok: false, code: "location_aborted" });
+    if (scopeHost[HANDLER_SCOPE_SYMBOL] === record) delete scopeHost[HANDLER_SCOPE_SYMBOL];
   };
 }
 
-module.exports = { locationParametersSchema, validateLocationInput, createPendingLocationMap, DEFAULT_LOCATION_TIMEOUT_MS, LOCATION_TOOL_DESCRIPTION, createLocationToolHandler, registerLocationTool };
+function createLocationHandlerFor(service     , keepResponse                   ) {
+  return createLocationToolHandler({
+    relay: {
+      sendLocationRequest: (msg) => service.sendLocationRequest(msg),
+      onLocationResponse: (cb) => {
+        keepResponse(cb);
+        return service.onLocationResponse(cb);
+      },
+    },
+    isSessionConnected: (_sessionKey) => {
+      if (typeof service.hasConnectedAppClient === "function") {
+        return service.hasConnectedAppClient();
+      }
+      return false;
+    },
+    isLocationAccessEnabled: () => {
+      if (typeof service.isLocationAccessEnabled === "function") {
+        return service.isLocationAccessEnabled();
+      }
+      return false;
+    },
+    emitDebug: (event, severity, data, context = {}) => {
+      if (typeof service.emitDebug === "function") {
+        service.emitDebug(
+          "relay.session",
+          event,
+          severity,
+          { sessionKey: context.sessionKey || undefined },
+          () => data || {},
+        );
+      }
+    },
+  });
+}
+
+module.exports = { locationParametersSchema, validateLocationInput, createPendingLocationMap, DEFAULT_LOCATION_TIMEOUT_MS, createLocationToolHandler, LOCATION_TOOL_DESCRIPTION, registerLocationTool };

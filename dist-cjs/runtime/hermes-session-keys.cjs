@@ -2,7 +2,7 @@ const HERMES_SESSION_KEY_PREFIX = "hermes:";
 
 const DEFAULT_HERMES_NAMESPACE = "main";
 
-function hermesProfileIdForNamespace(namespace) {
+function hermesProfileIdForNamespace(namespace     ) {
   const normalized = normalizeSegment(namespace);
   return normalized === DEFAULT_HERMES_NAMESPACE ? "default" : normalized;
 }
@@ -36,12 +36,21 @@ const ADOPTABLE_FOREIGN_SOURCES = Object.freeze(["desktop", "cli", "tui"]);
 function isAdoptableHermesSessionKey(key) {
   if (!isForeignHermesSessionKey(key)) return false;
   const segments = key.trim().toLowerCase().split(":");
+  if (segments.length === 6) {
+    return (
+      segments[3] === LOCAL_ROUTE_FOREIGN_SOURCE &&
+      segments[4] === "dm" &&
+      segments[5].length > 0
+    );
+  }
   return (
     segments.length === 5 &&
     ADOPTABLE_FOREIGN_SOURCES.includes(segments[3]) &&
     segments[4].length > 0
   );
 }
+
+const LOCAL_ROUTE_FOREIGN_SOURCE = "local";
 
 const ADOPT_CHAT_ID_PREFIX = "adopt-";
 
@@ -142,4 +151,4 @@ function normalizeSegment(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-module.exports = { HERMES_SESSION_KEY_PREFIX, DEFAULT_HERMES_NAMESPACE, hermesProfileIdForNamespace, HERMES_FOREIGN_KEY_MARKER, OCUCLAW_PLATFORM_SEGMENT, OCUCLAW_CHAT_TYPE_SEGMENT, isHermesSessionKey, isForeignHermesSessionKey, ADOPTABLE_FOREIGN_SOURCES, isAdoptableHermesSessionKey, ADOPT_CHAT_ID_PREFIX, isAdoptedHermesSessionKey, mintedHermesSessionKey, hermesDefaultSessionKeyPrefix, hermesSupportedSessionKeyPrefixes, stripAgentNamespace, deriveHermesPublicKey, parseHermesPublicKey };
+module.exports = { HERMES_SESSION_KEY_PREFIX, DEFAULT_HERMES_NAMESPACE, hermesProfileIdForNamespace, HERMES_FOREIGN_KEY_MARKER, OCUCLAW_PLATFORM_SEGMENT, OCUCLAW_CHAT_TYPE_SEGMENT, isHermesSessionKey, isForeignHermesSessionKey, ADOPTABLE_FOREIGN_SOURCES, isAdoptableHermesSessionKey, LOCAL_ROUTE_FOREIGN_SOURCE, ADOPT_CHAT_ID_PREFIX, isAdoptedHermesSessionKey, mintedHermesSessionKey, hermesDefaultSessionKeyPrefix, hermesSupportedSessionKeyPrefixes, stripAgentNamespace, deriveHermesPublicKey, parseHermesPublicKey };

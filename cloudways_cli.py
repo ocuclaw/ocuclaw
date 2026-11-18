@@ -58,13 +58,19 @@ def render_status(report: Mapping[str, Any]) -> List[str]:
     if daemon.get("key_expiry"):
         lines.append(f"  key expiry {daemon['key_expiry']}  (disable expiry for this node in the admin console)")
     lines.append(f"  receipt   {'present' if receipt else 'absent'}  {report.get('layout', {}).get('receipt', '')}")
-    lines.append(f"  script    {'present' if (report.get('script') or {}).get('present') else 'absent'}")
-    if job is None:
-        lines.append("  cron job  absent  (run: hermes ocuclaw cloudways install)")
+    binaries = report.get("binaries") or {}
+    if binaries:
+        lines.append(f"  binaries  {binaries.get('source')}  {binaries.get('path')}")
+        if binaries.get("movePending"):
+            lines.append("  still on the ~/bin download (run: hermes ocuclaw cloudways install to switch)")
+    supervisor = report.get("supervisor") or {}
+    if supervisor.get("present"):
+        lines.append(f"  kept alive by the OcuClaw runtime  enabled={_yes_no(supervisor.get('enabled'))}")
     else:
+        lines.append("  kept alive by nothing yet  (run: hermes ocuclaw cloudways install)")
+    if job is not None:
         lines.append(
-            f"  cron job  {job.get('id')}  schedule={job.get('schedule')}  enabled={_yes_no(job.get('enabled'))}"
-            f"  spec={'ok' if job.get('matches') else 'DRIFTED'}"
+            f"  old cron watchdog {job.get('id')} still present  (run: hermes ocuclaw cloudways install to retire it)"
         )
     lines.append(f"  serve route {route.get('classification')}" + (f"  ({route.get('reason')})" if route.get("reason") else ""))
     if daemon.get("auth_url"):
@@ -97,18 +103,22 @@ def render_install(report: Mapping[str, Any]) -> List[str]:
         lines.append(f"  binaries  {report['binaries']}  ({report.get('version')})")
     if report.get("receipt"):
         lines.append(f"  receipt   {report['receipt']}")
-    if report.get("script"):
-        lines.append(f"  script    {report['script']}  {report.get('path')}")
-    job = report.get("job") or {}
-    if job:
-        lines.append(f"  cron job  {job.get('action')}  id={job.get('jobId')}")
-    fired = report.get("fired") or {}
-    if fired:
-        # `unreported` is the honest answer for a background dispatch or a
-        # next-tick run, not a failure; `status` is what observes the daemon.
+    if report.get("watchdogRetired"):
+        lines.append(f"  retired   the old cron watchdog: {', '.join(report['watchdogRetired'])}")
+    moved = report.get("moved") or {}
+    if moved.get("moved"):
+        lines.append("  moved     onto the Tailscale this server ships (same node, same sign-in)")
+    adopted = report.get("adopted") or {}
+    if adopted:
+        # #6482: the server's own Tailscale is kept as it is, never restarted.
+        lines.append(f"  adopted   this server's own Tailscale  (socket {adopted.get('socket')})")
+    for item in report.get("foreignNotAdoptable") or []:
+        lines.append(f"  not adopted  tailscaled pid {item.get('pid')}: {item.get('reason')}")
+    daemon = report.get("daemon") or {}
+    if daemon:
+        # A start is not proof; `status` is what observes the daemon.
         lines.append(
-            f"  fired     {_yes_no(fired.get('fired'))}  (run verdict: "
-            f"{fired.get('verdict', 'unreported')}; `status` reports the daemon's real state)"
+            f"  daemon    {daemon.get('action')}  ({daemon.get('state')}; `status` reports its real state)"
         )
     if report.get("ok"):
         lines.append("  next: hermes ocuclaw cloudways status --wait 45, then enroll")
@@ -120,8 +130,6 @@ def render_enroll(report: Mapping[str, Any]) -> List[str]:
     if report.get("authUrl"):
         lines.append("  Open this link on any device signed in to the tailnet, then approve the node:")
         lines.append(f"    {report['authUrl']}")
-        if report.get("qr"):
-            lines.append(report["qr"])
         lines.append("  Then: hermes ocuclaw cloudways status --wait 45")
     elif report.get("state") == cloudways.STATE_RUNNING:
         lines.append(f"  node {report.get('nodeName')} ({report.get('dnsName')}) is authorized and running")
@@ -204,7 +212,7 @@ def run_cloudways(args: argparse.Namespace) -> int:
         _emit(report, render_detect(report), json_output=json_output)
         return EXIT_OK
     if verb == "install":
-        report = cloudways.install(layout, force_download=bool(getattr(args, "force_download", False)))
+        report = cloudways.install(layout)
         _emit(report, render_install(report), json_output=json_output)
         if report.get("ok"):
             return EXIT_OK
@@ -214,7 +222,6 @@ def run_cloudways(args: argparse.Namespace) -> int:
             report = cloudways.enroll(
                 layout,
                 hostname=getattr(args, "hostname", None),
-                qr=bool(getattr(args, "qr", False)),
                 progress=lambda message: print(message, file=sys.stderr, flush=True),
             )
         except KeyboardInterrupt:
@@ -248,7 +255,7 @@ def run_cloudways(args: argparse.Namespace) -> int:
             report: Dict[str, Any] = {
                 "ok": False,
                 "error": (
-                    "rollback removes the watchdog, daemon, script and the binaries and "
+                    "rollback removes the supervision state, daemon and the binaries and "
                     "receipt this plugin provisioned; re-run with --yes"
                 ),
             }

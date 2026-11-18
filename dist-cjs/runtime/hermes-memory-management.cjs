@@ -99,4 +99,4 @@ const MEMORY_ERRORS                         = {
   review_too_large: "The complete review is too large for this connection. Review it in native Hermes.",
 };
 
-module.exports = { MEMORY_OPERATIONS, MEMORY_ERRORS, memoryRequest, memoryResult };
+module.exports = { MEMORY_OPERATIONS, memoryRequest, memoryResult, MEMORY_ERRORS };

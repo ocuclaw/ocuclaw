@@ -9,23 +9,23 @@ const EVEN_AI_ASK_USER_BLOCK_REASON =
 const EVEN_AI_RUN_TTL_MS = 3_600_000;
 const EVEN_AI_RUN_CAP = 512;
 
-function trimString(value) {
+function trimString(value     ) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function createEvenAiAskUserGuard(opts = {}) {
+function createEvenAiAskUserGuard(opts      = {}) {
   const now = typeof opts.now === "function" ? opts.now : () => Date.now();
   const onBlocked = typeof opts.onBlocked === "function" ? opts.onBlocked : () => {};
   const evenAiRuns = new Map();
 
-  function prune(nowMs) {
+  function prune(nowMs     ) {
     for (const [runId, expiresAtMs] of evenAiRuns) {
       if (expiresAtMs > nowMs) break;
       evenAiRuns.delete(runId);
     }
   }
 
-  function noteEvenAiRun(runIdValue) {
+  function noteEvenAiRun(runIdValue     ) {
     const runId = trimString(runIdValue);
     if (!runId) return false;
     const nowMs = now();
@@ -39,15 +39,15 @@ function createEvenAiAskUserGuard(opts = {}) {
     return true;
   }
 
-  function observePromptTurnOwnership(consume) {
-    return (sessionKey, identity = null) => {
+  function observePromptTurnOwnership(consume     ) {
+    return (sessionKey     , identity      = null) => {
       const ownership = consume(sessionKey, identity);
       if (ownership && ownership.owner === "even-ai") noteEvenAiRun(identity);
       return ownership;
     };
   }
 
-  function isEvenAiRun(runIdValue) {
+  function isEvenAiRun(runIdValue     ) {
     const runId = trimString(runIdValue);
     if (!runId) return false;
     const expiresAtMs = evenAiRuns.get(runId);
@@ -59,7 +59,7 @@ function createEvenAiAskUserGuard(opts = {}) {
     return true;
   }
 
-  function beforeToolCall(event, ctx = null) {
+  function beforeToolCall(event     , ctx      = null) {
     if (trimString(event?.toolName) !== ASK_USER_TOOL_NAME) return undefined;
     const runId = trimString(event?.runId) || trimString(ctx?.runId);
     if (!isEvenAiRun(runId)) return undefined;

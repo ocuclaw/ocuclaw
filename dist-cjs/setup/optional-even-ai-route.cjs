@@ -1,10 +1,8 @@
 const fs = require("node:fs");
-
 const path = require("node:path");
-
 const { randomUUID } = require("node:crypto");
-const { planEvenAiRoute, readEvenAiHostContext } = require("./even-ai-setup-command.cjs");
-const { defaultRunTailscale, readNodeState, readServeStatus, resolveHostStateDir, READ_OK } = require("./private-route.cjs");
+const { evenAiHostCliProblem, planEvenAiRoute, readEvenAiHostContext } = require("./even-ai-setup-command.cjs");
+const { defaultRunTailscale, readNodeState, readServeStatus, resolveHostStateDir, tailscaleProblem, READ_OK } = require("./private-route.cjs");
 const { optionalPluginConfig } = require("./optional-credential-store.cjs");
 const { OPENCLAW_BUNDLE_DEFAULT_WS_PORT } = require("../config/runtime-config.cjs");
 
@@ -24,6 +22,10 @@ function unrelatedGraph(document     ) {
   return stable(copy);
 }
 
+function routeUnavailable(tailscale     ) {
+  return Object.assign(new Error("unavailable"), { tailscale });
+}
+
 function createOptionalEvenAiRouteService(api     , deps      = {}) {
   const now = deps.now || Date.now;
   const rows = new Map();
@@ -41,13 +43,16 @@ function createOptionalEvenAiRouteService(api     , deps      = {}) {
         || !Number.isInteger(port) || port < 1 || port > 65535 || port !== savedPort) throw new Error("unavailable");
     const host = await readHost(journey);
 
-    if (!host?.cliArgv) throw new Error("unavailable");
+    if (!host?.cliArgv) throw routeUnavailable(evenAiHostCliProblem(journey, deps));
     let nodeIdentity      = null;
+    let nodeRead      = { code: null, document: null };
     const read = async (args     ) => {
       const result      = await run(args, host.cliArgv);
+      if (args[0] === "status") nodeRead = { code: result?.code, document: null };
       if (args[0] === "status" && result?.code === READ_OK) {
         try {
-          const self = JSON.parse(result.stdout)?.Self;
+          nodeRead.document = JSON.parse(result.stdout);
+          const self = nodeRead.document?.Self;
           if (typeof self?.ID === "string" && self.ID) nodeIdentity = { id: self.ID,
             publicKey: typeof self.PublicKey === "string" ? self.PublicKey : null,
             addresses: Array.isArray(self.TailscaleIPs) ? self.TailscaleIPs : [] };
@@ -56,26 +61,34 @@ function createOptionalEvenAiRouteService(api     , deps      = {}) {
       return result;
     };
     const [serve, node]      = await Promise.all([readServeStatus(read), readNodeState(read)]);
-    if (!nodeIdentity) throw new Error("unavailable");
+    const tailscale = tailscaleProblem(nodeRead.code, nodeRead.document);
+    if (!nodeIdentity) throw routeUnavailable(tailscale);
     const latest = await deps.readJourney();
     const latestHost = await readHost(latest);
     if (latest?.installation?.id !== journey.installation.id || latest.currentHealth?.relay !== "running"
         || latest.currentHealth?.privateRoute?.relay?.status !== "running" || latest.currentHealth?.privateRoute?.relay?.port !== port
         || stable(latestHost) !== stable(host)) throw new Error("context_changed");
     const context = { ...node, ...host, runtime: "openclaw", relayPort: port };
-    const decision = planEvenAiRoute(serve.document, context);
+    const decision      = planEvenAiRoute(serve.document, context);
+    if (decision.reason === "tailnet_identity_unavailable" && tailscale) decision.tailscale = tailscale;
     return { identity: { installationId: journey.installation.id, port, host, node, nodeIdentity }, document: serve.document, decision };
   }
 
-  function publicRoute(row     , observation      = null, state      = null, reason      = null) {
+  function publicRoute(row     , observation      = null, state      = null, reason      = null, tailscale      = null) {
     const seen = observation || row.observation;
     const decision = seen?.decision;
     const endpoint = decision?.agentUrl || null;
-    return { operationId: row.id, expiresAtMs: row.expiresAtMs,
+    const route      = { operationId: row.id, expiresAtMs: row.expiresAtMs,
       state: state || (decision?.status === "proposal" ? "preview" : decision?.status === "ready" ? "ready" : "refused"),
       reason: reason || (decision?.status === "proposal" ? "route_absent" : decision?.status === "ready" ? "route_matches" : "route_conflict"),
       host: endpoint ? seen.identity.node.dnsName : null, agentUrl: endpoint,
       relayPort: endpoint ? seen.identity.port : null, tailnetOnly: true, requestVerified: false };
+
+    const conflict = route.state === "refused" && route.reason === "route_conflict";
+    const problem = tailscale || (conflict ? decision?.tailscale : null);
+    if (problem) route.tailscale = problem;
+    if (conflict && decision?.owner) route.owner = decision.owner;
+    return route;
   }
 
   async function handle(request     , connectionId     , guard     ) {
@@ -88,7 +101,7 @@ function createOptionalEvenAiRouteService(api     , deps      = {}) {
         if (!guard.fresh()) return { status: "rejected", code: "configuration_changed" };
         rows.set(row.id, row);
         return { status: "ok", route: publicRoute(row) };
-      } catch (_) { return { status: "unsupported", code: "unavailable", route: publicRoute(row, null, "unknown", "route_unavailable") }; }
+      } catch (error     ) { return { status: "unsupported", code: "unavailable", route: publicRoute(row, null, "unknown", "route_unavailable", error?.tailscale) }; }
     }
     const row = rows.get(request.operationId);
     if (!row || row.connectionId !== connectionId) return { status: "rejected", code: "operation_unknown" };
@@ -102,7 +115,7 @@ function createOptionalEvenAiRouteService(api     , deps      = {}) {
           return { status: "outcome_unknown", route: publicRoute(row, null, "unknown", "apply_unconfirmed") };
         }
         return { status: "ok", route: publicRoute(row, current) };
-      } catch (_) { return { status: "outcome_unknown", route: publicRoute(row, null, "unknown", "route_unavailable") }; }
+      } catch (error     ) { return { status: "outcome_unknown", route: publicRoute(row, null, "unknown", "route_unavailable", error?.tailscale) }; }
     }
     if (row.applied) return { status: "rejected", code: "operation_unknown" };
     row.applied = true;

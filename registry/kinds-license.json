@@ -1,0 +1,266 @@
+{
+  "schema": "glasses-ui/kinds-license@1",
+  "gate": "F3",
+  "decisionDate": "2026-08-25",
+  "v2DecisionDate": "2026-10-11",
+  "clientVersionAtDecision": "2.0.2",
+  "purpose": "Machine-readable Gate F3 decisions. CI binds the live descriptor enum and every template-registry entry to the kind rows, and binds the LiveUI Registry to the component and frame rows both ways (C13). Hand-kept, never generated, for every PR lane, including Hermes releases.",
+  "humanRecord": "docs/design/liveui-research/contract/GATE-F3-KINDS-LICENSE.md",
+  "kinds": [
+    {
+      "kind": "text_surface",
+      "status": "shipping",
+      "minClientVersion": "2.0.0",
+      "evidence": [
+        "extensions/ocuclaw/src/tools/glasses-ui-descriptors.ts"
+      ]
+    },
+    {
+      "kind": "list_surface",
+      "status": "shipping",
+      "minClientVersion": "2.0.0",
+      "evidence": [
+        "extensions/ocuclaw/src/tools/glasses-ui-descriptors.ts"
+      ]
+    },
+    {
+      "kind": "list_with_details_surface",
+      "status": "shipping",
+      "minClientVersion": "2.0.0",
+      "evidence": [
+        "extensions/ocuclaw/src/tools/glasses-ui-descriptors.ts"
+      ]
+    },
+    {
+      "kind": "paged_text_surface",
+      "status": "shipping",
+      "minClientVersion": "2.0.2",
+      "templates": [
+        "paged_briefing@1",
+        "guided_procedure@1",
+        "walking_brief@1"
+      ],
+      "evidence": [
+        "#540 ruling: all LiveUI moves at current payloads were perceptually seamless on G2; choose by semantics, not paint cost",
+        "docs/graphics-bench/2026-07-19-sdk-image-text-playbook.md: contentOffset/contentLength are ignored and textContainerUpgrade full-replaces",
+        "docs/superpowers/plans/2026-07-04-liveui-master-plan.md Part 2 B1: bounded pages and local paging contract",
+        "#550: TypeScript and Kotlin descriptors, local full-page upgrades, answer-first attachment, teaching, lint/corpus coverage, and both-host conformance"
+      ]
+    },
+    {
+      "kind": "checklist_surface",
+      "status": "shipping",
+      "minClientVersion": "2.0.2",
+      "templates": [
+        "checklist_routine@1"
+      ],
+      "evidence": [
+        "#1702: TypeScript and Kotlin checklist descriptors, local toggle renderer, full-state close outcome, and host conformance",
+        "#545: queueMode log landed with sim-clean multi-tap collection",
+        "docs/superpowers/plans/2026-07-04-liveui-master-plan.md Part 2 B2: local non-actuating toggles",
+        "extensions/ocuclaw/src/tools/glasses-ui-descriptors.ts: existing local cursor renderer pattern"
+      ]
+    },
+    {
+      "kind": "stepper_surface",
+      "status": "rescoped",
+      "successor": "stepper",
+      "replacement": "The stepper component of the LiveUI Registry, licensed on its own component row; no sixth V1 wire kind.",
+      "reason": "C13 and I22: the stepper is a component, not a kind. Slice 9a (#4666) landed I22's owed items and moved the stepper component row to shipping, as B6 moved to #1701.",
+      "evidence": [
+        "docs/design/liveui-research/v2/component-registry.md C13",
+        "docs/design/liveui-research/v2/interaction-charter.md I22",
+        "docs/adr/0029-liveui-v2-wire-and-stored-contract.md ruling 3",
+        "docs/superpowers/plans/2026-07-04-liveui-master-plan.md Part 2 B4 was a proposal only"
+      ]
+    },
+    {
+      "kind": "variable_list_surface",
+      "status": "rescoped",
+      "successor": "#1701",
+      "replacement": "Recipe/template array mapping on shipping list_surface and list_with_details_surface; no new wire kind.",
+      "reason": "Its proposed distinction is data mapping and bounded replacement, not a new display or interaction primitive.",
+      "evidence": [
+        "docs/superpowers/plans/2026-07-04-liveui-master-plan.md Part 2 B6",
+        "extensions/ocuclaw/src/tools/glasses-ui-template-registry.ts existing list templates"
+      ]
+    }
+  ],
+  "components": [
+    {
+      "component": "text",
+      "status": "shipping",
+      "since": 1,
+      "evidence": [
+        "docs/design/liveui-research/v2/component-registry.md C12",
+        "docs/design/liveui-research/v2/SLICE-PLAN.md slice 7 (#4664)",
+        "slice 7 (#4664): composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/liveui/components/TextRenderer.kt and render goldens for text.verdict, text.follows_row (LiveUiRenderGoldensTest)"
+      ]
+    },
+    {
+      "component": "pages",
+      "status": "shipping",
+      "since": 1,
+      "evidence": [
+        "docs/design/liveui-research/v2/component-registry.md C12",
+        "docs/design/liveui-research/v2/SLICE-PLAN.md slice 7 (#4664)",
+        "slice 7 (#4664): composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/liveui/components/PagesRenderer.kt and render goldens for pages.brief (LiveUiRenderGoldensTest)"
+      ]
+    },
+    {
+      "component": "list",
+      "status": "shipping",
+      "since": 1,
+      "evidence": [
+        "docs/design/liveui-research/v2/component-registry.md C12",
+        "docs/design/liveui-research/v2/SLICE-PLAN.md slice 7 (#4664)",
+        "slice 7 (#4664): composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/liveui/components/ListRenderer.kt and render goldens for list.hotels, list.rail_plate (LiveUiRenderGoldensTest)"
+      ]
+    },
+    {
+      "component": "checklist",
+      "status": "shipping",
+      "since": 1,
+      "evidence": [
+        "docs/design/liveui-research/v2/component-registry.md C12",
+        "docs/design/liveui-research/v2/SLICE-PLAN.md slice 7 (#4664)",
+        "slice 7 (#4664): composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/liveui/components/ChecklistRenderer.kt and render goldens for checklist.packing (LiveUiRenderGoldensTest)"
+      ]
+    },
+    {
+      "component": "graphic",
+      "status": "shipping",
+      "since": 1,
+      "evidence": [
+        "docs/design/liveui-research/v2/component-registry.md C12",
+        "docs/design/liveui-research/v2/SLICE-PLAN.md slice 7 (#4664)",
+        "slice 7 (#4664): composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/liveui/components/GraphicRenderer.kt and render goldens for graphic.trend (LiveUiRenderGoldensTest)"
+      ]
+    },
+    {
+      "component": "image",
+      "status": "shipping",
+      "since": 1,
+      "evidence": [
+        "docs/design/liveui-research/v2/component-registry.md C12",
+        "docs/design/liveui-research/v2/agent-pictures.md",
+        "docs/design/liveui-research/v2/SLICE-PLAN.md slice 13 (#4672)",
+        "slice 13 (#4672): the relay picture path (extensions/ocuclaw/src/tools/liveui-pictures/), composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/liveui/components/ImageRenderer.kt and render goldens for image.bird (LiveUiRenderGoldensTest)"
+      ]
+    },
+    {
+      "component": "stepper",
+      "status": "shipping",
+      "since": 1,
+      "evidence": [
+        "docs/design/liveui-research/v2/component-registry.md C13",
+        "docs/design/liveui-research/v2/interaction-charter.md I22",
+        "docs/adr/0029-liveui-v2-wire-and-stored-contract.md ruling 3",
+        "docs/design/liveui-research/v2/SLICE-PLAN.md slice 9a (#4666)",
+        "slice 9a (#4666): composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/liveui/components/StepperRenderer.kt with its Edit Mode state, render goldens for stepper.split_bill and stepper.size_choice (LiveUiRenderGoldensTest), the C15 interaction tests (LiveUiDriverInteractionTest), and the sim-clean proof of enter, save, discard and a draft kept across a patch"
+      ]
+    },
+    {
+      "component": "timer",
+      "status": "shipping",
+      "since": 1,
+      "evidence": [
+        "docs/design/liveui-research/v2/component-registry.md C11",
+        "docs/design/liveui-research/v2/SLICE-PLAN.md slice 7 (#4664)",
+        "slice 7 (#4664): composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/liveui/components/TimerRenderer.kt and render goldens for timer.pasta (LiveUiRenderGoldensTest)"
+      ]
+    },
+    {
+      "component": "facts",
+      "status": "shipping",
+      "since": 1,
+      "evidence": [
+        "docs/design/liveui-research/v2/component-registry.md C11",
+        "docs/design/liveui-research/v2/SLICE-PLAN.md slice 7 (#4664)",
+        "slice 7 (#4664): composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/liveui/components/FactsRenderer.kt and render goldens for facts.hotel_pane (LiveUiRenderGoldensTest)"
+      ]
+    },
+    {
+      "component": "tabs",
+      "status": "shipping",
+      "since": 3,
+      "evidence": [
+        "docs/design/liveui-research/v2/tabs-and-table.md TB1-TB4",
+        "docs/design/liveui-research/v2/interaction-charter.md I3 (the head row)",
+        "composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/liveui/components/TabsRenderer.kt, render goldens for tabs.trip and tabs.rail_pane (LiveUiRenderGoldensTest), and the tab line's interaction tests (LiveUiDriverInteractionTest)"
+      ]
+    },
+    {
+      "component": "table",
+      "status": "shipping",
+      "since": 3,
+      "evidence": [
+        "docs/design/liveui-research/v2/tabs-and-table.md TB5-TB8 (column alignment measured on the pretext font model)",
+        "docs/design/liveui-research/v2/formulas-and-behaviours.md R11 (sort)",
+        "composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/liveui/components/TableRenderer.kt, render goldens for table.trains and table.hotels_stack (LiveUiRenderGoldensTest), and the header's sort tests (LiveUiDriverInteractionTest)"
+      ]
+    },
+    {
+      "component": "draw",
+      "status": "held",
+      "since": 3,
+      "reason": "overnight idea 12's code plate: an experiment behind the program cards' Staging switch and OCUCLAW_LIVEUI_CODE_PLATE=1, never taught by default",
+      "evidence": [
+        "overnight idea 12 (code plate): vendor/program-card/plate.js and composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/liveui/components/DrawRenderer.kt, behind the program cards' Staging switch",
+        "tests/liveui-code-plate.test.js"
+      ]
+    }
+  ],
+  "frames": [
+    {
+      "frame": "full",
+      "status": "shipping",
+      "since": 1,
+      "evidence": [
+        "docs/design/liveui-research/v2/frame-set.md F15",
+        "docs/design/liveui-research/v2/SLICE-PLAN.md slice 7 (#4664)",
+        "slice 7 (#4664): LiveUiCompositor.kt over the frame, and render goldens for the valid examples that use it (LiveUiRenderGoldensTest, LiveUiCompositorTest)"
+      ]
+    },
+    {
+      "frame": "stack",
+      "status": "shipping",
+      "since": 1,
+      "evidence": [
+        "docs/design/liveui-research/v2/frame-set.md F15",
+        "docs/design/liveui-research/v2/SLICE-PLAN.md slice 7 (#4664)",
+        "slice 7 (#4664): LiveUiCompositor.kt over the frame, and render goldens for the valid examples that use it (LiveUiRenderGoldensTest, LiveUiCompositorTest)"
+      ]
+    },
+    {
+      "frame": "split",
+      "status": "shipping",
+      "since": 1,
+      "evidence": [
+        "docs/design/liveui-research/v2/frame-set.md F14",
+        "docs/design/liveui-research/v2/SLICE-PLAN.md slice 7 (#4664)",
+        "slice 7 (#4664): renderer goldens + sim proof of joined lines (F14)"
+      ]
+    },
+    {
+      "frame": "plate",
+      "status": "shipping",
+      "since": 1,
+      "evidence": [
+        "docs/design/liveui-research/v2/frame-set.md F12",
+        "docs/design/liveui-research/v2/SLICE-PLAN.md slice 7 (#4664)",
+        "slice 7 (#4664): LiveUiCompositor.kt over the frame, and render goldens for the valid examples that use it (LiveUiRenderGoldensTest, LiveUiCompositorTest)"
+      ]
+    },
+    {
+      "frame": "rail-plate",
+      "status": "shipping",
+      "since": 1,
+      "evidence": [
+        "docs/design/liveui-research/v2/frame-set.md F14",
+        "docs/design/liveui-research/v2/SLICE-PLAN.md slice 7 (#4664)",
+        "slice 7 (#4664): renderer goldens + sim proof of joined lines (F14)"
+      ]
+    }
+  ]
+}

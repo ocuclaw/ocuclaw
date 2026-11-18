@@ -182,6 +182,8 @@ _REPLY_DELIVERY_KEYS = frozenset(
 )
 
 def _welcome_surface(image_base64: str) -> Dict[str, Any]:
+    # The phone matches this title and body to ask for the finishing
+    # double-tap (``isHermesWelcomeSurface`` in ScreenManager.kt).
     return {
         "kind": "text_surface",
         "template": "image_caption",
@@ -247,6 +249,174 @@ PHONE_CANDIDATE_RUN_ERROR_CODES = frozenset(
         "provider_rate_limited",
     }
 )
+
+#: Hermes's own replies for a message its agent did not answer: a turn that
+#: raised (a missing provider SDK), no model sign-in, an unreadable history, a
+#: provider that kept failing, a model that returned nothing. The gateway sends
+#: each as an ordinary reply and reports the turn as delivered, and most never
+#: reach the ``api_request_error`` hook (run 42633524528, macOS: the glasses
+#: showed the first one and step 9 took it as the first reply). A closed list
+#: of whole replies; the ``hint_*`` fragments are not replies.
+_FAILED_TURN_REPLY_KEYS = (
+    "gateway.errors.generic_failed_with_hint",
+    "gateway.errors.generic_failed",
+    "gateway.errors.no_credentials",
+    "gateway.errors.launch_credentials_unavailable",
+    "gateway.errors.auth_failed",
+    "gateway.errors.bad_request",
+    "gateway.errors.rate_limited",
+    "gateway.errors.usage_limit_resets",
+    "gateway.errors.provider_kept_failing",
+    "gateway.errors.connection_interrupted",
+    "gateway.errors.connection_unknown",
+    "gateway.errors.unreachable",
+    "gateway.errors.context_overflow",
+    "gateway.errors.history_unavailable",
+    "gateway.errors.session_storage_unavailable",
+    "gateway.errors.session_storage_unavailable_disk",
+    "gateway.errors.workspace_unavailable",
+    "gateway.errors.cron_session_read_only",
+    "gateway.errors.interrupted_before_start",
+    "gateway.errors.previous_turn_cleanup",
+    "gateway.errors.stopped_before_finishing",
+    "gateway.errors.no_response",
+    "gateway.errors.unexpected_silence",
+    # Proxy mode: the remote agent could not be reached, or said nothing.
+    "gateway.proxy.requires_aiohttp",
+    "gateway.proxy.url_missing",
+    "gateway.proxy.http_error",
+    "gateway.proxy.closed_early",
+    "gateway.proxy.connection_error",
+    "gateway.proxy.no_response",
+    # The model returned nothing, even after its retries.
+    "explainer.empty_response",
+)
+#: Replies the gateway builds from Hermes's English source text whatever the
+#: profile's language (v0.23.0 ``EMPTY_RESPONSE_EXPLANATION``): these are read
+#: in English as well.
+_FAILED_TURN_ENGLISH_SOURCE_KEYS = ("explainer.empty_response",)
+_FAILED_TURN_SLOT = "\x00"
+#: Every placeholder those replies carry. Each renders as the slot, which
+#: splits a reply into the fixed text the check reads.
+_FAILED_TURN_REPLY_SLOTS = (
+    "hint",
+    "detail",
+    "path",
+    "reason",
+    "window",
+    "status",
+    "error",
+    "model",
+)
+#: Less fixed text than this, in all, proves nothing about a reply.
+_FAILED_TURN_PATTERN_MIN_CHARS = 12
+#: How much of the fixed text after a placeholder is compared, and how far a
+#: filled placeholder may push it along the reply.
+_FAILED_TURN_PROBE_CHARS = 40
+_FAILED_TURN_SLOT_MAX_CHARS = 400
+#: The code such a candidate carries: step 9 then reads ``model_error``.
+FAILED_TURN_REPLY_RUN_ERROR_CODE = "provider_error"
+
+#: How a failure reply begins, and the fixed text after each placeholder.
+FailedTurnReplyPattern = Tuple[str, Tuple[str, ...]]
+
+
+def _hermes_translate(key: str, **kwargs: Any) -> str:
+    from agent.i18n import t  # type: ignore[import-not-found]
+
+    return t(key, **kwargs)
+
+
+def _reply_from_first_word(text: str) -> str:
+    """The text from its first letter or digit on. The warning sign and the
+    blank lines before the words never decide a match."""
+
+    for index, char in enumerate(text):
+        if char.isalnum():
+            return text[index:]
+    return ""
+
+
+def _failed_turn_reply_pattern(rendered: str) -> Optional[FailedTurnReplyPattern]:
+    """One rendered reply as the fixed text a real one must carry.
+
+    The beginning runs from the first letter to the first placeholder; it is
+    empty for a reply that opens with a placeholder (the model's name). The
+    text after each placeholder is cut to a short probe that stops at a code
+    mark, and a probe with no letter or digit in it is dropped.
+    """
+
+    parts = rendered.split(_FAILED_TURN_SLOT)
+    head = _reply_from_first_word(parts[0]).rstrip()
+    probes = []
+    for part in parts[1:]:
+        probe = part.split("`", 1)[0].strip()[:_FAILED_TURN_PROBE_CHARS].strip()
+        if any(char.isalnum() for char in probe):
+            probes.append(probe)
+    if len(head) + sum(len(probe) for probe in probes) < _FAILED_TURN_PATTERN_MIN_CHARS:
+        return None
+    return head, tuple(probes)
+
+
+def _reply_carries_pattern(reply: str, pattern: FailedTurnReplyPattern) -> bool:
+    head, probes = pattern
+    if not reply.startswith(head):
+        return False
+    at = len(head)
+    for probe in probes:
+        found = reply.find(probe, at, at + _FAILED_TURN_SLOT_MAX_CHARS + len(probe))
+        if found < 0:
+            return False
+        at = found + len(probe)
+    return True
+
+
+def failed_turn_reply_patterns(
+    translate: Optional[Callable[..., str]] = None,
+) -> Tuple[FailedTurnReplyPattern, ...]:
+    """Hermes's failure replies as fixed text, in the profile's language.
+
+    Rendered through Hermes's own translator from the keys the gateway sends,
+    never matched as English prose. A Hermes without the keys (or without the
+    translator) yields nothing, and then no reply is ever read as a failure.
+    """
+
+    translate = translate or _hermes_translate
+    slots = {name: _FAILED_TURN_SLOT for name in _FAILED_TURN_REPLY_SLOTS}
+    renders = [(key, slots) for key in _FAILED_TURN_REPLY_KEYS]
+    renders += [
+        (key, {**slots, "lang": "en"}) for key in _FAILED_TURN_ENGLISH_SOURCE_KEYS
+    ]
+    patterns = []
+    for key, kwargs in renders:
+        try:
+            rendered = str(translate(key, **kwargs))
+        except Exception:  # noqa: BLE001 - no translator, no text verdict
+            continue
+        if not rendered or rendered == key or "{" in rendered:
+            # Missing here, or a placeholder this list does not know: Hermes
+            # returns such a string unformatted, and it proves nothing.
+            continue
+        pattern = _failed_turn_reply_pattern(rendered)
+        if pattern is not None:
+            patterns.append(pattern)
+    return tuple(dict.fromkeys(patterns))
+
+
+def is_failed_turn_reply(
+    text: Any, translate: Optional[Callable[..., str]] = None
+) -> bool:
+    """Whether this committed reply is one of Hermes's own failure replies."""
+
+    if not isinstance(text, str) or not text.strip():
+        return False
+    reply = _reply_from_first_word(text)
+    if not reply:
+        return False
+    return any(
+        _reply_carries_pattern(reply, pattern)
+        for pattern in failed_turn_reply_patterns(translate)
+    )
 
 
 class PhoneTurnCandidateGate:
@@ -1722,6 +1892,7 @@ def record_welcome_outcome(
 
 
 __all__ = [
+    "FAILED_TURN_REPLY_RUN_ERROR_CODE",
     "FIRST_RUN_ATTEMPT_FILENAME",
     "FIRST_RUN_LOCK_FILENAME",
     "FIRST_RUN_ATTEMPT_RESUME_SECONDS",
@@ -1748,6 +1919,7 @@ __all__ = [
     "arm_first_run_proof",
     "first_run_attempt_path",
     "inspect_attempt",
+    "is_failed_turn_reply",
     "is_welcome_surface",
     "phone_turn_run_error_code",
     "record_reply_delivery",

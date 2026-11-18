@@ -1,4 +1,7 @@
-const TOOLS_OPERATIONS = new Set(["tools.read", "tools.block", "tools.skillToggle", "tools.receipt", "tools.recover"]);
+const TOOLS_OPERATIONS = new Set(["tools.read", "tools.block", "tools.profile", "tools.skillToggle", "tools.receipt", "tools.recover"]);
+
+const TOOL_PROFILES = ["default", "minimal", "coding", "messaging", "full"];
+const KINDS = ["blocks", "skills", "profile"];
 const record = (v     ) => v && typeof v === "object" && !Array.isArray(v);
 const text = (v     , max = 160) => typeof v === "string" && v.length <= max && !/[\u0000-\u001f]/.test(v);
 const revision = (v     ) => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
@@ -12,8 +15,9 @@ function toolsRequest(op        , raw     )      {
   if (Object.keys(raw).length !== keys.length || !keys.every(k => Object.hasOwn(raw, k))) return null;
   if (op !== "tools.receipt" && raw.confirmed !== true) return null;
   if (op !== "tools.receipt" && (!Number.isSafeInteger(raw.producedAtMs) || !Number.isSafeInteger(raw.expiresAtMs) || raw.producedAtMs < 0 || raw.expiresAtMs <= raw.producedAtMs || raw.expiresAtMs - raw.producedAtMs > 30000)) return null;
-  if (op === "tools.recover" && !["blocks", "skills"].includes(raw.kind)) return null;
+  if (op === "tools.recover" && !KINDS.includes(raw.kind)) return null;
   if (["tools.block", "tools.skillToggle"].includes(op) && (!text(raw.name) || !raw.name || !revision(raw.revision) || typeof raw.value !== "boolean" || op === "tools.block" && !["web", "files", "terminal"].includes(raw.name))) return null;
+  if (op === "tools.profile" && (!TOOL_PROFILES.includes(raw.name) || !revision(raw.revision) || raw.value !== true)) return null;
   return Object.fromEntries(keys.map(k => [k, raw[k]]));
 }
 function toolsSnapshot(raw     )      {
@@ -33,9 +37,13 @@ function toolsSnapshot(raw     )      {
     skills.push(Object.fromEntries(["name", "description", "reason", "origin", "contentRevision", "overrides", "available", "essential", "enabled", "globalBlocked", "writable"].map(k => [k, row[k]])));
   }
   const result      = {platform: raw.platform, blocksRevision: raw.blocksRevision, skillsRevision: raw.skillsRevision, applyTiming: raw.applyTiming, refresh: raw.refresh, tools: rows, installedSkills: skills};
+  if (raw.profile != null) {
+    if (!record(raw.profile) || !TOOL_PROFILES.includes(raw.profile.value) || typeof raw.profile.writable !== "boolean") return null;
+    result.profile = {value: raw.profile.value, writable: raw.profile.writable};
+  }
   if (raw.receipt != null) {
     const r = raw.receipt;
-    if (!record(r) || !id(r.mutationId) || !["committed", "unknown", "cancelled", "reconciled_unknown"].includes(r.outcome) || !Array.isArray(r.changedFields) || r.changedFields.length > 1 || !r.changedFields.every((v     ) => ["blocks", "skills"].includes(v))) return null;
+    if (!record(r) || !id(r.mutationId) || !["committed", "unknown", "cancelled", "reconciled_unknown"].includes(r.outcome) || !Array.isArray(r.changedFields) || r.changedFields.length > 1 || !r.changedFields.every((v     ) => KINDS.includes(v))) return null;
     result.receipt = {mutationId: r.mutationId, outcome: r.outcome, changedFields: [...r.changedFields]};
   }
   return result;
@@ -43,19 +51,29 @@ function toolsSnapshot(raw     )      {
 const errors                         = {
   intent_expired: "This change expired before native admission. Review current settings before another change.",
   invalid_request: "Review this change and confirmation.", unsupported: "This Hermes needs native tool management compatibility.", profile_not_served: "This profile is not served by the connected gateway.", native_read_failed: "Hermes could not read this profile's native tool catalog.", managed_setting: "This setting is inherited, essential, or managed and cannot be changed here.", config_conflict: "Settings or installed skills changed elsewhere. Refresh and review your change.", outcome_unknown: "The change outcome is unknown. Check its receipt before another edit.",
+  rate_limited: "Too many changes in a minute. Wait a moment, then try again.",
+  host_migration_needed: "OpenClaw needs a one-time config update. Run `openclaw doctor --fix` on the host, then try again.",
 };
-function toolsManagementResult(identity     , raw     )      {
+
+const openClawErrors                         = {
+  unsupported: "This OpenClaw can't manage tools from here.", native_read_failed: "OpenClaw could not read this agent's tools and skills.",
+};
+function toolsManagementResult(identity     , raw     , backend = "Hermes")      {
   const snapshot = toolsSnapshot(raw.tools);
   const op = identity.operation;
   const mutation = !["tools.read", "tools.receipt"].includes(op);
-  const kind = op === "tools.block" ? "blocks" : op === "tools.skillToggle" ? "skills" : identity.tools?.kind;
+  const kind = op === "tools.block" ? "blocks" : op === "tools.skillToggle" ? "skills" : op === "tools.profile" ? "profile" : identity.tools?.kind;
   const receipt = snapshot?.receipt;
-  const readbackMatches = op === "tools.block" ? snapshot?.tools.find((row     ) => row.id === identity.tools?.name)?.blocked === identity.tools?.value : op === "tools.skillToggle" ? snapshot?.installedSkills.find((row     ) => row.name === identity.tools?.name)?.enabled === identity.tools?.value : true;
+  const readbackMatches = op === "tools.block" ? snapshot?.tools.find((row     ) => row.id === identity.tools?.name)?.blocked === identity.tools?.value
+    : op === "tools.skillToggle" ? snapshot?.installedSkills.find((row     ) => row.name === identity.tools?.name)?.enabled === identity.tools?.value
+    : op === "tools.profile" ? snapshot?.profile?.value === identity.tools?.name : true;
   const valid = op === "tools.read" || receipt?.mutationId === identity.tools?.mutationId && (!mutation || receipt.changedFields.length === 1 && receipt.changedFields[0] === kind && (op === "tools.recover" ? ["committed", "cancelled", "reconciled_unknown"].includes(receipt.outcome) : receipt.outcome === "committed"));
   const envelope = Object.fromEntries(["requestId", "operation", "scope", "profileId"].map(k => [k, identity[k]]));
   if (raw.status === "ok" && snapshot && valid && readbackMatches) return {...envelope, status: "ok", capabilities: [], tools: snapshot};
-  const code = raw.status !== "ok" && errors[raw.errorCode] ? raw.errorCode : mutation ? "outcome_unknown" : "native_read_failed";
-  return {...envelope, status: code === "unsupported" ? "unsupported" : "error", capabilities: [], errorCode: code, errorMessage: errors[code], ...(snapshot ? {tools: snapshot} : {})};
+
+  const code = raw.status === "unsupported" ? "unsupported" : raw.status !== "ok" && errors[raw.errorCode] ? raw.errorCode : mutation ? "outcome_unknown" : "native_read_failed";
+  const message = (backend === "OpenClaw" && openClawErrors[code]) || errors[code];
+  return {...envelope, status: code === "unsupported" ? "unsupported" : "error", capabilities: [], errorCode: code, errorMessage: message, ...(snapshot ? {tools: snapshot} : {})};
 }
 
-module.exports = { TOOLS_OPERATIONS, toolsRequest, toolsSnapshot, toolsManagementResult };
+module.exports = { TOOLS_OPERATIONS, TOOL_PROFILES, toolsRequest, toolsSnapshot, toolsManagementResult };

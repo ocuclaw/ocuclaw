@@ -1,11 +1,13 @@
-const { createHash, createHmac, randomUUID } = require("node:crypto");
-const { Agent } = require("undici");
+const { createHash, createHmac, randomBytes, randomUUID } = require("node:crypto");
+const { Agent, fetch: undiciFetch } = require("undici");
 const { constantTimeEqual } = require("../domain/constant-time-equal.cjs");
 const { activeBackendDisplayName, getActiveBackendKind, isKnownBackendKind } = require("../gateway/backend-contract.cjs");
 const { filterPlainAssistantOutputText } = require("../domain/message-emoji-filter.cjs");
 const { composeReadabilitySystemPrompt } = require("../domain/readability-system-prompt.cjs");
 const { normalizeEvenAiSystemPrompt } = require("./even-ai-settings-store.cjs");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
+const { observeNativePerformance } = require("./native-performance.cjs");
+const { createNativeObservationRegistry, parseNativeObservation, pollNativePeerObservation, NATIVE_OBSERVATION_FIELD, NATIVE_OBSERVATION_HEADER, NATIVE_POLL_RESPONSE_LIMIT } = require("./native-peer-observation.cjs");
 
 const DEFAULT_RESPONSE_MODEL = "ocuclaw-active-session";
 const DEFAULT_TIMEOUT_MS = 60000;
@@ -13,6 +15,9 @@ const DEFAULT_MAX_BODY_BYTES = 65536;
 const DEFAULT_DEDUP_WINDOW_MS = 500;
 
 const DEFAULT_MAX_INTERCEPT_INFLIGHT = 4;
+
+const EVEN_AI_LISTEN_CLOSEOUT_TEXT = "Answering in OcuClaw.";
+const EVEN_AI_LISTEN_BUSY_TEXT = "OcuClaw is busy. Please retry shortly.";
 const EVEN_AI_MAX_PEER_FORWARD_DEPTH = 2;
 const EVEN_AI_CHAT_COMPLETIONS_PATH = "/v1/chat/completions";
 const EVEN_AI_LISTEN_INJECT_FIELD = "ocuclawListenInject";
@@ -48,6 +53,7 @@ function hasPeerForwardControlMarker(payload) {
   if (!payload || typeof payload !== "object") return false;
   return (
     payload[EVEN_AI_LISTEN_INJECT_FIELD] === true ||
+    payload[NATIVE_OBSERVATION_FIELD] !== undefined ||
     payload[EVEN_AI_PEER_FORWARD_FIELD] === true ||
     payload[EVEN_AI_PEER_FORWARD_DEPTH_FIELD] !== undefined
   );
@@ -185,11 +191,11 @@ function buildPeerEndpointUrl(rawUrl) {
   return url;
 }
 
-function normalizedHostname(url) {
+function normalizedHostname(url     ) {
   return url.hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "").replace(/\.$/, "");
 }
 
-function mappedIpv4Address(address) {
+function mappedIpv4Address(address     ) {
   const normalized = String(address || "").toLowerCase();
   const prefix = normalized.startsWith("::ffff:")
     ? "::ffff:"
@@ -208,14 +214,14 @@ function mappedIpv4Address(address) {
   return [high >> 8, high & 0xff, low >> 8, low & 0xff].join(".");
 }
 
-function ipAddressFamily(address) {
+function ipAddressFamily(address     ) {
   const normalized = String(address || "").toLowerCase();
   if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(normalized)) return 4;
   if (/^[a-f0-9:.]+$/.test(normalized) && normalized.includes(":")) return 6;
   return 0;
 }
 
-function isLoopbackAddress(address) {
+function isLoopbackAddress(address     ) {
   const normalized = String(address || "").toLowerCase();
   if (normalized === "::1") return true;
   const mapped = mappedIpv4Address(normalized);
@@ -224,7 +230,7 @@ function isLoopbackAddress(address) {
   return Number(normalized.split(".")[0]) === 127;
 }
 
-function isPublicIpv4(address) {
+function isPublicIpv4(address     ) {
   const parts = String(address || "").split(".").map(Number);
   if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
     return false;
@@ -247,7 +253,7 @@ function isPublicIpv4(address) {
   );
 }
 
-function isPublicIpAddress(address) {
+function isPublicIpAddress(address     ) {
   const normalized = String(address || "").toLowerCase();
   const family = ipAddressFamily(normalized);
   if (family === 4) return isPublicIpv4(normalized);
@@ -266,7 +272,7 @@ function isPublicIpAddress(address) {
   );
 }
 
-function isTailnetIpAddress(address) {
+function isTailnetIpAddress(address     ) {
   const normalized = String(address || "").toLowerCase();
   if (ipAddressFamily(normalized) === 4) {
     const [a, b] = normalized.split(".").map(Number);
@@ -275,15 +281,15 @@ function isTailnetIpAddress(address) {
   return normalized.startsWith("fd7a:115c:a1e0:");
 }
 
-function peerAddressAllowed(hostname, address) {
+function peerAddressAllowed(hostname     , address     ) {
   const normalizedHost = String(hostname || "").toLowerCase();
   return isPublicIpAddress(address) ||
     (normalizedHost === "localhost" && isLoopbackAddress(address)) ||
     (normalizedHost.endsWith(".ts.net") && isTailnetIpAddress(address));
 }
 
-function makePeerSafeLookup(resolveAddresses) {
-  return function peerSafeLookup(hostname, options, callback) {
+function makePeerSafeLookup(resolveAddresses     ) {
+  return function peerSafeLookup(hostname     , options     , callback     ) {
     Promise.resolve(resolveAddresses(hostname))
       .then((addresses) => {
         const records = Array.isArray(addresses)
@@ -319,7 +325,7 @@ function makePeerSafeLookup(resolveAddresses) {
   };
 }
 
-async function assertAllowedPeerEndpointUrl(rawUrl, resolveAddresses) {
+async function assertAllowedPeerEndpointUrl(rawUrl     , resolveAddresses     ) {
   const url = buildPeerEndpointUrl(rawUrl);
   const hostname = normalizedHostname(url);
   const loopback = hostname === "localhost" || isLoopbackAddress(hostname);
@@ -356,9 +362,9 @@ async function assertAllowedPeerEndpointUrl(rawUrl, resolveAddresses) {
   return url.toString();
 }
 
-async function defaultResolvePeerAddresses(hostname) {
+async function defaultResolvePeerAddresses(hostname     ) {
 
-  const dns = await import("node:dns/promises");
+  const dns      = await import("node:dns/promises");
   return dns.lookup(hostname, { all: true, verbatim: true });
 }
 
@@ -385,13 +391,60 @@ function buildCompletionPayload(opts = {}) {
   };
 }
 
-function buildListenInterceptCloseoutPayload(opts = {}) {
+function buildListenInterceptCloseoutPayload(opts      = {}) {
   return buildCompletionPayload({
     id: opts.id,
     createdMs: opts.createdMs,
     model: opts.model,
-    content: "\u200B",
+    content: opts.busy === true ? EVEN_AI_LISTEN_BUSY_TEXT : EVEN_AI_LISTEN_CLOSEOUT_TEXT,
   });
+}
+
+function completionHasVisibleText(payload     ) {
+  const content = payload?.choices?.[0]?.message?.content;
+  return typeof content === "string" && content.replace(/[\s​-‍﻿]/g, "") !== "";
+}
+
+const SHAPE_LIST_LIMIT = 24;
+const SHAPE_KEY_PATTERN = /^[A-Za-z0-9_.-]{1,48}$/;
+
+function shapeNames(names          ) {
+  return names.slice(0, SHAPE_LIST_LIMIT)
+    .map((name) => (SHAPE_KEY_PATTERN.test(name) ? name : "?"))
+    .sort();
+}
+
+function shapeKind(value         ) {
+  if (value === null) return "null";
+  return Array.isArray(value) ? "array" : typeof value;
+}
+
+function describeRequestShape(payload     , headers     ) {
+  const body = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : null;
+  const messages = body && Array.isArray(body.messages) ? body.messages : null;
+  const shown        = messages ? messages.slice(-SHAPE_LIST_LIMIT) : [];
+  const partTypes = new Set();
+  for (const message of shown) {
+    if (!message || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      const type = part && typeof part.type === "string" ? part.type : shapeKind(part);
+      partTypes.add(SHAPE_KEY_PATTERN.test(type) ? type : "?");
+    }
+  }
+  return {
+    bodyKind: shapeKind(payload),
+    bodyKeys: body ? shapeNames(Object.keys(body)) : [],
+    messageCount: messages ? messages.length : null,
+    roles: shown.map((message) => {
+      const role = message && typeof message.role === "string" ? message.role : shapeKind(message?.role);
+      return SHAPE_KEY_PATTERN.test(role) ? role : "?";
+    }),
+    contentKinds: shown.map((message) => shapeKind(message?.content)),
+    partTypes: [...partTypes].slice(0, SHAPE_LIST_LIMIT).sort(),
+    stream: !body || !("stream" in body) ? null
+      : typeof body.stream === "boolean" ? body.stream : shapeKind(body.stream),
+    headerNames: headers && typeof headers === "object" ? shapeNames(Object.keys(headers)) : [],
+  };
 }
 
 function extractLastUserText(payload) {
@@ -617,6 +670,11 @@ function promiseWithTimeout(promise, timeoutMs, onTimeout) {
 }
 
 function createEvenAiEndpoint(opts = {}) {
+  const nativeObservations = createNativeObservationRegistry();
+  const activeNativePerformances = new Set                                             ();
+  const activeNativePollers = new Set                                              ();
+  let nativeClosed = false;
+  let nativePollWindowAt = 0, nativePollCount = 0;
   const logger = normalizeLogger(opts.logger);
   const httpServer = opts.httpServer || null;
   const enabled = opts.enabled === true;
@@ -650,7 +708,7 @@ function createEvenAiEndpoint(opts = {}) {
   const dispatchGatewayUserSend =
     typeof configuredDispatchGatewayUserSend === "function"
       ? configuredDispatchGatewayUserSend
-      : (_sessionKey, send) => send();
+      : (_sessionKey     , send     ) => send();
   const configuredBeginPromptTurnOwnership = Reflect.get(
     opts,
     "beginPromptTurnOwnership",
@@ -672,7 +730,7 @@ function createEvenAiEndpoint(opts = {}) {
     "gatewayUserSendHoldDeadlineMs",
   );
   const runWaiter = opts.runWaiter;
-  const restartRecoveryOption = Reflect.get(opts, "restartRecovery");
+  const restartRecoveryOption      = Reflect.get(opts, "restartRecovery");
   const restartRecovery =
     restartRecoveryOption && typeof restartRecoveryOption.recordAcceptedSend === "function"
       ? restartRecoveryOption
@@ -706,6 +764,11 @@ function createEvenAiEndpoint(opts = {}) {
     typeof opts.hasConnectedAppClient === "function"
       ? opts.hasConnectedAppClient
       : () => false;
+
+  const hasGlassesSurfaceAppClient =
+    typeof opts.hasGlassesSurfaceAppClient === "function"
+      ? opts.hasGlassesSurfaceAppClient
+      : hasConnectedAppClient;
   const shouldSeedThinkingForRoute =
     typeof opts.shouldSeedThinkingForRoute === "function"
       ? opts.shouldSeedThinkingForRoute
@@ -739,7 +802,7 @@ function createEvenAiEndpoint(opts = {}) {
     if (!getDefaultMintAgentRef) return "";
     try {
       return trimString(await Promise.resolve(getDefaultMintAgentRef()));
-    } catch (err) {
+    } catch (err     ) {
       logger.warn(
         `[evenai] default mint agent lookup failed: ${err && err.message ? err.message : err}`,
       );
@@ -752,10 +815,10 @@ function createEvenAiEndpoint(opts = {}) {
     typeof configuredResolveMintAgentRef === "function"
       ? configuredResolveMintAgentRef
       : null;
-  async function resolveMintAgentRef(oneShotAgentRef, bindingAgentRef) {
+  async function resolveMintAgentRef(oneShotAgentRef     , bindingAgentRef     ) {
     if (resolveMintAgentRefHook) {
       try {
-        const resolved = await Promise.resolve(
+        const resolved      = await Promise.resolve(
           resolveMintAgentRefHook({ oneShotAgentRef, bindingAgentRef }),
         );
         if (resolved && typeof resolved === "object") {
@@ -764,7 +827,7 @@ function createEvenAiEndpoint(opts = {}) {
             oneShotHonoured: resolved.oneShotHonoured === true,
           };
         }
-      } catch (err) {
+      } catch (err     ) {
         logger.warn(
           `[evenai] mint agent resolution failed: ${err && err.message ? err.message : err}`,
         );
@@ -792,12 +855,8 @@ function createEvenAiEndpoint(opts = {}) {
     typeof configuredSetHeyEvenBinding === "function"
       ? configuredSetHeyEvenBinding
       : null;
-  const fetchImpl =
-    typeof opts.fetch === "function"
-      ? opts.fetch
-      : typeof globalThis.fetch === "function"
-        ? globalThis.fetch.bind(globalThis)
-        : null;
+
+  const fetchImpl = typeof opts.fetch === "function" ? opts.fetch : undiciFetch;
   const configuredResolvePeerAddresses = Reflect.get(opts, "resolvePeerAddresses");
   const resolvePeerAddresses =
     typeof configuredResolvePeerAddresses === "function"
@@ -944,7 +1003,9 @@ function createEvenAiEndpoint(opts = {}) {
     responseModel,
     abortController,
     res,
-  }) {
+    nativeObservation,
+    nativeVisualEligible,
+  }                        ) {
     if (!fetchImpl) {
       throw new Error("Even AI peer pathway fetch is unavailable.");
     }
@@ -958,6 +1019,13 @@ function createEvenAiEndpoint(opts = {}) {
     const forwardedPayload = {
       ...(payload && typeof payload === "object" ? payload : {}),
     };
+    const localPublish = Reflect.get(opts, "publishNativePerformance");
+    const attached                                   = !nativeClosed && nativeVisualEligible && !injectListen &&
+      (nativeObservation || typeof localPublish === "function")
+      ? nativeObservation || { version: 1, op: "attach", nonce: randomBytes(24).toString("hex"),
+        requestId, backend: localBackendKind === "hermes" ? "hermes" : "openclaw" } : null;
+    delete forwardedPayload[NATIVE_OBSERVATION_FIELD];
+    if (attached) forwardedPayload[NATIVE_OBSERVATION_FIELD] = attached;
     forwardedPayload[EVEN_AI_PEER_FORWARD_DEPTH_FIELD] = normalizePeerForwardDepth(
       forwardDepth,
     ) || 1;
@@ -1007,7 +1075,38 @@ function createEvenAiEndpoint(opts = {}) {
         fetchAbortController.abort();
       }
     };
-    const { status, bodyText } = await promiseWithTimeout(
+    let forwardedPublish                                = null;
+    const poller = attached ? pollNativePeerObservation({
+      identity: attached, timeoutMs: Math.max(1, requestTimeoutMs - (now() - startedAtMs)),
+      publish(frame) {
+        if (nativeClosed) return;
+        if (nativeObservation) {
+          if (!forwardedPublish && frame.phase === "accepted") forwardedPublish = nativeObservations.claim(nativeObservation);
+          forwardedPublish?.(frame);
+        } else if (typeof localPublish === "function") localPublish(frame);
+      },
+      async request(identity, signal) {
+        const body = JSON.stringify({ [NATIVE_OBSERVATION_FIELD]: identity });
+        const response = await fetchImpl(peerUrl, {
+          method: "POST", headers: { "content-type": "application/json",
+            authorization: `Bearer ${peerTarget.bearerToken}`, [NATIVE_OBSERVATION_HEADER]: "1",
+            [EVEN_AI_PEER_SIGNATURE_HEADER]: createPeerSignature(peerTarget.forwardSecret, body) },
+          body, signal, redirect: "error", ...(peerDispatcher ? { dispatcher: peerDispatcher } : {}),
+        });
+        const text = await readBoundedPeerResponseText(response, NATIVE_POLL_RESPONSE_LIMIT, () => {});
+        return JSON.parse(text);
+      },
+    }) : null;
+    if (poller) activeNativePollers.add(poller);
+    const stopPoller = () => {
+      if (res.writableEnded) return;
+      void poller?.close().catch(() => {});
+      if (poller) activeNativePollers.delete(poller);
+    };
+    res.once("close", stopPoller);
+    let peerResult;
+    try {
+      peerResult = await promiseWithTimeout(
       (async () => {
         const response = await fetchImpl(peerUrl, {
           method: "POST",
@@ -1043,13 +1142,25 @@ function createEvenAiEndpoint(opts = {}) {
       requestTimeoutMs,
       abortPeerFetch,
     );
+
+      void poller?.done.finally(() => { if (poller) activeNativePollers.delete(poller); });
+    } catch (error) {
+      await poller?.close();
+      if (poller) activeNativePollers.delete(poller);
+      throw error;
+    } finally {
+      res.removeListener?.("close", stopPoller);
+    }
+    const { status, bodyText } = peerResult;
     if (status < 200 || status >= 300) {
+      await poller?.close();
       throw new Error(`Even AI peer pathway returned HTTP ${status || "unknown"}.`);
     }
     let responsePayload;
     try {
       responsePayload = bodyText ? JSON.parse(bodyText) : null;
     } catch {
+      await poller?.close();
       throw new Error("Even AI peer pathway returned invalid JSON.");
     }
     emitDebug(
@@ -1063,6 +1174,18 @@ function createEvenAiEndpoint(opts = {}) {
         injectListen: !!injectListen,
       }),
     );
+
+    if (injectListen && !completionHasVisibleText(responsePayload)) {
+      writeJson(
+        res,
+        buildListenInterceptCloseoutPayload({
+          id: requestId,
+          createdMs: startedAtMs,
+          model: responseModel,
+        }),
+      );
+      return;
+    }
     writeJson(
       res,
       responsePayload || buildCompletionPayload({
@@ -1077,7 +1200,7 @@ function createEvenAiEndpoint(opts = {}) {
   async function resolveRoutingDecision({
     payload,
     settingsSnapshot,
-    listenEnabled,
+    listenEnabled: listenSetting,
     upstreamConnected,
     trustedPeerForward,
     requestId,
@@ -1090,9 +1213,16 @@ function createEvenAiEndpoint(opts = {}) {
       !!(trustedPeerForward && payload && payload[EVEN_AI_LISTEN_INJECT_FIELD] === true);
     const explicitPeerForward =
       !!(trustedPeerForward && payload && payload[EVEN_AI_PEER_FORWARD_FIELD] === true);
+    const connectedAppClient = hasConnectedAppClient();
+
+    const glassesSurfaceClosed =
+      listenSetting && connectedAppClient && !hasGlassesSurfaceAppClient();
+    if (glassesSurfaceClosed && !explicitPeerInject) {
+      emitDebug("evenai", "listen_glasses_closed", "info", null, () => ({ requestId }));
+    }
+    const listenEnabled = listenSetting && !glassesSurfaceClosed;
     const listenInjectRequested =
       explicitPeerInject || (listenEnabled && !explicitPeerForward);
-    const connectedAppClient = hasConnectedAppClient();
     const inboundPeerForwardDepth = normalizePeerForwardDepth(
       payload && payload[EVEN_AI_PEER_FORWARD_DEPTH_FIELD],
     );
@@ -1244,15 +1374,19 @@ function createEvenAiEndpoint(opts = {}) {
     req[REQUEST_HANDLED_MARKER] = true;
     res[REQUEST_HANDLED_MARKER] = true;
 
+    let nativeIngressClosed = res.destroyed === true || res.closed === true;
+    res.once("close", () => { if (!res.writableEnded) nativeIngressClosed = true; });
+
     const requestId = `chatcmpl-${randomUUID()}`;
     const startedAtMs = now();
+    const nativeSnapshotIngress = getHeaderValue(req.headers, NATIVE_OBSERVATION_HEADER) === "1";
     const authToken = parseBearerToken(req.headers && req.headers.authorization);
     const configuredSystemPrompt = normalizeEvenAiSystemPrompt(getSystemPrompt());
     const systemPrompt = composeReadabilitySystemPrompt(configuredSystemPrompt, {
       hostProvidesReadability,
     });
 
-    emitDebug(
+    if (!nativeSnapshotIngress) emitDebug(
       "evenai",
       "request_received",
       "info",
@@ -1293,6 +1427,7 @@ function createEvenAiEndpoint(opts = {}) {
       return true;
     }
 
+    if (!nativeSnapshotIngress) Reflect.get(opts, "requestObservation")?.authenticatedReceipt?.(requestId);
     let bodyResult;
     try {
       bodyResult = await readRequestBody(req, maxBodyBytes);
@@ -1373,6 +1508,29 @@ function createEvenAiEndpoint(opts = {}) {
       bodyText: bodyResult.bodyText,
       settingsSnapshot,
     });
+    const nativeObservationValue = payload?.[NATIVE_OBSERVATION_FIELD];
+    const nativeObservation = parseNativeObservation(nativeObservationValue);
+    if (nativeSnapshotIngress || nativeObservationValue !== undefined) {
+      const valid = trustedPeerForward && nativeObservation &&
+        (nativeSnapshotIngress ? nativeObservation.op === "snapshot" && Object.keys(payload).length === 1
+          : nativeObservation.op === "attach");
+      if (!valid) {
+        writeJson(res, { type: "ocuclaw.evenai.observation", version: 1, supported: false });
+        return true;
+      }
+      if (nativeObservation.op === "snapshot") {
+        const at = now();
+        if (at - nativePollWindowAt >= 1_000) { nativePollWindowAt = at; nativePollCount = 0; }
+        if (++nativePollCount > 32) writeJson(res, { type: "ocuclaw.evenai.observation", version: 1, supported: false });
+        else writeJson(res, nativeObservations.snapshot(nativeObservation));
+        return true;
+      }
+    }
+    emitDebug("evenai", "request_shape", "info", null, () => ({
+      requestId,
+      peerForwarded: !!trustedPeerForward,
+      ...describeRequestShape(payload, req.headers),
+    }));
     const configuredDefaultModel = normalizeDefaultModel(settingsSnapshot.defaultModel);
     const configuredDefaultThinking = normalizeDefaultThinking(
       settingsSnapshot.defaultThinking,
@@ -1578,7 +1736,7 @@ function createEvenAiEndpoint(opts = {}) {
               if (!res.writableEnded) duplicateDisconnected = true;
               finish(null);
             };
-            const finish = (value) => {
+            const finish = (value     ) => {
               if (settled) return;
               settled = true;
               clearTimeout(timer);
@@ -1590,7 +1748,7 @@ function createEvenAiEndpoint(opts = {}) {
             const timer = setTimeout(() => finish(null), Math.max(1, remainingTimeoutMs));
             res.once("close", onDuplicateClose);
             matchingFinalContent.promise.then(
-              (value) => finish(typeof value === "string" ? value : null),
+              (value     ) => finish(typeof value === "string" ? value : null),
               () => finish(null),
             );
           });
@@ -1682,6 +1840,7 @@ function createEvenAiEndpoint(opts = {}) {
               id: requestId,
               createdMs: startedAtMs,
               model: responseModel,
+              busy: true,
             }),
           );
         } else {
@@ -1728,6 +1887,8 @@ function createEvenAiEndpoint(opts = {}) {
           responseModel,
           abortController: peerAbortController,
           res,
+          nativeObservation,
+          nativeVisualEligible: !nativeIngressClosed,
         });
       } catch (err) {
         if (
@@ -1851,6 +2012,7 @@ function createEvenAiEndpoint(opts = {}) {
             id: requestId,
             createdMs: startedAtMs,
             model: responseModel,
+            busy: true,
           }),
         );
         return true;
@@ -2141,7 +2303,20 @@ function createEvenAiEndpoint(opts = {}) {
       startedAtMs,
     };
     const observation = Reflect.get(opts, "requestObservation");
-    const observationTicket = observation?.begin();
+    const publishPerformance = nativeObservation ? nativeObservations.claim(nativeObservation)
+      : Reflect.get(opts, "publishNativePerformance");
+    let nativePerformance                                                     = null;
+    if (typeof publishPerformance === "function" && !nativeIngressClosed && !nativeClosed) {
+      try {
+        nativePerformance = observeNativePerformance({ bridge: gatewayBridge,
+          requestId: nativeObservation?.requestId || requestId, servingRequestId: requestId,
+          backend: localBackendKind, sessionKey, generation: randomUUID(),
+          publish: frame => { if (!nativeClosed) publishPerformance(frame); },
+          onRetired() { if (nativePerformance) activeNativePerformances.delete(nativePerformance); } });
+        activeNativePerformances.add(nativePerformance);
+      } catch {  }
+    }
+    const observationTicket = observation?.begin(requestId);
     let observationSettled = false;
     const settleObservation = (outcome = "") => {
       if (observationSettled) return;
@@ -2156,6 +2331,7 @@ function createEvenAiEndpoint(opts = {}) {
     const onClientDisconnect = () => {
       if (res.writableEnded) return;
       clientDisconnected = true;
+      nativePerformance?.cancel();
 
       settleFinalContent();
       if (inFlightFinalContent.get(fingerprint) === finalContentRecord) {
@@ -2203,7 +2379,7 @@ function createEvenAiEndpoint(opts = {}) {
     );
 
     try {
-      const sendOptions = {
+      const sendOptions      = {
         prompt: {
           content: systemPrompt,
           owner: "even-ai",
@@ -2338,6 +2514,7 @@ function createEvenAiEndpoint(opts = {}) {
           trimString(ack && ack.error) || `Even AI upstream returned ${ack.status}.`,
         );
       }
+      nativePerformance?.bind(runId);
 
       if (restartRecovery && !userText.trimStart().startsWith("/")) {
         restartRecovery.recordAcceptedSend({
@@ -2349,6 +2526,7 @@ function createEvenAiEndpoint(opts = {}) {
         });
       }
 
+      observation?.dispatched?.(observationTicket);
       emitDebug(
         "evenai",
         "request_dispatched",
@@ -2386,6 +2564,7 @@ function createEvenAiEndpoint(opts = {}) {
       });
       const filteredAssistantText = filterPlainAssistantOutputText(assistantText);
       const emptyText = !trimString(filteredAssistantText);
+
       const completionContent = emptyText
         ? "Even AI finished without a text reply."
         : (observation?.decorateReply?.(observationTicket, filteredAssistantText) ?? filteredAssistantText);
@@ -2417,6 +2596,7 @@ function createEvenAiEndpoint(opts = {}) {
       settleFinalContent(completionContent);
       return true;
     } catch (err) {
+      if (err?.code !== "evenai_upstream_error") nativePerformance?.fail();
       settleObservation("failed");
       const handled = classifyHandledError(err);
       emitDebug(
@@ -2485,6 +2665,13 @@ function createEvenAiEndpoint(opts = {}) {
 
   return {
     close() {
+      if (nativeClosed) return;
+      nativeClosed = true;
+      for (const performance of activeNativePerformances) performance.cancel();
+      activeNativePerformances.clear();
+      for (const poller of activeNativePollers) void poller.close().catch(() => {});
+      activeNativePollers.clear();
+      nativeObservations.close();
       if (
         attached &&
         httpServer &&
@@ -2502,4 +2689,4 @@ function createEvenAiEndpoint(opts = {}) {
   };
 }
 
-module.exports = { EVEN_AI_LISTEN_INJECT_FIELD, EVEN_AI_PEER_FORWARD_FIELD, EVEN_AI_BINDING_AGENT_FIELD, EVEN_AI_TARGET_SESSION_FIELD, EVEN_AI_PEER_FORWARD_DEPTH_FIELD, createEvenAiEndpoint };
+module.exports = { EVEN_AI_LISTEN_CLOSEOUT_TEXT, EVEN_AI_LISTEN_BUSY_TEXT, EVEN_AI_LISTEN_INJECT_FIELD, EVEN_AI_PEER_FORWARD_FIELD, EVEN_AI_BINDING_AGENT_FIELD, EVEN_AI_TARGET_SESSION_FIELD, EVEN_AI_PEER_FORWARD_DEPTH_FIELD, createEvenAiEndpoint };

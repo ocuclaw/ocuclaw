@@ -110,11 +110,11 @@ def parse(payload) -> tuple:
     if not isinstance(payload, dict) or set(payload) - PAYLOAD_KEYS:
         raise bm.BoardReadError("invalid_request")
     slug, anchor, key = payload.get("slug"), payload.get("anchor"), payload.get("key")
-    if not isinstance(slug, str) or not bm._SLUG.match(slug):
+    if not isinstance(slug, str) or not bm._SLUG.fullmatch(slug):
         raise bm.BoardReadError("invalid_request")
-    if not isinstance(anchor, str) or not bm._ANCHOR.match(anchor):
+    if not isinstance(anchor, str) or not bm._ANCHOR.fullmatch(anchor):
         raise bm.BoardReadError("invalid_request")
-    if not isinstance(key, str) or not board_ops.KEY.match(key):
+    if not isinstance(key, str) or not board_ops.KEY.fullmatch(key):
         raise bm.BoardReadError("invalid_request")
     title = _text(payload.get("title"), TITLE_MAX)
     if title is None:
@@ -125,7 +125,7 @@ def parse(payload) -> tuple:
         if body is None:
             raise bm.BoardReadError("invalid_request")
     assignee = payload.get("assignee")
-    if assignee is not None and (not isinstance(assignee, str) or not _ASSIGNEE.match(assignee)):
+    if assignee is not None and (not isinstance(assignee, str) or not _ASSIGNEE.fullmatch(assignee)):
         raise bm.BoardReadError("invalid_request")
     priority = payload.get("priority", 0)
     if isinstance(priority, bool) or not isinstance(priority, int) or not PRIORITY_MIN <= priority <= PRIORITY_MAX:
@@ -149,7 +149,7 @@ def _parents(value) -> list:
         return []
     if not isinstance(value, list) or len(value) > PARENTS_MAX:
         raise bm.BoardReadError("invalid_request")
-    if any(not isinstance(p, str) or not bm._CARD_ID.match(p) for p in value) or len(set(value)) != len(value):
+    if any(not isinstance(p, str) or not bm._CARD_ID.fullmatch(p) for p in value) or len(set(value)) != len(value):
         raise bm.BoardReadError("invalid_request")
     return list(value)
 
@@ -500,6 +500,9 @@ def lookup(root: Path, payload, profile: str) -> dict:
     if receipt["operation"] == board_ops.TOMBSTONE:
         return {"receipt": wire_receipt(receipt)}
     from . import board_actions, board_review
+    if receipt["operation"] == "board.acknowledge":
+        from . import board_unknown
+        return board_unknown.looked_up(root, receipt)
     if receipt["operation"] == board_review.OPERATION:
         # #3056: a verdict's receipt, settled by its own rules.
         return board_review.looked_up(root, receipt)

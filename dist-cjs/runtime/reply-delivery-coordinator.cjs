@@ -4,10 +4,10 @@ const SWEEP_INTERVAL_MS = 1000;
 
 const STALL_GAP_MS = 2000;
 
-function selectReplyTarget(entries, sessionKey, runId, runErrored = false) {
+function selectReplyTarget(entries     , sessionKey     , runId     , runErrored      = false) {
   if (runErrored === true) return { target: null, reason: "reply_run_errored" };
   const ofRun = (Array.isArray(entries) ? entries : [])
-    .filter((entry) => entry && entry.role === "assistant" && entry.runId === runId);
+    .filter((entry     ) => entry && entry.role === "assistant" && entry.runId === runId);
   if (ofRun.length === 0) return { target: null, reason: "reply_entry_not_found" };
   for (let index = ofRun.length - 1; index >= 0; index -= 1) {
     const entry = ofRun[index];
@@ -35,8 +35,8 @@ function createReplyDeliveryCoordinator({
   emitDebug = null,
 
   isRunErrored = null,
-}) {
-  const listeners = new Set();
+}     ) {
+  const listeners      = new Set();
 
   const runOrigins = new Map();
 
@@ -45,9 +45,9 @@ function createReplyDeliveryCoordinator({
   const terminals = new Map();
 
   const tracked = new Map();
-  let sweepTimer = null;
+  let sweepTimer      = null;
 
-  let lastBeat = null;
+  let lastBeat      = null;
   let frozenMs = 0;
   function liveNow() {
     const at = now();
@@ -59,11 +59,11 @@ function createReplyDeliveryCoordinator({
     return at - frozenMs;
   }
 
-  const debug = (event, data) => {
+  const debug = (event     , data     ) => {
     if (typeof emitDebug === "function") emitDebug(event, data);
   };
 
-  function announce(candidateKey, status) {
+  function announce(candidateKey     , status     ) {
     debug("reply_delivery_settled", { status: status.status, reason: status.reason });
     for (const listener of listeners) {
       try { listener(candidateKey, status); } catch (_) {}
@@ -72,7 +72,7 @@ function createReplyDeliveryCoordinator({
   }
 
   const delivery = createReplyDelivery({ now: liveNow, randomId, deadlineMs, maxPending, onSettle: announce });
-  const terminal = (candidateKey, status, reason) => {
+  const terminal = (candidateKey     , status     , reason     ) => {
     const result = { status, reason, evidence: null };
     delivery.invalidate(candidateKey);
     terminals.delete(candidateKey);
@@ -116,14 +116,14 @@ function createReplyDeliveryCoordinator({
     stopSweepIfIdle();
   }
 
-  function noteRunOrigin(runId, clientId) {
+  function noteRunOrigin(runId     , clientId     ) {
     if (typeof runId !== "string" || !runId || typeof clientId !== "string" || !clientId) return;
     runOrigins.delete(runId);
     runOrigins.set(runId, clientId);
     while (runOrigins.size > maxPending) runOrigins.delete(runOrigins.keys().next().value);
   }
 
-  function tryObserve(candidateKey, sessionKey, runId, startedAt) {
+  function tryObserve(candidateKey     , sessionKey     , runId     , startedAt     ) {
 
     const ledger = getLedger() || {};
     const ledgerSessionKey = typeof ledger.sessionKey === "string" && ledger.sessionKey ? ledger.sessionKey : sessionKey;
@@ -139,15 +139,15 @@ function createReplyDeliveryCoordinator({
     if (!originId) return { settled: terminal(candidateKey, "unconfirmed", "origin_unbound") };
 
     const origin = (listClients() || [])
-      .filter((entry) => entry && entry.clientId === originId)
-      .map((entry) => ({
+      .filter((entry     ) => entry && entry.clientId === originId)
+      .map((entry     ) => ({
         clientId: entry.clientId,
         clientKind: entry.clientKind,
         supportsReceipt: Array.isArray(entry.clientCapabilities) &&
           entry.clientCapabilities.includes(REPLY_DELIVERY_CAPABILITY),
       }));
     terminals.delete(candidateKey);
-    const seen = delivery.observe(candidateKey, selected.target, origin, startedAt);
+    const seen      = delivery.observe(candidateKey, selected.target, origin, startedAt);
     if (seen.status === "pending") {
       if (!tracked.has(candidateKey)) tracked.set(candidateKey, { sessionKey, runId });
       startSweep();
@@ -159,15 +159,15 @@ function createReplyDeliveryCoordinator({
     return { settled: { status: seen.status, reason: seen.reason || null } };
   }
 
-  function observe({ candidateKey, sessionKey, runId }) {
-    const valid = (value) => typeof value === "string" && value.length > 0 && value.length <= 512;
+  function observe({ candidateKey, sessionKey, runId }     ) {
+    const valid = (value     ) => typeof value === "string" && value.length > 0 && value.length <= 512;
     if (!valid(candidateKey) || !valid(sessionKey) || !valid(runId)) {
       return { status: "unsupported", reason: "target_identity_missing" };
     }
 
     const earlier = waiting.get(candidateKey);
     const at = earlier ? earlier.at : liveNow();
-    const attempt = tryObserve(candidateKey, sessionKey, runId, at);
+    const attempt      = tryObserve(candidateKey, sessionKey, runId, at);
     if (attempt.settled) return attempt.settled;
 
     waiting.delete(candidateKey);
@@ -183,7 +183,7 @@ function createReplyDeliveryCoordinator({
 
   function notifyEntriesChanged() {
     for (const [candidateKey, entry] of [...waiting]) {
-      const attempt = tryObserve(candidateKey, entry.sessionKey, entry.runId, entry.at);
+      const attempt      = tryObserve(candidateKey, entry.sessionKey, entry.runId, entry.at);
       if (attempt.settled) waiting.delete(candidateKey);
       else entry.reason = attempt.reason;
     }
@@ -195,25 +195,25 @@ function createReplyDeliveryCoordinator({
     }
   }
 
-  function acceptReceipt(sender, receipt) {
+  function acceptReceipt(sender     , receipt     ) {
     const result = delivery.accept(sender, receipt);
     debug("reply_render_receipt_recv", { ok: result.ok, reason: result.reason });
     return result;
   }
 
-  function status(candidateKey) {
+  function status(candidateKey     ) {
     if (waiting.has(candidateKey)) return { status: "pending", reason: null, evidence: null };
     return terminals.get(candidateKey) || delivery.status(candidateKey);
   }
 
-  function forgetClient(clientId) {
+  function forgetClient(clientId     ) {
     delivery.forgetClient(clientId);
     for (const [runId, originId] of [...runOrigins]) {
       if (originId === clientId) runOrigins.delete(runId);
     }
   }
 
-  function onSettled(listener) {
+  function onSettled(listener     ) {
     if (typeof listener !== "function") return () => {};
     listeners.add(listener);
     return () => listeners.delete(listener);

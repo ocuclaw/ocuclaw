@@ -14,4 +14,4 @@ function decideTitleWrite(previous, origin) {
   return { allowed: true, nextUserSet };
 }
 
-module.exports = { decideTitleWrite, isUserOrigin };
+module.exports = { isUserOrigin, decideTitleWrite };

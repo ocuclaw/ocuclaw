@@ -8,7 +8,7 @@ const CONNECT_PROBE_TIMEOUT_MS = 750;
 const SS_TIMEOUT_MS = 2000;
 const UNKNOWN_OWNER = "unknown";
 
-function parseSsPortHolders(ssOutput, port) {
+function parseSsPortHolders(ssOutput     , port     ) {
   const suffix = `:${port}`;
   const rows = [];
   for (const line of String(ssOutput || "").split("\n")) {
@@ -28,12 +28,12 @@ function parseSsPortHolders(ssOutput, port) {
   return rows;
 }
 
-function describeRow(row) {
+function describeRow(row     ) {
   const who = row.process ? `${row.process} pid ${row.pid}` : "unknown process";
   return `${who} (${row.state} ${row.local})`;
 }
 
-function describeSsPortHolders(rows) {
+function describeSsPortHolders(rows     ) {
   const list = Array.isArray(rows) ? rows : [];
   if (list.length === 0) return UNKNOWN_OWNER;
   const listen = list.find((row) => row && row.state === "LISTEN");
@@ -42,14 +42,14 @@ function describeSsPortHolders(rows) {
   return extra > 0 ? `${describeRow(head)} +${extra} more` : describeRow(head);
 }
 
-function probeHostForBindHost(host) {
+function probeHostForBindHost(host     ) {
   const value = typeof host === "string" ? host.trim() : "";
   if (!value || value === "0.0.0.0") return "127.0.0.1";
   if (value === "::" || value === "[::]") return "::1";
   return value.replace(/^\[(.*)\]$/, "$1");
 }
 
-function probeRelayPortListener(options = {}) {
+function probeRelayPortListener(options      = {}) {
   const connect = typeof options.connect === "function" ? options.connect : net.connect;
   const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
     ? options.timeoutMs
@@ -58,9 +58,9 @@ function probeRelayPortListener(options = {}) {
   const port = options.port;
   return new Promise((resolve) => {
     let settled = false;
-    let socket = null;
-    let timer = null;
-    const settle = (verdict) => {
+    let socket      = null;
+    let timer      = null;
+    const settle = (verdict     ) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
@@ -74,7 +74,7 @@ function probeRelayPortListener(options = {}) {
       return;
     }
     socket.once("connect", () => settle("listening"));
-    socket.once("error", (err) => {
+    socket.once("error", (err     ) => {
       settle(err && err.code === "ECONNREFUSED" ? "not_listening" : "unknown");
     });
     timer = setTimeout(() => settle("unknown"), timeoutMs);
@@ -82,7 +82,7 @@ function probeRelayPortListener(options = {}) {
   });
 }
 
-function readSsPortHolders(options = {}) {
+function readSsPortHolders(options      = {}) {
   const platform = options.platform || process.platform;
   if (platform !== "linux") return Promise.resolve(null);
   const run = typeof options.execFile === "function" ? options.execFile : execFile;
@@ -93,7 +93,7 @@ function readSsPortHolders(options = {}) {
         "ss",
         ["-tanp", `sport = :${port}`],
         { timeout: SS_TIMEOUT_MS, maxBuffer: 1024 * 1024, windowsHide: true },
-        (err, stdout) => {
+        (err     , stdout     ) => {
           if (err) {
             resolve(null);
             return;
@@ -107,7 +107,7 @@ function readSsPortHolders(options = {}) {
   });
 }
 
-const PROC_NET_TCP_STATES = Object.freeze({
+const PROC_NET_TCP_STATES      = Object.freeze({
   "01": "ESTAB",
   "02": "SYN-SENT",
   "03": "SYN-RECV",
@@ -121,7 +121,7 @@ const PROC_NET_TCP_STATES = Object.freeze({
   "0B": "CLOSING",
 });
 
-function procNetLocalAddress(hexAddress) {
+function procNetLocalAddress(hexAddress     ) {
   const value = String(hexAddress || "");
   const bytes = [];
   for (let i = 0; i + 1 < value.length; i += 2) bytes.push(parseInt(value.slice(i, i + 2), 16));
@@ -138,7 +138,7 @@ function procNetLocalAddress(hexAddress) {
   return value;
 }
 
-function parseProcNetTcpHolders(tableText, port) {
+function parseProcNetTcpHolders(tableText     , port     ) {
   const wantPort = Number(port);
   const rows = [];
   for (const line of String(tableText || "").split("\n")) {
@@ -157,7 +157,7 @@ function parseProcNetTcpHolders(tableText, port) {
   return rows;
 }
 
-function readProcNetPortHolders(options = {}) {
+function readProcNetPortHolders(options      = {}) {
   const platform = options.platform || process.platform;
   if (platform !== "linux") return Promise.resolve(null);
   const readFile = typeof options.readFile === "function" ? options.readFile : fs.promises.readFile;
@@ -173,7 +173,7 @@ function readProcNetPortHolders(options = {}) {
   });
 }
 
-async function readPortHolders(options = {}) {
+async function readPortHolders(options      = {}) {
   const readSs = typeof options.readSs === "function" ? options.readSs : readSsPortHolders;
   const readProc = typeof options.readProc === "function" ? options.readProc : readProcNetPortHolders;
   const fromSs = await readSs({ port: options.port }).catch(() => null);
@@ -181,7 +181,7 @@ async function readPortHolders(options = {}) {
   return readProc({ port: options.port }).catch(() => null);
 }
 
-async function describeRelayPortHolder(options = {}) {
+async function describeRelayPortHolder(options      = {}) {
   const probe = typeof options.probeListener === "function"
     ? options.probeListener
     : probeRelayPortListener;
@@ -210,27 +210,27 @@ async function describeRelayPortHolder(options = {}) {
   };
 }
 
-function relayPortLabel(host, port) {
+function relayPortLabel(host     , port     ) {
   return `relay port ${port} on ${host || "127.0.0.1"}`;
 }
 
 const FIX_HINT = "Stop that process or set the relay port (wsPort) to a free port.";
 
-function formatRelayPortListenerMessage(options = {}) {
+function formatRelayPortListenerMessage(options      = {}) {
   return `${relayPortLabel(options.host, options.port)} is in use (EADDRINUSE) by a listening process: ${options.owner || UNKNOWN_OWNER}. ${FIX_HINT}`;
 }
 
-function formatRelayPortHeldRetryMessage(options = {}) {
+function formatRelayPortHeldRetryMessage(options      = {}) {
   const seconds = Math.round((Number(options.delayMs) || 0) / 100) / 10;
   return `${relayPortLabel(options.host, options.port)} is held (EADDRINUSE) by ${options.owner || UNKNOWN_OWNER} with nothing listening (an outbound connection took it as its ephemeral port, #3749); bind retry ${options.attempt}/${options.maxAttempts} in ${seconds}s`;
 }
 
-function formatRelayPortHeldExhaustedMessage(options = {}) {
+function formatRelayPortHeldExhaustedMessage(options      = {}) {
   const seconds = Math.round((Number(options.elapsedMs) || 0) / 1000);
   return `${relayPortLabel(options.host, options.port)} is still held (EADDRINUSE) by ${options.owner || UNKNOWN_OWNER} after ${options.attempts} bind retries over ${seconds}s, with nothing listening (an outbound connection holds it as its ephemeral port, #3749). Close that connection or set the relay port (wsPort) to a free port.`;
 }
 
-function createRelayBindConflictError(message, conflict) {
+function createRelayBindConflictError(message     , conflict     ) {
   return Object.assign(new Error(message), {
     code: "EADDRINUSE",
     bindConflict: conflict,

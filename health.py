@@ -11,21 +11,24 @@ no network connection and mutates nothing.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import os
 import re
 import shutil
+import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
-from . import serve
+from . import custom_route, secret_access, serve
 from .control_link import HERMES_BUNDLE_DEFAULT_WS_BIND, HERMES_BUNDLE_DEFAULT_WS_PORT
 from .receipts import (
     fingerprint_home,
     read_app_presence,
     read_first_run_proof,
     read_gateway_state,
+    read_serving,
     resolve_receipt_home,
 )
 from .provenance import STATE_CERTIFIED_SOURCE, collect_hermes_source
@@ -38,21 +41,26 @@ PLATFORM_NAME = "ocuclaw"
 BUNDLE_DIR = Path(__file__).resolve().parent
 DEFAULT_RUNTIME_ENTRY = BUNDLE_DIR / "dist-cjs" / "runtime" / "hermes-runtime-entry.cjs"
 
-CERTIFIED_HERMES_VERSION = "0.21.5"
-CERTIFIED_HERMES_TAG = "v2026.9.24"
-CERTIFIED_HERMES_COMMIT = "f97608f178d1ffeca59860195ab7da295f7c8e5f"
-SUPPORTED_HERMES_MIN = (0, 21, 1)
-SUPPORTED_HERMES_MAX_EXCLUSIVE = (0, 22, 0)
+CERTIFIED_HERMES_VERSION = "0.23.2"
+CERTIFIED_HERMES_TAG = "v0.23.2"
+CERTIFIED_HERMES_COMMIT = "ae2a81ccc00e9b7c06301523e5bb09608397149c"
+SUPPORTED_HERMES_MIN = (0, 21, 4)
+SUPPORTED_HERMES_MAX_EXCLUSIVE = (0, 24, 0)
 
 # The ONE user id the adapter stamps on every wearer-originated event
 # (adapter.py `_build_message_event` → `build_source`). Continue here (#2509)
 # needs `platforms.ocuclaw.extra.allow_admin_from` to list exactly this id.
 OCUCLAW_WEARER_USER_ID = "ocuclaw-wearer"
+# Shared chats (on by default, Matty RULED 2026-11-07): Continue here without the
+# single-driver lock, on the first Hermes whose gateway owns every session for
+# every surface. `platforms.ocuclaw.extra.sharedChats: false` turns it off.
+SHARED_CHATS_EXTRA_KEY = "sharedChats"
+SHARED_CHATS_MIN_HERMES = (0, 23, 0)
 
 OCUCLAW_RELAY_TOKEN_ENV = "OCUCLAW_RELAY_TOKEN"
 OCUCLAW_SONIOX_API_KEY_ENV = "OCUCLAW_SONIOX_API_KEY"
 OCUCLAW_EVEN_AI_TOKEN_ENV = "OCUCLAW_EVEN_AI_TOKEN"
-# Silent input's TypeSafe key (#3359); the same `.env` contract as the others.
+# The saved TypeSafe key for the Jev features (#3359); the same `.env` contract as the others.
 OCUCLAW_TYPESAFE_API_KEY_ENV = "OCUCLAW_TYPESAFE_API_KEY"
 
 _SECRET_ENV_TO_KEY = {
@@ -185,6 +193,7 @@ def env_seed_reaches_extra(
     relay_token_present: bool,
     host_supported: bool,
     node_available: bool,
+    node_installable: bool = False,
 ) -> bool:
     """Whether Hermes would actually COMMIT the env seed onto this platform.
 
@@ -204,7 +213,10 @@ def env_seed_reaches_extra(
       that has written only `OCUCLAW_ALLOW_ADMIN_FROM` is not yet configured.
     * line 405 — ``check_fn`` must pass, or the platform must register
       ``ensure_deps_fn``. OcuClaw's `check_ocuclaw_requirements` is "supported
-      host and node found", and it registers no `ensure_deps_fn`.
+      host and node found". OcuClaw registers `ensure_ocuclaw_requirements`
+      as its ``ensure_deps_fn`` only on a supported host whose Hermes installs
+      Node itself (``node_installable``, 0.21.6+); there a missing Node does
+      not stop the commit, because the gateway installs it at start.
     """
     block = platform_config if isinstance(platform_config, Mapping) else {}
     enabled = block.get("enabled")
@@ -219,7 +231,8 @@ def env_seed_reaches_extra(
         )
         if not (host_supported and (relay_token_present or yaml_relay_token)):
             return False
-    return bool(host_supported and node_available)  # check_fn, no ensure_deps_fn
+    # check_fn, or the ensure_deps_fn registered beside it
+    return bool(host_supported and (node_available or node_installable))
 
 
 def effective_platform_extra(
@@ -294,6 +307,38 @@ def continue_here_configured(extra: Any) -> bool:
     return OCUCLAW_WEARER_USER_ID in admin_ids_from_extra(block)
 
 
+def shared_chats_requested(extra: Any) -> bool:
+    """Whether the host wants shared chats (`platforms.ocuclaw.extra.sharedChats`).
+
+    On unless the key turns it off: a literal false, or the string "false" a
+    hand-edited YAML or an env override can leave. A missing key or block, or a
+    value that is neither, keeps the default (on). `shared_chats_enabled` still
+    needs Continue here and Hermes 0.23 before anything is shared.
+    """
+    block = extra if isinstance(extra, Mapping) else {}
+    value = block.get(SHARED_CHATS_EXTRA_KEY)
+    if isinstance(value, bool):
+        return value
+    return not (isinstance(value, str) and value.strip().lower() == "false")
+
+
+def shared_chats_enabled(extra: Any, version: Any) -> bool:
+    """Shared chats: Continue here without the single-driver lock.
+
+    Hermes 0.23 runs every conversation in one gateway; Desktop, the TUI and
+    `hermes chat` attach to it as viewers instead of running their own agent, so
+    a Desktop window no longer answers from a private copy of the history. A
+    chat continued on glasses is then one conversation with one queue on every
+    surface. All three must hold: the host has not turned it off, Hermes honours the
+    wearer's `/resume --all` (`continue_here_configured`), and the gateway is
+    0.23.0 or newer. Any doubt reads as off.
+    """
+    if not shared_chats_requested(extra) or not continue_here_configured(extra):
+        return False
+    parsed = parse_version(str(version or ""))
+    return parsed is not None and parsed >= SHARED_CHATS_MIN_HERMES
+
+
 def streaming_setting(raw_config: Any) -> Optional[bool]:
     """`display.platforms.ocuclaw.streaming` as True, False, or None when unset.
 
@@ -331,6 +376,83 @@ def streaming_explicitly_off(raw_config: Any) -> bool:
     return streaming_setting(raw_config) is False
 
 
+LIVE_REASONING_KEY = "stream_reasoning_deltas"
+_LIVE_REASONING_HOOK_NAMES = (
+    "on_interim_message",
+    "on_stream_start",
+    "on_stream_delta",
+    "on_stream_end",
+)
+_LIVE_REASONING_HOOKS_MODULE = "agent.plugin_stream_hooks"
+
+
+def live_reasoning_setting(raw_config: Any) -> Optional[bool]:
+    """`plugins.stream_reasoning_deltas` as True, False, or None when unset.
+
+    Exactly as strict as the adapter's registration gate
+    (`adapter._stream_reasoning_deltas_configured`): only a real boolean
+    counts, so a value the gate would not act on is reported as unset rather
+    than as a choice. False is an operator's choice and stays theirs.
+    """
+    plugins = raw_config.get("plugins") if isinstance(raw_config, Mapping) else None
+    value = plugins.get(LIVE_REASONING_KEY) if isinstance(plugins, Mapping) else None
+    return value if isinstance(value, bool) else None
+
+
+def busy_input_mode_setting(raw_config: Any) -> Optional[str]:
+    """`display.busy_input_mode` as written in config.yaml, or None when unset.
+
+    `hermes config get` answers Hermes's default (`interrupt`) for an unset
+    key, so only the raw file can tell "nobody chose" from a choice.
+    """
+    display = raw_config.get("display") if isinstance(raw_config, Mapping) else None
+    value = display.get("busy_input_mode") if isinstance(display, Mapping) else None
+    text = str(value).strip() if value is not None else ""
+    return text or None
+
+
+def shared_chats_queue_owed(raw_config: Any, extra: Any, version: Any) -> bool:
+    """Shared chats live, and no busy mode saved (Matty RULED 2026-11-06).
+
+    With one conversation on the glasses and Desktop, Hermes's default
+    `interrupt` lets a message from one side cut the other side's reply short.
+    Setup writes `queue` here; any saved mode, `interrupt` included, is a
+    choice and owes nothing. Only a host where chats are actually shared
+    (`shared_chats_enabled`: not turned off, Continue here on, Hermes 0.23+)
+    owes it, since the key changes every chat on this Hermes.
+    """
+    return shared_chats_enabled(extra, version) and busy_input_mode_setting(raw_config) is None
+
+
+def live_reasoning_hooks_available() -> Optional[bool]:
+    """Whether this Hermes has the reasoning-delta hooks (0.20.5+).
+
+    The same probe the adapter runs at registration, side-effect free:
+    ``find_spec`` never imports the dispatcher module. None when Hermes'
+    hook vocabulary cannot be read at all.
+    """
+    try:
+        from hermes_cli.plugins import VALID_HOOKS
+
+        names = frozenset(str(name) for name in VALID_HOOKS)
+    except Exception:  # noqa: BLE001 - off-platform / broken host
+        return None
+    try:
+        module_present = importlib.util.find_spec(_LIVE_REASONING_HOOKS_MODULE) is not None
+    except Exception:  # noqa: BLE001 - a broken parent package is "absent"
+        module_present = False
+    return module_present and all(name in names for name in _LIVE_REASONING_HOOK_NAMES)
+
+
+def live_reasoning_hook_facts() -> Tuple[Optional[bool], Optional[bool]]:
+    """``(hooks available, hooks registered by this gateway)``.
+
+    Out of the gateway process nothing registered anything, so registration
+    is unknown (None) here; the adapter supplies its own answer in-process.
+    """
+    return live_reasoning_hooks_available(), None
+
+
 def parse_version(raw: str) -> Optional[Tuple[int, int, int]]:
     if not raw:
         return None
@@ -350,32 +472,49 @@ def parse_version(raw: str) -> Optional[Tuple[int, int, int]]:
 
 
 def hermes_version_supported(raw: str) -> bool:
+    """The hard gate: an identified Hermes at or above ``SUPPORTED_HERMES_MIN``.
+
+    There is no upper bound. A Hermes at or above
+    ``SUPPORTED_HERMES_MAX_EXCLUSIVE`` is newer than OcuClaw has tested: it
+    runs, and :func:`hermes_version_untested` makes every presenter say so.
+    """
     parsed = parse_version(raw)
-    return bool(parsed is not None and SUPPORTED_HERMES_MIN <= parsed < SUPPORTED_HERMES_MAX_EXCLUSIVE)
+    return bool(parsed is not None and parsed >= SUPPORTED_HERMES_MIN)
+
+
+def hermes_version_untested(raw: str) -> bool:
+    """True for a Hermes newer than the tested range (a warning, never a block)."""
+    parsed = parse_version(raw)
+    return bool(parsed is not None and parsed >= SUPPORTED_HERMES_MAX_EXCLUSIVE)
+
+
+def hermes_untested_message(version: Any) -> str:
+    """The one warning sentence the CLI, the dashboard and the gateway log show."""
+    return (
+        f"Hermes {version or 'unknown'} is newer than OcuClaw has tested "
+        f"(certified {CERTIFIED_HERMES_VERSION}). It should work; report "
+        "anything odd."
+    )
 
 
 def supported_hermes_range() -> str:
-    minimum = ".".join(map(str, SUPPORTED_HERMES_MIN))
-    maximum = ".".join(map(str, SUPPORTED_HERMES_MAX_EXCLUSIVE))
-    return f">={minimum},<{maximum}"
+    """The range the gate admits: the floor alone (plugin.yaml states the same)."""
+    return ">=" + ".".join(map(str, SUPPORTED_HERMES_MIN))
 
 
-# ``hermes_cli.__release_date__`` of each release in the supported range. A
-# checkout with no install stamp and no release tags (an old ``--depth 1``
-# install that pulled newer main) still carries the date of the release it
-# descends from. Only a date listed here identifies a version, so an unknown or
-# newer date stays unidentified and is refused.
+# The date-tagged releases in the supported range (tag ``v<date>``) and their
+# versions. The cross-OS e2e resolver reads this table to turn "floor" into a
+# release tag. The plugin no longer reads a version from
+# ``hermes_cli.__release_date__``: from 0.21.6 Hermes froze it at 2026.9.24,
+# so every later release would read as 0.21.5.
 HERMES_RELEASE_DATES = {
-    "2026.9.7": "0.21.1",
-    "2026.9.11": "0.21.2",
-    "2026.9.14": "0.21.3",
     "2026.9.21": "0.21.4",
     "2026.9.24": "0.21.5",
 }
 
 HERMES_VERSION_UNKNOWN_HINT = (
-    "OcuClaw could not identify the Hermes version (no install stamp, no "
-    "release tag and no known release date). Update Hermes with "
+    "OcuClaw could not identify the Hermes version (no install stamp and no "
+    "release tag). Update Hermes with "
     "`hermes update` or re-run the Hermes installer, then restart the gateway"
 )
 
@@ -405,17 +544,9 @@ def _version_from_version_info() -> str:
     return _identified_version(get_version_info().base_version)
 
 
-def _version_from_release_date() -> str:
-    from hermes_cli import __release_date__
-
-    date = str(__release_date__ or "").strip()
-    return HERMES_RELEASE_DATES.get(date, "")
-
-
 _HERMES_VERSION_SOURCES = (
     _version_from_attribute,
     _version_from_version_info,
-    _version_from_release_date,
 )
 
 
@@ -425,10 +556,11 @@ def hermes_version() -> str:
     The ONE place the plugin reads the Hermes version. First usable source wins:
     1. ``hermes_cli.__version__`` (skipping main's "0.0.0" placeholder);
     2. ``hermes_cli.version_info.get_version_info().base_version``
-       (install stamp, then git release tags);
-    3. ``hermes_cli.__release_date__`` looked up in ``HERMES_RELEASE_DATES``.
+       (install stamp, then git release tags).
     Package metadata and pyproject are not used: main ships them as "0.0.0",
     and an editable install's metadata keeps the version it was installed at.
+    Nor is ``__release_date__``: frozen at 2026.9.24 since 0.21.6, it would
+    report any newer tagless checkout as 0.21.5 and let it past the gate.
     """
     for source in _HERMES_VERSION_SOURCES:
         try:
@@ -441,6 +573,12 @@ def hermes_version() -> str:
 
 
 def find_node() -> Optional[str]:
+    """The Node the gateway would run, or None.
+
+    No PATH fallback when the helper answers None: from Hermes 0.21.6 that
+    None means "Hermes has not installed Node yet", and reporting a PATH
+    Node here would claim a runtime the gateway refuses to use.
+    """
     try:
         from hermes_constants import find_node_executable
 
@@ -449,13 +587,25 @@ def find_node() -> Optional[str]:
         return shutil.which("node")
 
 
-def setup_secret_present(env_name: str) -> bool:
-    try:
-        from hermes_cli.config import get_env_value
+def node_install_available() -> bool:
+    """Can Hermes' package manager install Node for OcuClaw?
 
-        return bool(str(get_env_value(env_name) or "").strip())
-    except Exception:  # noqa: BLE001 - presence only, never the value
-        return bool(os.environ.get(env_name, "").strip())
+    Hermes 0.21.6 moved Node under its package manager (``pm``).
+    ``hermes_constants.find_node_executable`` returns only Node that ``pm``
+    installed and None otherwise, never the PATH copy, because mixed
+    toolchains break native-addon ABIs and npm caches; callers are meant to
+    ``pm.ensure`` on None. Hermes 0.21.5 and older have no ``pm``, and their
+    helper still falls back to the PATH copy itself.
+    """
+    try:
+        return importlib.util.find_spec("pm") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def setup_secret_present(env_name: str) -> bool:
+    # Presence only, never the value; read through Hermes (catalogue rule 11).
+    return secret_access.secret_present(env_name)
 
 
 def secret_presence_inventory() -> Dict[str, bool]:
@@ -488,9 +638,73 @@ def _read_loaded_version() -> Optional[str]:
 # gateway claim it is already running the newly installed code.
 _LOADED_OCUCLAW_VERSION = _read_loaded_version()
 
+# The holder the adapter keeps OUTSIDE the purged `hermes_plugins.ocuclaw*`
+# namespace (#3625). A Hermes plugin reload re-imports this module, and Hermes
+# 0.22.3+ reloads after every Desktop "Update" click, so the capture above then
+# reads the NEW plugin.yaml while the adapter and Node child built before the
+# reload still serve the old code until a gateway restart. The adapter records
+# the version it was built from here, and that is the version this process
+# serves.
+LIVE_ADAPTER_HOLDER_MODULE = "_ocuclaw_hermes_live_adapters"
+
+
+def loaded_ocuclaw_version() -> Optional[str]:
+    """The version this copy of the module was imported from."""
+    return _LOADED_OCUCLAW_VERSION
+
 
 def ocuclaw_version() -> Optional[str]:
+    """The version this process serves: the live adapter's, else this import's."""
+    holder = sys.modules.get(LIVE_ADAPTER_HOLDER_MODULE)
+    serving = getattr(holder, "serving_version", None)
+    if isinstance(serving, str) and serving:
+        return serving
     return _LOADED_OCUCLAW_VERSION
+
+
+def installed_ocuclaw_version() -> Optional[str]:
+    """The version in plugin.yaml on disk now, which an update replaces."""
+    return _read_loaded_version()
+
+
+_VERSION_TOKEN = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$")
+
+
+def restart_to_finish(*, home: Optional[Path] = None) -> Optional[Dict[str, str]]:
+    """Describe installed code or saved setup settings awaiting a restart.
+
+    Read in the Desktop backend, which cannot see the gateway's memory. Only
+    the gateway that is live now counts, by pid and start time: a receipt left by a stopped
+    or restarted gateway says nothing about the code running.
+    """
+    resolved = home if home is not None else resolve_receipt_home()
+    if resolved is None:
+        return None
+    serving, _status = read_serving(fingerprint_home(resolved), home=resolved)
+    gateway, _gateway_status, live = read_gateway_state(home=resolved)
+    if serving is None or gateway is None or live is not True:
+        return None
+    pid = serving.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid != gateway.get("pid"):
+        return None
+    # A recycled PID must not make an old gateway's receipt authoritative.
+    if serving.get("start_time") != gateway.get("start_time"):
+        return None
+    serving_version = serving.get("version")
+    installed = installed_ocuclaw_version()
+    if not all(isinstance(v, str) and _VERSION_TOKEN.match(v) for v in (serving_version, installed)):
+        return None
+    if serving_version == installed:
+        from .setup_activation import current_fingerprint
+
+        loaded = serving.get("setupConfigurationFingerprint")
+        saved = current_fingerprint()
+        if not (isinstance(loaded, str) and re.fullmatch(r"[a-f0-9]{64}", loaded)
+                and saved is not None and saved != loaded):
+            return None
+        return {"installedVersion": installed, "servingVersion": serving_version,
+                "reason": "configuration"}
+    return {"installedVersion": installed, "servingVersion": serving_version}
 
 
 def profile_name(home: Optional[Path]) -> Optional[str]:
@@ -578,6 +792,47 @@ def collect_serve_facts(extra: Mapping[str, Any], relay_port_valid: bool) -> Dic
     }
 
 
+def _host_is_cloudways() -> bool:
+    """The decisive Cloudways verdict only; fail-soft to an ordinary host."""
+    try:
+        from . import cloudways
+
+        return cloudways.detect().verdict == cloudways.DETECT_CLOUDWAYS
+    except Exception:  # noqa: BLE001 - a classification must not become an outage
+        logger.exception("[ocuclaw] cloudways detection unavailable")
+        return False
+
+
+def collect_custom_route_facts(
+    phone_address: str,
+    extra: Mapping[str, Any],
+    relay_port_valid: bool,
+    *,
+    cloudways_fn: Callable[[], bool] = _host_is_cloudways,
+) -> Dict[str, Any]:
+    """The config-only half of the custom route check (#5209).
+
+    Passive: canonical form and the Cloudways refusal read only local state.
+    DNS, TCP, TLS and the route probe are doctor's bounded active lane, so a
+    passive collector leaves them unasked, exactly as it leaves Serve
+    reachability to the probe. No `tailscale` command runs in custom mode.
+    """
+    relay_port: Optional[int] = None
+    if relay_port_valid:
+        try:
+            relay_port = int(extra.get("wsPort", HERMES_BUNDLE_DEFAULT_WS_PORT))
+        except (TypeError, ValueError):
+            relay_port = None
+    stopped = custom_route.static_result(phone_address, is_cloudways=bool(cloudways_fn()))
+    return {
+        "customPhoneAddress": phone_address,
+        "customRouteReason": None if stopped is None else stopped.reason,
+        "customRouteObservedAt": snapshot_now_iso(),
+        # The loopback port the user's front door must forward to.
+        "serveRelayPort": relay_port,
+    }
+
+
 def collect_health_facts(
     *,
     observation_mode: str = OBSERVATION_PASSIVE,
@@ -585,9 +840,11 @@ def collect_health_facts(
     setup_raw_config_fn: Callable[[], Tuple[Dict[str, Any], bool]] = setup_raw_config,
     hermes_version_fn: Callable[[], str] = hermes_version,
     supported_fn: Callable[[str], bool] = hermes_version_supported,
+    untested_fn: Callable[[str], bool] = hermes_version_untested,
     supported_range_fn: Callable[[], str] = supported_hermes_range,
     secret_inventory_fn: Callable[[], Dict[str, bool]] = secret_presence_inventory,
     node_fn: Callable[[], Optional[str]] = find_node,
+    node_installable_fn: Callable[[], bool] = node_install_available,
     ocuclaw_version_fn: Callable[[], Optional[str]] = ocuclaw_version,
     source_fn: Callable[[str, Optional[Path]], Mapping[str, Any]] = hermes_source,
     profile_name_fn: Callable[[Optional[Path]], Optional[str]] = profile_name,
@@ -597,6 +854,10 @@ def collect_health_facts(
     gateway_facts_fn: Callable[[], Dict[str, Any]] = collect_gateway_facts,
     serve_facts_fn: Callable[[Mapping[str, Any], bool], Dict[str, Any]] = collect_serve_facts,
     runtime_entry: Path = DEFAULT_RUNTIME_ENTRY,
+    custom_route_facts_fn: Callable[..., Dict[str, Any]] = collect_custom_route_facts,
+    live_reasoning_hooks_fn: Callable[
+        [], Tuple[Optional[bool], Optional[bool]]
+    ] = live_reasoning_hook_facts,
 ) -> Dict[str, Any]:
     """Collect the frozen Snapshot v1 facts dict without adapter imports.
 
@@ -628,6 +889,7 @@ def collect_health_facts(
             relay_token_present=bool(secret_inventory.get("relayToken")),
             host_supported=bool(supported_fn(version)),
             node_available=node is not None,
+            node_installable=bool(node_installable_fn()),
         ),
     )
 
@@ -635,8 +897,9 @@ def collect_health_facts(
     relay_port_valid = True
     if "wsPort" in extra:
         try:
-            relay_port_valid = 1 <= int(extra["wsPort"]) <= 65535
-        except (TypeError, ValueError):
+            # #7316: a bool is not a port, and YAML `.inf` overflows int().
+            relay_port_valid = not isinstance(extra["wsPort"], bool) and 1 <= int(extra["wsPort"]) <= 65535
+        except (TypeError, ValueError, OverflowError):
             relay_port_valid = False
 
     # Agent choice (#2515): the same two leaves `_setup_status` judges, carried
@@ -657,6 +920,7 @@ def collect_health_facts(
     fingerprint = fingerprint_home(home)
     presence_record, presence_status, presence_writer_live = read_presence_fn(fingerprint, home=home)
     proof_record, proof_status = read_proof_fn(fingerprint, home=home)
+    live_hooks_available, live_hooks_registered = live_reasoning_hooks_fn()
 
     facts = blank_facts(
         observedAt=snapshot_now_iso(),
@@ -674,6 +938,7 @@ def collect_health_facts(
         hermesPackageVersion=version or None,
         hermesSource=source_receipt,
         hermesVersionSupported=supported_fn(version),
+        hermesVersionUntested=untested_fn(version),
         supportedHermesRange=supported_range_fn(),
         configReadable=config_readable,
         platformExplicitlyDisabled=platform_config.get("enabled") is False,
@@ -684,6 +949,13 @@ def collect_health_facts(
         continueHereConfigured=continue_here_configured(extra),
         streamingConfigured=streaming_configured(raw_config),
         streamingExplicitlyOff=streaming_explicitly_off(raw_config),
+        liveReasoningSetting=(
+            live_reasoning_setting(raw_config) if config_readable else None
+        ),
+        liveReasoningHooksAvailable=live_hooks_available,
+        liveReasoningHooksRegistered=live_hooks_registered,
+        sharedChatsQueueOwed=config_readable
+        and shared_chats_queue_owed(raw_config, extra, version),
         multiplexProfiles=multiplex_profiles,
         agentMode=agent_mode,
         secretsPresent=secret_inventory,
@@ -699,7 +971,12 @@ def collect_health_facts(
         firstRunProofStatus=proof_status,
     )
     facts.update(gateway_facts_fn())
-    facts.update(serve_facts_fn(extra, relay_port_valid))
+    # #5209: a configured phone address replaces the Serve route entirely.
+    phone_address = custom_route.configured_phone_address(extra)
+    if phone_address is None:
+        facts.update(serve_facts_fn(extra, relay_port_valid))
+    else:
+        facts.update(custom_route_facts_fn(phone_address, extra, relay_port_valid))
     return facts
 
 
@@ -711,6 +988,10 @@ __all__ = [
     "admin_ids_from_extra",
     "continue_here_configured",
     "effective_platform_extra",
+    "SHARED_CHATS_EXTRA_KEY",
+    "SHARED_CHATS_MIN_HERMES",
+    "shared_chats_enabled",
+    "shared_chats_requested",
     "env_seed_reaches_extra",
     "platform_env_seed",
     "reset_platform_env_warnings",
@@ -718,6 +999,7 @@ __all__ = [
     "CERTIFIED_HERMES_TAG",
     "CERTIFIED_HERMES_VERSION",
     "collect_gateway_facts",
+    "collect_custom_route_facts",
     "collect_health_facts",
     "collect_serve_facts",
     "gateway_facts_from_receipt",

@@ -1,7 +1,5 @@
 const { randomUUID, createHmac } = require("node:crypto");
-
 const fs = require("node:fs");
-
 const path = require("node:path");
 
 function requestProofStore(stateDir     ) {
@@ -61,10 +59,26 @@ function createEvenAiRequestObservation(options      = {}) {
   let testSerial = 0;
   let expiresAtMs      = null;
   let timer      = null;
+  let testId                = null;
+  let armedAtMs                = null;
+  let requestId                = null;
+  let markerApplied = false;
+  let authenticatedReceipts = 0;
+  let observedStages                         = {};
+  const diagnostic = (stage        , terminal = "pending") => {
+    observedStages[stage] ??= now();
+    const coverage = options.captureCoverage?.(armedAtMs) || "unknown";
+    options.diagnostic?.({ version: 1, testId, revision, stage, terminal,
+      armedAtMs, deadlineMs: expiresAtMs, observedAtMs: now(), requestId,
+      markerApplied, authenticatedReceipts, stages: { ...observedStages }, captureCoverage: coverage,
+      noRequestEvidence: stage === "timed_out" && testSerial === 0
+        ? authenticatedReceipts > 0 ? "request_observed_not_admitted" : coverage === "complete" ? "no_request_observed" : coverage : "not_applicable" });
+  };
   const clearTimer = () => { if (timer) clearTimeout(timer); timer = null; };
   function expire() {
     if (["waiting", "received"].includes(testState) && now() >= expiresAtMs) {
       testState = "timed_out";
+      diagnostic("timed_out", "failure");
       clearTimer();
       changed();
     }
@@ -75,6 +89,7 @@ function createEvenAiRequestObservation(options      = {}) {
     const nextProofKey = proofs.key(readProofContext());
     if (next === context && nextProofKey === proofKey) return false;
     const first = context === undefined;
+    if (!first && ["waiting", "received"].includes(testState)) diagnostic("context_changed", "superseded");
     context = next;
     proofKey = nextProofKey;
     if (!first) revision = newRevision();
@@ -93,13 +108,20 @@ function createEvenAiRequestObservation(options      = {}) {
   return {
     refresh,
     close: clearTimer,
-    arm() {
+    arm(requestedTestId         ) {
       refresh();
       expire();
       if (["waiting", "received"].includes(testState)) return false;
+      testId = requestedTestId && /^[a-zA-Z0-9_-]{1,80}$/.test(requestedTestId) ? requestedTestId : randomUUID();
+      armedAtMs = now();
+      requestId = null;
+      markerApplied = false;
+      authenticatedReceipts = 0;
+      observedStages = {};
       testState = "waiting";
       testSerial = 0;
       expiresAtMs = now() + 120_000;
+      diagnostic("armed");
       clearTimer();
       timer = setTimeout(expire, 120_000);
       timer?.unref?.();
@@ -111,24 +133,44 @@ function createEvenAiRequestObservation(options      = {}) {
       if (!["waiting", "received"].includes(testState)) return;
       clearTimer();
       testState = "cancelled";
+      diagnostic("cancelled", "cancellation");
       changed();
     },
-    begin() {
+    authenticatedReceipt(endpointRequestId        ) {
+      refresh();
+      expire();
+      if (testState !== "waiting") return;
+      authenticatedReceipts = Math.min(2147483647, authenticatedReceipts + 1);
+      requestId = /^[a-zA-Z0-9_-]{1,80}$/.test(endpointRequestId) ? endpointRequestId : null;
+      diagnostic("authenticated_request_received");
+    },
+    begin(endpointRequestId         ) {
       refresh();
       expire();
       const ticket = { revision, serial: ++serial };
       if (testState === "waiting") {
+        requestId = endpointRequestId && /^[a-zA-Z0-9_-]{1,80}$/.test(endpointRequestId) ? endpointRequestId : null;
         testState = "received";
         testSerial = ticket.serial;
+        diagnostic("request_accepted");
         changed();
       }
       return ticket;
     },
+    dispatched(ticket     ) {
+      refresh();
+      expire();
+      if (ticket?.revision === revision && ticket.serial === testSerial && testState === "received") diagnostic("request_dispatched");
+    },
     decorateReply(ticket     , text        ) {
       refresh();
       expire();
-      return ticket?.revision === revision && ticket.serial === testSerial && testState === "received" && text.trim()
-        ? `OcuClaw is now configured correctly with Even AI.\n\n${text}` : text;
+      if (ticket?.revision === revision && ticket.serial === testSerial && testState === "received" && text.trim()) {
+        markerApplied = true;
+        diagnostic("reply_marker_applied");
+        return `OcuClaw is now configured correctly with Even AI.\n\n${text}`;
+      }
+      return text;
     },
     complete(ticket     , result     ) {
       refresh();
@@ -142,6 +184,7 @@ function createEvenAiRequestObservation(options      = {}) {
       expire();
       if (ticket.serial === testSerial && testState === "received") {
         testState = result === "succeeded" ? "replied" : "failed";
+        diagnostic(testState, result === "succeeded" ? "success" : "failure");
         clearTimer();
       } else if (!["waiting", "received"].includes(testState)) {
 

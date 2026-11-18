@@ -10,20 +10,34 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import receipts, optional_diagnostics as diagnostics
+from . import receipts, secret_access, optional_diagnostics as diagnostics
 
 PENDING = "ocuclaw.optional-pending.json"
 ACTIVE = "ocuclaw.optional-active.json"
 LOCK = "ocuclaw.optional-setup.lock"
 FIELDS = {"soniox": "OCUCLAW_SONIOX_API_KEY", "evenAi": "OCUCLAW_EVEN_AI_TOKEN",
           "typesafe": "OCUCLAW_TYPESAFE_API_KEY"}
-# One masked-prompt label per FIELDS key. Saving the TypeSafe key is itself the
-# arming gesture for silent input's word ranking (#3359) — there is no second
-# switch — so the label names the service, not a feature toggle.
+# One masked-prompt label per FIELDS key. The TypeSafe key (#3359) is shared by
+# LiveUI Jev, Jev in program cards and the Bot Screen's Jev mode, and saving it
+# turns none of them on: each has its own phone switch (`optional_diagnostics`),
+# so the label names the service, not a feature toggle.
 LABELS = {"soniox": "Soniox API key", "evenAi": "Even AI token",
           "typesafe": "TypeSafe API key"}
 # `hermes ocuclaw optional-setup save <choice>` spellings, kebab-case for the CLI.
 CLI_CHOICES = {"soniox": "soniox", "even-ai": "evenAi", "typesafe": "typesafe"}
+#: Credentials the phone may remove, and the loaded-settings key that shows the
+#: running relay still holds one. Removing Even AI ("Turn off Even AI") also
+#: turns `platforms.ocuclaw.extra.evenAiEnabled` off, and its loaded evidence
+#: is the token AND the relay's enable (`_loaded`).
+REMOVABLE = frozenset({"typesafe", "evenAi"})
+LOADED_SETTINGS = {"typesafe": "typesafeApiKey", "evenAi": "evenAiToken"}
+#: `hermes ocuclaw optional-setup remove <choice>` spellings.
+CLI_REMOVE_CHOICES = {cli: name for cli, name in CLI_CHOICES.items() if name in REMOVABLE}
+#: Internal states a restart activates, and the state each settles into after it.
+#: `removed_not_activated`: the key is gone from `.env`, but the fresh observation
+#: says the running relay still loaded it.
+RESTART_STATES = {"saved_not_activated": "available_to_test",
+                  "removed_not_activated": "not_configured"}
 
 
 def _home() -> Path:
@@ -149,13 +163,18 @@ def _finish_save_once(home: Path, revision: str, selected: str, *, saved: bool) 
 
 
 def _disk_values() -> tuple[dict, bool]:
-    from hermes_cli.config import invalidate_env_cache, load_env, read_raw_config
+    """The saved keys and the Even AI switch, as the profile's store holds them now.
 
-    invalidate_env_cache()
-    env = load_env()
+    Through Hermes's own scope builder (catalogue rule 11), never a raw `.env`
+    parse, and without the process environment: a removal that waits on a
+    restart must read as removed although this process still holds the key.
+    """
+    from hermes_cli.config import read_raw_config
+
     cfg = read_raw_config()
     extra = ((cfg.get("platforms") or {}).get("ocuclaw") or {}).get("extra") or {}
-    return {name: str(env.get(key) or "").strip() for name, key in FIELDS.items()}, extra.get("evenAiEnabled") is True
+    return ({name: secret_access.read_stored_secret(key) or "" for name, key in FIELDS.items()},
+            extra.get("evenAiEnabled") is True)
 
 
 def _file_revision(home: Path) -> list:
@@ -169,10 +188,60 @@ def _file_revision(home: Path) -> list:
     return result
 
 
+def _typesafe_fallback_present() -> bool:
+    """Whether the deployment-time `TYPESAFE_API_KEY` is set (env store, then process env).
+
+    LiveUI Jev falls back to it when no key is saved (`adapter._resolve_liveui_jev`), so the
+    phone must not say "no key" while it would still be used. A boolean only, read the same
+    way the adapter reads the key (`adapter._typesafe_api_key`).
+    """
+    return secret_access.secret_present("TYPESAFE_API_KEY")
+
+
+#: #6942 · The relay's last Jev check (#6938): a small file in the relay's state folder,
+#: deleted when the relay starts and rewritten after each check, so a missing file means
+#: "not checked since this relay started". The result only, never the key.
+JEV_CHECK_FILENAME = "jev-check.json"
+JEV_CHECK_RESULTS = frozenset({"working", "key_rejected", "unreachable", "no_key", "not_loaded"})
+
+
+def _relay_state_dir(home: Path) -> Path:
+    """The relay's `stateDir`, as `adapter` resolves it: `extra.stateDir`, else `<home>/ocuclaw`."""
+    try:
+        from hermes_cli.config import read_raw_config
+
+        extra = ((read_raw_config().get("platforms") or {}).get("ocuclaw") or {}).get("extra") or {}
+        configured = extra.get("stateDir")
+        if isinstance(configured, str) and configured.strip():
+            return Path(configured).expanduser()
+    except Exception:  # noqa: BLE001 - an unreadable config keeps the default folder
+        pass
+    return home / "ocuclaw"
+
+
+def read_jev_check(home: Path) -> str | None:
+    """The last Jev check's result, or None when there is none or it can't be read."""
+    try:
+        row = json.loads((_relay_state_dir(home) / JEV_CHECK_FILENAME).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(row, dict) or row.get("v") != 1:
+        return None
+    # As the OpenClaw reader (readJevCheckRecord): the writer always stamps the time.
+    checked_at = row.get("checkedAtMs")
+    if isinstance(checked_at, bool) or not isinstance(checked_at, (int, float)) or checked_at != checked_at:
+        return None
+    if checked_at in (float("inf"), float("-inf")):
+        return None
+    result = row.get("result")
+    return result if isinstance(result, str) and result in JEV_CHECK_RESULTS else None
+
+
 def read_disk(home: Path) -> dict:
     """One read of `.env`/`config.yaml` that `status`/snapshot callers can share."""
     values, enabled = _disk_values()
-    return {"values": values, "enabled": enabled, "files": _file_revision(home)}
+    return {"values": values, "enabled": enabled, "files": _file_revision(home),
+            "typesafeFallback": _typesafe_fallback_present()}
 
 
 def read_state(home: Path) -> dict:
@@ -222,12 +291,14 @@ def observe_runtime(settings: dict, *, home: Path | None = None) -> dict | None:
                 "soniox": bool(values["soniox"]) and settings.get("sonioxApiKey") == values["soniox"],
                 "evenAi": bool(values["evenAi"]) and settings.get("evenAiToken") == values["evenAi"]
                 and settings.get("evenAiEnabled") is True and enabled,
-                # The saved key IS the switch for ranking, so a loaded key is the
-                # whole activation evidence — there is no separate enabled flag.
+                # A loaded key is the key's whole activation evidence. Whether a Jev
+                # feature is on is its own switch's match below (e.g. `liveui_jev`).
                 "typesafe": bool(values["typesafe"]) and settings.get("typesafeApiKey") == values["typesafe"],
             }
-            loaded_permissions = {key: settings.get(field) if type(settings.get(field)) is bool else None
-                                  for key, field in diagnostics.FIELDS.items()}
+            # The Jev and MCP in cards switches are nested: the relay loaded
+            # `settings["liveuiJev"]["enabled"]`,
+            # `settings["programCardsJev"]["enabled"]` and `settings["programCardsMcp"]["enabled"]`.
+            loaded_permissions = {key: diagnostics.loaded(settings, key) for key in diagnostics.FIELDS}
             matches.update({diagnostics.CHOICES[key]: loaded_permissions[key] is permissions[key]
                             for key in diagnostics.FIELDS})
             active = {"v": 1, "revision": marker.get("revision"),
@@ -235,9 +306,13 @@ def observe_runtime(settings: dict, *, home: Path | None = None) -> dict | None:
                       "observedAt": time.time(), "files": before, "matches": matches,
                       # These settings belong to the relay that just answered,
                       # never the CLI's next-start/default configuration.
-                      "relayPort": settings.get("wsPort"), "diagnostics": loaded_permissions}
+                      "relayPort": settings.get("wsPort"), "diagnostics": loaded_permissions,
+                      # Booleans only: which removable credentials the relay holds.
+                      # A key removed from `.env` stays loaded until a restart.
+                      "loaded": _loaded(settings)}
             _write(home, ACTIVE, active)
-            return {"disk": {"values": values, "enabled": enabled, "files": before},
+            return {"disk": {"values": values, "enabled": enabled, "files": before,
+                             "typesafeFallback": _typesafe_fallback_present()},
                     "pending": {"v": 1, **marker}, "active": active, "permissions": permissions}
     except Exception:
         # Optional evidence must not break the relay or reveal a writer error.
@@ -270,6 +345,32 @@ def observation_current(home: Path, state: dict | None = None) -> bool:
             and active.get("files") == state["disk"]["files"]
             and active.get("revision") == state["pending"].get("revision")
             and 0 <= time.time() - active.get("observedAt", 0) <= OBSERVATION_REFRESH_S)
+
+
+def _loaded(settings: dict) -> dict:
+    """Booleans only: which removable credentials the answering relay holds.
+
+    Even AI counts as held only while the relay also loaded it enabled: a
+    token loaded with Even AI off serves nothing, so a restart is not needed
+    to turn it off.
+    """
+    loaded = {name: bool(settings.get(key)) for name, key in LOADED_SETTINGS.items()}
+    loaded["evenAi"] = loaded["evenAi"] and settings.get("evenAiEnabled") is True
+    return loaded
+
+
+def has_removable(name: str, values: dict, even_ai_enabled: bool) -> bool:
+    """Is there anything to remove? Even AI also counts its enable flag, so a
+    retry after a half-finished turn-off (token kept, flag off, or the reverse)
+    finishes the job."""
+    return bool(values[name]) or (name == "evenAi" and even_ai_enabled)
+
+
+def _removed(name: str, values: dict, even_ai_enabled: bool) -> bool:
+    """Is this credential removed on disk? Even AI is removed only once it is
+    also turned off: a host whose token sits in config.yaml (not `.env`) with
+    Even AI on still runs it, and is not offered a restart."""
+    return not values[name] and (name != "evenAi" or not even_ai_enabled)
 
 
 def _would_load(name: str, values: dict, even_ai_enabled: bool) -> bool:
@@ -313,7 +414,11 @@ def status(home: Path | None = None, *, state: dict | None = None) -> dict:
         gateway, live = state["gateway"], state["live"]
         row, active, disk = state["pending"], state["active"], state["disk"]
         values, even_ai_enabled, current_files = disk["values"], disk["enabled"], disk["files"]
-        choices = row.get("choices") or {}
+        # Only choices this bundle still knows. A receipt from a retired switch (such
+        # as the old `silentInputJev`, Matt 2026-10-31) can no longer be re-saved, so
+        # a stale "saving" for it must never fence restart admission forever.
+        choices = {name: value for name, value in (row.get("choices") or {}).items()
+                   if name in FIELDS or name in diagnostics.CHOICES.values()}
         fresh = (live is True and _relay_is_connected_now(gateway)
                  and active.get("pid") == gateway.get("pid")
                  and active.get("startTime") == gateway.get("start_time")
@@ -331,6 +436,7 @@ def status(home: Path | None = None, *, state: dict | None = None) -> dict:
             and isinstance(gateway, dict)
             and (attempt.get("pid"), attempt.get("startTime")) != (gateway.get("pid"), gateway.get("start_time")))
         states, reasons = {}, {}
+        loaded = active.get("loaded") or {}
         for name in FIELDS:
             mismatch_after_restart = restarted_for_this_env and matches.get(name) is False
             loadable = _would_load(name, values, even_ai_enabled)
@@ -338,6 +444,16 @@ def status(home: Path | None = None, *, state: dict | None = None) -> dict:
                 states[name] = "save_failed"
             elif current and matches.get(name) is True:
                 states[name] = "available_to_test"
+            elif (_removed(name, values, even_ai_enabled) and fresh and loaded.get(name) is True
+                  and (files_match or (choices.get(name) == "saved" and not same_revision))):
+                # Removed from `.env` while the live relay still holds it: one
+                # restart drops it. A restart for this `.env` that still loads it
+                # (yaml or process env supplies it) must not loop.
+                if restarted_for_this_env:
+                    states[name] = "unknown"
+                    reasons[name] = REASON_DIFFERS_AFTER_RESTART
+                else:
+                    states[name] = "removed_not_activated"
             elif not values[name]:
                 states[name] = "not_configured"
             elif mismatch_after_restart and loadable:
@@ -367,7 +483,7 @@ def status(home: Path | None = None, *, state: dict | None = None) -> dict:
                 permission_states[name] = "unknown"
         # Never restart underneath a credential/config writer. A later status
         # can admit the grouped activation once every in-flight save finishes.
-        pending = (any(value == "saved_not_activated" for value in (*states.values(), *permission_states.values()))
+        pending = (any(value in RESTART_STATES for value in (*states.values(), *permission_states.values()))
                    and "saving" not in choices.values())
         admission = row.get("activationRequested") or {}
         admitted_here = (bool(admission) and isinstance(gateway, dict)
@@ -378,12 +494,30 @@ def status(home: Path | None = None, *, state: dict | None = None) -> dict:
                             "startTime": gateway.get("start_time"), "revision": row.get("revision")}
                            if current and isinstance(port, int) and not isinstance(port, bool)
                            and 1 <= port <= 65535 else None)
+        loaded_permissions = (active.get("diagnostics") or {}) if fresh else {}
         return {"state": "ready", "capabilities": states, "reasons": reasons, "restartRequired": pending,
-                "diagnostics": {"supported": True, **permissions,
-                    "activeAccess": (active.get("diagnostics") or {}).get("access") if fresh else None,
-                    "activeHandoff": (active.get("diagnostics") or {}).get("handoff") if fresh else None},
+                # Public camelCase keys only; `liveui_jev`, `program_cards_jev` and
+                # `program_cards_mcp` are this lane's internal names. Silent input no longer
+                # uses Jev (Matt, 2026-10-31): no `silentInputJev`/`activeSilentInputJev`.
+                "diagnostics": {"supported": True,
+                    "access": permissions["access"], "handoff": permissions["handoff"],
+                    "liveuiJev": permissions["liveui_jev"],
+                    "programCardsJev": permissions["program_cards_jev"],
+                    "programCardsMcp": permissions["program_cards_mcp"],
+                    "programCardsModel": permissions["program_cards_model"],
+                    "activeAccess": loaded_permissions.get("access") if fresh else None,
+                    "activeHandoff": loaded_permissions.get("handoff") if fresh else None,
+                    "activeLiveuiJev": loaded_permissions.get("liveui_jev") if fresh else None,
+                    "activeProgramCardsJev": loaded_permissions.get("program_cards_jev") if fresh else None,
+                    "activeProgramCardsMcp": loaded_permissions.get("program_cards_mcp") if fresh else None,
+                    "activeProgramCardsModel": loaded_permissions.get("program_cards_model") if fresh else None,
+                    # Whether LiveUI Jev would find a key: the saved one, else TYPESAFE_API_KEY.
+                    "liveuiJevKeyAvailable": bool(values["typesafe"]) or disk.get("typesafeFallback") is True},
                 "permissionStates": {name: value for name, value in permission_states.items() if name in choices},
                 "activationRequested": admitted_here,
+                # #6942 · the last Jev check's result (None: not checked since the relay
+                # started). Chat setup's `jev` extra reads it; the phone snapshot does not.
+                "jevCheck": read_jev_check(home),
                 "revision": row.get("revision"), "runtimeContext": runtime_context}
     except Exception:
         return {"state": "unavailable", "capabilities": {}, "restartRequired": False}
@@ -555,6 +689,112 @@ def save_credential(home: Path | None, name: str, value: str) -> bool:
     if not enabled:
         raise ValueError(ENABLE_FAILED)
     return True
+
+
+def remove_credential(home: Path, name: str) -> bool:
+    """Remove one saved credential from `.env` under the same receipt fence as a save.
+
+    Only `REMOVABLE` credentials: the TypeSafe key, and Even AI ("Turn off
+    Even AI"). Writes through Hermes's `remove_env_value` and reads `.env`
+    back. Even AI first turns `platforms.ocuclaw.extra.evenAiEnabled` off
+    through `set_config_value` (read back too), then removes the token: the
+    relay refuses to load an enabled Even AI with no token, so the flag must
+    never outlive the token. The running relay keeps the removed key until a
+    restart, which `status` reports as `removed_not_activated`. Returns True
+    when something was removed, False when nothing was on disk. Raises
+    `ValueError(code)`:
+
+    - `invalid_selection`, `busy`, `activation_pending_reconnect`: refused
+      before any write; nothing changed.
+    - `save_failed`: a write did not take (a managed `.env`/`config.yaml`
+      refuses it, or the read-back still finds it); the receipt records
+      `save_failed`. A retry finishes a half-done Even AI turn-off.
+    - `save_unconfirmed`: the writes took but the receipt could not complete.
+
+    Never logs or returns the value.
+    """
+    from hermes_cli.config import remove_env_value
+
+    if name not in REMOVABLE:
+        raise ValueError("invalid_selection")
+    if not has_removable(name, *_disk_values()):
+        return False
+    revision = begin_save(home, name)  # Refusals raise here, before any write.
+    try:
+        if name == "evenAi" and _disk_values()[1]:
+            from hermes_cli.config import set_config_value
+            set_config_value("platforms.ocuclaw.extra.evenAiEnabled", "false")
+            if _disk_values()[1]:
+                raise ValueError("save_failed")
+        if _disk_values()[0][name]:
+            remove_env_value(FIELDS[name])
+        if has_removable(name, *_disk_values()):
+            raise ValueError("save_failed")
+    except (Exception, SystemExit):
+        # `set_config_value` exits (SystemExit) on a refused key or an
+        # unreadable config.yaml; inside the gateway that must stay a
+        # recorded `save_failed`, never a process exit.
+        try:
+            finish_save(home, revision, name, saved=False)
+        except ValueError:
+            pass  # Still `saving`, which status already reports as save_failed.
+        raise ValueError("save_failed") from None
+    try:
+        finish_save(home, revision, name, saved=True)
+    except ValueError:
+        raise ValueError("save_unconfirmed") from None
+    return True
+
+
+#: `remove`'s success line per credential; neither names a value.
+REMOVED_MESSAGES = {
+    "evenAi": "Even AI turned off: the saved Even AI token is removed and evenAiEnabled is false.",
+    "typesafe": "TypeSafe API key removed.",
+}
+
+
+def remove(selected: str, *, out=None) -> int:
+    """`hermes ocuclaw optional-setup remove <choice>`: the phone's remove, for an operator.
+
+    The same `remove_credential` under the same Desktop/phone credential lock;
+    no secret is read or printed. The running relay keeps the credential
+    until the usual restart (`optional-setup activate`).
+    """
+    out = out or sys.stdout
+    if selected not in REMOVABLE:
+        return 2
+    try:
+        home = _home()
+        from . import desktop_credentials
+        with receipts.receipt_state_lock(receipts.state_dir(home), desktop_credentials.LOCK_FILE) as locked:
+            if not locked:
+                out.write("Optional setup is busy. Retry in a moment; nothing changed.\n")
+                return 1
+            try:
+                removed = remove_credential(home, selected)
+            except ValueError as error:
+                code = str(error)
+                if code == "activation_pending_reconnect":
+                    out.write(SAVE_REFUSED_MESSAGE + "\n")
+                    return 2
+                if code == "busy":
+                    out.write("Optional setup is busy. Retry in a moment; nothing changed.\n")
+                    return 1
+                if code == "save_unconfirmed":
+                    out.write("Removed, but the receipt could not be completed. Run hermes ocuclaw optional-setup status.\n")
+                    return 1
+                out.write("Removal did not finish (managed .env or config.yaml?). Retry, or check "
+                          "hermes ocuclaw optional-setup status.\n")
+                return 1
+        if not removed:
+            out.write("Nothing to remove. Nothing changed.\n")
+            return 0
+        out.write(REMOVED_MESSAGES[selected] + " The running gateway keeps it until a restart. Run:\n"
+                  "hermes ocuclaw optional-setup status\nhermes ocuclaw optional-setup activate\n")
+        return 0
+    except Exception:
+        out.write("Optional removal could not finish. Check hermes ocuclaw optional-setup status.\n")
+        return 1
 
 
 def save(selected: str, *, prompt=None, out=None) -> int:
@@ -766,12 +1006,17 @@ def register_cli(subs) -> None:
     commands.add_parser("status", help="Read activation state; never installs or restarts")
     save_parser = commands.add_parser("save", help="Privately save one optional credential")
     save_parser.add_argument("optional_choice", choices=tuple(CLI_CHOICES))
+    remove_parser = commands.add_parser(
+        "remove", help="Remove one saved optional credential (even-ai also turns Even AI off)")
+    remove_parser.add_argument("optional_choice", choices=tuple(CLI_REMOVE_CHOICES))
     commands.add_parser("activate", help="Review and explicitly activate saved optional choices")
 
 
 def dispatch(args: argparse.Namespace) -> int:
     if args.optional_action == "save":
         return save(CLI_CHOICES[args.optional_choice])
+    if args.optional_action == "remove":
+        return remove(CLI_REMOVE_CHOICES[args.optional_choice])
     if args.optional_action == "activate":
         return activate()
     result = status()

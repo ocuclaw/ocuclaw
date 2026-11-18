@@ -7,10 +7,19 @@ from typing import Any
 
 from . import even_ai_route, optional_setup
 
+CUSTOM_ROUTE_NOTE = ("The phone must be on that private network, and your front door must forward "
+                     "everything at that address to OcuClaw, not only the phone's WebSocket.")
 
-def observe(*, action: str = "route", status_reader=None, planner=None) -> dict[str, Any]:
+
+def _configured_phone_address():
+    from .cloudways_setup import configured_phone_address
+    return configured_phone_address()
+
+
+def observe(*, action: str = "route", status_reader=None, planner=None, phone_address_reader=None) -> dict[str, Any]:
     status_reader = status_reader or optional_setup.status
     planner = planner or even_ai_route.plan_live
+    phone_address_reader = phone_address_reader or _configured_phone_address
 
     def refused(reason: str, next_action: str) -> dict[str, Any]:
         return {"ok": False, "runtime": "hermes", "capability": "even-ai",
@@ -27,16 +36,27 @@ def observe(*, action: str = "route", status_reader=None, planner=None) -> dict[
                 or isinstance(port, bool) or not 1 <= port <= 65535):
             return refused("live_runtime_context_unavailable",
                            "Run hermes ocuclaw optional-setup status. Finish your chosen saves, activate once if requested, then reconnect and retry. The running relay's current port must be observed; no default port was guessed.")
+        capability_state = before.get("capabilities", {}).get("evenAi")
+        activated = capability_state == "available_to_test"
+        inactive_status = {"not_configured": "not-configured", "saved_not_activated": "saved",
+                           "save_failed": "save-failed"}.get(capability_state, "unknown")
+        # Own private network (#5209): the relay serves Even AI on the paired address too.
+        custom_url = even_ai_route.custom_agent_url(phone_address_reader())
+        if custom_url is not None:
+            return {"ok": action != "verify" or activated, "runtime": "hermes", "capability": "even-ai",
+                    "status": "available-to-test" if activated else inactive_status,
+                    "activation": "active" if activated else "pending", "requestVerification": "not-verified",
+                    "phoneRoute": "custom", "agentUrl": custom_url, "note": CUSTOM_ROUTE_NOTE,
+                    "action": ("Even AI uses your phone address. Use agentUrl and your existing private token in Even app Agent Configuration, "
+                               "select that agent, then make a real Even AI glasses request. This observation does not verify that request."
+                               if activated else "Even AI uses your phone address once it is active. Finish optional-setup save even-ai "
+                               "and the grouped activation, then re-read status.")}
         decision = planner(relay_port=port, selected_runtime="hermes",
                            known_runtime_ports={"hermes": port})
         after = status_reader()
         if (after.get("state") != "ready" or after.get("runtimeContext") != context
                 or after.get("capabilities") != before.get("capabilities")):
             return refused("runtime_context_changed", "The selected runtime changed during observation. Reconnect and re-run route before applying any command.")
-        capability_state = before.get("capabilities", {}).get("evenAi")
-        activated = capability_state == "available_to_test"
-        inactive_status = {"not_configured": "not-configured", "saved_not_activated": "saved",
-                           "save_failed": "save-failed"}.get(capability_state, "unknown")
         route_ready = decision.state == "verified_noop"
         if decision.state == "approval_required":
             next_action = ("Optional, tailnet only: re-run route immediately before applying its exact command yourself. "

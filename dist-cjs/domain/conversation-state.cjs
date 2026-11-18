@@ -1,6 +1,9 @@
 const { filterDisplayEmojiText } = require("./message-emoji-filter.cjs");
 const { stripAllTaggedSpans } = require("./tagged-span-strip.cjs");
+const { protectSpeckMarkers, restoreSpeckMarkers, stripSpeckMarkers } = require("./speck-marker.cjs");
 const { marked } = require("marked");
+const { liftReplySources, replySourceMarkFor } = require("./reply-sources.cjs");
+const { createFailedTurnTraces, isFailedTurnMessage } = require("./failed-turn-traces.cjs");
 
 const DEFAULT_AGENT_NAME = "Agent";
 const REPLY_DIRECTIVE_TAG_RE = /\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]/gi;
@@ -29,11 +32,11 @@ const COMPACTION_SUMMARY_MARKER = "— context compacted —";
 const HISTORY_TRUNCATED_MARKER = "— earlier messages not loaded —";
 const HISTORY_UNAVAILABLE_MARKER = "— history unavailable —";
 
-let messages = [];
+let messages        = [];
 let agentName = DEFAULT_AGENT_NAME;
 let displayEntries = [];
 
-let headNotice = null;
+let headNotice      = null;
 let cachedTranscript = "";
 let transcriptDirty = false;
 let entriesRevision = 0;
@@ -44,6 +47,9 @@ let assistantCommitText = "";
 
 const pendingUserSendIds = new Set();
 const PENDING_USER_SEND_MAX_AGE_MS = 120_000;
+
+const failedTurns = createFailedTurnTraces();
+const rawTextOf = (msg     ) => extractText(msg?.content) || "";
 
 const DEFAULT_SEQUENCE_SESSION_KEY = "__default__";
 const SEQUENCE_SESSION_MAX = 256;
@@ -58,12 +64,12 @@ function createSequenceState() {
   };
 }
 
-function normalizedSequenceSessionKey(sessionKey) {
+function normalizedSequenceSessionKey(sessionKey     ) {
   if (typeof sessionKey !== "string") return DEFAULT_SEQUENCE_SESSION_KEY;
   return sessionKey.trim() || DEFAULT_SEQUENCE_SESSION_KEY;
 }
 
-function activateSequenceSession(sessionKey, reset = false) {
+function activateSequenceSession(sessionKey     , reset      = false) {
   const key = normalizedSequenceSessionKey(sessionKey);
   let state = reset ? null : sequenceStateBySession.get(key);
   if (!state) {
@@ -84,7 +90,7 @@ function resetAllSequenceSessions() {
   sequenceStateBySession.set(DEFAULT_SEQUENCE_SESSION_KEY, activeSequenceState);
 }
 
-function sequenceAliases(entry) {
+function sequenceAliases(entry     ) {
   const aliases = [];
   if (entry.idSource === "server") aliases.push(`id:${entry.id}`);
   if (entry.role === "user" && entry.clientSendId) {
@@ -93,14 +99,14 @@ function sequenceAliases(entry) {
   return aliases;
 }
 
-function mappedSequence(state, entry) {
+function mappedSequence(state     , entry     ) {
   for (const alias of sequenceAliases(entry)) {
     if (state.seqByAlias.has(alias)) return state.seqByAlias.get(alias);
   }
   return null;
 }
 
-function assignSequence(state, entry) {
+function assignSequence(state     , entry     ) {
   let seq = mappedSequence(state, entry);
   if (!Number.isFinite(seq)) {
     seq = state.nextSeq;
@@ -116,9 +122,9 @@ function assignSequence(state, entry) {
   return entry;
 }
 
-function requiresSequenceRebase(state, entries) {
-  const mapped = entries.map((entry) => mappedSequence(state, entry));
-  if (state.nextSeq > 0 && entries.length > 0 && mapped.every((seq) => seq === null)) {
+function requiresSequenceRebase(state     , entries     ) {
+  const mapped = entries.map((entry     ) => mappedSequence(state, entry));
+  if (state.nextSeq > 0 && entries.length > 0 && mapped.every((seq     ) => seq === null)) {
     return true;
   }
   let lastMappedIndex = -1;
@@ -141,9 +147,9 @@ function requiresSequenceRebase(state, entries) {
   return false;
 }
 
-function reclaimUnmappedTailSequence(state, entries) {
-  const mapped = entries.map((entry) => mappedSequence(state, entry));
-  const firstUnmappedIndex = mapped.findIndex((seq) => seq === null);
+function reclaimUnmappedTailSequence(state     , entries     ) {
+  const mapped = entries.map((entry     ) => mappedSequence(state, entry));
+  const firstUnmappedIndex = mapped.findIndex((seq     ) => seq === null);
   if (firstUnmappedIndex <= 0) return;
   const previousSeq = mapped[firstUnmappedIndex - 1];
   if (Number.isFinite(previousSeq)) state.nextSeq = previousSeq + 1;
@@ -159,19 +165,24 @@ function buildDisplayEntry(msg, options = {}) {
   let text = extractText(msg.content);
   if (!text) return null;
 
+  let sources        = [];
   if (msg.role === "assistant") {
     text = stripAllTaggedSpans(text);
+    sources = liftReplySources(text);
 
-    text = text.replaceAll(EXACT_BEAT_MARKER, BEAT_MARKER_SENTINEL);
+    text = protectSpeckMarkers(text.replaceAll(EXACT_BEAT_MARKER, BEAT_MARKER_SENTINEL));
   }
 
   const { text: markdownText } = markdownToPlainText(text, {
     stripReplyTags: msg.role === "assistant",
+    numberLinks: msg.role === "assistant",
   });
-  const plainText = markdownText.replaceAll(BEAT_MARKER_SENTINEL, EXACT_BEAT_MARKER);
+  const plainText = restoreSpeckMarkers(
+    markdownText.replaceAll(BEAT_MARKER_SENTINEL, EXACT_BEAT_MARKER),
+  );
   if (!plainText) return null;
   if (msg.role === "assistant" && isSilentControlReplyText(plainText)) return null;
-  const normalizedOptions = { ...options };
+  const normalizedOptions      = { ...options };
   if (
     msg.role === "user" &&
     normalizedOptions.isFirstVisibleEntry === true &&
@@ -208,16 +219,22 @@ function buildDisplayEntry(msg, options = {}) {
     runId: runId || null,
     clientSendId: clientSendId || null,
     ...(sentAtMs !== null ? { sentAtMs } : {}),
+
+    ...(msg.role === "assistant" && msg.pluginMessage === true ? { pluginMessage: true } : {}),
+
+    ...(isFailedTurnMessage(msg) ? { failedCode: String(msg.failedTurn.code) } : {}),
+
+    ...(sources.length > 0 ? { sources } : {}),
   };
 }
 
-function sentAtMsOf(msg) {
+function sentAtMsOf(msg     ) {
   return authoredMsOf(msg) ?? arrivalMsOf(msg);
 }
 
 const EPOCH_MS_FLOOR = 1e12;
 
-function authoredMsOf(msg) {
+function authoredMsOf(msg     ) {
   const raw = msg?.timestamp;
   if (raw === undefined || raw === null || raw === "" || typeof raw === "boolean") return null;
   let value = Number(raw);
@@ -248,7 +265,7 @@ const SILENT_CONTROL_REPLY_RES = SILENT_CONTROL_REPLY_TOKENS.map(
   (token) => new RegExp(`^\\s*${token}(?:\\s+${token})*\\s*$`, "i"),
 );
 
-function isSilentControlReplyText(text) {
+function isSilentControlReplyText(text     ) {
   if (typeof text !== "string") return false;
   const trimmed = text.trim();
   if (!trimmed) return false;
@@ -269,7 +286,7 @@ function isLikelySyntheticSessionStarterPrompt(text) {
   return countSyntheticSessionInstructionSignals(normalized) >= 2;
 }
 
-function upstreamMessageIdentity(msg) {
+function upstreamMessageIdentity(msg     ) {
   if (!msg || (msg.role !== "user" && msg.role !== "assistant")) return null;
   const idempotencyKey = typeof msg.idempotencyKey === "string"
     ? msg.idempotencyKey.trim()
@@ -279,6 +296,45 @@ function upstreamMessageIdentity(msg) {
     : "";
   const identity = idempotencyKey || mirrorIdentity;
   return identity ? `${msg.role}:${identity}` : null;
+}
+
+function abortPartialText(msg     ) {
+  return (extractText(msg.content) || "").replace(/\s+/g, " ").trim();
+}
+
+function isGatewayAbortPartial(msg     ) {
+  return !!msg && msg.role === "assistant" && msg.openclawAbort?.aborted === true;
+}
+
+function sameAbortedPartial(gatewayText     , other     ) {
+  const otherText = abortPartialText(other);
+  if (!otherText || !gatewayText) return false;
+  return otherText.startsWith(gatewayText) || gatewayText.startsWith(otherText);
+}
+
+function redundantAbortPartialIndexes(msgs     ) {
+  const skipped = new Set();
+  for (let index = 0; index < msgs.length; index += 1) {
+    const gatewayRow = msgs[index];
+    if (!isGatewayAbortPartial(gatewayRow)) continue;
+    const gatewayText = abortPartialText(gatewayRow);
+    for (const step of [-1, 1]) {
+      let match = -1;
+      for (let probe = index + step; probe >= 0 && probe < msgs.length; probe += step) {
+        const other = msgs[probe];
+        if (!other || other.role === "user") break;
+        if (other.role !== "assistant" || isGatewayAbortPartial(other) || skipped.has(probe)) continue;
+        if (sameAbortedPartial(gatewayText, other)) {
+          match = probe;
+          break;
+        }
+      }
+      if (match < 0) continue;
+      skipped.add(gatewayText.length > abortPartialText(msgs[match]).length ? match : index);
+      break;
+    }
+  }
+  return skipped;
 }
 
 function formatEntry(entry) {
@@ -293,8 +349,9 @@ function formatEntry(entry) {
 }
 
 function stripBeatMarkers(text = "") {
-  if (!text.includes(EXACT_BEAT_MARKER)) return text;
-  return text.replace(/ ?<beat\/>(?= )/g, "").replaceAll(EXACT_BEAT_MARKER, "");
+  const withoutSpeck = stripSpeckMarkers(text);
+  if (!withoutSpeck.includes(EXACT_BEAT_MARKER)) return withoutSpeck;
+  return withoutSpeck.replace(/ ?<beat\/>(?= )/g, "").replaceAll(EXACT_BEAT_MARKER, "");
 }
 
 function rebuildDisplayCache() {
@@ -306,10 +363,12 @@ function rebuildDisplayCache() {
     const identity = upstreamMessageIdentity(msg);
     if (identity) lastMessageIndexByUpstreamIdentity.set(identity, index);
   });
+  const redundantAbortPartials = redundantAbortPartialIndexes(messages);
 
   let messageEntryCount = 0;
   for (let index = 0; index < messages.length; index += 1) {
     const msg = messages[index];
+    if (redundantAbortPartials.has(index)) continue;
     const upstreamIdentity = upstreamMessageIdentity(msg);
     if (
       upstreamIdentity &&
@@ -337,7 +396,7 @@ function rebuildDisplayCache() {
   );
   const sequencedMessageEntries = entries.filter((entry) => entry.role !== NOTICE_ROLE);
   const retainedAliases = new Set(
-    sequencedMessageEntries.flatMap((entry) => sequenceAliases(entry)),
+    sequencedMessageEntries.flatMap((entry     ) => sequenceAliases(entry)),
   );
   for (const alias of activeSequenceState.seqByAlias.keys()) {
     if (!retainedAliases.has(alias)) activeSequenceState.seqByAlias.delete(alias);
@@ -345,7 +404,8 @@ function rebuildDisplayCache() {
   ledgerCapable = true;
   for (const entry of sequencedMessageEntries) {
     if (entry.idSource === "derived") ledgerCapable = false;
-    if (entry.role === "assistant") {
+
+    if (entry.role === "assistant" && !entry.failedCode) {
       assistantCommitPresent = true;
       assistantCommitText = entry.text;
     }
@@ -362,6 +422,13 @@ function getTranscript() {
   cachedTranscript = displayEntries.map((entry) => formatEntry(entry)).join("\n\n");
   transcriptDirty = false;
   return cachedTranscript;
+}
+
+const MEDIA_DIRECTIVE_LINE_RE = /^([ \t]*)MEDIA:[ \t]*\S[^\n]*$/gm;
+
+function mediaLinesAsPictures(text        ) {
+  if (!text || !text.includes("MEDIA:")) return text;
+  return text.replace(MEDIA_DIRECTIVE_LINE_RE, "$1[Picture]");
 }
 
 function stripReplyDirectives(text) {
@@ -382,7 +449,7 @@ function stripReplyDirectives(text) {
     .trimEnd();
 }
 
-function renderInlineTokens(tokens) {
+function renderInlineTokens(tokens, refs                  = null) {
   let out = "";
   for (const token of tokens) {
     switch (token.type) {
@@ -393,8 +460,12 @@ function renderInlineTokens(tokens) {
       case "strong":
       case "em":
       case "del":
+        out += token.tokens ? renderInlineTokens(token.tokens, refs) : (token.text || "");
+        break;
       case "link":
-        out += token.tokens ? renderInlineTokens(token.tokens) : (token.text || "");
+        out += token.tokens ? renderInlineTokens(token.tokens, refs) : (token.text || "");
+
+        if (refs) out += replySourceMarkFor(refs, token.href);
         break;
       case "br":
         out += "\n";
@@ -405,9 +476,12 @@ function renderInlineTokens(tokens) {
       case "html":
 
         break;
-      case "image":
-        out += token.text || token.title || "";
+      case "image": {
+
+        const alt = String(token.text || token.title || "").replace(/\s+/g, " ").trim();
+        out += alt ? `[Picture: ${alt}]` : "[Picture]";
         break;
+      }
       default:
 
         if (token.text) out += token.text;
@@ -417,22 +491,22 @@ function renderInlineTokens(tokens) {
   return out;
 }
 
-function renderBlockTokens(tokens) {
+function renderBlockTokens(tokens, refs                  = null) {
   const blocks = [];
 
   for (const token of tokens) {
     switch (token.type) {
       case "paragraph":
-        blocks.push(token.tokens ? renderInlineTokens(token.tokens) : token.text);
+        blocks.push(token.tokens ? renderInlineTokens(token.tokens, refs) : token.text);
         break;
 
       case "heading":
-        blocks.push(token.tokens ? renderInlineTokens(token.tokens) : token.text);
+        blocks.push(token.tokens ? renderInlineTokens(token.tokens, refs) : token.text);
         break;
 
       case "text":
 
-        blocks.push(token.tokens ? renderInlineTokens(token.tokens) : token.text);
+        blocks.push(token.tokens ? renderInlineTokens(token.tokens, refs) : token.text);
         break;
 
       case "code":
@@ -441,7 +515,7 @@ function renderBlockTokens(tokens) {
 
       case "blockquote":
         if (token.tokens) {
-          const inner = renderBlockTokens(token.tokens);
+          const inner = renderBlockTokens(token.tokens, refs);
           blocks.push(...inner);
         }
         break;
@@ -449,7 +523,7 @@ function renderBlockTokens(tokens) {
       case "list": {
         const items = [];
         for (const item of token.items) {
-          const itemText = item.tokens ? renderBlockTokens(item.tokens).join("\n") : item.text;
+          const itemText = item.tokens ? renderBlockTokens(item.tokens, refs).join("\n") : item.text;
           const bullet = token.ordered
             ? `${items.length + 1}. `
             : "- ";
@@ -463,12 +537,12 @@ function renderBlockTokens(tokens) {
         const rows = [];
 
         rows.push(
-          token.header.map((cell) => renderInlineTokens(cell.tokens)).join(" | ")
+          token.header.map((cell) => renderInlineTokens(cell.tokens, refs)).join(" | ")
         );
 
         for (const row of token.rows) {
           rows.push(
-            row.map((cell) => renderInlineTokens(cell.tokens)).join(" | ")
+            row.map((cell) => renderInlineTokens(cell.tokens, refs)).join(" | ")
           );
         }
         blocks.push(rows.join("\n"));
@@ -490,7 +564,7 @@ function renderBlockTokens(tokens) {
       default:
 
         if (token.tokens) {
-          blocks.push(...renderBlockTokens(token.tokens));
+          blocks.push(...renderBlockTokens(token.tokens, refs));
         } else if (token.text) {
           blocks.push(token.text);
         }
@@ -509,16 +583,193 @@ function cleanupDisplayWhitespace(text) {
 
 function markdownToPlainText(markdown, options = {}) {
   if (!markdown) return { text: "" };
-  const source = options.stripReplyTags ? stripReplyDirectives(markdown) : markdown;
+  const source = options.stripReplyTags ? mediaLinesAsPictures(stripReplyDirectives(markdown)) : markdown;
   if (!source) return { text: "" };
+  const numberLinks = (options       ).numberLinks === true;
+  const prefixCache = (options       ).prefixCache;
+  if (prefixCache && typeof prefixCache === "object") {
+    return { text: streamingMarkdownToPlainText(source, prefixCache, numberLinks) };
+  }
 
   const tokens = marked.lexer(source);
-  const blocks = renderBlockTokens(tokens);
+  const blocks = renderBlockTokens(tokens, numberLinks ? [] : null);
   const text = cleanupDisplayWhitespace(
     filterDisplayEmojiText(blocks.join("\n\n"))
   );
 
   return { text };
+}
+
+const STREAM_CACHE_MAX_ENTRIES = 4;
+
+const STREAM_CARRIAGE_RETURN_RE = /\r\n|\r/g;
+const STABLE_BLOCK_START_RE = /^\p{L}/u;
+
+const INLINE_STATE_TAG_RE = /<(?:a\s|pre|code|kbd|script)/i;
+
+function cleanDisplayText(text        )         {
+  return cleanupDisplayWhitespace(filterDisplayEmojiText(text));
+}
+
+function newLineCache()                  {
+  return { lineIn: "", lineOut: "", midIn: "", midOut: "" };
+}
+
+function isAsciiAlnum(code        )          {
+  return (
+    (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122)
+  );
+}
+
+function lastFilterResumePoint(line        , from        )         {
+  for (let k = line.length - 1; k > from; k--) {
+    if (isAsciiAlnum(line.charCodeAt(k)) && isAsciiAlnum(line.charCodeAt(k - 1))) return k;
+  }
+  return -1;
+}
+
+function cleanDisplayTextIncremental(joined        , lines                 )         {
+  if (!joined.startsWith(lines.lineIn)) {
+    lines.lineIn = "";
+    lines.lineOut = "";
+    lines.midIn = "";
+    lines.midOut = "";
+  }
+  let rest = joined.slice(lines.lineIn.length);
+  const lastNewline = rest.lastIndexOf("\n");
+  if (lastNewline >= 0) {
+    const settled = rest.slice(0, lastNewline + 1);
+    lines.lineIn += settled;
+    lines.lineOut += cleanDisplayText(settled);
+    rest = rest.slice(lastNewline + 1);
+    lines.midIn = "";
+    lines.midOut = "";
+  }
+  if (!rest.startsWith(lines.midIn)) {
+    lines.midIn = "";
+    lines.midOut = "";
+  }
+  const resumeAt = lastFilterResumePoint(rest, lines.midIn.length);
+  if (resumeAt > lines.midIn.length) {
+    lines.midOut += filterDisplayEmojiText(rest.slice(lines.midIn.length, resumeAt));
+    lines.midIn = rest.slice(0, resumeAt);
+  }
+  const openLine = lines.midOut + filterDisplayEmojiText(rest.slice(lines.midIn.length));
+  return lines.lineOut + cleanupDisplayWhitespace(openLine);
+}
+
+function joinBlockText(
+  headOut        ,
+  headBlocks        ,
+  restOut        ,
+  restBlocks        ,
+)         {
+  if (headBlocks === 0) return restOut;
+  if (restBlocks === 0) return headOut;
+  return `${headOut}\n\n${restOut}`;
+}
+
+function continuesStablePrefix(source        , stableSrc        )          {
+  if (!stableSrc) return true;
+  return (
+    source.startsWith(stableSrc) &&
+    STABLE_BLOCK_START_RE.test(source.slice(stableSrc.length, stableSrc.length + 2))
+  );
+}
+
+function pickStreamCacheEntry(
+  cache                                  ,
+  source        ,
+  numberLinks         ,
+)                   {
+  if (!Array.isArray(cache.entries)) cache.entries = [];
+  const entries = cache.entries;
+  let best = -1;
+  let bestLength = -1;
+  for (let i = 0; i < entries.length; i++) {
+    const key = entries[i].stableSrc;
+    if (entries[i].numberLinks !== numberLinks) continue;
+    if (key.length > bestLength && continuesStablePrefix(source, key)) {
+      best = i;
+      bestLength = key.length;
+    }
+  }
+  let entry;
+  if (best >= 0) {
+    entry = entries.splice(best, 1)[0];
+  } else {
+    entry = {
+      stableSrc: "",
+      stableBlocks: 0,
+      stableOut: "",
+      numberLinks,
+      stableRefs: [],
+      tailLines: newLineCache(),
+      wholeLines: newLineCache(),
+    };
+    if (entries.length >= STREAM_CACHE_MAX_ENTRIES) entries.pop();
+  }
+  entries.unshift(entry);
+  return entry;
+}
+
+function hasReferenceLinks(tokens                    )          {
+  for (const _tag in tokens.links) return true;
+  return false;
+}
+
+function settledBoundary(
+  tail        ,
+  tokens                                ,
+)                                    {
+  let total = 0;
+  for (const token of tokens) total += token.raw.length;
+  if (total !== tail.length) return { count: 0, length: 0 };
+  const stateTagAt = tail.search(INLINE_STATE_TAG_RE);
+  let offset = total;
+  for (let j = tokens.length - 1; j >= 1; j--) {
+    offset -= tokens[j].raw.length;
+    if (stateTagAt >= 0 && stateTagAt < offset) continue;
+    if (
+      offset >= 2 &&
+      tail.charCodeAt(offset - 1) === 10 &&
+      tail.charCodeAt(offset - 2) === 10 &&
+      STABLE_BLOCK_START_RE.test(tail.slice(offset, offset + 2))
+    ) {
+      return { count: j, length: offset };
+    }
+  }
+  return { count: 0, length: 0 };
+}
+
+function streamingMarkdownToPlainText(source        , cache        , numberLinks         )         {
+  const src = source.includes("\r") ? source.replace(STREAM_CARRIAGE_RETURN_RE, "\n") : source;
+  const entry = pickStreamCacheEntry(cache, src, numberLinks);
+  const tail = src.slice(entry.stableSrc.length);
+  const tokens = marked.lexer(tail);
+  if (hasReferenceLinks(tokens)) {
+    const all = entry.stableSrc ? marked.lexer(src) : tokens;
+    return cleanDisplayTextIncremental(renderBlockTokens(all, numberLinks ? [] : null).join("\n\n"), entry.wholeLines);
+  }
+  let tailTokens            = tokens;
+  const boundary = settledBoundary(tail, tokens);
+  if (boundary.count > 0) {
+    const settledRefs = numberLinks ? [...entry.stableRefs] : null;
+    const settled = renderBlockTokens(tokens.slice(0, boundary.count), settledRefs);
+    if (settledRefs) entry.stableRefs = settledRefs;
+    entry.stableOut = joinBlockText(
+      entry.stableOut,
+      entry.stableBlocks,
+      cleanDisplayText(settled.join("\n\n")),
+      settled.length,
+    );
+    entry.stableBlocks += settled.length;
+    entry.stableSrc = src.slice(0, entry.stableSrc.length + boundary.length);
+    tailTokens = tokens.slice(boundary.count);
+  }
+  const tailBlocks = renderBlockTokens(tailTokens, numberLinks ? [...entry.stableRefs] : null);
+  const tailOut = cleanDisplayTextIncremental(tailBlocks.join("\n\n"), entry.tailLines);
+  return joinBlockText(entry.stableOut, entry.stableBlocks, tailOut, tailBlocks.length);
 }
 
 function extractText(content) {
@@ -552,23 +803,23 @@ function normalizeRetagMatchText(value) {
   return value.replace(/\s+/g, " ").trim();
 }
 
-function stampArrival(msg, atMs) {
+function stampArrival(msg     , atMs     ) {
   if (msg && typeof msg === "object" && Number.isFinite(atMs)) {
     messageArrivalMs.set(msg, atMs);
   }
 }
 
-function arrivalMsOf(msg) {
+function arrivalMsOf(msg     ) {
   if (!msg || typeof msg !== "object") return null;
   const value = messageArrivalMs.get(msg);
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function trimmedId(value) {
+function trimmedId(value     ) {
   return typeof value === "string" || typeof value === "number" ? String(value).trim() : "";
 }
 
-function arrivalCarryKeys(msg) {
+function arrivalCarryKeys(msg     ) {
   const keys = [];
   const sendId = trimmedId(msg.clientSendId ?? msg.sendId);
   if (sendId) keys.push(`send:${sendId}`);
@@ -582,7 +833,7 @@ function arrivalCarryKeys(msg) {
   return keys;
 }
 
-function carryArrivalStamps(previous, next) {
+function carryArrivalStamps(previous     , next     ) {
   if (!Array.isArray(previous) || previous.length === 0) return;
   const byKey = new Map();
   const userByText = new Map();
@@ -616,7 +867,7 @@ function carryArrivalStamps(previous, next) {
   }
 }
 
-function carryCommitRunId(next, runId, text) {
+function carryCommitRunId(next     , runId     , text     ) {
   const normalizedRunId = typeof runId === "string" ? runId.trim() : "";
   const target = normalizeRetagMatchText(text);
   if (!normalizedRunId || !target || !Array.isArray(next)) return;
@@ -633,11 +884,11 @@ function carryCommitRunId(next, runId, text) {
   match.runId = normalizedRunId;
 }
 
-function serverIdOf(msg) {
+function serverIdOf(msg     ) {
   return trimmedId(msg.id ?? msg.messageId ?? msg.__openclaw?.id);
 }
 
-function carryPendingUserSends(previous, next, commitRunId) {
+function carryPendingUserSends(previous     , next     , commitRunId     ) {
   if (pendingUserSendIds.size === 0) return;
   const seenUserIds = new Set();
   for (const msg of previous) {
@@ -678,7 +929,7 @@ function carryPendingUserSends(previous, next, commitRunId) {
   for (const sendId of stillPending) pendingUserSendIds.add(sendId);
 }
 
-function findNarrationMessageIndex(target, messageId = null) {
+function findNarrationMessageIndex(target     , messageId      = null) {
   const wantedId = typeof messageId === "string" || typeof messageId === "number"
     ? String(messageId).trim()
     : "";
@@ -706,7 +957,7 @@ function findNarrationMessageIndex(target, messageId = null) {
   return null;
 }
 
-function originInsertIndex(originAtMs) {
+function originInsertIndex(originAtMs     ) {
   let index = messages.length;
   for (let cursor = messages.length - 1; cursor >= 0; cursor -= 1) {
     const msg = messages[cursor];
@@ -755,14 +1006,14 @@ function paginate() {
 
 const conversationState = {
 
-  hydrate(msgs, name, sessionKeyOrOptions = null, maybeOptions = undefined) {
+  hydrate(msgs     , name     , sessionKeyOrOptions      = null, maybeOptions      = undefined) {
     const sessionKey = typeof sessionKeyOrOptions === "string" ? sessionKeyOrOptions : null;
     const previousSequenceState = activeSequenceState;
     if (sessionKey !== null && sessionKey !== undefined) {
       activateSequenceSession(sessionKey);
     }
     const previousMessages = conversationState.getRawMessages();
-    const nextMessages = Array.isArray(msgs) ? [...msgs] : [];
+    const nextMessages      = Array.isArray(msgs) ? [...msgs] : [];
     const options = sessionKey === null ? sessionKeyOrOptions : maybeOptions;
     const opts = options && typeof options === "object" ? options : {};
     if (activeSequenceState === previousSequenceState) {
@@ -770,7 +1021,7 @@ const conversationState = {
     }
 
     carryPendingUserSends(previousMessages, nextMessages, opts.commitRunId);
-    messages = nextMessages;
+    messages = failedTurns.weave(nextMessages, rawTextOf);
     if (name) agentName = name;
 
     headNotice = opts.historyUnavailable === true
@@ -779,13 +1030,13 @@ const conversationState = {
         ? HISTORY_TRUNCATED_MARKER
         : null;
 
-    carryCommitRunId(nextMessages, opts.commitRunId, opts.commitText);
+    carryCommitRunId(messages, opts.commitRunId, opts.commitText);
     rebuildDisplayCache();
     entriesRevision += 1;
 
   },
 
-  addMessage(role, content, name, metadata = {}) {
+  addMessage(role     , content     , name     , metadata      = {}) {
     const clientSendId = typeof (metadata.clientSendId ?? metadata.sendId) === "string"
       ? String(metadata.clientSendId ?? metadata.sendId).trim()
       : "";
@@ -800,7 +1051,7 @@ const conversationState = {
         const definedMetadata = Object.fromEntries(
           Object.entries(metadata).filter(([, value]) => value !== undefined),
         );
-        const reconciled = { ...existing, role, content, ...definedMetadata };
+        const reconciled      = { ...existing, role, content, ...definedMetadata };
         if (name) reconciled.name = name;
 
         stampArrival(reconciled, arrivalMsOf(existing));
@@ -843,10 +1094,10 @@ const conversationState = {
   },
 
   addAssistantMessageAtOrigin(
-    content,
-    originAtMs,
-    name,
-    metadata = {},
+    content     ,
+    originAtMs     ,
+    name     ,
+    metadata      = {},
   ) {
     if (!Number.isFinite(originAtMs)) {
       conversationState.addMessage("assistant", content, name, metadata);
@@ -858,7 +1109,7 @@ const conversationState = {
       stampArrival(messages[messages.length - 1], originAtMs);
       return false;
     }
-    const msg = { role: "assistant", content, ...metadata };
+    const msg      = { role: "assistant", content, ...metadata };
     if (name) msg.name = name;
     stampArrival(msg, originAtMs);
     messages.splice(index, 0, msg);
@@ -874,10 +1125,10 @@ const conversationState = {
   },
 
   repositionAssistantMessageMatching(
-    runId,
-    text,
-    originAtMs,
-    messageId = null,
+    runId     ,
+    text     ,
+    originAtMs     ,
+    messageId      = null,
   ) {
     const target = normalizeRetagMatchText(text);
     if (!target) return false;
@@ -904,7 +1155,7 @@ const conversationState = {
     return true;
   },
 
-  removeLastAssistantMessageMatching(runId, text, messageId = null) {
+  removeLastAssistantMessageMatching(runId     , text     , messageId      = null) {
     const target = normalizeRetagMatchText(text);
     if (!target) return false;
 
@@ -914,6 +1165,21 @@ const conversationState = {
     rebuildDisplayCache();
     entriesRevision += 1;
     return true;
+  },
+
+  replaceAssistantMessageContent(messageId     , content     ) {
+    const id = trimmedId(messageId);
+    if (!id) return false;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const msg      = messages[index];
+      if (!msg || msg.role !== "assistant" || serverIdOf(msg) !== id) continue;
+      msg.content = content;
+      msg.rev = Number.isFinite(Number(msg.rev)) ? Math.floor(Number(msg.rev)) + 1 : 1;
+      rebuildDisplayCache();
+      entriesRevision += 1;
+      return true;
+    }
+    return false;
   },
 
   replaceLatestUserMessage(content, name) {
@@ -937,7 +1203,7 @@ const conversationState = {
   markUserSendPending(clientSendId = "") {
     const sendId = trimmedId(clientSendId);
     if (!sendId) return false;
-    const present = conversationState.getRawMessages().some((msg) =>
+    const present = conversationState.getRawMessages().some((msg     ) =>
       msg && msg.role === "user" && !serverIdOf(msg) &&
       trimmedId(msg.clientSendId ?? msg.sendId) === sendId
     );
@@ -1010,7 +1276,7 @@ const conversationState = {
   },
 
   getRawMessages() {
-    return [...messages];
+    return messages.filter((msg) => !isFailedTurnMessage(msg));
   },
 
   getAssistantCommitSnapshot() {
@@ -1021,8 +1287,17 @@ const conversationState = {
     };
   },
 
-  clear(sessionKey = null, resetSequence = false) {
+  recordFailedTurn(input                                                               ) {
+    if (!failedTurns.record(input, messages, rawTextOf)) return false;
+    messages = failedTurns.weave(messages, rawTextOf);
+    rebuildDisplayCache();
+    entriesRevision += 1;
+    return true;
+  },
+
+  clear(sessionKey      = null, resetSequence      = false) {
     if (sessionKey === null || sessionKey === undefined) {
+      failedTurns.reset();
       resetAllSequenceSessions();
     } else {
       activateSequenceSession(sessionKey, resetSequence === true);
@@ -1046,6 +1321,7 @@ const conversationState = {
   _COMPACTION_SUMMARY_MARKER: COMPACTION_SUMMARY_MARKER,
   _HISTORY_TRUNCATED_MARKER: HISTORY_TRUNCATED_MARKER,
   _HISTORY_UNAVAILABLE_MARKER: HISTORY_UNAVAILABLE_MARKER,
+  serverIdOf,
 };
 
 const {
@@ -1054,6 +1330,7 @@ const {
   addAssistantMessageAtOrigin,
   repositionAssistantMessageMatching,
   removeLastAssistantMessageMatching,
+  replaceAssistantMessageContent,
   replaceLatestUserMessage,
   markUserSendPending,
   settleUserSend,
@@ -1065,6 +1342,7 @@ const {
   getPageCount,
   getRawMessages,
   getAssistantCommitSnapshot,
+  recordFailedTurn,
   clear,
   _markdownToPlainText,
   _extractText,

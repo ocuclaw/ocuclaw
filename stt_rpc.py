@@ -92,6 +92,31 @@ Three more rules the transcribe half holds:
   wearer an utterance on a provider that would simply have ignored it.
   ``_BUILTIN_SUPPORTS_PROMPT`` annotates the PICKER and nothing else.
 
+Live words (``stt.stream.*``) add partial text while the wearer talks, and
+never replace the batch result:
+
+- **Batch stays the floor.** A live session is optional and additive. The
+  transcript still reaches the phone exactly once, as the ``stt.transcribe``
+  result. With a ``streamId`` that names an open session, that result is the
+  live session's final text when it is a non-empty success; any other outcome
+  (no session, expired session, provider mismatch, empty or failed final)
+  cancels the session and runs the unchanged batch path on the same file.
+- **The listing still never connects.** ``streaming`` per row is read from the
+  module's presence, the row's own availability and credential reads that
+  mirror Hermes's live wires (``_streaming_verdict``). No socket opens, nothing
+  installs, and ``_get_provider`` is not called.
+- **The staged upload is only read.** ``stt.stream.open`` tails the relay's
+  ``ocuclaw-stt-upload-*`` file through its own read-only descriptor. It never
+  claims, renames or deletes it — the spill-file rules above stay with
+  ``stt.transcribe``. Its guard mirrors ``_resolve_spill_path`` (system temp
+  dir set, exact prefix) and also refuses a symlink or non-regular file.
+- **Partials never block or fail anything.** They go to the child through an
+  injected async sender, coalesced (latest text wins, one in flight, ~100 ms
+  apart), never after finalize or cancel begins, with every error swallowed.
+
+``stt.stream.open`` and ``stt.stream.cancel`` never raise across the RPC:
+every refusal is ``{opened:false, reason}`` / ``{cancelled:false}``.
+
 Hermes imports stay deferred so the bundle remains importable outside a Hermes
 environment; both handler bodies run off the event loop via
 ``asyncio.to_thread``.
@@ -119,6 +144,13 @@ from .native_readers import command_stt_providers, stt_private_url_reader
 
 STT_METHOD_CAPABILITIES_LIST = "stt.capabilities.list"
 STT_METHOD_TRANSCRIBE = "stt.transcribe"
+# Live words (Hermes 0.22+ `tools.transcription_streaming`). Open/cancel are
+# child → parent like the two above; `stt.stream.partial` is the one
+# parent → child call this lane makes, through the injected sender.
+STT_METHOD_STREAM_OPEN = "stt.stream.open"
+STT_METHOD_STREAM_CANCEL = "stt.stream.cancel"
+STT_METHOD_STREAM_PARTIAL = "stt.stream.partial"
+STT_STREAM_PROTOCOL_VERSION = 1
 
 logger = logging.getLogger(__name__)
 
@@ -1403,23 +1435,626 @@ def _dispatch_overlay(
     return overlay
 
 
+# -- live words (Hermes 0.22+) -------------------------------------------------
+
+# The relay's staged upload WAV (`<os.tmpdir()>/ocuclaw-stt-upload-<pid>-<uuid>
+# .wav`): a 44-byte header, then PCM appended while the wearer talks. Narrower
+# than `_SPILL_BASENAME_PREFIX` on purpose — a live session only ever tails a
+# file the upload lane is still writing.
+_STREAM_UPLOAD_PREFIX = f"{_SPILL_BASENAME_PREFIX}upload-"
+_WAV_HEADER_BYTES = 44
+_STREAM_MAX_OPEN = 4
+_STREAM_EXPIRY_S = 200.0
+_STREAM_POLL_S = 0.05
+_STREAM_READ_CHUNK = 64 * 1024
+# Node closes the staged file before it calls `stt.transcribe`, so draining is
+# a local read of a few MB at most; the bound only stops a wedged disk from
+# holding the transcribe worker.
+_STREAM_DRAIN_TIMEOUT_S = 5.0
+_STREAM_FINALIZE_TIMEOUT_S = 10.0
+_PARTIAL_MIN_SPACING_S = 0.1
+_STREAM_ID_MAX_LEN = 128
+# Cancelled ids remembered so a cancel that overtakes its own open still wins
+# (`_LiveStreams`). Ids are fresh UUIDs, so this only bounds memory.
+_STREAM_TOMBSTONE_MAX = 256
+_DEFAULT_STREAMING_PROVIDERS = ("openai", "xai", "elevenlabs")
+
+# Wearer-facing reasons (contract §1). Short and plain on purpose: the phone
+# shows them as a settings summary line.
+_STREAMING_TOO_OLD_REASON = "Needs Hermes 0.22 or newer"
+_STREAMING_NOUS_REASON = (
+    "Needs your own OpenAI key in Hermes. The Nous subscription only "
+    "transcribes after you finish."
+)
+_STREAMING_XAI_KEY_REASON = (
+    "Needs your own xAI API key in Hermes. xAI sign-in only transcribes "
+    "after you finish."
+)
+_STREAMING_SETUP_REASON = "Set up this provider in Hermes first"
+_STREAMING_BATCH_ONLY_REASON = "{name} transcribes after you finish"
+
+
+def _streaming_module() -> Any:
+    """Hermes's live STT module, or None on a Hermes older than 0.22.
+
+    Importing it is cheap and side-effect free: its websocket import is
+    deferred to the session worker. Any failure reads as "absent", which turns
+    the whole feature off rather than the listing.
+    """
+    try:
+        from tools import transcription_streaming as ts
+    except Exception:  # noqa: BLE001 — absent or broken module: no live words
+        return None
+    return ts
+
+
+def _streaming_providers(ts: Any) -> frozenset:
+    raw = getattr(ts, "STREAMING_PROVIDERS", _DEFAULT_STREAMING_PROVIDERS)
+    try:
+        return frozenset(str(name) for name in raw)
+    except TypeError:
+        return frozenset(_DEFAULT_STREAMING_PROVIDERS)
+
+
+def _openai_selection_is_managed() -> bool:
+    """True when the operator picked the Nous-managed STT row."""
+    try:
+        from tools import tool_backend_helpers as helpers
+
+        selection = _clean_str(helpers.read_selection("stt"))
+        managed = getattr(helpers, "NOUS_MANAGED_PROVIDER", "nous")
+    except Exception:  # noqa: BLE001 — unreadable selection is "not managed"
+        return False
+    return selection is not None and selection.lower() == str(managed).lower()
+
+
+def _openai_direct_credential(tt: Any, stt_config: Dict[str, Any]) -> bool:
+    """A credential the Realtime socket can use: anything but the managed gateway.
+
+    Mirrors ``_probe_openai`` minus its last rung. The Nous gateway proxies the
+    REST audio API only, so Hermes's live wire refuses it
+    (``transcription_streaming._openai_credentials``).
+    """
+    section = _section(stt_config, "openai")
+    if _clean_str(section.get("api_key")):
+        return True
+    try:
+        from tools.tool_backend_helpers import resolve_openai_audio_api_key
+
+        if str(resolve_openai_audio_api_key() or "").strip():
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    base_url = _clean_str(section.get("base_url"))
+    if base_url:
+        try:
+            return bool(stt_private_url_reader(tt)(base_url))
+        except Exception:  # noqa: BLE001
+            return False
+    return False
+
+
+def _xai_api_key_present(tt: Any) -> bool:
+    """The xAI live wire takes an API key only, read the way Hermes reads it."""
+    try:
+        from hermes_cli.config import get_env_value
+    except Exception:  # noqa: BLE001
+        get_env_value = None
+    if callable(get_env_value):
+        try:
+            return bool(str(get_env_value("XAI_API_KEY") or "").strip())
+        except Exception:  # noqa: BLE001
+            return False
+    return bool(_resolve_key(tt, "XAI_API_KEY", "xai"))
+
+
+def _plugin_streams(provider: Any) -> bool:
+    try:
+        return bool(getattr(provider, "streaming_capable", False))
+    except Exception:  # noqa: BLE001 — a raising property streams nothing
+        return False
+
+
+def _streaming_verdict(
+    tt: Any,
+    ts: Any,
+    stt_config: Dict[str, Any],
+    *,
+    lane: str,
+    pid: str,
+    display_name: str,
+    available: bool,
+) -> Tuple[bool, Optional[str]]:
+    """(streams, reason) for one provider. Reads only; never connects.
+
+    The built-in branches mirror the credential each Hermes live wire needs
+    (``transcription_streaming._builtin_session``) using the same read-only
+    probes as the listing. Hermes's own ``streaming_available`` is not called:
+    it resolves through ``_get_provider``, whose explicit xAI and OpenAI
+    resolvers can take the refresh-aware credential paths this lane avoids.
+    """
+    if ts is None:
+        return False, _STREAMING_TOO_OLD_REASON
+    batch_only = _STREAMING_BATCH_ONLY_REASON.format(name=display_name)
+    if lane == "built-in":
+        if pid not in _streaming_providers(ts):
+            return False, batch_only
+        if not available:
+            return False, _STREAMING_SETUP_REASON
+        if pid == "openai":
+            if _openai_selection_is_managed():
+                return False, _STREAMING_NOUS_REASON
+            if not _openai_direct_credential(tt, stt_config):
+                # Available, but only through the managed gateway.
+                return False, _STREAMING_NOUS_REASON
+        if pid == "xai" and not _xai_api_key_present(tt):
+            return False, _STREAMING_XAI_KEY_REASON
+        return True, None
+    if lane == "plugin":
+        if not _plugin_streams(_registry_provider(pid)):
+            return False, batch_only
+        if not available:
+            return False, _STREAMING_SETUP_REASON
+        return True, None
+    return False, batch_only
+
+
+def _annotate_streaming(
+    rows: List[Dict[str, Any]],
+    *,
+    lane: str,
+    tt: Any,
+    ts: Any,
+    stt_config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    for row in rows:
+        try:
+            streams, reason = _streaming_verdict(
+                tt, ts, stt_config,
+                lane=lane, pid=row["id"], display_name=row["displayName"],
+                available=bool(row["available"]),
+            )
+        except Exception:  # noqa: BLE001 — one bad verdict, one batch-only row
+            logger.warning(
+                "live-words verdict for STT provider %r failed", row.get("id"),
+                exc_info=True,
+            )
+            streams, reason = False, _STREAMING_SETUP_REASON
+        row["streaming"] = bool(streams)
+        row["streamingUnavailableReason"] = None if streams else reason
+    return rows
+
+
+def _stream_id(raw: Any) -> Optional[str]:
+    value = _clean_str(raw)
+    if value is None or len(value) > _STREAM_ID_MAX_LEN:
+        return None
+    return value
+
+
+def _resolve_stream_upload_path(raw: Any) -> Tuple[Optional[Path], Optional[str]]:
+    """(staged upload, None) when *raw* is a file this lane may tail, else (None, why).
+
+    Same directory rule as ``_resolve_spill_path`` (the temp-dir candidate
+    set, never a request-named parent) with the narrower upload prefix. The
+    named path itself must be a regular file and not a symlink — this handler
+    opens it, and tailing someone else's file through a planted link is the
+    one thing the guard exists to stop. Nothing is renamed or unlinked here.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None, "stt.stream.open needs the staged upload `path`."
+    given = Path(raw.strip())
+    if not given.is_absolute():
+        return None, "The staged upload path must be absolute."
+    try:
+        parent = given.parent.resolve(strict=False)
+        info = given.lstat()
+    except FileNotFoundError:
+        return None, "The staged upload file does not exist."
+    except (OSError, ValueError, RuntimeError) as exc:  # noqa: BLE001
+        return None, f"The staged upload file could not be read: {exc}"
+    if parent not in _spill_dir_candidates() or not given.name.startswith(
+        _STREAM_UPLOAD_PREFIX
+    ):
+        return None, (
+            "The staged upload path is not a relay upload file "
+            f"({_STREAM_UPLOAD_PREFIX}* directly inside the system temp "
+            "directory)."
+        )
+    if not stat.S_ISREG(info.st_mode):
+        return None, "The staged upload path is not a regular file."
+    return parent / given.name, None
+
+
+def _open_upload_readonly(path: Path) -> int:
+    """A read-only descriptor on the staged upload; raises OSError."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(str(path), flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
+PartialSender = Callable[[str, Dict[str, Any]], Any]
+
+
+class _LiveStream:
+    """One live session: the Hermes session, the tailed upload, the partial pump.
+
+    States: ``opening`` (descriptor open, session not yet attached) → ``open``
+    (feeder running, partials flowing) → ``finalizing`` or ``cancelled``.
+    Only the feeder thread reads or closes the descriptor once it has started,
+    so a cancel never closes it under a read in progress.
+    """
+
+    def __init__(
+        self,
+        *,
+        stream_id: str,
+        provider: str,
+        fd: int,
+        deadline: float,
+        clock: Callable[[], float],
+        loop: Optional[asyncio.AbstractEventLoop],
+        send: Optional[PartialSender],
+        on_expired: Callable[["_LiveStream"], None],
+    ) -> None:
+        self.stream_id = stream_id
+        self.provider = provider
+        self.deadline = deadline
+        self._fd: Optional[int] = fd
+        self._clock = clock
+        self._loop = loop
+        self._send = send
+        self._on_expired = on_expired
+        self._lock = threading.Lock()
+        self._state = "opening"
+        self._session: Any = None
+        self._wake = threading.Event()
+        self._drain = threading.Event()
+        self._offset = _WAV_HEADER_BYTES
+        self._feeder = threading.Thread(
+            target=self._feed, name="ocuclaw-stt-live-feeder", daemon=True
+        )
+        # Partial pump. `_latest` is written from the provider worker thread;
+        # everything else here is touched on the event loop only.
+        self._latest: Optional[str] = None
+        self._sent: Optional[str] = None
+        self._last_sent_at: Optional[float] = None
+        self._pump: Optional[asyncio.Task] = None
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def expired(self) -> bool:
+        return self._clock() >= self.deadline
+
+    def attach(self, session: Any) -> bool:
+        """Bind the opened Hermes session and start tailing. False if cancelled meanwhile."""
+        with self._lock:
+            cancelled = self._state == "cancelled"
+            if not cancelled:
+                self._session = session
+                self._state = "open"
+        if cancelled:
+            _cancel_session(session)
+            self._close_fd()
+            return False
+        self._feeder.start()
+        return True
+
+    def abandon(self) -> None:
+        """The open failed before a session existed."""
+        with self._lock:
+            self._state = "cancelled"
+        self._close_fd()
+
+    def cancel(self) -> bool:
+        """Stop partials and tailing and cancel the session. Idempotent."""
+        with self._lock:
+            if self._state == "cancelled":
+                return False
+            self._state = "cancelled"
+            session = self._session
+        self._wake.set()
+        if session is not None:
+            _cancel_session(session)
+        return True
+
+    def finalize(self, timeout: float) -> Optional[Dict[str, Any]]:
+        """Drain the upload to its final size, end the audio, wait for the final.
+
+        None when the session is not open (cancelled, expired, still opening)
+        or the drain did not finish; otherwise Hermes's envelope as returned.
+        """
+        with self._lock:
+            if self._state != "open":
+                return None
+            self._state = "finalizing"
+            session = self._session
+        self._drain.set()
+        self._wake.set()
+        self._feeder.join(_STREAM_DRAIN_TIMEOUT_S)
+        if self._feeder.is_alive():
+            logger.warning(
+                "live STT stream %s did not drain its upload in time", self.stream_id
+            )
+            return None
+        try:
+            result = session.finalize(timeout)
+        except Exception:  # noqa: BLE001 — a raising finalize is a failed live result
+            logger.warning(
+                "live STT stream %s failed to finalize", self.stream_id, exc_info=True
+            )
+            return None
+        return result if isinstance(result, dict) else None
+
+    # -- feeder (its own thread) ------------------------------------------
+
+    def _feed(self) -> None:
+        try:
+            while True:
+                state = self._state
+                if state == "cancelled":
+                    return
+                if state == "open" and self.expired():
+                    self._on_expired(self)
+                    return
+                pushed = self._push_available()
+                if self._drain.is_set():
+                    if not pushed:
+                        return
+                    continue
+                if not pushed:
+                    self._wake.wait(_STREAM_POLL_S)
+                    self._wake.clear()
+        except Exception:  # noqa: BLE001 — the batch path still has the file
+            logger.warning(
+                "live STT feeder for %s stopped", self.stream_id, exc_info=True
+            )
+        finally:
+            self._close_fd()
+
+    def _push_available(self) -> int:
+        fd = self._fd
+        if fd is None:
+            return 0
+        available = os.fstat(fd).st_size - self._offset
+        size = min(available, _STREAM_READ_CHUNK)
+        size -= size % 2
+        if size <= 0:
+            return 0
+        os.lseek(fd, self._offset, os.SEEK_SET)
+        data = os.read(fd, size)
+        if len(data) % 2:
+            data = data[:-1]
+        if not data:
+            return 0
+        self._offset += len(data)
+        self._session.push_audio(data)
+        return len(data)
+
+    def _close_fd(self) -> None:
+        with self._lock:
+            fd, self._fd = self._fd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:  # noqa: BLE001
+                pass
+
+    # -- partials ----------------------------------------------------------
+
+    def offer_partial(self, text: Any) -> None:
+        """Hermes ``on_partial`` (provider worker thread): latest text wins."""
+        if self._state not in ("opening", "open") or self._send is None:
+            return
+        loop = self._loop
+        if loop is None:
+            return
+        value = str(text or "").strip()
+        if not value:
+            return
+        self._latest = value
+        try:
+            loop.call_soon_threadsafe(self._kick)
+        except RuntimeError:  # loop closed: the adapter is gone
+            pass
+
+    def _kick(self) -> None:
+        if self._state != "open":
+            return
+        if self._pump is not None and not self._pump.done():
+            return  # the running pump re-reads `_latest` after each await
+        assert self._loop is not None
+        self._pump = self._loop.create_task(self._pump_partials())
+
+    async def _pump_partials(self) -> None:
+        loop = asyncio.get_running_loop()
+        while self._state == "open":
+            text = self._latest
+            if text is None or text == self._sent:
+                return
+            if self._last_sent_at is not None:
+                wait = self._last_sent_at + _PARTIAL_MIN_SPACING_S - loop.time()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                    continue
+            self._sent = text
+            self._last_sent_at = loop.time()
+            try:
+                assert self._send is not None
+                await self._send(
+                    STT_METHOD_STREAM_PARTIAL,
+                    {"streamId": self.stream_id, "text": text},
+                )
+            except Exception:  # noqa: BLE001 — a lost partial costs nothing
+                logger.debug(
+                    "stt.stream.partial for %s failed", self.stream_id, exc_info=True
+                )
+
+
+def _cancel_session(session: Any) -> None:
+    try:
+        session.cancel()
+    except Exception:  # noqa: BLE001
+        logger.debug("live STT session cancel raised", exc_info=True)
+
+
+class _LiveStreams:
+    """The open live sessions by ``streamId``: at most four, each 200 s at most.
+
+    A cancel can overtake its own open: the relay cancels an open that timed
+    out on the link, and that open may still be validating here. So a cancel
+    for an id the table does not hold leaves a tombstone, and ``reserve``
+    refuses a tombstoned id. A cancel that lands while the open is waiting on
+    Hermes finds the reserved record and cancels it; ``attach`` then tears the
+    late session down. Tombstones live as long as a session could.
+    """
+
+    def __init__(self, clock: Callable[[], float]) -> None:
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._records: Dict[str, _LiveStream] = {}
+        self._tombstones: Dict[str, float] = {}
+
+    def _prune_tombstones(self) -> None:
+        """Drop old tombstones and bound the table. Caller holds the lock."""
+        now = self.clock()
+        for stream_id, at in list(self._tombstones.items()):
+            if now - at >= _STREAM_EXPIRY_S:
+                del self._tombstones[stream_id]
+        while len(self._tombstones) > _STREAM_TOMBSTONE_MAX:
+            del self._tombstones[next(iter(self._tombstones))]
+
+    def reserve(self, record: _LiveStream) -> Optional[str]:
+        """Admit *record*, or say why not. Expired records are reaped first."""
+        reaped: List[_LiveStream] = []
+        with self._lock:
+            self._prune_tombstones()
+            for stream_id, existing in list(self._records.items()):
+                if existing.expired():
+                    reaped.append(self._records.pop(stream_id))
+            if record.stream_id in self._tombstones:
+                reason: Optional[str] = "The live session was cancelled before it opened."
+            elif record.stream_id in self._records:
+                reason = "This live session is already open."
+            elif len(self._records) >= _STREAM_MAX_OPEN:
+                reason = "Too many live sessions are open on this Hermes."
+            else:
+                self._records[record.stream_id] = record
+                reason = None
+        for stale in reaped:
+            stale.cancel()
+        return reason
+
+    def take(self, stream_id: Optional[str]) -> Optional[_LiveStream]:
+        """Remove and return the live record; an expired one is cancelled instead."""
+        if stream_id is None:
+            return None
+        with self._lock:
+            record = self._records.pop(stream_id, None)
+        if record is not None and record.expired():
+            record.cancel()
+            return None
+        return record
+
+    def discard(self, record: _LiveStream) -> None:
+        with self._lock:
+            if self._records.get(record.stream_id) is record:
+                del self._records[record.stream_id]
+
+    def expire(self, record: _LiveStream) -> None:
+        self.discard(record)
+        if record.cancel():
+            logger.info("live STT stream %s expired", record.stream_id)
+
+    def cancel(self, stream_id: Optional[str]) -> bool:
+        if stream_id is None:
+            return False
+        with self._lock:
+            record = self._records.pop(stream_id, None)
+            self._tombstones[stream_id] = self.clock()
+            self._prune_tombstones()
+        return record.cancel() if record is not None else False
+
+    def cancel_all(self) -> int:
+        with self._lock:
+            records = list(self._records.values())
+            self._records.clear()
+        return sum(1 for record in records if record.cancel())
+
+
+def _not_opened(reason: str) -> Dict[str, Any]:
+    return {"opened": False, "reason": reason}
+
+
 class SttRpc:
     """``stt.*`` control-link handlers (child → parent).
 
-    Stateless: every call re-reads Hermes config and the live registry, because
-    the phone refreshes this listing precisely when the operator has just
-    changed something Hermes-side.
+    The listing and batch transcribe are stateless: every call re-reads Hermes
+    config and the live registry, because the phone refreshes this listing
+    precisely when the operator has just changed something Hermes-side. The
+    only state is the live-words session table (``stt.stream.*``).
+
+    ``send_to_child(method, params)`` is an async callable that issues a
+    parent → child request (``stt.stream.partial``); without one, live
+    sessions still produce their final text but send no partials.
     """
+
+    def __init__(
+        self,
+        send_to_child: Optional[PartialSender] = None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._send_to_child = send_to_child
+        self._streams = _LiveStreams(clock)
 
     def handlers(self) -> Dict[str, Callable[[Any], Any]]:
         """method → async handler, for LinkProcess.register_request_handler."""
         return {
             STT_METHOD_CAPABILITIES_LIST: self.capabilities_list,
             STT_METHOD_TRANSCRIBE: self.transcribe,
+            STT_METHOD_STREAM_OPEN: self.stream_open,
+            STT_METHOD_STREAM_CANCEL: self.stream_cancel,
         }
+
+    def cancel_all_streams(self) -> int:
+        """Cancel every live session (adapter shutdown / link loss). Never raises."""
+        try:
+            return self._streams.cancel_all()
+        except Exception:  # noqa: BLE001
+            logger.warning("could not cancel the live STT sessions", exc_info=True)
+            return 0
 
     async def capabilities_list(self, params: Any) -> Dict[str, Any]:
         return await asyncio.to_thread(self._sync_capabilities_list, params)
+
+    async def stream_open(self, params: Any) -> Dict[str, Any]:
+        """Open a live session tailing the relay's staged upload. Never raises."""
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.to_thread(self._sync_stream_open, params, loop)
+        except Exception as exc:  # noqa: BLE001 — a raise would strand the relay
+            logger.warning("stt.stream.open failed unexpectedly", exc_info=True)
+            return _not_opened(
+                f"OcuClaw could not start live words: {type(exc).__name__}: {exc}"
+            )
+
+    async def stream_cancel(self, params: Any) -> Dict[str, Any]:
+        """Best-effort, idempotent. Cheap (signals only), so it runs on the loop."""
+        try:
+            stream_id = _stream_id(
+                params.get("streamId") if isinstance(params, dict) else None
+            )
+            return {"cancelled": self._streams.cancel(stream_id)}
+        except Exception:  # noqa: BLE001
+            logger.warning("stt.stream.cancel failed unexpectedly", exc_info=True)
+            return {"cancelled": False}
 
     async def transcribe(self, params: Any) -> Dict[str, Any]:
         """One batch transcription of one committed utterance.
@@ -1454,9 +2089,16 @@ class SttRpc:
         # off. Nothing here is pickable, and annotating eight providers with
         # the same reason would bury that one fact — so this is the honest
         # empty listing the phone renders as "no STT configured in Hermes".
+        # Live words: present only on a Hermes that ships the module (0.22+).
+        ts = _streaming_module()
+        result: Dict[str, Any] = {}
+        if ts is not None:
+            result["streamProtocolVersion"] = STT_STREAM_PROTOCOL_VERSION
+
         try:
             if not tt.is_stt_enabled(stt_config):
-                return {"providers": []}
+                result["providers"] = []
+                return result
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
                 f"Could not read the Hermes stt config: {exc}"
@@ -1465,12 +2107,16 @@ class SttRpc:
         # Wire order IS Hermes's dispatch precedence: built-in > command-type
         # > plugin (transcription_tools.py:379-410, and
         # `_dispatch_to_plugin_provider` invariants 1-2 re-verify it).
-        lanes = (
-            ("built-in", self._builtin_entries(tt, stt_config)),
-            ("command-type", self._command_entries(tt, stt_config)),
-            ("plugin", self._plugin_entries()),
+        lanes = tuple(
+            (lane, _annotate_streaming(rows, lane=lane, tt=tt, ts=ts, stt_config=stt_config))
+            for lane, rows in (
+                ("built-in", self._builtin_entries(tt, stt_config)),
+                ("command-type", self._command_entries(tt, stt_config)),
+                ("plugin", self._plugin_entries()),
+            )
         )
-        return {"providers": _dedupe_by_id(lanes)}
+        result["providers"] = _dedupe_by_id(lanes)
+        return result
 
     def _builtin_entries(
         self, tt: Any, stt_config: Dict[str, Any]
@@ -1682,6 +2328,60 @@ class SttRpc:
     # -- transcribe --------------------------------------------------------
 
     def _sync_transcribe(self, params: Any) -> Dict[str, Any]:
+        """Live-session owner for one transcribe; the batch body is unchanged.
+
+        A ``streamId`` naming an open live session takes it out of the table
+        first, so nothing else can finalize or expire it mid-call, and the
+        ``finally`` cancels it on every path the live result did not settle.
+        """
+        live = self._streams.take(
+            _stream_id(params.get("streamId") if isinstance(params, dict) else None)
+        )
+        try:
+            return self._sync_transcribe_spill(params, live)
+        finally:
+            if live is not None:
+                live.cancel()
+
+    def _live_envelope(
+        self, live: _LiveStream, provider: str
+    ) -> Optional[Dict[str, Any]]:
+        """The live session's final as the wire envelope, or None to run batch.
+
+        Only a non-empty success counts. Anything else — a different pick than
+        the session opened with, a drain or finalize failure, an empty final —
+        falls through to the batch path on the same claimed file.
+        """
+        if live.provider != provider:
+            logger.info(
+                "live STT stream %s opened for %r but transcribe picked %r; "
+                "using batch", live.stream_id, live.provider, provider,
+            )
+            return None
+        result = live.finalize(_STREAM_FINALIZE_TIMEOUT_S)
+        if result is None or not result.get("success"):
+            logger.info(
+                "live STT stream %s gave no final (%s); using batch",
+                live.stream_id,
+                None if result is None else _envelope_error(result.get("error"), provider),
+            )
+            return None
+        transcript = result.get("transcript")
+        if not isinstance(transcript, str) or not transcript.strip():
+            logger.info(
+                "live STT stream %s finished empty; using batch", live.stream_id
+            )
+            return None
+        return {
+            "success": True,
+            "transcript": transcript.strip(),
+            "provider": _clean_str(result.get("provider")) or provider,
+            "error": None,
+        }
+
+    def _sync_transcribe_spill(
+        self, params: Any, live: Optional[_LiveStream]
+    ) -> Dict[str, Any]:
         """Spill-file lifecycle owner. Delegates the decision to `_transcribed`.
 
         Split exactly here because the spill file has two states and only two:
@@ -1689,6 +2389,10 @@ class SttRpc:
         it is deleted no matter what happens next, including an exception this
         handler did not anticipate — or it did not, in which case nothing on
         disk is touched at all.
+
+        A live session is asked for its final only after the claim, so the
+        spill rules hold whichever result wins: the live session reads through
+        its own descriptor, which the rename does not disturb.
         """
         _maybe_sweep_orphaned_spills()
         provider = _clean_str(
@@ -1727,6 +2431,17 @@ class SttRpc:
                 return _failed(provider, claim_error)
 
         try:
+            if live is not None and spill is not None:
+                try:
+                    envelope = self._live_envelope(live, provider)
+                except Exception:  # noqa: BLE001 — batch still has the file
+                    logger.warning(
+                        "live STT final failed unexpectedly; using batch",
+                        exc_info=True,
+                    )
+                    envelope = None
+                if envelope is not None:
+                    return envelope
             return self._transcribed(provider, params, audio, spill)
         except Exception as exc:  # noqa: BLE001 — a raise would strand the phone
             logger.warning(
@@ -1883,3 +2598,116 @@ class SttRpc:
                 _TRANSCRIBE_SOURCE,
             )
         return _normalize_envelope(raw, provider)
+
+    # -- live words ----------------------------------------------------------
+
+    def _sync_stream_open(
+        self, params: Any, loop: Optional[asyncio.AbstractEventLoop]
+    ) -> Dict[str, Any]:
+        """Validate, then start a Hermes live session fed from the staged upload.
+
+        The same read-only gates as the transcribe lane (enabled, dispatchable,
+        available) plus the listing's live verdict, so a pick the settings
+        screen showed as batch-only is refused here with the same words. The
+        model pick is deliberately not forwarded: a live wire has its own model
+        (``stt.openai.streaming_model``), and the batch model is often not one.
+        """
+        if not isinstance(params, dict):
+            return _not_opened("stt.stream.open needs an object of params.")
+        stream_id = _stream_id(params.get("streamId"))
+        if stream_id is None:
+            return _not_opened("stt.stream.open needs a `streamId`.")
+        provider = _clean_str(params.get("provider"))
+        if provider is None:
+            return _not_opened("stt.stream.open needs the picked `provider`.")
+        path, path_error = _resolve_stream_upload_path(params.get("path"))
+        if path_error is not None:
+            return _not_opened(path_error)
+        assert path is not None
+
+        ts = _streaming_module()
+        open_session = getattr(ts, "open_streaming_session", None)
+        if ts is None or not callable(open_session):
+            return _not_opened(_STREAMING_TOO_OLD_REASON)
+        try:
+            from tools import transcription_tools as tt
+        except Exception as exc:  # noqa: BLE001
+            return _not_opened(f"Hermes transcription surface is unavailable: {exc}")
+        try:
+            stt_config = tt._load_stt_config() or {}
+            if not isinstance(stt_config, dict):
+                stt_config = {}
+            enabled = tt.is_stt_enabled(stt_config)
+        except Exception as exc:  # noqa: BLE001
+            return _not_opened(f"Could not read the Hermes stt config: {exc}")
+        if not enabled:
+            return _not_opened("STT is disabled in the Hermes config (stt.enabled: false).")
+        refusal = _dispatch_refusal(tt, stt_config, provider)
+        if refusal is not None:
+            return _not_opened(refusal)
+        unavailable = _unavailable_reason(tt, stt_config, provider)
+        if provider in _builtin_ids(tt):
+            lane = "built-in"
+        elif provider in _command_provider_ids(tt, stt_config):
+            lane = "command-type"
+        else:
+            lane = "plugin"
+        streams, reason = _streaming_verdict(
+            tt, ts, stt_config,
+            lane=lane, pid=provider,
+            display_name=_BUILTIN_DISPLAY_NAMES.get(provider, provider),
+            available=unavailable is None,
+        )
+        if not streams:
+            return _not_opened(reason or _STREAMING_SETUP_REASON)
+
+        try:
+            fd = _open_upload_readonly(path)
+        except OSError as exc:
+            return _not_opened(
+                f"The staged upload file could not be opened: "
+                f"{exc.strerror or type(exc).__name__}."
+            )
+        record = _LiveStream(
+            stream_id=stream_id,
+            provider=provider,
+            fd=fd,
+            deadline=self._streams.clock() + _STREAM_EXPIRY_S,
+            clock=self._streams.clock,
+            loop=loop,
+            send=self._send_to_child,
+            on_expired=self._streams.expire,
+        )
+        full = self._streams.reserve(record)
+        if full is not None:
+            record.abandon()
+            return _not_opened(full)
+
+        tweaks = _SttCallTweaks(
+            provider=provider,
+            language=_clean_str(params.get("language")),
+            prompt=_with_default_vocabulary(
+                tt, stt_config, provider, _clean_str(params.get("prompt"))
+            ),
+        )
+        overlay = _dispatch_overlay(stt_config, tweaks)
+        overlay["provider"] = provider
+        overlay["streaming"] = True
+        try:
+            session = open_session(on_partial=record.offer_partial, stt_config=overlay)
+        except Exception:  # noqa: BLE001 — documented to return None; hold it here
+            logger.warning(
+                "Hermes live STT open raised for %r", provider, exc_info=True
+            )
+            session = None
+        if session is None:
+            self._streams.discard(record)
+            record.abandon()
+            return _not_opened(
+                "Hermes could not start a live session for this provider. "
+                "Words will show after you finish."
+            )
+        if not record.attach(session):
+            self._streams.discard(record)
+            return _not_opened("The live session was cancelled while it opened.")
+        return {"opened": True}

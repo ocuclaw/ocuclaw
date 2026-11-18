@@ -120,7 +120,7 @@ function applyFilter(value, filter, data, previous) {
   }
 }
 
-function stringify(value, opts) {
+function stringify(value, opts     )      {
   if (value === undefined || value === null) return "";
   if (typeof value === "string") return value;
   if (Array.isArray(value) && opts && typeof opts.arraySeparator === "string") {
@@ -129,7 +129,7 @@ function stringify(value, opts) {
   return String(value);
 }
 
-function evaluateExpression(exprSrc, data, previous) {
+function evaluateExpression(exprSrc     , data     , previous     )      {
   const parts = exprSrc.split("|").map((s) => s.trim());
   const path = parts[0];
   let value = resolvePath(path, data, previous);

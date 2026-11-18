@@ -8,9 +8,13 @@ const process = require("node:process");
 const HERMES_UPLOAD_LIMITS = Object.freeze({
   pcmBytes: 3_999_956, chunkBytes: 16_384, queuedBytes: 262_144,
   uploads: 4, records: 256, idleMs: 30_000, lifetimeMs: 180_000, orphanRpcs: 2,
+
+  streamOpenWaitMs: 5_000,
 });
 
-function wavHeader(bytes) {
+const HERMES_UPLOAD_PARTIAL_TYPE = "ocuclaw.voice.hermes.stt.upload.partial";
+
+function wavHeader(bytes     ) {
   const b = Buffer.alloc(44);
   b.write("RIFF"); b.writeUInt32LE(36 + bytes, 4); b.write("WAVEfmt ", 8);
   b.writeUInt32LE(16, 16); b.writeUInt16LE(1, 20); b.writeUInt16LE(1, 22);
@@ -20,25 +24,26 @@ function wavHeader(bytes) {
   return b;
 }
 
-function createHermesSttUpload(deps) {
+function createHermesSttUpload(deps     ) {
   const limits = { ...HERMES_UPLOAD_LIMITS, ...deps.limits };
   const io = deps.fs || fs;
   const records = new Map();
   let queuedBytes = 0;
   let closed = false;
+  let partialSink      = null;
   const now = deps.now || Date.now;
-  const validId = (id) => typeof id === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(id);
-  const failure = (message) => ({ success: false, error: { code: "upload_failed", message } });
-  const keyFor = (client, id) => JSON.stringify([client, id]);
-  const terminal = (r) => r.state === "done" || r.state === "cancelled";
-  const log = (level, message) => { const fn = deps.logger && deps.logger[level]; if (typeof fn === "function") fn.call(deps.logger, message); };
+  const validId = (id     ) => typeof id === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(id);
+  const failure = (message     ) => ({ success: false, error: { code: "upload_failed", message } });
+  const keyFor = (client     , id     ) => JSON.stringify([client, id]);
+  const terminal = (r     ) => r.state === "done" || r.state === "cancelled";
+  const log = (level     , message     ) => { const fn = deps.logger && deps.logger[level]; if (typeof fn === "function") fn.call(deps.logger, message); };
 
-  async function cleanup(r) {
+  async function cleanup(r     ) {
     if (r.file) { const file = r.file; r.file = null; await file.close().catch(() => {}); }
     await io.unlink(r.path).catch(() => {});
     r.cleaned = true;
   }
-  async function writeAll(file, bytes, position) {
+  async function writeAll(file     , bytes     , position     ) {
     let offset = 0;
     while (offset < bytes.length) {
       const result = await file.write(bytes, offset, bytes.length - offset, position + offset);
@@ -46,7 +51,37 @@ function createHermesSttUpload(deps) {
       offset += result.bytesWritten;
     }
   }
-  function cancel(r, message = "upload cancelled") {
+
+  function openStream(r     ) {
+    const live = r.live;
+    r.streamId = randomUUID();
+    r.streamOpen = Promise.resolve()
+      .then(() => deps.openStream({ streamId: r.streamId, path: r.path, provider: live.provider,
+        model: live.model, language: live.language, prompt: live.prompt }))
+      .then((opened     ) => opened === true, () => false);
+  }
+
+  function releaseStream(r     ) {
+    if (!r.streamOpen || r.streamUsed || r.streamReleased) return;
+    r.streamReleased = true;
+    const streamId = r.streamId;
+    void r.streamOpen.then((opened     ) => {
+      if (opened && typeof deps.cancelStream === "function") return deps.cancelStream(streamId);
+    }).catch(() => {});
+  }
+
+  async function streamForCommit(r     ) {
+    if (!r.streamOpen || r.streamReleased) return null;
+    let timer     ;
+    const late = new Promise(resolve => { timer = setTimeout(() => resolve(false), limits.streamOpenWaitMs); });
+    const opened = await Promise.race([r.streamOpen, late]);
+    clearTimeout(timer);
+    if (opened !== true || r.state === "cancelled" || r.streamReleased) return null;
+    r.streamUsed = true;
+    return r.streamId;
+  }
+  function cancel(r     , message = "upload cancelled") {
+    releaseStream(r);
     r.state = "cancelled";
     r.result = failure(message);
 
@@ -63,20 +98,20 @@ function createHermesSttUpload(deps) {
       }
     }
   }
-  const timer = setInterval(sweep, Math.min(limits.idleMs, 1000));
+  const timer      = setInterval(sweep, Math.min(limits.idleMs, 1000));
   timer.unref?.();
 
-  const recovery = io.readdir(os.tmpdir()).then(async (names) => {
+  const recovery = io.readdir(os.tmpdir()).then(async (names     ) => {
     for (const name of names) {
       const match = /^ocuclaw-stt-upload-(\d+)-[a-f0-9-]+\.wav$/.exec(name);
       if (!match) continue;
-      try { process.kill(Number(match[1]), 0); } catch (error) {
+      try { process.kill(Number(match[1]), 0); } catch (error     ) {
         if (error.code === "ESRCH") await io.unlink(path.join(os.tmpdir(), name)).catch(() => {});
       }
     }
   }).catch(() => {});
 
-  function handle(client, msg) {
+  function handle(client     , msg     ) {
     sweep();
     if (closed || !client || !validId(msg.uploadId)) return Promise.resolve(failure("invalid upload identity"));
     const key = keyFor(client, msg.uploadId);
@@ -98,7 +133,13 @@ function createHermesSttUpload(deps) {
         return Promise.resolve(failure("previous transcriptions still running"));
       }
       if (orphans) log("info", `[hermes-stt] upload admitted beside ${orphans} orphaned transcription(s)`);
-      r = { client, state: "open", created: now(), touched: now(), bytes: 0, chunks: 0,
+      const text = (v     ) => typeof v === "string" ? v : null;
+      const live = msg.live === true && typeof msg.provider === "string" && msg.provider.trim() &&
+        typeof deps.openStream === "function"
+        ? { provider: msg.provider, model: text(msg.model), language: text(msg.language), prompt: text(msg.prompt) }
+        : null;
+      r = { client, uploadId: msg.uploadId, voiceSessionId: msg.voiceSessionId, live,
+        state: "open", created: now(), touched: now(), bytes: 0, chunks: 0,
         file: null, rpc: null, result: null, cleaned: false,
         path: path.join(os.tmpdir(), `ocuclaw-stt-upload-${process.pid}-${randomUUID()}.wav`) };
       records.set(key, r);
@@ -106,7 +147,9 @@ function createHermesSttUpload(deps) {
         if (r.state === "cancelled") return;
         r.file = await io.open(r.path, "wx", 0o600);
         await writeAll(r.file, wavHeader(0), 0);
-      }).catch(async () => { r.state = "cancelled"; r.result = failure("audio staging failed"); await cleanup(r); });
+
+        if (r.live && r.state === "open") openStream(r);
+      }).catch(async () => { releaseStream(r); r.state = "cancelled"; r.result = failure("audio staging failed"); await cleanup(r); });
       return r.chain.then(() => r.result || { success: true });
     }
     if (!r) return Promise.resolve(failure("unknown upload"));
@@ -129,7 +172,7 @@ function createHermesSttUpload(deps) {
       r.bytes += bytes.length; r.chunks++; queuedBytes += bytes.length;
       r.chain = r.chain.then(async () => {
         if (r.state !== "cancelled") await writeAll(r.file, bytes, position);
-      }).catch(async () => { r.state = "cancelled"; r.result = failure("audio staging failed"); await cleanup(r); })
+      }).catch(async () => { releaseStream(r); r.state = "cancelled"; r.result = failure("audio staging failed"); await cleanup(r); })
         .finally(() => { queuedBytes -= bytes.length; });
       return r.chain.then(() => r.result || { success: true });
     }
@@ -145,25 +188,49 @@ function createHermesSttUpload(deps) {
         await writeAll(r.file, wavHeader(r.bytes), 0);
         await r.file.close(); r.file = null;
         if (r.state === "cancelled") { await cleanup(r); return r.result; }
-        r.rpc = deps.transcribeStaged(msg, r.path);
+        const streamId = await streamForCommit(r);
+        if (r.state === "cancelled") { await cleanup(r); return r.result; }
+        r.rpc = streamId
+          ? deps.transcribeStaged(msg, r.path, undefined, { streamId })
+          : deps.transcribeStaged(msg, r.path);
         const result = await r.rpc;
         if (r.state !== "cancelled") { r.state = "done"; r.result = result; }
         return r.result;
       } catch (_) {
         r.state = "done"; r.result = failure("audio staging failed");
         return r.result;
-      } finally { r.rpc = null; r.touched = now(); await cleanup(r); }
+      } finally { releaseStream(r); r.rpc = null; r.touched = now(); await cleanup(r); }
     });
     return r.commit;
   }
-  async function removeClient(client) {
+  async function removeClient(client     ) {
     await Promise.all([...records.values()].filter(r => r.client === client).map(r => cancel(r)));
   }
   async function dispose() {
     closed = true; clearInterval(timer);
     await Promise.all([...records.values()].map(r => cancel(r)));
   }
-  return { handle, removeClient, dispose };
+  function setPartialSink(fn     ) {
+    partialSink = typeof fn === "function" ? fn : null;
+  }
+
+  function partial(streamId     , text     ) {
+    if (typeof streamId !== "string" || !streamId || typeof text !== "string" || !partialSink) return false;
+    for (const r of records.values()) {
+      if (r.streamId !== streamId) continue;
+      if (r.state !== "open") return false;
+      try {
+        partialSink(r.client, { type: HERMES_UPLOAD_PARTIAL_TYPE, uploadId: r.uploadId,
+          voiceSessionId: r.voiceSessionId, text });
+        return true;
+      } catch (error     ) {
+        log("warn", `[hermes-stt] partial delivery failed: ${error && error.message ? error.message : error}`);
+        return false;
+      }
+    }
+    return false;
+  }
+  return { handle, removeClient, dispose, setPartialSink, partial };
 }
 
-module.exports = { HERMES_UPLOAD_LIMITS, createHermesSttUpload };
+module.exports = { HERMES_UPLOAD_LIMITS, HERMES_UPLOAD_PARTIAL_TYPE, createHermesSttUpload };

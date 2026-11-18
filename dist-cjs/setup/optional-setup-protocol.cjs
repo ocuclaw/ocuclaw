@@ -3,6 +3,7 @@ const operations      = {
   status: [],
   "credential.begin": ["capability", "intent"],
   "credential.save": ["transactionId", "credential"],
+  "credential.remove": ["transactionId"],
   "credential.cancel": ["transactionId"],
   "activation.preview": [],
   "activation.apply": ["operationId"],
@@ -14,21 +15,31 @@ const operations      = {
   "route.status": ["operationId"],
   "evenai.test.arm": [],
   "evenai.test.cancel": [],
+
+  "jev.check": [],
 };
 const id = (value     ) => typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
 
 const OPTIONAL_SETUP_CAPABILITIES = Object.freeze(["soniox", "even_ai", "typesafe"]);
+
+const JEV_CHECK_RESULTS = Object.freeze(["working", "key_rejected", "unreachable", "no_key", "not_loaded"]);
+
+const OPTIONAL_SETUP_REMOVABLE_CAPABILITIES = Object.freeze(["typesafe", "even_ai"]);
+
+const OPTIONAL_SETUP_PERMISSIONS = Object.freeze(["access", "handoff", "liveui_jev", "program_cards_jev",
+  "program_cards_mcp", "program_cards_model"]);
 function parseOptionalSetupRequest(value     ) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || !id(value.requestId) || !Object.prototype.hasOwnProperty.call(operations, value.operation)) return null;
   const keys = ["type", "requestId", "operation", ...operations[value.operation]];
   if (Object.keys(value).some(key => !keys.includes(key))
       || (value.type !== undefined && value.type !== "ocuclaw.optional.setup.request")) return null;
-  if (value.operation === "credential.begin" && (!OPTIONAL_SETUP_CAPABILITIES.includes(value.capability) || !["create", "replace"].includes(value.intent))) return null;
+  if (value.operation === "credential.begin" && (!OPTIONAL_SETUP_CAPABILITIES.includes(value.capability) || !["create", "replace", "remove"].includes(value.intent))) return null;
+  if (value.operation === "credential.begin" && value.intent === "remove" && !OPTIONAL_SETUP_REMOVABLE_CAPABILITIES.includes(value.capability)) return null;
   if (value.operation.startsWith("credential.") && value.operation !== "credential.begin" && !id(value.transactionId)) return null;
   if (value.operation === "credential.save" && (typeof value.credential !== "string" || !/^[\x21-\x7e]{1,4096}$/.test(value.credential))) return null;
   if (["activation.apply", "activation.status", "diagnostics.apply", "route.apply", "route.status"].includes(value.operation) && !id(value.operationId)) return null;
-  if (value.operation === "diagnostics.preview" && (!["access", "handoff"].includes(value.permission) || typeof value.allowed !== "boolean")) return null;
+  if (value.operation === "diagnostics.preview" && (!OPTIONAL_SETUP_PERMISSIONS.includes(value.permission) || typeof value.allowed !== "boolean")) return null;
   const request      = { requestId: value.requestId, operation: value.operation };
   for (const key of operations[value.operation]) request[key] = value[key];
   return request;
@@ -42,7 +53,7 @@ function optionalSetupFailure(request     , code = "unavailable", status = "reje
 function optionalSetupResult(request     , result     ) {
   const states = ["not_configured", "saved", "available_to_test", "unknown", "save_failed"];
   const modes = ["hot_reload", "restart", "manual", "none"];
-  const allowedStatus = ["ok", "saved", "preserved", "cancelled", "rejected", "unsupported", "outcome_unknown"];
+  const allowedStatus = ["ok", "saved", "removed", "preserved", "cancelled", "rejected", "unsupported", "outcome_unknown"];
   const codes = ["invalid_request", "phone_only", "unsupported", "unavailable", "not_connected", "configuration_changed", "transaction_expired", "transaction_invalid", "replacement_required", "busy", "save_unconfirmed", "activation_unavailable", "operation_unknown", "activation_pending", "invalid_input"];
   if (!result || !allowedStatus.includes(result.status)) return optionalSetupFailure(request, "unavailable", "outcome_unknown");
   const out      = { requestId: request.requestId, operation: request.operation, status: result.status };
@@ -63,7 +74,20 @@ function optionalSetupResult(request     , result     ) {
       const d = snapshot.diagnostics;
       out.snapshot.diagnostics = { supported: d.supported === true, access: d.access === true, handoff: d.handoff === true,
         activeAccess: typeof d.activeAccess === "boolean" ? d.activeAccess : null,
-        activeHandoff: typeof d.activeHandoff === "boolean" ? d.activeHandoff : null };
+        activeHandoff: typeof d.activeHandoff === "boolean" ? d.activeHandoff : null,
+
+        liveuiJev: d.liveuiJev === true,
+        activeLiveuiJev: typeof d.activeLiveuiJev === "boolean" ? d.activeLiveuiJev : null,
+
+        programCardsJev: d.programCardsJev === true,
+        activeProgramCardsJev: typeof d.activeProgramCardsJev === "boolean" ? d.activeProgramCardsJev : null,
+
+        programCardsMcp: d.programCardsMcp === true,
+        activeProgramCardsMcp: typeof d.activeProgramCardsMcp === "boolean" ? d.activeProgramCardsMcp : null,
+        programCardsModel: d.programCardsModel === true,
+        activeProgramCardsModel: typeof d.activeProgramCardsModel === "boolean" ? d.activeProgramCardsModel : null,
+
+        liveuiJevKeyAvailable: typeof d.liveuiJevKeyAvailable === "boolean" ? d.liveuiJevKeyAvailable : null };
     }
 
     const hostContext = snapshot.hostContext;
@@ -73,7 +97,7 @@ function optionalSetupResult(request     , result     ) {
   }
   const transaction = result.transaction;
   if (transaction && id(transaction.id) && Number.isFinite(transaction.expiresAtMs)
-      && OPTIONAL_SETUP_CAPABILITIES.includes(transaction.capability) && ["create", "replace"].includes(transaction.intent)) {
+      && OPTIONAL_SETUP_CAPABILITIES.includes(transaction.capability) && ["create", "replace", "remove"].includes(transaction.intent)) {
     out.transaction = { id: transaction.id, expiresAtMs: transaction.expiresAtMs, capability: transaction.capability, intent: transaction.intent };
   }
   const activation = result.activation;
@@ -84,7 +108,7 @@ function optionalSetupResult(request     , result     ) {
   }
   const diagnostics = result.diagnostics;
   if (diagnostics && id(diagnostics.operationId) && Number.isFinite(diagnostics.expiresAtMs)
-      && ["access", "handoff"].includes(diagnostics.permission) && typeof diagnostics.allowed === "boolean"
+      && OPTIONAL_SETUP_PERMISSIONS.includes(diagnostics.permission) && typeof diagnostics.allowed === "boolean"
       && ["preview", "saved", "unknown", "unsupported"].includes(diagnostics.state)) {
     out.diagnostics = { operationId: diagnostics.operationId, expiresAtMs: diagnostics.expiresAtMs,
       permission: diagnostics.permission, allowed: diagnostics.allowed, state: diagnostics.state };
@@ -102,8 +126,18 @@ function optionalSetupResult(request     , result     ) {
       reason: endpoint || route.state === "refused" ? route.reason : "route_unavailable",
       host: endpoint ? host : null, agentUrl: endpoint ? route.agentUrl : null,
       relayPort: endpoint ? route.relayPort : null, tailnetOnly: true, requestVerified: false };
+
+    if (["route_unavailable", "route_conflict"].includes(out.route.reason)
+        && ["not_installed", "signed_out", "offline"].includes(route.tailscale)) out.route.tailscale = route.tailscale;
+    if (out.route.state === "refused" && out.route.reason === "route_conflict"
+        && ["hermes", "openclaw"].includes(route.owner)) out.route.owner = route.owner;
+  }
+
+  const jevCheck = result.jevCheck;
+  if (request?.operation === "jev.check" && jevCheck && JEV_CHECK_RESULTS.includes(jevCheck.result)) {
+    out.jevCheck = { result: jevCheck.result };
   }
   return out;
 }
 
-module.exports = { OPTIONAL_SETUP_CAPABILITIES, parseOptionalSetupRequest, optionalSetupFailure, optionalSetupResult };
+module.exports = { OPTIONAL_SETUP_CAPABILITIES, JEV_CHECK_RESULTS, OPTIONAL_SETUP_REMOVABLE_CAPABILITIES, OPTIONAL_SETUP_PERMISSIONS, parseOptionalSetupRequest, optionalSetupFailure, optionalSetupResult };

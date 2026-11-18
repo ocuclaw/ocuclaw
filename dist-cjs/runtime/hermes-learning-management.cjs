@@ -30,7 +30,7 @@ function learningRequest(operation        , raw     )      {
 }
 
 function learningSnapshot(raw     )      {
-  if (!record(raw) || !exact(raw.fields, LEARNING_FIELDS) || raw.currentWork !== "unchanged_not_observed" || raw.pendingProposals !== "preserved" ||
+  if (!record(raw) || !record(raw.fields) || !fields(Object.keys(raw.fields)) || raw.currentWork !== "unchanged_not_observed" || raw.pendingProposals !== "preserved" ||
       typeof raw.modelsTruncated !== "boolean" || typeof raw.selectedModelAvailable !== "boolean" || typeof raw.customReviewRoute !== "boolean" ||
       !Array.isArray(raw.models) || raw.models.length < 1 || raw.models.length > 1000 || raw.models[0] !== "inherit" ||
       new Set(raw.models).size !== raw.models.length || !raw.models.every(model) || !record(raw.futureRoute) ||
@@ -38,7 +38,8 @@ function learningSnapshot(raw     )      {
       (raw.futureRoute.state === "unknown" && raw.futureRoute.model != null) ||
       (raw.futureRoute.model != null && (!model(raw.futureRoute.model) || raw.futureRoute.model === "inherit"))) return null;
   const rows      = {};
-  for (const name of LEARNING_FIELDS) {
+
+  for (const name of LEARNING_FIELDS.filter(key => Object.hasOwn(raw.fields, key))) {
     const row = raw.fields[name];
     if (!record(row) || !revision(row.revision) || typeof row.writable !== "boolean" || typeof row.savedPresent !== "boolean" ||
         !["managed", "user", "default"].includes(row.source) || !["absent", "recognized", "unrecognized"].includes(row.savedState) ||

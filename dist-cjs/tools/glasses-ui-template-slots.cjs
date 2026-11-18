@@ -31,13 +31,13 @@ const CONTROL_FIELDS = Object.freeze([
   "refresh",
 ]);
 
-function isPlainObject(value) {
+function isPlainObject(value     )      {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
 }
 
-function copyLiveuiStaticJson(value, state = { keys: 0 }, depth = 0) {
+function copyLiveuiStaticJson(value     , state      = { keys: 0 }, depth = 0)      {
   if (
     value === null ||
     typeof value === "string" ||
@@ -67,22 +67,22 @@ function copyLiveuiStaticJson(value, state = { keys: 0 }, depth = 0) {
   return output;
 }
 
-function rejected(code, message) {
+function rejected(code     , message     )      {
   return { ok: false, code, message };
 }
 
-function firstUnknown(value, allowed) {
+function firstUnknown(value     , allowed     )      {
   if (!isPlainObject(value)) return null;
   return Object.keys(value).find((key) => !allowed.has(key)) || null;
 }
 
-function visitStrings(value, path, visitor) {
+function visitStrings(value     , path     , visitor     )      {
   if (typeof value === "string") {
     visitor(value, path);
     return;
   }
   if (Array.isArray(value)) {
-    value.forEach((entry, index) => visitStrings(entry, `${path}[${index}]`, visitor));
+    value.forEach((entry     , index     ) => visitStrings(entry, `${path}[${index}]`, visitor));
     return;
   }
   if (!isPlainObject(value)) return;
@@ -91,7 +91,7 @@ function visitStrings(value, path, visitor) {
   }
 }
 
-function validateFragment(fragment, path, references, slotByKey, allowError) {
+function validateFragment(fragment     , path     , references     , slotByKey     , allowError     )      {
   if (!isPlainObject(fragment)) {
     return rejected("template_presentations_invalid", `${path} must be an object`);
   }
@@ -137,16 +137,16 @@ function validateFragment(fragment, path, references, slotByKey, allowError) {
       }
     }
   }
-  let stringError = null;
-  visitStrings(fragment, path, (text, stringPath) => {
+  let stringError      = null;
+  visitStrings(fragment, path, (text     , stringPath     ) => {
     if (stringError) return;
     stringError = validateReferenceString(text, stringPath, references, slotByKey, allowError);
   });
   return stringError || { ok: true };
 }
 
-function validateReferenceString(text, path, references, slotByKey, allowError) {
-  const syntax = validateTemplate(text);
+function validateReferenceString(text     , path     , references     , slotByKey     , allowError     )      {
+  const syntax      = validateTemplate(text);
   if (!syntax.ok) return rejected(syntax.code, `${path}: ${syntax.message}`);
   const expression = /\{\{([^}]+)\}\}/g;
   let match;
@@ -174,7 +174,7 @@ function validateReferenceString(text, path, references, slotByKey, allowError) 
   return null;
 }
 
-function validatePagesFragment(fragment, references, slotByKey) {
+function validatePagesFragment(fragment     , references     , slotByKey     )      {
   if (!isPlainObject(fragment)) {
     return rejected("template_presentations_invalid", "presentations.pages must be an object");
   }
@@ -209,7 +209,7 @@ function validatePagesFragment(fragment, references, slotByKey) {
   return { ok: true };
 }
 
-function validateLiveuiTemplateSlotContract(template) {
+function validateLiveuiTemplateSlotContract(template     ) {
   const slots = template && template.slots;
   const presentations = template && template.presentations;
   if (slots === undefined && presentations === undefined) return { ok: true };
@@ -219,7 +219,7 @@ function validateLiveuiTemplateSlotContract(template) {
       `slots must be an array with at most ${LIVEUI_TEMPLATE_SLOT_MAX} declarations`,
     );
   }
-  const slotByKey = new Map();
+  const slotByKey      = new Map();
   for (let index = 0; index < (slots || []).length; index += 1) {
     const slot = slots[index];
     if (!isPlainObject(slot)) {
@@ -237,8 +237,8 @@ function validateLiveuiTemplateSlotContract(template) {
     if (!LIVEUI_TEMPLATE_SLOT_TYPES.includes(slot.type)) {
       return rejected("template_slot_type_invalid", `unknown slot type: ${slot.type}`);
     }
-    const slotBoundFields = SLOT_BOUND_FIELDS;
-    const allowed = new Set([...SLOT_COMMON_FIELDS, ...slotBoundFields[slot.type]]);
+    const slotBoundFields      = SLOT_BOUND_FIELDS;
+    const allowed      = new Set([...SLOT_COMMON_FIELDS, ...slotBoundFields[slot.type]]);
     const unknown = firstUnknown(slot, allowed);
     if (unknown) {
       return rejected("template_field_unknown", `unknown slots[${index}] field: ${unknown}`);
@@ -291,10 +291,10 @@ function validateLiveuiTemplateSlotContract(template) {
     slotByKey.set(slot.key, slot);
   }
 
-  const references = new Set();
-  let stringError = null;
+  const references      = new Set();
+  let stringError      = null;
   for (const section of ["fields", "defaults"]) {
-    visitStrings(template && template[section], section, (text, path) => {
+    visitStrings(template && template[section], section, (text     , path     ) => {
       if (stringError) return;
       stringError = validateReferenceString(text, path, references, slotByKey, false);
     });
@@ -399,8 +399,8 @@ function validateLiveuiTemplateSlotContract(template) {
   return { ok: true };
 }
 
-function validateImageValue(value) {
-  let image;
+function validateImageValue(value     )      {
+  let image     ;
   if (typeof value === "string") {
     image = { imageAsset: value };
   } else if (isPlainObject(value)) {
@@ -412,10 +412,10 @@ function validateImageValue(value) {
   }
   if (image.imageAsset !== undefined) {
     if (!GLASSES_UI_IMAGE_ASSETS.includes(image.imageAsset) ||
-        Object.keys(image).some((key) => key !== "imageAsset")) return null;
+        Object.keys(image).some((key     ) => key !== "imageAsset")) return null;
   }
-  const descriptor = getKindDescriptor("text_surface");
-  const validation = descriptor.validateSpec({
+  const descriptor      = getKindDescriptor("text_surface");
+  const validation      = descriptor.validateSpec({
     kind: "text_surface",
     template: "image_caption",
     body: "x",
@@ -423,12 +423,12 @@ function validateImageValue(value) {
   });
   return validation.ok
     ? Object.fromEntries(
-        Object.entries(validation.spec).filter(([key]) => key.startsWith("image")),
+        Object.entries(validation.spec).filter(([key]     ) => key.startsWith("image")),
       )
     : null;
 }
 
-function jsonByteLength(value) {
+function jsonByteLength(value     )      {
   try {
     return new TextEncoder().encode(JSON.stringify(value)).length;
   } catch (_) {
@@ -436,7 +436,7 @@ function jsonByteLength(value) {
   }
 }
 
-function validateSlotValue(slot, value) {
+function validateSlotValue(slot     , value     )      {
   if (slot.type === "text") {
     const maxLength = slot.maxLength === undefined
       ? LIVEUI_TEMPLATE_SLOT_TEXT_MAX
@@ -454,7 +454,7 @@ function validateSlotValue(slot, value) {
   if (slot.type === "list") {
     const maxItems = slot.maxItems === undefined ? 20 : slot.maxItems;
     const valid = Array.isArray(value) && value.length <= maxItems &&
-      value.every((item) => typeof item === "string" &&
+      value.every((item     ) => typeof item === "string" &&
         item.length <= LIVEUI_TEMPLATE_SLOT_LIST_ITEM_MAX);
     return valid ? { ok: true, value: [...value] } : { ok: false };
   }
@@ -470,7 +470,7 @@ function validateSlotValue(slot, value) {
   return image ? { ok: true, value: image } : { ok: false };
 }
 
-function copyAndValidateValues(template, rawValues) {
+function copyAndValidateValues(template     , rawValues     )      {
   if (rawValues === undefined) rawValues = {};
   if (!isPlainObject(rawValues)) {
     return {
@@ -479,9 +479,9 @@ function copyAndValidateValues(template, rawValues) {
     };
   }
   const descriptors = Object.getOwnPropertyDescriptors(rawValues);
-  const slotByKey = new Map((template.slots || []).map((slot) => [slot.key, slot]));
-  const values = {};
-  const invalid = [];
+  const slotByKey      = new Map((template.slots || []).map((slot     ) => [slot.key, slot]));
+  const values      = {};
+  const invalid      = [];
   for (const key of Object.keys(descriptors)) {
     const descriptor = descriptors[key];
     const slot = slotByKey.get(key);
@@ -489,22 +489,22 @@ function copyAndValidateValues(template, rawValues) {
       invalid.push({ key, code: "slot_value_invalid" });
       continue;
     }
-    let copied;
+    let copied     ;
     try {
       copied = copyLiveuiStaticJson(descriptor.value);
     } catch (_) {
       invalid.push({ key, code: "slot_value_invalid" });
       continue;
     }
-    const checked = validateSlotValue(slot, copied);
+    const checked      = validateSlotValue(slot, copied);
     if (!checked.ok) invalid.push({ key, code: "slot_value_invalid" });
     else values[key] = checked.value;
   }
   return { values, invalid };
 }
 
-function templateBaseSpec(template) {
-  const base = {
+function templateBaseSpec(template     )      {
+  const base      = {
     ...(template.defaults || {}),
     ...(template.fields || {}),
     ...(template.assets || {}),
@@ -518,7 +518,7 @@ function templateBaseSpec(template) {
   return base;
 }
 
-function substituteValue(value, data, opts = {}, depth = 0) {
+function substituteValue(value     , data     , opts      = {}, depth = 0)      {
   if (typeof value === "string") {
     return substituteTemplate(value, data, {
       preserveWholeValue: opts.preserveWholeValue === true,
@@ -526,20 +526,21 @@ function substituteValue(value, data, opts = {}, depth = 0) {
     });
   }
   if (Array.isArray(value)) {
-    return value.map((entry) => substituteValue(entry, data, opts, depth + 1));
+    return value.map((entry     ) => substituteValue(entry, data, opts, depth + 1));
   }
   if (!isPlainObject(value)) return value;
-  const output = {};
+  const output      = {};
   for (const [key, child] of Object.entries(value)) {
     const preserveWholeValue = opts.preserveWholeValue === true ||
       (depth === 0 && key === "graphic") ||
+      (depth === 0 && key === "durationPicker") ||
       (depth === 0 && key === "items" && typeof child === "string");
     output[key] = substituteValue(child, data, { preserveWholeValue }, depth + 1);
   }
   return output;
 }
 
-function applyImageSlot(template, spec, values) {
+function applyImageSlot(template     , spec     , values     )      {
   const imageSlot = template.assets && template.assets.imageSlot;
   if (!imageSlot) return spec;
   delete spec.imageAsset;
@@ -555,29 +556,29 @@ function applyImageSlot(template, spec, values) {
   return spec;
 }
 
-function applyClosedListItemShape(template, spec) {
+function applyClosedListItemShape(template     , spec     )      {
   const declaredItems = template && template.fields && template.fields.items !== undefined
     ? template.fields.items
     : template && template.defaults && template.defaults.items;
   if (typeof declaredItems !== "string" || !Array.isArray(spec.items)) return spec;
   if (spec.kind === "list_with_details_surface") {
-    spec.items = spec.items.map((label) => ({ label }));
+    spec.items = spec.items.map((label     ) => ({ label }));
   } else if (spec.kind === "checklist_surface") {
-    spec.items = spec.items.map((label) => ({ label, checked: false }));
+    spec.items = spec.items.map((label     ) => ({ label, checked: false }));
   }
   return spec;
 }
 
-function controlsFrom(spec) {
-  const controls = {};
+function controlsFrom(spec     )      {
+  const controls      = {};
   for (const key of CONTROL_FIELDS) {
     if (spec[key] !== undefined) controls[key] = spec[key];
   }
   return controls;
 }
 
-function fragmentSpec(template, name, values, errorText) {
-  const base = substituteValue(templateBaseSpec(template), {
+function fragmentSpec(template     , name     , values     , errorText     )      {
+  const base      = substituteValue(templateBaseSpec(template), {
     slot: values,
     error: errorText,
   });
@@ -590,7 +591,7 @@ function fragmentSpec(template, name, values, errorText) {
       ...controlsFrom(base),
     };
   }
-  const filled = substituteValue(fragment, { slot: values, error: errorText });
+  const filled      = substituteValue(fragment, { slot: values, error: errorText });
   if (Array.isArray(filled.items)) {
     return {
       kind: "list_surface",
@@ -611,7 +612,7 @@ function fragmentSpec(template, name, values, errorText) {
   };
 }
 
-function rawErrorMessage(value) {
+function rawErrorMessage(value     )      {
   return typeof value === "string"
     ? value
     : value && typeof value.message === "string"
@@ -619,17 +620,17 @@ function rawErrorMessage(value) {
       : String(value || "unknown error");
 }
 
-function errorMessage(value) {
+function errorMessage(value     )      {
   return LIVEUI_TEMPLATE_ERROR_PREFIX + rawErrorMessage(value).slice(0, 100);
 }
 
-function previewLiveuiTemplatePresentation(template, name, values = {}, error = "preview error") {
-  const checked = copyAndValidateValues(template, values);
+function previewLiveuiTemplatePresentation(template     , name     , values      = {}, error      = "preview error") {
+  const checked      = copyAndValidateValues(template, values);
   return fragmentSpec(template, name, checked.values, rawErrorMessage(error));
 }
 
-function sampleLiveuiTemplateValues(template) {
-  const values = {};
+function sampleLiveuiTemplateValues(template     ) {
+  const values      = {};
   for (const slot of (template && template.slots) || []) {
     if (slot.type === "text") values[slot.key] = "x";
     else if (slot.type === "number") values[slot.key] = Math.min(slot.max, Math.max(slot.min, 0));
@@ -641,7 +642,7 @@ function sampleLiveuiTemplateValues(template) {
   return values;
 }
 
-function fillLiveuiTemplate(template, rawValues = {}, options = {}) {
+function fillLiveuiTemplate(template     , rawValues      = {}, options      = {}) {
   const hasContract = !!(
     template &&
     (template.slots !== undefined || template.presentations !== undefined)
@@ -652,7 +653,7 @@ function fillLiveuiTemplate(template, rawValues = {}, options = {}) {
     return { status: "filled", spec: template.spec };
   }
 
-  const checked = copyAndValidateValues(template || {}, rawValues);
+  const checked      = copyAndValidateValues(template || {}, rawValues);
   const values = checked.values;
   if (options && options.error !== undefined) {
     const text = rawErrorMessage(options.error).slice(0, 100);
@@ -660,7 +661,7 @@ function fillLiveuiTemplate(template, rawValues = {}, options = {}) {
   }
   if (checked.invalid.length > 0) {
     const text = rawErrorMessage(
-      `slot_value_invalid: ${checked.invalid.map((entry) => entry.key).join(", ")}`,
+      `slot_value_invalid: ${checked.invalid.map((entry     ) => entry.key).join(", ")}`,
     );
     return {
       status: "error",
@@ -670,9 +671,9 @@ function fillLiveuiTemplate(template, rawValues = {}, options = {}) {
   }
 
   const missing = (template.slots || [])
-    .filter((slot) => slot.required === true &&
+    .filter((slot     ) => slot.required === true &&
       !Object.prototype.hasOwnProperty.call(values, slot.key))
-    .map((slot) => slot.key);
+    .map((slot     ) => slot.key);
   if (missing.length > 0) {
     const loading = !!(template.presentations && template.presentations.loading);
     const status = loading ? "loading" : "empty";
@@ -682,7 +683,7 @@ function fillLiveuiTemplate(template, rawValues = {}, options = {}) {
       missing,
     };
   }
-  const emptyRequiredList = (template.slots || []).find((slot) =>
+  const emptyRequiredList = (template.slots || []).find((slot     ) =>
     slot.required === true && slot.type === "list" &&
     Array.isArray(values[slot.key]) && values[slot.key].length === 0,
   );
@@ -693,7 +694,7 @@ function fillLiveuiTemplate(template, rawValues = {}, options = {}) {
     };
   }
 
-  const spec = applyImageSlot(
+  const spec      = applyImageSlot(
     template,
     applyClosedListItemShape(
       template,
@@ -704,11 +705,11 @@ function fillLiveuiTemplate(template, rawValues = {}, options = {}) {
   return { status: "filled", spec };
 }
 
-function liveuiTemplateHasErrorPresentation(template) {
+function liveuiTemplateHasErrorPresentation(template     ) {
   return !!(template && template.presentations && template.presentations.error);
 }
 
-function readLiveuiTemplateRefreshPath(output, path) {
+function readLiveuiTemplateRefreshPath(output     , path     ) {
   if (typeof path !== "string" || !path.trim()) return undefined;
   const data = output && typeof output === "object" && !Array.isArray(output)
     ? { ...output, output }

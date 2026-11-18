@@ -70,13 +70,13 @@ def parse(payload) -> tuple:
         raise bm.BoardReadError("invalid_request")
     slug, anchor, key = payload["slug"], payload["anchor"], payload["key"]
     card_id, body = payload["id"], payload["body"]
-    if not isinstance(slug, str) or not bm._SLUG.match(slug):
+    if not isinstance(slug, str) or not bm._SLUG.fullmatch(slug):
         raise bm.BoardReadError("invalid_request")
-    if not isinstance(anchor, str) or not bm._ANCHOR.match(anchor):
+    if not isinstance(anchor, str) or not bm._ANCHOR.fullmatch(anchor):
         raise bm.BoardReadError("invalid_request")
-    if not isinstance(key, str) or not board_ops.KEY.match(key):
+    if not isinstance(key, str) or not board_ops.KEY.fullmatch(key):
         raise bm.BoardReadError("invalid_request")
-    if not isinstance(card_id, str) or not bm._CARD_ID.match(card_id):
+    if not isinstance(card_id, str) or not bm._CARD_ID.fullmatch(card_id):
         raise bm.BoardReadError("invalid_request")
     if not isinstance(body, str):
         raise bm.BoardReadError("invalid_request")

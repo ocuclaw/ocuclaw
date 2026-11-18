@@ -3,8 +3,8 @@
 The OcuClaw widget is reconciled before the TUI starts.  While inert it only
 polls a fixed loopback activation port.  ``pair_phone`` temporarily owns that
 port and supplies public run metadata; the already-loaded widget then opens
-itself, drives the relay's QR/four-word ceremony, and returns a secret-free
-outcome to the blocked setup tool.
+itself, drives the relay's phone-code, manual and four-word ceremony, and
+returns a secret-free outcome to the blocked setup tool.
 
 This avoids relying on filesystem hot reload, which is not portable across all
 filesystems Hermes runs on. The activation server owns the Relay Credential
@@ -47,10 +47,31 @@ ACTIVATION_CONTROL_HEADER = "x-ocuclaw-tui-control-capability"
 ACTIVATION_CHALLENGE_HEADER = "x-ocuclaw-tui-activation-challenge"
 ACTIVATION_SERVER_CHALLENGE_HEADER = "x-ocuclaw-tui-server-challenge"
 ACTIVATION_CLAIM_PROOF_HEADER = "x-ocuclaw-tui-claim-proof"
+ACTIVATION_WIDGET_PROTOCOL_HEADER = "x-ocuclaw-tui-widget-protocol"
+# The activation contract the loaded widget speaks; it sends this with each
+# claim. Hermes loads tui-widgets/*.mjs when the TUI starts, before the
+# gateway it spawns loads this plugin and reconciles the file, so after an
+# update the running TUI can still hold the old module (and on a Hermes that
+# hot-reloads widgets, the old module's activation timer keeps polling next to
+# the new one). Protocol 2 (#5483, #5427): the activation signs the phone-code
+# answer and the relay's block has no QR. A protocol-1 widget fails both checks
+# in silence, so its claim is refused and reported as a relaunch. Bump this
+# with the widget's own WIDGET_PROTOCOL whenever the two must change together.
+WIDGET_PROTOCOL = "2"
+# How long a claim from an older widget may stand before the run says
+# "relaunch": time for a current widget in the same TUI (two 750 ms polls,
+# each a challenge and a claim) to claim first.
+STALE_WIDGET_GRACE_SECONDS = 3.0
+# How long the owning TUI has to claim before any TUI holding the token may:
+# the same two polls (Hermes 0.22 shared gateway, see _ActivationState.claim).
+ANY_TUI_GRACE_SECONDS = 3.0
+# With no claim at all by then, no TUI window is showing the panel: say so
+# now, with the terminal fallback, instead of waiting out the pairing.
+UNCLAIMED_SECONDS = 20.0
 CALLBACK_HEADER = "x-ocuclaw-pairing-callback"
 MAX_CALLBACK_BODY_BYTES = 512
 MAX_CONTROL_BODY_BYTES = 4096
-PAIRING_WAIT_SECONDS = 165.0
+PAIRING_WAIT_SECONDS = 345.0
 RECEIPT_WAIT_SECONDS = 5.0
 _ALLOWED_STATES = frozenset({"completed", "failed", "cancelled", "refused"})
 _SAFE_CODE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,79}$")
@@ -218,8 +239,10 @@ class _ActivationState:
         relay_credential: str = "",
         control_post: Optional[Callable[..., Any]] = None,
         activation_signing_key: str = "",
+        route_flags: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.token = token
+        self.route_flags = dict(route_flags or {})
         self.run_id = run_id
         self.activation = dict(activation)
         self.owner_tui_pid = owner_tui_pid
@@ -232,6 +255,10 @@ class _ActivationState:
         self.activation_signing_key = activation_signing_key
         self.server_challenge = secrets.token_urlsafe(32)
         self.claimed = False
+        # When an authentic claim first came from a widget on another
+        # protocol (a module loaded before this plugin was updated).
+        self.stale_widget_at: Optional[float] = None
+        self.opened_at = time.monotonic()
         self.event = threading.Event()
         self.result: Optional[Dict[str, str]] = None
         self.lock = threading.Lock()
@@ -244,11 +271,21 @@ class _ActivationState:
         request_challenge: str = "",
         request_server_challenge: str = "",
         request_claim_proof: str = "",
+        request_widget_protocol: str = "",
     ) -> Optional[Dict[str, Any]]:
         with self.lock:
             if self.claimed or request_surface != self.surface:
                 return None
-            if self.surface == "tui" and request_owner_pid != str(self.owner_tui_pid):
+            # The owning TUI is the gateway's parent when it started the
+            # gateway. On Hermes 0.22 the TUI may be a client of a shared
+            # gateway instead, so no widget ever matches: after a short grace
+            # any widget holding the token may claim. The pid is
+            # self-reported, so it only routes; the proofs below guard.
+            if (
+                self.surface == "tui"
+                and request_owner_pid != str(self.owner_tui_pid)
+                and time.monotonic() - self.opened_at < ANY_TUI_GRACE_SECONDS
+            ):
                 return None
             if self.surface == "tui" and (
                 not self.activation_signing_key
@@ -277,6 +314,14 @@ class _ActivationState:
                 request_capability, self.claim_capability
             ):
                 return None
+            if self.surface == "tui" and request_widget_protocol != WIDGET_PROTOCOL:
+                # The owning TUI, proven, but running an older widget that
+                # cannot verify or render this activation. Leave it unclaimed
+                # so a current widget in the same TUI can still take it;
+                # run_tui_pairing reports a relaunch if none does.
+                if self.stale_widget_at is None:
+                    self.stale_widget_at = time.monotonic()
+                return None
             self.claimed = True
             result = dict(self.activation)
             if self.surface == "tui":
@@ -292,6 +337,10 @@ class _ActivationState:
                     result.get("runId"),
                     result.get("expiresAtMs"),
                 ]
+                # #5483. Signed only when present, so an activation without
+                # a phone-code decision keeps today's proof.
+                if "phoneCode" in result:
+                    proof_fields.append(result["phoneCode"])
                 proof = json.dumps(proof_fields, separators=(",", ":"))
                 result["activationMac"] = hmac.new(
                     self.activation_signing_key.encode("utf-8"),
@@ -313,12 +362,23 @@ class _ActivationState:
             or self.control_post is None
         ):
             return 403, {"error": "pairing_control_refused"}
+        extra: Dict[str, Any] = {}
+        if payload.get("op") == "create" and "phoneCode" in payload:
+            # #5483. As Hermes pair and Desktop: the host's own custom-route
+            # answer goes with the code, and the relay gets the longer wait a
+            # lookup plus a sealed delivery can take. A plain create is
+            # forwarded as it came.
+            from . import pairing
+
+            payload = {**payload, **self.route_flags}
+            extra["timeout"] = pairing.PHONE_CODE_CREATE_TIMEOUT_SECONDS
         try:
             return self.control_post(
                 self.control_url,
                 payload,
                 credential=self.relay_credential,
                 control_secret=control_secret or None,
+                **extra,
             )
         except Exception:  # noqa: BLE001 - never expose credential/proxy internals
             return 502, {"error": "pairing_control_unavailable"}
@@ -390,6 +450,7 @@ def _handler_for(
                 self.headers.get(ACTIVATION_CHALLENGE_HEADER, ""),
                 self.headers.get(ACTIVATION_SERVER_CHALLENGE_HEADER, ""),
                 self.headers.get(ACTIVATION_CLAIM_PROOF_HEADER, ""),
+                self.headers.get(ACTIVATION_WIDGET_PROTOCOL_HEADER, ""),
             )
             if activation is None:
                 self.send_response(204)
@@ -442,7 +503,7 @@ def _completion_id(record: Any) -> Optional[str]:
     return str(record.get("completionId")) if isinstance(record, Mapping) else None
 
 
-#: #3829. The pairing codes that mean "the two-minute window ran out". Nothing
+#: #3829. The pairing codes that mean "the five-minute window ran out". Nothing
 #: is wrong with the phone or the route, so the recovery is a fresh code in
 #: the SAME panel (call ``pair_phone`` again), never the terminal fallback.
 #: `completion-window-elapsed` is included for a relay older than #3829, which
@@ -452,7 +513,7 @@ EXPIRED_CODES = frozenset({"expired", "completion-window-elapsed"})
 #: The phone's own words for an expiry (``hostReasonMessage`` in
 #: PhonePairingController.kt), so the computer and the phone agree.
 EXPIRED_MESSAGE = (
-    "Pairing took longer than the two-minute window. Nothing is wrong with "
+    "Pairing took longer than the five-minute window. Nothing is wrong with "
     "the phone. Start pairing again to get a fresh code in this same window."
 )
 
@@ -502,19 +563,114 @@ def _window_too_small_result(result: Mapping[str, Any]) -> Dict[str, Any]:
     return response
 
 
+#: #5483. The activation's recorded answer to "does the relay offer a phone
+#: code?" (Desktop's ``PHONE_CODE_DECISIONS``). The panel asks for the code
+#: only on ``available``.
+PHONE_CODE_DECISIONS = ("available", "off", "custom_route", "unavailable")
+
+
+def _custom_route_flags() -> Dict[str, Any]:
+    """``{"customRoute": True}`` when this host pairs over a custom route.
+
+    The same check Hermes Desktop makes; unreadable config means none, and
+    the gateway still fences the address itself.
+    """
+    try:
+        from .desktop_pairing import _desktop_custom_route
+
+        return {"customRoute": True} if _desktop_custom_route() else {}
+    except Exception:  # noqa: BLE001 - the gateway reads its own config too
+        return {}
+
+
+def _phone_code_decision(
+    address: str,
+    control_url: str,
+    *,
+    credential: str,
+    post: Callable[..., Any],
+    route_flags: Mapping[str, Any],
+) -> str:
+    """The relay's phone-code answer, as one of :data:`PHONE_CODE_DECISIONS`.
+
+    Asked before any exchange exists, like Hermes pair. A refused, failed or
+    old control endpoint means off, which keeps today's panel.
+    """
+    from . import pairing
+
+    try:
+        status, body = post(
+            control_url,
+            {"v": 1, "op": "phone-code-status", "address": address, **route_flags},
+            credential=credential,
+            timeout=pairing.PHONE_CODE_STATUS_TIMEOUT_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 - any failed status call means off
+        return "off"
+    if status != 200 or not isinstance(body, Mapping):
+        return "off"
+    if body.get("available") is True:
+        return "available"
+    reason = body.get("reason")
+    return reason if reason in ("custom_route", "unavailable") else "off"
+
+
+def _phone_code_wait_seconds() -> float:
+    """Desktop's typing budget while a phone code is in play."""
+    try:
+        from .desktop_pairing import _phone_code_wait_seconds as desktop_wait
+
+        return desktop_wait()
+    except Exception:  # noqa: BLE001 - today's wait still pairs
+        return PAIRING_WAIT_SECONDS
+
+
+def _await_callback(state: _ActivationState, wait_seconds: float) -> str:
+    """Wait for the panel's result: ``result``, ``timeout`` or ``stale_widget``.
+
+    ``stale_widget`` once an older widget in the owning TUI has stood as the
+    only claimant for the grace period: no current widget took the activation,
+    so the panel would never open.
+    """
+
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    while True:
+        remaining = deadline - time.monotonic()
+        if state.event.wait(max(0.0, min(remaining, 0.1))):
+            return "result"
+        with state.lock:
+            claimed = state.claimed
+            stale_at = None if claimed else state.stale_widget_at
+        now = time.monotonic()
+        if stale_at is not None and now - stale_at >= STALE_WIDGET_GRACE_SECONDS:
+            return "stale_widget"
+        if not claimed and stale_at is None and now - state.opened_at >= UNCLAIMED_SECONDS:
+            return "unclaimed"
+        if now >= deadline:
+            return "timeout"
+
+
 def run_tui_pairing(
     address: str,
     *,
     control_url: str,
     home: Optional[Path] = None,
-    wait_seconds: float = PAIRING_WAIT_SECONDS,
+    wait_seconds: Optional[float] = None,
     receipt_wait_seconds: float = RECEIPT_WAIT_SECONDS,
     completion_reader: Callable[[], Any] = read_pairing_completion,
     owner_tui_pid: Optional[int] = None,
     credential_reader: Optional[Callable[[], str]] = None,
     control_post: Optional[Callable[..., Any]] = None,
+    phone_codes: Optional[Callable[[str, str], str]] = None,
 ) -> Dict[str, Any]:
-    """Activate the preloaded widget and return its verified secret-free result."""
+    """Activate the preloaded widget and return its verified secret-free result.
+
+    Without ``wait_seconds`` the setup tool first asks the relay whether it
+    offers a phone code (#5483) and records the answer in the activation: on
+    ``available`` the panel asks for the code before creating anything and
+    waits Desktop's longer typing budget, otherwise it waits today's 345 s. A
+    caller that names its wait records no answer, and the panel is today's.
+    """
 
     resolved_owner_tui_pid = (
         resolve_owner_tui_pid() if owner_tui_pid is None else owner_tui_pid
@@ -577,6 +733,21 @@ def run_tui_pairing(
                 "there is nothing for a phone to pair with."
             ),
         }
+    post = control_post or pairing._post
+    decision: Optional[str] = None
+    route_flags: Dict[str, Any] = {}
+    if wait_seconds is None:
+        route_flags = _custom_route_flags()
+        decision = (phone_codes or (
+            lambda addr, url: _phone_code_decision(
+                addr, url, credential=relay_credential, post=post, route_flags=route_flags,
+            )
+        ))(address, control_url)
+        if decision not in PHONE_CODE_DECISIONS:
+            decision = "off"
+        wait_seconds = (
+            _phone_code_wait_seconds() if decision == "available" else PAIRING_WAIT_SECONDS
+        )
     callback_token = secrets.token_urlsafe(32)
     presenter_token = secrets.token_urlsafe(32)
     control_token = secrets.token_urlsafe(32)
@@ -596,6 +767,8 @@ def run_tui_pairing(
         "runId": run_id,
         "expiresAtMs": int((time.time() + wait_seconds) * 1000),
     }
+    if decision is not None:
+        activation["phoneCode"] = decision
     callback_state = _ActivationState(
         token=callback_token,
         run_id=run_id,
@@ -604,8 +777,9 @@ def run_tui_pairing(
         control_token=control_token,
         control_url=control_url,
         relay_credential=relay_credential,
-        control_post=control_post or pairing._post,
+        control_post=post,
         activation_signing_key=presenter_token,
+        route_flags=route_flags,
     )
     try:
         server = ThreadingHTTPServer(
@@ -644,7 +818,31 @@ def run_tui_pairing(
     before_id = _completion_id(completion_reader())
     try:
         thread.start()
-        if not callback_state.event.wait(max(0.0, wait_seconds)):
+        waited = _await_callback(callback_state, wait_seconds)
+        if waited == "stale_widget":
+            return {
+                "ok": False,
+                "state": "refused",
+                "code": "tui_relaunch_required",
+                "message": (
+                    "This Hermes TUI still runs the OcuClaw pairing panel it "
+                    "loaded before OcuClaw was updated. Relaunch Hermes TUI "
+                    "once, then continue this setup checkpoint."
+                ),
+            }
+        if waited == "unclaimed":
+            # Answered by the skill's "any other code" row: the terminal fallback.
+            return {
+                "ok": False,
+                "state": "failed",
+                "code": "tui_window_unclaimed",
+                "message": (
+                    "No Hermes TUI window opened the pairing panel, so nothing "
+                    "was paired. Pair from a terminal you open yourself on this "
+                    f"machine instead: hermes ocuclaw pair --address {address}"
+                ),
+            }
+        if waited == "timeout":
             return {
                 "ok": False,
                 "state": "failed",
@@ -706,11 +904,13 @@ __all__ = [
     "ACTIVATION_OWNER_HEADER",
     "ACTIVATION_SERVER_CHALLENGE_HEADER",
     "ACTIVATION_SURFACE_HEADER",
+    "ACTIVATION_WIDGET_PROTOCOL_HEADER",
     "ACTIVATION_URL",
     "CALLBACK_HEADER",
     "PRESENTER_CAPABILITY_FILENAME",
     "WIDGET_FILENAME",
     "WIDGET_MARKER",
+    "WIDGET_PROTOCOL",
     "reconcile_pairing_widget",
     "presenter_capability_path",
     "remove_owned_widget",

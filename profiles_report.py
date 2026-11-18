@@ -37,10 +37,13 @@ strings that reach them are profile names passed through
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+
+from . import secret_access
 
 PLATFORM_NAME = "ocuclaw"
 DEFAULT_PROFILE = "default"
@@ -48,6 +51,17 @@ PROFILES_DIRNAME = "profiles"
 
 RELAY_TOKEN_ENV = "OCUCLAW_RELAY_TOKEN"
 MULTIPLEX_ENV = "GATEWAY_MULTIPLEX_PROFILES"
+#: The one sender id the adapter stamps (health.OCUCLAW_WEARER_USER_ID).
+WEARER_USER_ID = "ocuclaw-wearer"
+#: Env allowlists Hermes checks for an ocuclaw sender. When either is set,
+#: Hermes 0.22 consults only the env lists and never the adapter's in-memory
+#: wearer grant (authz_mixin ``_principal_authorized``).
+SENDER_ALLOWLIST_ENVS: Tuple[str, ...] = ("GATEWAY_ALLOWED_USERS", "OCUCLAW_ALLOWED_USERS")
+#: The Hermes releases whose native admission (``gateway/session_envelope.py``
+#: ``_validate_native``) ignores ``authorization_is_upstream``: only 0.22.1.
+#: 0.22.0 and 0.22.2 were cut from release/0.22.1, which has no native
+#: admission, and 0.22.3 honours the flag again (upstream #139199).
+WEARER_GRANT_VERSIONS = frozenset({(0, 22, 1)})
 
 GATEWAY_STATE_FILENAME = "gateway_state.json"
 GATEWAY_PID_FILENAME = "gateway.pid"
@@ -106,7 +120,12 @@ FAULT_SECONDARY_GATEWAY = "secondary_gateway_beside_multiplexer"
 FAULT_SECONDARY_TRANSPORT_OWNER = "transport_owner_is_secondary_standalone"
 FAULT_MODE_DISAGREEMENT = "profile_mode_disagreement"
 FAULT_PROVENANCE_MISSING = "transport_provenance_missing"
+FAULT_ALLOWLIST_EXCLUDES_WEARER = "sender_allowlist_excludes_wearer"
+FAULT_GATEWAY_ENV_ALLOWLIST_EXCLUDES_WEARER = "gateway_env_allowlist_excludes_wearer"
 WARNING_INSTALLED_BUT_DISABLED = "ocuclaw_installed_but_disabled_in_secondary"
+#: #6797: a profile still selects the `ocuclaw-agents` delegation backend
+#: where OcuClaw is not loaded, so Hermes fails its delegation closed.
+FAULT_DELEGATION_BACKEND_STRANDED = "delegation_backend_stranded"
 
 FAULT_CODES: Tuple[str, ...] = (
     FAULT_ENABLED_BUT_MISSING,
@@ -115,7 +134,10 @@ FAULT_CODES: Tuple[str, ...] = (
     FAULT_SECONDARY_TRANSPORT_OWNER,
     FAULT_MODE_DISAGREEMENT,
     FAULT_PROVENANCE_MISSING,
+    FAULT_ALLOWLIST_EXCLUDES_WEARER,
+    FAULT_GATEWAY_ENV_ALLOWLIST_EXCLUDES_WEARER,
     WARNING_INSTALLED_BUT_DISABLED,
+    FAULT_DELEGATION_BACKEND_STRANDED,
 )
 
 SEVERITY_ERROR = "error"
@@ -210,28 +232,111 @@ def env_multiplex_override(env: Mapping[str, str]) -> Optional[bool]:
 
 
 def relay_credential_present(home: Path) -> Optional[bool]:
-    """Whether this profile's ``.env`` carries a non-empty relay token.
+    """Whether this profile's own secret store carries a non-empty relay token.
 
     Presence only. The value is never read into a variable that outlives this
-    function, never returned, and never rendered.
+    function, never returned, and never rendered. Read through Hermes's scope
+    builder for that profile (catalogue rule 11), without the process
+    environment: this process's env belongs to whichever profile launched the
+    doctor, not to [home]. ``None`` when the store cannot be read.
     """
-    path = home / ".env"
+    token = secret_access.read_stored_secret(RELAY_TOKEN_ENV, home)
+    return None if token is None else bool(token)
+
+
+def sender_allowlists(home: Path) -> Optional[Dict[str, List[str]]]:
+    """The env sender allowlists this profile's own store sets, by name.
+
+    Only :data:`SENDER_ALLOWLIST_ENVS`; an empty value is unset, as Hermes
+    reads it. Sender ids are not secrets, but they live in ``.env``, so they
+    are read through Hermes's scope builder for [home], never by parsing the
+    file, and without the process environment for the same reason as
+    :func:`relay_credential_present`. ``None`` when the store cannot be read.
+    """
+    found: Dict[str, List[str]] = {}
+    for key in SENDER_ALLOWLIST_ENVS:
+        raw = secret_access.read_stored_secret(key, home)
+        if raw is None:
+            return None
+        ids = _parse_sender_ids(raw)
+        if ids:
+            found[key] = ids
+    return found
+
+
+#: Hermes' approved-sender files for the ocuclaw platform, current layout then
+#: legacy (``gateway/pairing.py``), relative to the profile home.
+_APPROVED_SENDER_FILES = (
+    "platforms/pairing/ocuclaw-approved.json",
+    "pairing/ocuclaw-approved.json",
+)
+
+
+def wearer_sender_approved(home: Path) -> Optional[bool]:
+    """Whether Hermes' pairing store approves the wearer in this profile.
+
+    Pairing records it (``sender_approval.py``), and Hermes checks that store
+    before the env allowlists, so an approved wearer passes a list that leaves
+    it out. Read-only; ``None`` when a store file is unreadable.
+    """
+    unreadable = False
+    for name in _APPROVED_SENDER_FILES:
+        try:
+            approved = json.loads((home / name).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError, ValueError):
+            unreadable = True
+            continue
+        if isinstance(approved, dict) and WEARER_USER_ID in approved:
+            return True
+    return None if unreadable else False
+
+
+def _parse_sender_ids(raw: str) -> List[str]:
+    """One gate value as Hermes's ``_coerce_allow_set`` splits it."""
+    raw = raw.strip()
+    parts: List[Any] = raw.split(",")
+    if raw.startswith("["):  # `hermes config set` writes JSON list literals
+        try:
+            decoded = json.loads(raw)
+        except ValueError:
+            decoded = None
+        if isinstance(decoded, list):
+            parts = decoded
+    return [str(part).strip() for part in parts if str(part).strip()]
+
+
+def gateway_sender_gate() -> Tuple[Optional[bool], Optional[Dict[str, List[str]]]]:
+    """``(multiplexed, allowlists)`` as THIS process's sender gate reads them.
+
+    The gateway half of the gateway-environment check: the adapter calls it
+    inside the gateway and records the answer in a receipt, because doctor is
+    a separate process and cannot read the gateway's environment. Hermes reads
+    these gates through ``platform_gate_env``: a single-profile gateway reads
+    ``os.environ`` (which already holds the profile's ``.env``, loaded over
+    the launch environment at boot), while a multiplexer reads each profile's
+    own secrets and ignores the process environment. So lists come back only
+    when not multiplexed; ``(None, None)`` when the mode cannot be read.
+    Read-only: nothing here changes who is admitted.
+    """
     try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return False
-    except (OSError, UnicodeError):
-        return None
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#") or "=" not in stripped:
+        from agent.secret_scope import is_multiplex_active
+
+        multiplexed = bool(is_multiplex_active())
+    except Exception:  # noqa: BLE001 - an unknown mode proves nothing
+        return None, None
+    if multiplexed:
+        return True, None
+    found: Dict[str, List[str]] = {}
+    for name in SENDER_ALLOWLIST_ENVS:
+        raw = os.environ.get(name)
+        if raw is None:
             continue
-        key, _, value = stripped.partition("=")
-        if key.strip() != RELAY_TOKEN_ENV:
-            continue
-        token = value.strip().strip("'\"").strip()
-        return bool(token)
-    return False
+        ids = _parse_sender_ids(str(raw))
+        if ids:
+            found[name] = ids
+    return False, found
 
 
 def bundle_version(plugin_dir: Path) -> Optional[str]:
@@ -546,6 +651,9 @@ def collect(
             "codeProfiles": code_profiles,
             "owner": owner,
             "provenanceObserved": provenance_observed,
+            "senderApproved": wearer_sender_approved(default_home),
+            "senderAllowlists": sender_allowlists(default_home),
+            "gatewayEnv": _collect_gateway_env(default_home),
         },
         "profiles": rows,
         "hermesVersion": hermes_version,
@@ -612,6 +720,41 @@ def _collect_migration(default_home: Path) -> Dict[str, Any]:
     }
 
 
+def _collect_gateway_env(default_home: Path) -> Dict[str, Any]:
+    """The sender allowlists the live default gateway reads from its process.
+
+    This process cannot see the gateway's environment, so it reads the
+    receipt the adapter writes from inside the gateway
+    (:func:`gateway_sender_gate`). Only a receipt for this home whose writer
+    is still alive counts: a dead gateway's view says nothing about the next
+    one. ``senderAllowlists`` is set only when the state is ``observed``.
+    """
+    try:
+        from .receipts import fingerprint_home, read_gateway_sender_gate
+
+        record, status = read_gateway_sender_gate(
+            fingerprint_home(default_home), home=default_home
+        )
+    except Exception:  # noqa: BLE001 - a diagnostic never becomes an outage
+        return {"state": "unknown", "senderAllowlists": None}
+    if status != "ok" or record is None:
+        return {"state": status, "senderAllowlists": None}
+    if record_pid_is_live(record) is not True:
+        return {"state": "stale", "senderAllowlists": None}
+    multiplexed = record.get("multiplexed")
+    if multiplexed is True:
+        return {"state": "multiplexed", "senderAllowlists": None}
+    raw = record.get("senderAllowlists")
+    if multiplexed is not False or not isinstance(raw, Mapping):
+        return {"state": "unknown", "senderAllowlists": None}
+    lists = {
+        name: [item for item in ids if isinstance(item, str)]
+        for name, ids in raw.items()
+        if name in SENDER_ALLOWLIST_ENVS and isinstance(ids, list)
+    }
+    return {"state": "observed", "senderAllowlists": lists}
+
+
 def _collect_profile(
     name: str,
     home: Path,
@@ -660,10 +803,26 @@ def _collect_profile(
         except OSError:
             continue
 
+    delegation_backend = None
+    delegation_previous = None
+    if config_readable:
+        from . import delegation_handoffs
+
+        delegation = _dig(config, ("delegation",))
+        delegation_backend = delegation_handoffs.backend_name(
+            delegation.get("backend") if isinstance(delegation, Mapping) else None
+        )
+        if delegation_backend == delegation_handoffs.BACKEND_NAME:
+            delegation_previous = delegation_handoffs.previous_backend(
+                delegation_handoffs.own_settings(delegation)
+            )
+
     return {
         "name": name,
         "isDefault": name == DEFAULT_PROFILE,
         "configReadable": config_readable,
+        "delegationBackend": delegation_backend,
+        "delegationPrevious": delegation_previous,
         "pluginEnabled": plugin_enabled,
         "codePresent": code_present,
         "bundleVersion": bundle_version(plugin_dir) if code_present else None,
@@ -684,6 +843,28 @@ def _fault(code: str, severity: str, profiles: Sequence[str], summary: str, fix:
         "summary": summary,
         "fix": fix,
     }
+
+
+def _version_at_least(hermes_version: Any, minimum: Tuple[int, int, int]) -> bool:
+    try:
+        from .health import parse_version
+
+        parsed = parse_version(str(hermes_version or ""))
+    except Exception:  # noqa: BLE001 - an unreadable version proves nothing
+        return False
+    return parsed is not None and parsed >= minimum
+
+
+def _allowlist_can_refuse_wearer(hermes_version: Any) -> bool:
+    """True on the Hermes releases whose admission reads only the env
+    allowlists for an ocuclaw sender (``WEARER_GRANT_VERSIONS``)."""
+    try:
+        from .health import parse_version
+
+        parsed = parse_version(str(hermes_version or ""))
+    except Exception:  # noqa: BLE001 - an unreadable version proves nothing
+        return False
+    return parsed in WEARER_GRANT_VERSIONS
 
 
 def _migrate_fix(hermes_version: Optional[str], profiles: Sequence[str]) -> str:
@@ -938,6 +1119,169 @@ def derive_faults(inventory: Mapping[str, Any]) -> List[Dict[str, Any]]:
             )
         )
 
+    # 6b. An env allowlist that leaves the wearer out. Hermes 0.22.1 authorizes
+    #     glasses turns through the adapter's in-memory wearer grant, but only
+    #     while no env allowlist is set; once one is, Hermes reads the env
+    #     lists alone and every glasses message is refused. 0.21.x, 0.22.0,
+    #     0.22.2 and 0.22.3+ answer from the delegated relay grant first, so
+    #     the fault is 0.22.1's alone (``WEARER_GRANT_VERSIONS``).
+    #     A wearer approved in Hermes' pairing store (pairing records it) is
+    #     admitted before any env list is read, so the list shuts nobody out.
+    allowlists = transport.get("senderAllowlists")
+    shadowing = sorted(
+        name
+        for name, ids in (allowlists.items() if isinstance(allowlists, Mapping) else ())
+        if isinstance(ids, list) and WEARER_USER_ID not in ids and "*" not in ids
+    )
+    if transport.get("senderApproved") is True:
+        shadowing = []
+    if shadowing and _allowlist_can_refuse_wearer(inventory.get("hermesVersion")):
+        # OcuClaw has one sender, so its own list is never needed: remove it.
+        # The global list serves other platforms too: add the wearer to it.
+        steps = []
+        if "OCUCLAW_ALLOWED_USERS" in shadowing:
+            steps.append("remove the OCUCLAW_ALLOWED_USERS line")
+        if "GATEWAY_ALLOWED_USERS" in shadowing:
+            steps.append("add " + WEARER_USER_ID + " to GATEWAY_ALLOWED_USERS")
+        faults.append(
+            _fault(
+                FAULT_ALLOWLIST_EXCLUDES_WEARER,
+                SEVERITY_ERROR,
+                [DEFAULT_PROFILE],
+                "The default profile's .env sets "
+                + _names(shadowing)
+                + " without the glasses' sender id, so Hermes refuses every "
+                "glasses message.",
+                "Pair the glasses again: approving the pairing also approves "
+                "them in Hermes. Or, in the default profile's .env, "
+                + " and ".join(steps)
+                + ", then restart the gateway.",
+            )
+        )
+
+    # 6c. The same refusal from a list this process cannot read: one exported
+    #     in the environment the gateway was started in (a shell, a service
+    #     unit, a container). A single-profile gateway reads these gates from
+    #     its process environment; a multiplexer ignores it, so the adapter
+    #     records lists only when not multiplexed, and only a live writer's
+    #     view counts. A name 6b already names is left to it: .env wins over
+    #     the launch environment at boot, so fixing .env fixes that one. The
+    #     repair never widens admission: add the wearer, or drop the list.
+    #     A wearer approved in the pairing store passes here too, as in 6b.
+    env_lists = allowlists if isinstance(allowlists, Mapping) else None
+    gateway_env = transport.get("gatewayEnv")
+    gateway_lists = (
+        gateway_env.get("senderAllowlists") if isinstance(gateway_env, Mapping) else None
+    )
+    exported = sorted(
+        name
+        for name, ids in (gateway_lists.items() if isinstance(gateway_lists, Mapping) else ())
+        if name in SENDER_ALLOWLIST_ENVS
+        and isinstance(ids, list)
+        and WEARER_USER_ID not in ids
+        and "*" not in ids
+        and name not in shadowing
+    )
+    if transport.get("senderApproved") is True:
+        exported = []
+    if (
+        exported
+        and env_lists is not None
+        and _allowlist_can_refuse_wearer(inventory.get("hermesVersion"))
+    ):
+        # Absent from .env: it comes from the launch environment. Present in
+        # .env (and admitting the wearer, or 6b would own it): .env changed
+        # after this gateway started, so a restart alone repairs it.
+        launch = [name for name in exported if name not in env_lists]
+        restarted = [name for name in exported if name in env_lists]
+        summary = (
+            "The running gateway's environment sets "
+            + _names(exported)
+            + " without the glasses' sender id, so Hermes refuses every "
+            "glasses message."
+        )
+        if launch:
+            summary += (
+                " The default profile's .env does not set "
+                + _names(launch)
+                + ", so it comes from the environment the gateway was "
+                "started in."
+            )
+        if restarted:
+            summary += (
+                " The default profile's .env admits the wearer in "
+                + _names(restarted)
+                + " now; the gateway started before that change."
+            )
+        steps = []
+        if "GATEWAY_ALLOWED_USERS" in launch:
+            steps.append(
+                "add " + WEARER_USER_ID + " to GATEWAY_ALLOWED_USERS, or unset "
+                "it if no other platform relies on it"
+            )
+        if "OCUCLAW_ALLOWED_USERS" in launch:
+            steps.append("unset OCUCLAW_ALLOWED_USERS")
+        if steps:
+            fix = (
+                "Pair the glasses again: approving the pairing also approves "
+                "them in Hermes. Or, in the environment the gateway starts in "
+                "(shell profile, "
+                "service unit or container), "
+                + " and ".join(steps)
+                + ", then restart the gateway."
+            )
+        else:
+            fix = "Restart the gateway so it reads the default profile's .env again."
+        faults.append(
+            _fault(
+                FAULT_GATEWAY_ENV_ALLOWLIST_EXCLUDES_WEARER,
+                SEVERITY_ERROR,
+                [DEFAULT_PROFILE],
+                summary,
+                fix,
+            )
+        )
+
+    # 8. "Asks other agents" left on where OcuClaw is not loaded (#6797).
+    #    Hermes fails a missing delegation backend closed: every delegate_task
+    #    in that agent is a tool error until the backend is put back. OcuClaw
+    #    is loaded for the default profile when it is enabled with its code on
+    #    disk, and for a secondary only when that gateway also serves it.
+    from .delegation_handoffs import BACKEND_NAME as HANDOFF_BACKEND
+
+    default_loads = bool(
+        default_row
+        and default_row.get("pluginEnabled") is True
+        and default_row.get("codePresent") is True
+    )
+    # An unknown mode is no proof that a secondary goes unserved.
+    standalone = mode.get("effective") == MODE_STANDALONE
+    stranded = [
+        row
+        for row in rows
+        if row.get("delegationBackend") == HANDOFF_BACKEND
+        and (not default_loads or (not row.get("isDefault") and standalone))
+    ]
+    if stranded:
+        names = [str(row["name"]) for row in stranded]
+        commands = []
+        for row in stranded:
+            previous = str(row.get("delegationPrevious") or "default")
+            prefix = "hermes" if row.get("isDefault") else f"hermes -p {row['name']}"
+            commands.append(f"`{prefix} config set delegation.backend {previous}`")
+        faults.append(
+            _fault(
+                FAULT_DELEGATION_BACKEND_STRANDED,
+                SEVERITY_ERROR,
+                names,
+                "These agents still hand work to other agents through OcuClaw, "
+                "but OcuClaw is not loaded where they run, so Hermes refuses "
+                "every delegated task.",
+                "Turn off Asks other agents for them on the phone, or put the "
+                "previous delegation backend back: " + " ; ".join(commands) + ".",
+            )
+        )
+
     # 7. Installed-but-disabled code in a secondary. Not a fault — the adapter
     #    is never constructed for it, so it is not a second listener and not a
     #    port clash. It is dead weight, and cleanup is optional.
@@ -977,6 +1321,7 @@ __all__ = [
     "DEFAULT_PROFILE",
     "FAULT_CODES",
     "FAULT_ENABLED_BUT_MISSING",
+    "FAULT_GATEWAY_ENV_ALLOWLIST_EXCLUDES_WEARER",
     "FAULT_MODE_DISAGREEMENT",
     "FAULT_OCUCLAW_OUTSIDE_DEFAULT",
     "FAULT_PROVENANCE_MISSING",
@@ -992,4 +1337,5 @@ __all__ = [
     "collect",
     "default_home_for",
     "derive_faults",
+    "gateway_sender_gate",
 ]

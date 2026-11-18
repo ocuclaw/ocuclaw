@@ -9,16 +9,21 @@ in a worker thread via ``asyncio.to_thread``.
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import hashlib
 import json
 import os
 import math
+import re
+import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from .overrides import parse_soul_name
 from . import desktop_fleet
+from .config_writer import replace_config
 from .profile_lifecycle import (
     PROFILE_MUTATION_LOCK, WORKSPACE_UNSUPPORTED, admit_profile,
     bootstrap_profile, write_private,
@@ -43,11 +48,31 @@ GW_METHOD_AGENT_IDENTITY = "gw.agent.identity"
 GW_METHOD_PROFILES_LIST = "gw.profiles.list"
 GW_METHOD_PROFILES_CREATE = "gw.profiles.create"
 GW_METHOD_PROFILES_EMOJI_SET = "gw.profiles.emoji.set"
+# #6798: what each agent is for (profile.yaml), the text Auto picks by.
+GW_METHOD_PROFILES_DESCRIPTION_SET = "gw.profiles.description.set"
+GW_METHOD_PROFILES_DESCRIPTION_AUTO = "gw.profiles.description.auto"
+# Hermes trims a drafted description to 280; a written one is held to the same.
+PROFILE_DESCRIPTION_MAX_CHARS = 280
+# One batch runs its drafts side by side and answers well inside the relay's 60 s
+# link timeout: up to 4 agents, 25 s each. The phone sends the missing agents 4 at a time.
+PROFILE_DESCRIBE_TIMEOUT_S = 25
+PROFILE_DESCRIBE_MAX_PROFILES = 4
+
+# #6798: a wearer's description write and a draft's landing never interleave. Hermes's
+# ``describe_profile`` checks authorship only before its model call, then writes the
+# draft; a wearer who saved words meanwhile bumps the profile's generation, and the
+# draft's check-after (under this lock) puts the wearer's words back.
+_DESCRIPTION_LOCK = threading.Lock()
+_DESCRIPTION_GENERATION: Dict[str, int] = {}
+_DESCRIPTION_WEARER: Dict[str, str] = {}
+_DESCRIPTION_DRAFTING: Set[str] = set()
 GW_METHOD_PROFILES_SETTINGS_GET = "gw.profiles.settings.get"
 GW_METHOD_PROFILES_SETTINGS_SET = "gw.profiles.settings.set"
 GW_METHOD_PROFILES_SOUL = "gw.profiles.soul"
 GW_METHOD_SKILLS_STATUS = "gw.skills.status"
 GW_METHOD_COMMANDS_LIST = "gw.commands.list"
+GW_METHOD_STARMAP_GRAPH = "gw.starmap.graph"
+GW_METHOD_STARMAP_FORGET = "gw.starmap.forget"
 
 ROUTABLE_USAGE_PROVIDERS: Tuple[str, ...] = (
     "anthropic",
@@ -87,6 +112,90 @@ class IncompleteRetryRefused(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class ProfileCreateRefused(ValueError):
+    """A ``gw.profiles.create`` refusal with a stable, wire-visible code.
+
+    ``error_code`` rides the link error frame as ``error.errorCode``
+    (PROTOCOL.md, additive) and the message is one wearer-safe sentence. Still
+    a ``ValueError`` so callers that caught the old untyped refusals keep
+    working.
+    """
+
+    def __init__(self, error_code: str, message: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+
+
+#: Longest display name the creation receipt keeps for a profile.
+DISPLAY_NAME_MAX = 80
+
+
+def _receipt_display_name(home: Optional[Path]) -> Optional[str]:
+    """The name the wearer typed when OcuClaw created this profile, if any.
+
+    The profile id is a normalized slug ("Scout" -> "scout"); the creation
+    receipt keeps the typed name. Profiles made before this field existed, or
+    made outside OcuClaw, have none and callers fall back to the id.
+    """
+    if home is None:
+        return None
+    try:
+        raw = json.loads((Path(home) / CREATE_RECEIPT_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    name = _clean_str(raw.get("displayName"))
+    return name[:DISPLAY_NAME_MAX] if name else None
+
+
+def _validated_profile_id(
+    raw_name: str,
+    normalize: Callable[[str], str],
+    validate: Callable[[str], Any],
+) -> str:
+    """Normalize *raw_name* to a native profile id, or refuse with a code.
+
+    ``default`` is the pairing profile and never a new agent:
+    ``reserved_agent_id``. Anything the native validator rejects, or that
+    normalizes to nothing, is ``invalid_name``. The native message is not
+    forwarded: it names CLI rules, not something a wearer can act on.
+    """
+    try:
+        canon = normalize(raw_name)
+    except (ValueError, TypeError):
+        canon = ""
+    canon = canon if isinstance(canon, str) else ""
+    if canon == "default":
+        raise ProfileCreateRefused(
+            "reserved_agent_id", "This profile name is reserved. Choose another name."
+        )
+    if not canon:
+        raise ProfileCreateRefused(
+            "invalid_name", "That name can't be used for an agent. Try letters and numbers."
+        )
+    try:
+        validate(canon)
+    except ValueError:
+        raise ProfileCreateRefused(
+            "invalid_name", "That name can't be used for an agent. Try letters and numbers."
+        )
+    return canon
+
+
+class ProfileRefused(ValueError):
+    """A profile this gateway will not read for the wearer.
+
+    Still a ``ValueError`` with the old message, so readers that let it raise
+    keep their behaviour; ``code`` is the wire-safe slug for readers that
+    answer with a status instead.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _validated_setup(setup: Any) -> Tuple[Dict[str, str], str, List[str]]:
@@ -158,6 +267,23 @@ def _clean_str(value: Any) -> Optional[str]:
     return text or None
 
 
+def _read_profile_meta(home: Path) -> Dict[str, Any]:
+    """``profile.yaml``'s description fields; an unreadable file reads as none (#6798)."""
+    try:
+        from .yaml_compat import yaml
+
+        data = yaml.safe_load((home / "profile.yaml").read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - missing or broken profile.yaml is "no description"
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    description = data.get("description")
+    return {
+        "description": description.strip() if isinstance(description, str) else "",
+        "description_auto": data.get("description_auto") is True,
+    }
+
+
 def _profile_home(profile: Any) -> Optional[Path]:
     """The HERMES_HOME directory of one ``ProfileInfo`` row.
 
@@ -180,6 +306,123 @@ def _profile_home(profile: Any) -> Optional[Path]:
         return Path(get_profile_dir(name))
     except Exception:  # noqa: BLE001
         return None
+
+
+def _profile_avatar(home: Optional[Path]) -> Optional[str]:
+    """Hermes Desktop's canonical avatar, including its backfilled bot faces.
+
+    Match profiles.get_asset's format order and magic checks. Bound each read;
+    a missing/large asset must never fail the roster or read outside its home.
+    """
+    if home is None:
+        return None
+    for ext, mime, checks in (
+        ("png", "image/png", ((0, b"\x89PNG\r\n\x1a\n"),)),
+        ("jpg", "image/jpeg", ((0, b"\xff\xd8\xff"),)),
+        ("webp", "image/webp", ((0, b"RIFF"), (8, b"WEBP"))),
+    ):
+        try:
+            target = home / "assets" / f"avatar.{ext}"
+            if not target.resolve().is_relative_to(home.resolve()):
+                continue
+            with target.open("rb") as asset:
+                raw = asset.read(128 * 1024 + 1)
+            if len(raw) > 128 * 1024 or not all(raw[start:start + len(magic)] == magic for start, magic in checks):
+                continue
+            return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+        except (OSError, RuntimeError):
+            continue
+    return None
+
+
+_CLASSIC_FACE_SHAPES = ("circle", "squircle", "pill", "triangle", "hexagon", "cloud", "drop")
+_LEGACY_FACE_SHAPES = ("blob", "tetrahedron", "cube", "octahedron", "dodecahedron", "icosahedron", "pebble", "teardrop", "wedge", "hex")
+_BLOB_FACE_KINDS = ("round", "organic", "boxy", "capsule", "nub", "cloud", "droplet", "hexagon", "sun", "triangle")
+
+
+def _face_shape(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or len(value) > 96:
+        return None
+    if value in _CLASSIC_FACE_SHAPES + _LEGACY_FACE_SHAPES or re.fullmatch(r"sigil-[0-9]{1,4}", value):
+        return value
+    if value == "blobatar":
+        return value
+    parts = value.split(":")
+    if (len(parts) in (2, 3) and parts[0] == "blobatar" and
+            re.fullmatch(r"[a-zA-Z0-9_-]{0,64}", parts[1]) and
+            (len(parts) == 2 or parts[2] in _BLOB_FACE_KINDS)):
+        return value
+    return None
+
+
+def _face_color(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    if re.fullmatch(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})", value):
+        return value
+    if re.fullmatch(r"hsl\([0-9]{1,3}(?:\.[0-9]+)? [0-9]{1,3}(?:\.[0-9]+)?% [0-9]{1,3}(?:\.[0-9]+)?%\)", value):
+        return value
+    return None
+
+
+def _profile_appearance(home: Optional[Path], name: str, avatar: Optional[str]) -> Optional[Dict[str, str]]:
+    """Allowlisted native BotFace appearance, never arbitrary profile UI data.
+
+    Desktop's 160px PNGs are backfilled vector faces, not chosen photos.
+    Match that upstream discriminator, respecting its explicit photo/pet flags.
+    Keep the raster alongside appearance for clients that cannot draw the face.
+    """
+    meta: Dict[str, Any] = {}
+    if home is not None:
+        try:
+            from .yaml_compat import yaml
+            path = home / "profile.yaml"
+            if not path.resolve().is_relative_to(home.resolve()):
+                return None
+            with path.open("rb") as source:
+                raw = source.read(64 * 1024 + 1)
+            if len(raw) > 64 * 1024:
+                return None
+            document = yaml.safe_load(raw.decode("utf-8"))
+            ui_meta = document.get("ui_meta") if isinstance(document, dict) else None
+            bots = ui_meta.get("hermes-bots") if isinstance(ui_meta, dict) else None
+            if isinstance(bots, dict):
+                meta = bots
+        except FileNotFoundError:
+            pass
+        except Exception:  # noqa: BLE001 - broken metadata preserves the static fallback
+            return None
+    if meta.get("imageKind") == "photo" or meta.get("pet"):
+        return None
+    if avatar is None and home is not None:
+        try:
+            # An existing image that failed the bounded raster read might be
+            # a chosen photo. Do not turn it into an unrelated generated face.
+            if any((home / "assets" / f"avatar.{ext}").exists() for ext in ("png", "jpg", "webp")):
+                return None
+        except (OSError, RuntimeError):
+            return None
+    if avatar:
+        is_face = False
+        if avatar.startswith("data:image/png;base64,"):
+            try:
+                header = base64.b64decode(avatar.split(",", 1)[1][:48])
+                is_face = len(header) >= 24 and header[16:24] == (160).to_bytes(4, "big") * 2
+            except (ValueError, TypeError):
+                pass
+        if not is_face:
+            return None
+    # Hermes profile names are ASCII slugs, so both native JS hashes agree.
+    hashed = 0
+    for char in name:
+        hashed = (hashed * 31 + ord(char)) & 0xFFFFFFFF
+    if name.strip().lower() == "default" and not meta.get("custom"):
+        return {"shape": "squircle", "color": "#8b5cf6", "name": name}
+    return {
+        "shape": _face_shape(meta.get("shape")) or _CLASSIC_FACE_SHAPES[hashed % len(_CLASSIC_FACE_SHAPES)],
+        "color": _face_color(meta.get("color")) or (f"hsl({hashed % 360} 68% 58%)" if name != "default" else "#8b5cf6"),
+        "name": name,
+    }
 
 
 def _model_ref_from_config(raw: Any) -> Optional[Dict[str, str]]:
@@ -256,6 +499,8 @@ class GwRpc:
             Callable[[], Tuple[bool, Dict[str, Path]]]
         ] = None,
         adopt_supported_provider: Optional[Callable[[], bool]] = None,
+        shared_chats_provider: Optional[Callable[[], bool]] = None,
+        auto_route_provider: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._namespace = namespace or DEFAULT_NAMESPACE
         self._create_lock = PROFILE_MUTATION_LOCK
@@ -264,6 +509,12 @@ class GwRpc:
         # host (`allow_admin_from` lists the wearer id). Read live per list so
         # the capability snapshot tracks the config the gateway booted with.
         self._adopt_supported_provider = adopt_supported_provider
+        # Shared chats (Hermes 0.23+, on by default): Continue here without the
+        # single-driver lock. Read live per list, like the adopt posture.
+        self._shared_chats_provider = shared_chats_provider
+        # Auto agent (#6795, opt-in): the host switch is on and the router's
+        # auxiliary task registered. Read live per list.
+        self._auto_route_provider = auto_route_provider
         # #2942: the routes are READ, never frozen. This reader used to copy
         # the adapter's boot snapshot here, which meant a profile created from
         # the glasses could not appear in the agent list until the gateway was
@@ -296,11 +547,15 @@ class GwRpc:
             "gw.hermes.management": self.hermes_management,
             GW_METHOD_PROFILES_CREATE: self.profiles_create,
             GW_METHOD_PROFILES_EMOJI_SET: self.profiles_emoji_set,
+            GW_METHOD_PROFILES_DESCRIPTION_SET: self.profiles_description_set,
+            GW_METHOD_PROFILES_DESCRIPTION_AUTO: self.profiles_description_auto,
             GW_METHOD_PROFILES_SETTINGS_GET: self.profiles_settings_get,
             GW_METHOD_PROFILES_SETTINGS_SET: self.profiles_settings_set,
             GW_METHOD_PROFILES_SOUL: self.profiles_soul,
             GW_METHOD_SKILLS_STATUS: self.skills_status,
             GW_METHOD_COMMANDS_LIST: self.commands_list,
+            GW_METHOD_STARMAP_GRAPH: self.starmap_graph,
+            GW_METHOD_STARMAP_FORGET: self.starmap_forget,
         }
 
     async def list_models(self, params: Any) -> Dict[str, Any]:
@@ -332,6 +587,12 @@ class GwRpc:
     async def profiles_emoji_set(self, params: Any) -> Dict[str, Any]:
         return await asyncio.to_thread(self._sync_profiles_emoji_set, params)
 
+    async def profiles_description_set(self, params: Any) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._sync_profiles_description_set, params)
+
+    async def profiles_description_auto(self, params: Any) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._sync_profiles_description_auto, params)
+
     async def profiles_settings_get(self, params: Any) -> Dict[str, Any]:
         return await asyncio.to_thread(self._sync_profiles_settings_get, params)
 
@@ -347,19 +608,63 @@ class GwRpc:
     async def commands_list(self, params: Any) -> Dict[str, Any]:
         return await asyncio.to_thread(self._sync_commands_list, params)
 
-    def _sync_list_models(self, _params: Any) -> Dict[str, Any]:
+    async def starmap_graph(self, params: Any) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._sync_starmap_graph, params)
+
+    async def starmap_forget(self, params: Any) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._sync_starmap_forget, params)
+
+    @contextlib.contextmanager
+    def _profile_home_scope(self, params: Any) -> Iterator[None]:
+        """Run a read against the served profile ``params["ns"]`` names.
+
+        ``load_config()``, the credential pool and the usage fetchers resolve
+        the gateway's own Hermes home. A multiplexed profile keeps its models,
+        defaults and accounts in its own home, so the read is scoped with
+        hermes' context-local home override. No ``ns``, the default namespace,
+        a profile this gateway does not serve, or a Hermes without the
+        override keep the gateway-home read.
+        """
+        p = params if isinstance(params, dict) else {}
+        ns = _clean_str(p.get("ns"))
+        reset = None
+        token = None
+        if ns and ns != DEFAULT_NAMESPACE:
+            multiplex, served_homes = self._routing_snapshot()
+            home = served_homes.get(ns) if multiplex else None
+            if home is not None:
+                try:
+                    from hermes_constants import (
+                        reset_hermes_home_override,
+                        set_hermes_home_override,
+                    )
+
+                    token = set_hermes_home_override(home)
+                    reset = reset_hermes_home_override
+                except Exception:  # noqa: BLE001 - older Hermes: gateway-home read
+                    reset = None
+        try:
+            yield
+        finally:
+            if reset is not None:
+                reset(token)
+
+    def _sync_list_models(self, params: Any) -> Dict[str, Any]:
+        with self._profile_home_scope(params):
+            return self._list_models_in_scope()
+
+    def _list_models_in_scope(self) -> Dict[str, Any]:
         config = self._load_config()
         configured = self._configured_from_snapshot(config)
         try:
-            from agent.models_dev import get_model_info, list_provider_models
-            from hermes_cli.models import CANONICAL_PROVIDERS
+            from agent.models_dev import get_model_info
         except Exception:  # noqa: BLE001
-            CANONICAL_PROVIDERS = ()
+            get_model_info = lambda *_: None
 
         rows: List[Dict[str, Any]] = []
         seen: Set[Tuple[str, str]] = set()
-        for provider_entry in CANONICAL_PROVIDERS:
-            provider = _clean_str(getattr(provider_entry, "slug", None))
+        for provider_entry in self._model_provider_catalog(config):
+            provider = _clean_str(provider_entry.get("slug"))
             if not provider:
                 continue
             if not self._provider_enabled(config, provider):
@@ -367,7 +672,7 @@ class GwRpc:
             provider_rows: List[Tuple[Tuple[str, str], Dict[str, Any]]] = []
             local_seen: Set[Tuple[str, str]] = set()
             try:
-                for raw_mid in list_provider_models(provider):
+                for raw_mid in provider_entry.get("models", []):
                     model_id = _clean_str(raw_mid)
                     if not model_id:
                         continue
@@ -411,6 +716,60 @@ class GwRpc:
         return {"models": rows}
 
     @staticmethod
+    def _model_provider_catalog(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Use Hermes's own authenticated picker, including OAuth-only catalogs.
+
+        models.dev is metadata, not account availability: notably Nous and
+        Codex can have a catalog without any matching models.dev provider.
+        Let Hermes own credential lookup, exclusions, aliases and caching.
+        """
+        try:
+            from hermes_cli.model_switch import list_authenticated_providers
+        except ImportError:
+            list_authenticated_providers = None
+        if callable(list_authenticated_providers):
+            import inspect
+
+            model = config.get("model")
+            model = model if isinstance(model, dict) else {}
+            options = {
+                "current_provider": _clean_str(model.get("provider")) or "",
+                "current_model": _clean_str(model.get("default")) or "",
+                "current_base_url": _clean_str(model.get("base_url")) or "",
+                "user_providers": config.get("providers"),
+                "custom_providers": config.get("custom_providers"),
+                "excluded_providers": config.get("excluded_providers"),
+                "max_models": None,
+                "probe_custom_providers": False,
+                "non_blocking_catalogs": True,
+            }
+            try:
+                # Older supported releases predate the cache-only flag.
+                parameters = inspect.signature(list_authenticated_providers).parameters
+                result = list_authenticated_providers(**{
+                    key: value for key, value in options.items() if key in parameters
+                })
+                return [row for row in result if isinstance(row, dict)]
+            except Exception:  # noqa: BLE001 - keep configured routes on auth/catalog failure
+                return []
+        # Compatibility with hosts that predate the authenticated picker.
+        try:
+            from agent.models_dev import list_provider_models
+            from hermes_cli.models import CANONICAL_PROVIDERS
+
+            rows = []
+            for entry in CANONICAL_PROVIDERS:
+                provider = _clean_str(getattr(entry, "slug", None))
+                if provider:
+                    try:
+                        rows.append({"slug": provider, "models": list_provider_models(provider)})
+                    except Exception:  # noqa: BLE001
+                        continue
+            return rows
+        except Exception:  # noqa: BLE001
+            return []
+
+    @staticmethod
     def _provider_enabled(cfg: Dict[str, Any], provider: str) -> bool:
         providers = cfg.get("providers")
         block = providers.get(provider) if isinstance(providers, dict) else None
@@ -436,8 +795,9 @@ class GwRpc:
     def _configured_default(self, cfg: Dict[str, Any]) -> Optional[Dict[str, str]]:
         return _model_ref_from_config(cfg.get("model"))
 
-    def _sync_configured(self, _params: Any) -> Dict[str, Any]:
-        return self._configured_from_snapshot(self._load_config())
+    def _sync_configured(self, params: Any) -> Dict[str, Any]:
+        with self._profile_home_scope(params):
+            return self._configured_from_snapshot(self._load_config())
 
     def _configured_from_snapshot(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         default = self._configured_default(cfg)
@@ -477,11 +837,12 @@ class GwRpc:
 
     def _usage_candidates(self) -> List[str]:
         selected: Set[str] = set()
+        default_provider: Optional[str] = None
         default = self._configured_default(self._load_config())
         if default:
-            provider = _clean_str(default.get("provider"))
-            if provider:
-                selected.add(provider)
+            default_provider = _clean_str(default.get("provider"))
+            if default_provider:
+                selected.add(default_provider)
         try:
             from hermes_cli.auth import read_credential_pool
 
@@ -494,9 +855,19 @@ class GwRpc:
                     text = _clean_str(provider)
                     if text:
                         selected.add(text)
-        return [p for p in ROUTABLE_USAGE_PROVIDERS if p in selected]
+        candidates = [p for p in ROUTABLE_USAGE_PROVIDERS if p in selected]
+        # The profile's own provider always gets a row: a provider plugin may
+        # report usage, and otherwise its unavailableReason lets the phone say
+        # "usage not reported" instead of silently dropping the card.
+        if default_provider and default_provider not in candidates:
+            candidates.append(default_provider)
+        return candidates
 
-    def _sync_usage_status(self, _params: Any) -> Dict[str, Any]:
+    def _sync_usage_status(self, params: Any) -> Dict[str, Any]:
+        with self._profile_home_scope(params):
+            return self._usage_status_in_scope()
+
+    def _usage_status_in_scope(self) -> Dict[str, Any]:
         from agent.account_usage import fetch_account_usage
         from hermes_cli.auth import PROVIDER_REGISTRY
 
@@ -600,22 +971,43 @@ class GwRpc:
         if profile not in self._routable_profiles()[1]:
             return {"agentId": profile, "name": profile}
         soul_name: Optional[str] = None
+        receipt_name: Optional[str] = None
         try:
             from hermes_cli.profiles import get_profile_dir
 
             soul_path = Path(get_profile_dir(profile)) / "SOUL.md"
             if soul_path.is_file():
                 soul_name = parse_soul_name(soul_path.read_text(encoding="utf-8"))
+            receipt_name = _receipt_display_name(Path(get_profile_dir(profile)))
         except Exception:  # noqa: BLE001
             soul_name = None
-        name = soul_name or ("Hermes" if profile == DEFAULT_PROFILE else profile)
-        return {"agentId": profile, "name": name}
+        name = soul_name or receipt_name or ("Hermes" if profile == DEFAULT_PROFILE else profile)
+        result = {"agentId": profile, "name": name}
+        try:
+            home = Path(get_profile_dir(profile))
+            # OcuClaw's explicit icon choice overrides the synced default.
+            # Pass the same profile home used by the catalog's config reader.
+            from types import SimpleNamespace
+            emoji = self._profile_extra_emoji(SimpleNamespace(name=profile, path=home))
+            if emoji:
+                result["emoji"] = emoji
+            else:
+                avatar = _profile_avatar(home)
+                if avatar:
+                    result["avatar"] = avatar
+                appearance = _profile_appearance(home, profile, avatar)
+                if appearance:
+                    result["appearance"] = appearance
+        except Exception:  # noqa: BLE001 - older Hermes keeps its name/glyph fallback
+            pass
+        return result
 
     def _profile_extra_emoji(self, profile: Any) -> Optional[str]:
         """``platforms.<platform>.extra.emoji`` from THIS profile's own config.
 
-        Hermes has no emoji or avatar field of its own; OcuClaw owns the value
-        and stores it under the profile's ``config.yaml`` (SPEC R19).
+        OcuClaw owns this explicit glyph override and stores it under the
+        profile's ``config.yaml`` (SPEC R19). Native Hermes avatars remain
+        available as the default when this override is cleared.
 
         The read MUST be per-profile. ``load_config()`` resolves the ACTIVE
         profile's home, so using it here would stamp the default profile's
@@ -646,6 +1038,9 @@ class GwRpc:
 
         multiplex, routable_profiles = self._routable_profiles()
         rows = []
+        # The control-link frame limit is 1 MiB. Keep room for the roster's
+        # other fields even on a host with many customized bot images.
+        avatar_budget = 512 * 1024
         for profile in list_profiles():
             profile_name = str(getattr(profile, "name"))
             if profile_name not in routable_profiles:
@@ -655,6 +1050,11 @@ class GwRpc:
                 "isDefault": bool(getattr(profile, "is_default")),
             }
             display_name = _clean_str(getattr(profile, "display_name", None))
+            if not display_name:
+                # The name typed at creation ("Scout" for id "scout"). A
+                # receipt that only repeats the id adds nothing to the row.
+                typed = _receipt_display_name(_profile_home(profile))
+                display_name = typed if typed != profile_name else None
             if display_name:
                 row["displayName"] = display_name
             model = getattr(profile, "model", None)
@@ -666,9 +1066,20 @@ class GwRpc:
             description = getattr(profile, "description", None)
             if description:
                 row["description"] = description
+                # #6798: one Hermes drafted; the phone offers to redo only these.
+                if getattr(profile, "description_auto", False) is True:
+                    row["descriptionAuto"] = True
             emoji = self._profile_extra_emoji(profile)
             if emoji:
                 row["emoji"] = emoji
+            avatar = None if emoji else _profile_avatar(_profile_home(profile))
+            if avatar and len(avatar) <= avatar_budget:
+                row["avatar"] = avatar
+                avatar_budget -= len(avatar)
+            if not emoji:
+                appearance = _profile_appearance(_profile_home(profile), profile_name, avatar)
+                if appearance:
+                    row["appearance"] = appearance
             rows.append(row)
         adopt_supported = False
         if self._adopt_supported_provider is not None:
@@ -676,15 +1087,47 @@ class GwRpc:
                 adopt_supported = bool(self._adopt_supported_provider())
             except Exception:  # noqa: BLE001 - capability discovery fails closed
                 adopt_supported = False
+        shared_chats = False
+        if self._shared_chats_provider is not None:
+            try:
+                shared_chats = bool(self._shared_chats_provider())
+            except Exception:  # noqa: BLE001 - capability discovery fails closed
+                shared_chats = False
+        auto_route = False
+        if self._auto_route_provider is not None:
+            try:
+                auto_route = bool(self._auto_route_provider())
+            except Exception:  # noqa: BLE001 - capability discovery fails closed
+                auto_route = False
+        # A one-profile Hermes 0.23 host boots standalone and switches itself
+        # to multiple agents when a second profile appears, so "+" works there
+        # too (no setup, no restart). Any other standalone host still needs
+        # setup, and keeps the phone's "run /ocuclaw-setup" explainer.
+        can_create = bool(multiplex) or self._in_place_default_home() is not None
         return {
             "profiles": rows,
             "defaultProfile": DEFAULT_PROFILE,
-            "createSupported": multiplex,
-            "setupSupported": multiplex,
+            "createSupported": can_create,
+            "setupSupported": can_create,
             "settingsSupported": True,
             "adoptSupported": adopt_supported,
+            "sharedChats": shared_chats,
+            "autoRoute": auto_route,
             "desktopFleet": desktop_fleet.read(),
         }
+
+    def route_candidates(self) -> List[Any]:
+        """Auto's roster (#6795): the agents this gateway serves for the wearer.
+
+        The same served-and-enrolled set the Agent wheel lists, with what the
+        router reads about each one (display name, previous names and the
+        ``profile.yaml`` description).
+        """
+        from hermes_cli.profiles import list_profiles
+
+        from .agent_router import candidates_from_profiles
+
+        return candidates_from_profiles(list_profiles(), sorted(self._routable_profiles()[1]))
 
     def _read_routing_provider(self) -> Tuple[bool, Dict[str, Path]]:
         """The provider's answer, validated. ``(False, {})`` proves nothing.
@@ -747,8 +1190,8 @@ class GwRpc:
         # from a read that proved nothing, which would be a bare KeyError in
         # the middle of an irreversible native create.
         multiplex, served_homes = self._routing_snapshot()
-        default_home = served_homes.get(DEFAULT_NAMESPACE)
-        if not multiplex or default_home is None:
+        default_home = served_homes.get(DEFAULT_NAMESPACE) if multiplex else self._in_place_default_home()
+        if default_home is None:
             raise RuntimeError("Hermes profile creation requires gateway multiplexing")
         from hermes_cli.profiles import get_profile_dir, normalize_profile_name, validate_profile_name
         # Imported here, not where it is used: the setup body now runs inside a
@@ -764,11 +1207,9 @@ class GwRpc:
             raise ValueError("Missing or invalid setup request id")
         raw_name = _clean_str(params.get("name"))
         if not raw_name:
-            raise ValueError("profile name is required")
-        canon = normalize_profile_name(raw_name)
-        validate_profile_name(canon)
-        if canon == "default":
-            raise ValueError("Choose a name other than default")
+            raise ProfileCreateRefused("invalid_name", "Enter a name for the agent.")
+        canon = _validated_profile_id(raw_name, normalize_profile_name, validate_profile_name)
+        display_name = raw_name[:DISPLAY_NAME_MAX]
         profile_dir = Path(get_profile_dir(canon))
         receipt_path = profile_dir / CREATE_RECEIPT_FILENAME
         fingerprint = _setup_fingerprint(setup)
@@ -780,24 +1221,42 @@ class GwRpc:
         # It carries the wearer's instructions, so it is no more exposed than the
         # SOUL.md beside it: `write_private` lands 0600 in the profile's own
         # directory, and nothing reads the receipt back off this host.
-        receipt = {"requestId": request_id, "fingerprint": fingerprint, RECEIPT_SETUP_KEY: setup}
+        # `displayName` keeps the name as typed; the id is its normalized slug.
+        # Not part of the fingerprint: it never changes what setup applies.
+        receipt = {
+            "requestId": request_id,
+            "fingerprint": fingerprint,
+            "displayName": display_name,
+            RECEIPT_SETUP_KEY: setup,
+        }
         # Resolved once, so every exit from this call agrees about whether the
         # wearer must restart Hermes to use the agent they just made.
         restart_required = self._restart_required_to_activate()
+        already_exists = ProfileCreateRefused(
+            "agent_already_exists", f"A profile named {display_name} already exists."
+        )
         if profile_dir.exists():
             try:
                 old = json.loads(receipt_path.read_text())
             except (OSError, ValueError):
-                raise ValueError("Profile already exists. Check the profile list before creating another.")
+                raise already_exists
+            if not isinstance(old, dict):
+                raise already_exists
             if old.get("requestId") != request_id or old.get("fingerprint") != fingerprint:
-                raise ValueError("Profile already exists and belongs to another creation request")
+                # Only a replay of this very request may resume; anything else
+                # is the plain "that name is taken" the wearer can act on.
+                raise already_exists
+            # A receipt from before `displayName` existed resumes under the
+            # name this replay carries; the setup below then records it.
+            display_name = _clean_str(old.get("displayName")) or display_name
+            receipt["displayName"] = display_name
             if old.get("complete"):
-                return {"status": "created", "profile": {"id": canon, "name": canon}, "restartRequired": restart_required}
+                return {"status": "created", "profile": {"id": canon, "name": display_name}, "restartRequired": restart_required}
         else:
-            self._create_fresh_profile({"name": raw_name})
+            self._create_fresh_profile({"name": raw_name}, may_create=True)
             # Failure here leaves an existing profile, which fails closed above.
             write_private(receipt_path, json.dumps(receipt))
-        result = {"status": "created", "profile": {"id": canon, "name": canon}, "restartRequired": restart_required}
+        result = {"status": "created", "profile": {"id": canon, "name": display_name}, "restartRequired": restart_required}
         try:
             self._run_receipt_setup(
                 default_home=default_home,
@@ -835,7 +1294,14 @@ class GwRpc:
         """
         from .yaml_compat import yaml
 
-        bootstrap_profile(default_home, profile_dir)
+        not_carried = bootstrap_profile(default_home, profile_dir)
+        if not_carried:
+            # Names only, never values.
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "ocuclaw: new agent setup could not copy %s", ", ".join(not_carried)
+            )
         if fields["instructions"]:
             soul = profile_dir / "SOUL.md"
             tmp = profile_dir / ".ocuclaw-soul.tmp"
@@ -1023,11 +1489,29 @@ class GwRpc:
             # No `restartRequired`: this profile is already in the gateway's served
             # set -- that is how its row exists to be retried -- so there is nothing
             # for a restart to activate, on either supported engine.
-            return {"status": "finished", "profile": {"id": canon, "name": canon}}
+            return {"status": "finished", "profile": {
+                "id": canon, "name": _clean_str(receipt.get("displayName")) or canon,
+            }}
         finally:
             self._create_lock.release()
 
-    def _create_fresh_profile(self, params: Any) -> Dict[str, Any]:
+    def _in_place_default_home(self) -> Optional[Path]:
+        """The default home, when creating a profile switches this standalone
+        gateway to multiple agents in place; else None.
+
+        See :func:`.profile_routes.create_switches_on_in_place`. Fails closed.
+        """
+        try:
+            from .profile_routes import create_switches_on_in_place, resolve_default_home
+
+            home = resolve_default_home()
+            if home is None or not create_switches_on_in_place(home):
+                return None
+            return Path(home).resolve()
+        except Exception:  # noqa: BLE001 - capability discovery fails closed
+            return None
+
+    def _create_fresh_profile(self, params: Any, *, may_create: bool = False) -> Dict[str, Any]:
         """Create one native Hermes profile.
 
         A new profile still cannot leak into ``gw.profiles.list``, but since
@@ -1040,14 +1524,16 @@ class GwRpc:
         publish theirs once at gateway start. See
         :meth:`_restart_required_to_activate`.
         """
-        if not self._routing_snapshot()[0]:
+        # `may_create`: the caller already settled this, on the same reads,
+        # including the one-profile in-place case.
+        if not may_create and not self._routing_snapshot()[0]:
             raise RuntimeError(
                 "Hermes profile creation requires gateway multiplexing"
             )
         p = params if isinstance(params, dict) else {}
         raw_name = _clean_str(p.get("name"))
         if not raw_name:
-            raise ValueError("profile name is required")
+            raise ProfileCreateRefused("invalid_name", "Enter a name for the agent.")
 
         from hermes_cli.profiles import (
             check_alias_collision,
@@ -1058,9 +1544,13 @@ class GwRpc:
             validate_profile_name,
         )
 
-        canon = normalize_profile_name(raw_name)
-        validate_profile_name(canon)
-        profile_dir = create_profile(name=canon)
+        canon = _validated_profile_id(raw_name, normalize_profile_name, validate_profile_name)
+        try:
+            profile_dir = create_profile(name=canon)
+        except FileExistsError:
+            raise ProfileCreateRefused(
+                "agent_already_exists", f"A profile named {raw_name[:DISPLAY_NAME_MAX]} already exists."
+            )
 
         # Match `hermes profile create`: fresh profiles receive the bundled
         # skills, and a shell alias is created only when it does not collide.
@@ -1072,7 +1562,7 @@ class GwRpc:
 
         return {
             "status": "created",
-            "profile": {"id": canon, "name": canon},
+            "profile": {"id": canon, "name": raw_name[:DISPLAY_NAME_MAX]},
             "restartRequired": self._restart_required_to_activate(),
         }
 
@@ -1103,7 +1593,7 @@ class GwRpc:
         if home is None:
             raise RuntimeError("profile configuration could not be resolved")
 
-        from hermes_cli.config import atomic_config_write, read_user_config_raw
+        from hermes_cli.config import read_user_config_raw
 
         config_path = home / "config.yaml"
         raw_cfg = read_user_config_raw(config_path) if config_path.exists() else {}
@@ -1130,12 +1620,131 @@ class GwRpc:
         else:
             extra["emoji"] = emoji
 
-        atomic_config_write(config_path, raw_cfg)
+        # Clearing drops keys on purpose; 0.21.6+ refuses that through the
+        # plain writer.
+        replace_config(config_path, raw_cfg)
         return {
             "status": "updated",
             "profile": {"id": profile_id, "name": profile_id},
             "emoji": emoji,
         }
+
+    def _served_profile_home(self, profile_id: str) -> Path:
+        """The home of one profile this gateway serves; raises like the emoji write."""
+        from hermes_cli.profiles import list_profiles
+
+        if profile_id not in self._routable_profiles()[1]:
+            raise ValueError("profile is not served by this gateway")
+        profile = next(
+            (row for row in list_profiles() if str(getattr(row, "name")) == profile_id),
+            None,
+        )
+        if profile is None:
+            raise ValueError("profile does not exist")
+        home = _profile_home(profile)
+        if home is None or not home.is_dir():
+            raise RuntimeError("profile directory could not be resolved")
+        return home
+
+    def _sync_profiles_description_set(self, params: Any) -> Dict[str, Any]:
+        """#6798: the wearer's own description, stored as user-authored.
+
+        Hermes's ``write_profile_meta`` with ``description_auto=False`` marks it the
+        wearer's, so "Write missing ones for me" never replaces it. A blank one
+        clears it; Auto then reads the agent as undescribed.
+        """
+        p = params if isinstance(params, dict) else {}
+        profile_id = _clean_str(p.get("profileId"))
+        if not profile_id:
+            raise ValueError("profile id is required")
+        raw = p.get("description")
+        if not isinstance(raw, str):
+            raise ValueError("description must be a string")
+        description = raw.strip()
+        if len(description) > PROFILE_DESCRIPTION_MAX_CHARS or "\x00" in description:
+            raise ValueError("description is too long")
+        home = self._served_profile_home(profile_id)
+        from hermes_cli.profiles import write_profile_meta
+
+        with _DESCRIPTION_LOCK:
+            write_profile_meta(home, description=description, description_auto=False)
+            _DESCRIPTION_GENERATION[profile_id] = _DESCRIPTION_GENERATION.get(profile_id, 0) + 1
+            _DESCRIPTION_WEARER[profile_id] = description
+        return {
+            "status": "updated",
+            "profile": {"id": profile_id, "name": profile_id},
+            "description": description,
+            "descriptionAuto": False,
+        }
+
+    def _sync_profiles_description_auto(self, params: Any) -> Dict[str, Any]:
+        """#6798: Hermes drafts a description for each named agent that has none.
+
+        A description the wearer wrote is never sent to Hermes at all, and Hermes's
+        ``describe_profile`` refuses to overwrite one too (``overwrite=False``). Each
+        draft is stored with ``description_auto: true``. The drafts run side by side,
+        each bounded, and one failure never stops the rest.
+        """
+        p = params if isinstance(params, dict) else {}
+        raw_ids = p.get("profileIds")
+        if not isinstance(raw_ids, list):
+            raise ValueError("profile ids are required")
+        profile_ids: List[str] = []
+        for value in raw_ids:
+            profile_id = _clean_str(value) if isinstance(value, str) else None
+            if profile_id and profile_id not in profile_ids:
+                profile_ids.append(profile_id)
+        if not profile_ids or len(profile_ids) > PROFILE_DESCRIBE_MAX_PROFILES:
+            raise ValueError("profile ids are required")
+        from hermes_cli.profile_describer import describe_profile
+        from hermes_cli.profiles import write_profile_meta
+
+        def one(profile_id: str) -> Dict[str, Any]:
+            try:
+                home = self._served_profile_home(profile_id)
+            except (ValueError, RuntimeError):
+                return {"profileId": profile_id, "ok": False, "reason": "not_served"}
+            with _DESCRIPTION_LOCK:
+                meta = _read_profile_meta(home)
+                if meta.get("description") and not meta.get("description_auto"):
+                    return {"profileId": profile_id, "ok": False, "reason": "user_authored"}
+                # One draft per agent at a time: a second batch never races the first.
+                if profile_id in _DESCRIPTION_DRAFTING:
+                    return {"profileId": profile_id, "ok": False, "reason": "busy"}
+                _DESCRIPTION_DRAFTING.add(profile_id)
+                generation = _DESCRIPTION_GENERATION.get(profile_id, 0)
+            try:
+                try:
+                    outcome = describe_profile(profile_id, overwrite=False, timeout=PROFILE_DESCRIBE_TIMEOUT_S)
+                except Exception:  # noqa: BLE001 - one draft failing never stops the rest
+                    return {"profileId": profile_id, "ok": False, "reason": "failed"}
+                with _DESCRIPTION_LOCK:
+                    if _DESCRIPTION_GENERATION.get(profile_id, 0) != generation:
+                        # The wearer saved words while the draft ran: theirs stand.
+                        wearer = _DESCRIPTION_WEARER.get(profile_id, "")
+                        try:
+                            write_profile_meta(home, description=wearer, description_auto=False)
+                        except Exception:  # noqa: BLE001 - reported as not drafted
+                            pass
+                        return {"profileId": profile_id, "ok": False, "reason": "user_authored"}
+            finally:
+                with _DESCRIPTION_LOCK:
+                    _DESCRIPTION_DRAFTING.discard(profile_id)
+            description = _clean_str(getattr(outcome, "description", None))
+            if getattr(outcome, "ok", False) and description:
+                return {"profileId": profile_id, "ok": True, "description": description}
+            reason = str(getattr(outcome, "reason", "") or "")
+            return {
+                "profileId": profile_id,
+                "ok": False,
+                "reason": "user_authored" if "user-authored" in reason else "failed",
+            }
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(4, len(profile_ids))) as pool:
+            results = list(pool.map(one, profile_ids))
+        return {"status": "ok", "results": results}
 
     def _restart_required_to_activate(self) -> bool:
         """Must the wearer restart Hermes before a new agent works?
@@ -1227,6 +1836,9 @@ class GwRpc:
         model = _clean_str(cfg_get(cfg, "model", "default")) or ""
         provider = _clean_str(cfg_get(cfg, "model", "provider")) or ""
         workspace = _clean_str(cfg_get(cfg, "terminal", "cwd")) or ""
+        # LiveUI V2 A6: a non-local terminal backend runs the agent's tools
+        # elsewhere, so its paths are not this host's and picture files refuse.
+        terminal_backend = _clean_str(cfg_get(cfg, "terminal", "backend")) or ""
         disabled = cfg_get(cfg, "agent", "disabled_toolsets")
         disabled_set = {
             str(value).strip()
@@ -1247,7 +1859,11 @@ class GwRpc:
                 blocked = [key for key, value in groups.items() if value in effective]
                 block_revision = leaf["revision"]
                 block_writable = not leaf["managed"] and (leaf.get("value") or []) == effective
-        display_name = _clean_str(getattr(profile, "display_name", None)) or profile_id
+        display_name = (
+            _clean_str(getattr(profile, "display_name", None))
+            or _receipt_display_name(home)
+            or profile_id
+        )
         return {
             "status": "loaded",
             "backend": "hermes",
@@ -1263,6 +1879,7 @@ class GwRpc:
                 **({"blockedToolsRevision": block_revision} if block_revision else {}),
                 **({"blockedToolsWritable": False} if not block_writable else {}),
             },
+            **({"terminalBackend": terminal_backend} if terminal_backend else {}),
         }
 
     def _sync_profiles_settings_set(self, params: Any) -> Dict[str, Any]:
@@ -1330,7 +1947,7 @@ class GwRpc:
 
         _profile, home = self._settings_profile(profile_id)
         from .yaml_compat import yaml
-        from hermes_cli.config import atomic_config_write, read_user_config_raw
+        from hermes_cli.config import read_user_config_raw
 
         config_path = home / "config.yaml"
         cfg = read_user_config_raw(config_path) if config_path.exists() else {}
@@ -1414,7 +2031,8 @@ class GwRpc:
         soul_tmp.write_text(fields["instructions"], encoding="utf-8")
         os.replace(soul_tmp, home / "SOUL.md")
         try:
-            atomic_config_write(config_path, cfg)
+            # Cleared fields drop keys on purpose (see replace_config).
+            replace_config(config_path, cfg)
         except Exception as exc:
             raise RuntimeError(
                 "Instructions were saved, but the other settings were not. Reload before trying again."
@@ -1425,27 +2043,80 @@ class GwRpc:
             "restartRequired": False,
         }
 
-    def _sync_profiles_soul(self, params: Any) -> Dict[str, Any]:
-        p = params if isinstance(params, dict) else {}
-        profile = profile_for_namespace(p.get("profile", self._namespace))
-        # #2940: SOUL.md is the agent's own instructions — profile content, and
-        # before this gate any direct RPC could read it for a profile the
-        # wearer had never enrolled, simply by naming it. Hiding the menu row
-        # was never enough.
+    def _served_profile_dir(self, requested: Any) -> Path:
+        """The home of one served AND enrolled profile, or :class:`ProfileRefused`.
+
+        ``requested`` is a namespace or profile name; ``""``/``main`` is the
+        default profile. #2940: profile content (SOUL.md, the Star Map's skills
+        and memories) is the agent's own, and before this gate any direct RPC
+        could read it for a profile the wearer had never enrolled, simply by
+        naming it. Hiding the menu row was never enough.
+        """
+        profile = profile_for_namespace(requested)
         if profile not in self._routable_profiles()[1]:
-            raise ValueError("profile is not served by this gateway")
+            raise ProfileRefused(
+                "profile_not_served", "profile is not served by this gateway"
+            )
         try:
             from hermes_cli.profiles import get_profile_dir
 
             profile_dir = Path(get_profile_dir(profile))
         except Exception as exc:  # noqa: BLE001
-            raise ValueError(f"no such profile: {profile}") from exc
+            raise ProfileRefused(
+                "profile_not_found", f"no such profile: {profile}"
+            ) from exc
         if not profile_dir.exists():
-            raise ValueError(f"no such profile: {profile}")
+            raise ProfileRefused("profile_not_found", f"no such profile: {profile}")
+        return profile_dir
+
+    def _sync_profiles_soul(self, params: Any) -> Dict[str, Any]:
+        p = params if isinstance(params, dict) else {}
+        profile_dir = self._served_profile_dir(p.get("profile", self._namespace))
         soul_path = profile_dir / "SOUL.md"
         if not soul_path.is_file():
             return {"content": ""}
         return {"content": soul_path.read_text(encoding="utf-8")}
+
+    def _sync_starmap_graph(self, params: Any) -> Dict[str, Any]:
+        """The Star Map sky for one served profile (PROTOCOL.md "Gateway read lane").
+
+        Never raises: a thrown error crosses the link as a bare -32000 and the
+        bridge could no longer tell "this profile" from "this host". Refusals
+        and failures come back as ``status:"error"`` with a short ``errorCode``.
+        """
+        from .star_map_rpc import empty, read_star_map
+
+        p = params if isinstance(params, dict) else {}
+        try:
+            home = self._served_profile_dir(p.get("profile", self._namespace))
+        except ProfileRefused as exc:
+            return empty("error", exc.code)
+        except Exception:  # noqa: BLE001
+            return empty("error", "starmap_failed")
+        try:
+            return read_star_map(home)
+        except Exception:  # noqa: BLE001 - read_star_map already never raises
+            return empty("error", "starmap_failed")
+
+    def _sync_starmap_forget(self, params: Any) -> Dict[str, Any]:
+        """Forget one star of one served profile (PROTOCOL.md ``gw.starmap.forget``).
+
+        Same served-AND-enrolled gate as ``gw.starmap.graph``, and it never
+        raises for the same reason: a refusal keeps its ``errorCode``.
+        """
+        from .star_map_rpc import forget_star
+
+        p = params if isinstance(params, dict) else {}
+        try:
+            home = self._served_profile_dir(p.get("profile", self._namespace))
+        except ProfileRefused as exc:
+            return {"status": "error", "errorCode": exc.code}
+        except Exception:  # noqa: BLE001
+            return {"status": "error", "errorCode": "forget_failed"}
+        try:
+            return forget_star(home, p.get("id"), p.get("kind"), p.get("text"))
+        except Exception:  # noqa: BLE001 - forget_star already never raises
+            return {"status": "error", "errorCode": "forget_failed"}
 
     def _sync_skills_status(self, _params: Any) -> Dict[str, Any]:
         from agent.skill_commands import get_skill_commands

@@ -58,6 +58,12 @@ _CLIENT_VERSION_RE = re.compile(r"^[A-Za-z0-9._+\-]+$")
 #: Fallback cadence; also the receipt's own "writes every 30 seconds" rule.
 PULL_INTERVAL_S = 30.0
 
+#: After a pull that fails where a retry can help, one more pull this soon.
+#: A single slow moment (a busy machine) otherwise leaves the relay "unknown"
+#: until the next cadence tick, and pairing refuses with relay_not_healthy for
+#: up to 30 seconds (#4101: cross-os e2e, Hermes Desktop on Windows).
+RETRY_AFTER_FAILURE_S = 3.0
+
 PROJECTION_KEYS = (
     "relayListening",
     "authenticatedAppCount",
@@ -224,6 +230,7 @@ class PresencePump:
         epoch: Optional[int] = None,
         pull_timeout_s: float = PULL_TIMEOUT_S,
         interval_s: float = PULL_INTERVAL_S,
+        retry_after_s: float = RETRY_AFTER_FAILURE_S,
         log: Optional[logging.Logger] = None,
     ) -> None:
         self._pull = pull
@@ -232,9 +239,14 @@ class PresencePump:
         self._epoch = epoch
         self._pull_timeout_s = pull_timeout_s
         self._interval_s = interval_s
+        self._retry_after_s = retry_after_s
         self._log = log or logger
         self._task: Optional[asyncio.Task] = None
         self._timer: Optional[asyncio.Task] = None
+        self._retry: Optional[asyncio.Task] = None
+        # Only the first failure of a run of failures earns the quick retry;
+        # a relay that stays down is read at the normal cadence.
+        self._failing = False
         self._pending = False
         self._closed = False
         self._last_rev: Optional[int] = None
@@ -303,11 +315,12 @@ class PresencePump:
         last healthy reading to age out over the next two minutes.
         """
         self._closed = True
-        for task in (self._timer, self._task):
+        for task in (self._timer, self._task, self._retry):
             if task is not None and not task.done():
                 task.cancel()
         self._timer = None
         self._task = None
+        self._retry = None
         if final_write:
             self._write_body(
                 relay_listening=False,
@@ -327,6 +340,19 @@ class PresencePump:
                 self.schedule()
         except asyncio.CancelledError:  # pragma: no cover - teardown path
             raise
+
+    def _retry_soon(self) -> None:
+        if self._closed or (self._retry is not None and not self._retry.done()):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._retry = loop.create_task(self._retry_after())
+
+    async def _retry_after(self) -> None:
+        await asyncio.sleep(self._retry_after_s)
+        self.schedule()
 
     async def _run(self) -> None:
         while True:
@@ -365,7 +391,11 @@ class PresencePump:
                 device=None,
                 error_code=error_code or "pull_failed",
             )
+            if error_code != "pull_unsupported" and not self._failing:
+                self._retry_soon()
+            self._failing = True
             return
+        self._failing = False
         self._write_body(
             relay_listening=projection["relayListening"],
             count=projection["authenticatedAppCount"],

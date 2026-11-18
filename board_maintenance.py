@@ -138,13 +138,33 @@ def stale_reason(status, claim_expires, heartbeat, now: int) -> Optional[str]:
     A heartbeat older than stock's limit wins over a merely expired claim."""
     if status != "running":
         return None
-    hb = bm._int(heartbeat, None) if heartbeat is not None else None
+    hb = bm._epoch(heartbeat, None)
     if hb is not None and now - hb > _heartbeat_max():
         return "heartbeat_stale"
-    expires = bm._int(claim_expires, None) if claim_expires is not None else None
+    expires = bm._epoch(claim_expires, None)
     if expires is not None and expires < now:
         return "claim_expired"
     return None
+
+
+def reclaim_paused(conn: sqlite3.Connection, card_id: str) -> bool:
+    """Hermes 0.22.1's owner pause: the gateway admitted the card's current run
+    and its outcome is unknown, so a reclaim could repeat its side effects.
+    Every stock sweep skips such a card; so does Board. Always False on an
+    engine without ``kanban_owner_recovery`` (0.21.x). A check that cannot be
+    read holds the card, as stock's own check does."""
+    try:
+        from hermes_cli.kanban_owner_recovery import owner_reclaim_paused
+    except ImportError:
+        return False
+    factory = conn.row_factory
+    conn.row_factory = sqlite3.Row  # stock reads its rows by column name
+    try:
+        return bool(owner_reclaim_paused(conn, card_id))
+    except Exception:  # noqa: BLE001 - unknown is never permission to reclaim
+        return True
+    finally:
+        conn.row_factory = factory
 
 
 def claim_facts(conn: sqlite3.Connection, card_id: str, now: Optional[int] = None) -> Optional[dict]:
@@ -157,8 +177,10 @@ def claim_facts(conn: sqlite3.Connection, card_id: str, now: Optional[int] = Non
     if row is None:
         return None
     now = int(time.time()) if now is None else now
-    return {"claim": claim_digest(row[1]),
-            "stale": stale_reason(bm._decoded(row[0]), row[2], row[3], now)}
+    stale = stale_reason(bm._decoded(row[0]), row[2], row[3], now)
+    if stale is not None and reclaim_paused(conn, card_id):
+        stale = None
+    return {"claim": claim_digest(row[1]), "stale": stale}
 
 
 def _stale_cards(conn: sqlite3.Connection, now: int) -> tuple:
@@ -170,12 +192,14 @@ def _stale_cards(conn: sqlite3.Connection, now: int) -> tuple:
     for row in conn.execute(
             "SELECT t.id, t.title, t.assignee, t.claim_lock, t.claim_expires, t.last_heartbeat_at,"
             " (SELECT r.id FROM task_runs r WHERE r.task_id = t.id ORDER BY r.id DESC LIMIT 1)"
-            " FROM tasks t WHERE t.status = 'running'"):
+            " FROM tasks t WHERE t.status = 'running'").fetchall():
         reason = stale_reason("running", row[4], row[5], now)
         card_id = bm._decoded(row[0])
         if reason is None or not isinstance(card_id, str) or not bm._CARD_ID.match(card_id):
             continue
-        since = bm._int(row[5], now) if reason == "heartbeat_stale" else bm._int(row[4], now)
+        if reclaim_paused(conn, card_id):
+            continue
+        since = bm._epoch(row[5], now) if reason == "heartbeat_stale" else bm._epoch(row[4], now)
         out = {"id": card_id, "title": bm._clean(row[1], 200) or card_id, "run": int(row[6] or 0),
                "claim": claim_digest(row[3]), "reason": reason, "staleFor": max(0, now - since)}
         worker = bm._clean(row[2], 64)
@@ -363,9 +387,9 @@ def _parse_export(payload) -> tuple:
     if not isinstance(payload, dict) or set(payload) != {"slug", "anchor", "attachments", "logs"}:
         raise bm.BoardReadError("invalid_request")
     slug, anchor = payload["slug"], payload["anchor"]
-    if not isinstance(slug, str) or not bm._SLUG.match(slug):
+    if not isinstance(slug, str) or not bm._SLUG.fullmatch(slug):
         raise bm.BoardReadError("invalid_request")
-    if not isinstance(anchor, str) or not bm._ANCHOR.match(anchor):
+    if not isinstance(anchor, str) or not bm._ANCHOR.fullmatch(anchor):
         raise bm.BoardReadError("invalid_request")
     if not isinstance(payload["attachments"], bool) or not isinstance(payload["logs"], bool):
         raise bm.BoardReadError("invalid_request")
@@ -440,7 +464,7 @@ def part(payload, profile: str, capabilities: list) -> dict:
     if not isinstance(payload, dict) or set(payload) != {"id", "part"}:
         raise bm.BoardReadError("invalid_request")
     export_id, index = payload["id"], payload["part"]
-    if not isinstance(export_id, str) or not _EXPORT_ID.match(export_id):
+    if not isinstance(export_id, str) or not _EXPORT_ID.fullmatch(export_id):
         raise bm.BoardReadError("invalid_request")
     if isinstance(index, bool) or not isinstance(index, int) or index < 0:
         raise bm.BoardReadError("invalid_request")

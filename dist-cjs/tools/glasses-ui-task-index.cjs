@@ -6,11 +6,11 @@ const LIVEUI_TASK_INDEX_HEADER =
 const LIVEUI_TASK_INDEX_MAX_ROWS = 20;
 const LIVEUI_TASK_INDEX_MAX_CHARS = 1_800;
 
-function collapseWhitespace(value) {
+function collapseWhitespace(value     ) {
   return typeof value === "string" ? value.replace(/\s+/gu, " ").trim() : "";
 }
 
-function truncateWithEllipsis(value, maxUnits) {
+function truncateWithEllipsis(value     , maxUnits     ) {
   const normalized = collapseWhitespace(value);
   if (normalized.length <= maxUnits) return normalized;
   let prefix = normalized.slice(0, Math.max(0, maxUnits - 1));
@@ -19,7 +19,7 @@ function truncateWithEllipsis(value, maxUnits) {
   return `${prefix}…`;
 }
 
-function approvedTask(item) {
+function approvedTask(item     ) {
   if (!item || item.itemType !== "task" || item.status === "invalid") return false;
   if (typeof item.approvedVersionId === "string" && item.approvedVersionId) return true;
   if (
@@ -37,9 +37,9 @@ function approvedTask(item) {
   );
 }
 
-function projectLiveuiTaskIndexRows(listedItems, organization) {
+function projectLiveuiTaskIndexRows(listedItems     , organization     ) {
   if (!Array.isArray(listedItems)) return [];
-  const normalized = listedItems.map((item) => {
+  const normalized = listedItems.map((item     ) => {
     const taskId = item && typeof item.taskId === "string" ? item.taskId : item && item.itemId;
     return {
       ...item,
@@ -53,13 +53,13 @@ function projectLiveuiTaskIndexRows(listedItems, organization) {
     };
   });
   return orderLiveuiLibraryItems(normalized, organization)
-    .filter((item) =>
+    .filter((item     ) =>
       approvedTask(item) &&
       typeof item.itemId === "string" &&
       isLiveuiLibraryItemVisible(organization, "task", item.itemId),
     )
     .slice(0, LIVEUI_TASK_INDEX_MAX_ROWS)
-    .map((item) => {
+    .map((item     ) => {
       const approved = item.approved && typeof item.approved === "object"
         ? item.approved
         : item.versions && item.versions.approved;
@@ -78,14 +78,14 @@ function projectLiveuiTaskIndexRows(listedItems, organization) {
         ),
       };
     })
-    .filter((row) => row.name);
+    .filter((row     ) => row.name);
 }
 
-function formatLiveuiTaskIndex(rows) {
+function formatLiveuiTaskIndex(rows     ) {
   if (!Array.isArray(rows) || rows.length === 0) return "";
   const lines = rows
     .slice(0, LIVEUI_TASK_INDEX_MAX_ROWS)
-    .map((row) => {
+    .map((row     ) => {
       const description = collapseWhitespace(row && row.description);
       const name = truncateWithEllipsis(
         row && row.name,

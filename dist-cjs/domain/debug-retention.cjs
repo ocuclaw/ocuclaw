@@ -1,6 +1,6 @@
 const MAX_COUNT = 2_147_483_647;
 const COUNT_KEYS = ["maxEntries", "maxEstimatedBytes", "hotMaxBytes", "relayMaxBytes", "otherMaxBytes", "foldMaxBytes", "foldMaxLines", "ramHandedToTransport", "skippedShipped", "healthThrottled", "partOmitted", "partMaxBytes"];
-const RANGE_KEYS = ["ramGroup", "ramGlobal", "foldOmitted"];
+const RANGE_KEYS = ["ramGroup", "ramGlobal", "foldOmitted", "voiceSummaryLost", "voiceSummaryFoldOmitted"];
 const count = (v     ) => Number.isSafeInteger(v) && v >= 0 && v <= MAX_COUNT;
 
 function parseClientRetention(json     )      {
@@ -19,6 +19,7 @@ function parseClientRetention(json     )      {
   }
   for (const key of RANGE_KEYS) {
     const r = raw[key];
+    if (key.startsWith("voiceSummary") && r === undefined) continue;
     if (!r || !count(r.count) || !count(r.unknownTime) || r.unknownTime > r.count) return null;
     const hasTime = r.fromMs !== null || r.toMs !== null;
     if (hasTime && (!Number.isFinite(r.fromMs) || !Number.isFinite(r.toMs) || r.fromMs < 0 || r.toMs < r.fromMs)) return null;

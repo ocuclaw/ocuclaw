@@ -29,7 +29,10 @@ the envelope, handshake, RPC skeleton, and process discipline.
   boundary #1270). `default_child_env()` filters its source through
   `CHILD_ENV_ALLOWLIST` in `control_link.py` and adds the two typed
   `OCUCLAW_LINK_*` controls, which are synthesized from adapter settings rather
-  than read from the parent. No secret is on the list and none may be added:
+  than read from the parent. Besides the platform basics, the list carries only
+  non-secret OcuClaw switches the child reads: the two tool-schema flags and
+  `OCUCLAW_PAIR_URL` (phone-code pairing; unset means `https://pair.ocuclaw.com`,
+  `off` turns it off). No secret is on the list and none may be added:
   every credential the child uses is delivered over `link.hello.ack` (see
   [Config keys](#config-keys-pinned-d7d11)), so the environment is not a
   credential channel. Filtering applies to an explicitly supplied `base_env`
@@ -121,8 +124,10 @@ Every frame carries `v` (protocol version) and `type`:
 
 - `link.hello` (child → parent, first frame on boot):
   `{v, type, payload: {pid, runtimeName: "ocuclaw-runtime", liveui?, phoneTools?}}`
-  where `liveui.tools[]` advertises the `render_glasses_ui` descriptor
-  single-sourced from the TypeScript tool schema, and `phoneTools[]` is the
+  where `liveui.tools[]` advertises the LiveUI tool descriptors
+  (`get_glasses_ui_state`, `manage_liveui_templates`, `manage_liveui_tasks`,
+  `compose_glasses_ui`) single-sourced from the TypeScript tool schemas, and
+  `phoneTools[]` is the
   data-driven phone-tool descriptor list (see **Phone tools lane** below). Both
   keys are optional in both directions: a hello without `phoneTools` boots
   exactly as it did before #2800.
@@ -132,7 +137,10 @@ Every frame carries `v` (protocol version) and `type`:
   child ignores unknown keys.
 - `link.rpc.request` (either direction): `{v, type, id, method, params?}`
 - `link.rpc.response`: `{v, type, id, ok: true, result}` or
-  `{v, type, id, ok: false, error: {code, message}}`. Unknown methods are
+  `{v, type, id, ok: false, error: {code, message, errorCode?}}`. `errorCode`
+  is additive and optional: the stable string a handler's refusal carries (its
+  exception's `error_code`, e.g. `gw.profiles.create`'s), never set on a
+  private response; a peer that does not know it ignores it. Unknown methods are
   rejected with code `-32601`, message `method not found: <m>` (the JSON-RPC
   shape bridge callers already detect on the openclaw path).
 
@@ -167,10 +175,10 @@ lane are **unix seconds** (hermes-native); the Node bridge owns the ×1000.
 | `db.sessions.setRead` | `{identity, read?}` (default `true`) | `{ok:true}`; stamps the `last_read_at` watermark on the whole compression lineage (`set_session_read`); `read:false` writes `0` = EXPLICITLY unread. Refused with `session read state unsupported on this hermes` when the lane is unsupported |
 | `db.sessions.setHidden` | `{identity, hidden}` | `{ok:true}`; `set_session_hidden` per carrier. Same unsupported-host refusal |
 | `db.sessions.delete` | `{identity}` | `{deleted:[ids]}` — deletes the whole compression lineage tip→root |
-| `db.chat.history` | `{identity, limit?}` | `{messages:[{id, role, content, timestamp?, platform_message_id?}], sessionId, total}` — conversational rows ONLY (user/assistant with content) across the compression lineage; the public `SessionDB.get_messages_as_conversation(tip, include_ancestors=True)` projection remains authoritative for filtering/content, then a serialized private-connection read enriches rows with stable `messages.id` metadata; unavailable/divergent identity metadata logs a warning and degrades that session to derived ids. Rows are tail-sliced server-side to `limit` so bounded pages never risk the 1 MiB frame cap; content is scalar-or-block-list; the Node bridge re-shapes defensively over the same pinned shape. `total` is the **pre-slice** conversational row count, so `total > messages.length` is the only honest signal that the head was cut (the bridge forwards it and the relay renders one `— earlier messages not loaded —` notice). Deliberately no `offset`: no load-earlier affordance exists in composeApp or the plugin, and the slice stays tail-anchored |
-| `db.sessions.describe` | `{identity}` | `{model, tokens:{input,output,cacheRead,cacheWrite,reasoning}, lastMessageTokenCount?, messageCount, costUsd}` — `lastMessageTokenCount` is the public persisted `SessionStore.lookup_by_session_id(...).last_prompt_tokens` current-context count; omitted when that sanctioned read is unavailable (the child marks occupancy unknown and never substitutes cumulative billed totals). `costUsd = COALESCE(actual_cost_usd, estimated_cost_usd)` (upstream's own reaping filter uses the same coalesce, `hermes_state.py:8171`), `null` when neither column is present or populated |
-| `db.sessions.compactionInfo` | `{identity}` | `{hops}` — compression-chain hop count (in-place compactions invisible: documented undercount) |
-| `db.chat.watermark` | `{identity}` | `{sessionId, watermark, dbPath, hermesHome, inflight:{active, platform}}` — Desktop→glasses mirror (#2513). `watermark` is `MAX(messages.id)` over the lane's LIVE transcript (the compression tip), `null` when empty; read on its own `mode=ro` connection (no write lock) — NOT `latest_message_row_id`, which is role/text-filtered and sits still on a tool-call-only tail. `inflight` is the tier-0 verdict for that tip (the adapter wraps the bare session_rpc handler to add it). `db.chat.history` accepts `afterId` (rows with `id > afterId`, applied BEFORE `limit`) and answers `rowIdsUnavailable:true` with no rows when the host's projection carries no row ids. Both are read once per debounced WAL event, never on a timer |
+| `db.chat.history` | `{identity, limit?}` | `{messages:[{id, role, content, timestamp?, platform_message_id?}], sessionId, total}` — conversational rows ONLY (user/assistant with content) across the compression lineage; the public `SessionDB.get_messages_as_conversation(tip, include_ancestors=True)` projection remains authoritative for filtering/content, then a serialized private-connection read enriches rows with stable `messages.id` metadata; unavailable/divergent identity metadata logs a warning and degrades that session to derived ids. Rows are tail-sliced server-side to `limit` AND to a byte budget under the frame cap (`HISTORY_BYTE_BUDGET`, 1 MiB minus 64 KiB for the envelope; newest rows kept, contiguous; a newest row that alone exceeds it yields no rows, never clipped content), so a page of large rows never trips the 1 MiB frame cap (#7327); content is scalar-or-block-list; the Node bridge re-shapes defensively over the same pinned shape. `total` is the **pre-slice** conversational row count, so `total > messages.length` is the only honest signal that the head was cut, whether by `limit` or by the byte budget (the bridge forwards it and the relay renders one `— earlier messages not loaded —` notice). Deliberately no `offset`: no load-earlier affordance exists in composeApp or the plugin, and the slice stays tail-anchored |
+| `db.sessions.describe` | `{identity}` | `{model, tokens:{input,output,cacheRead,cacheWrite,reasoning}, lastMessageTokenCount?, messageCount, costUsd, contextWindow?}` — `lastMessageTokenCount` is the public persisted `SessionStore.lookup_by_session_id(...).last_prompt_tokens` current-context count; omitted when that sanctioned read is unavailable (the child marks occupancy unknown and never substitutes cumulative billed totals; a session with `messageCount: 0` and a known window reads as occupancy 0). `contextWindow` is the window Hermes enforces for the session's model when the owning profile's `config.yaml` pins it — `model.context_length`, else a `custom_providers`/`providers` per-model `context_length` for the configured `base_url` (via `hermes_cli.config.get_custom_provider_context_length` when present) — applied only when the session runs on the profile's main model (or has no model yet). Config-only, never a network probe; omitted when unresolved, and the child then falls back to the `models.list` catalog window and its per-model cache. `costUsd = COALESCE(actual_cost_usd, estimated_cost_usd)` (upstream's own reaping filter uses the same coalesce, `hermes_state.py:8171`), `null` when neither column is present or populated. `lastMessageTokenCountEstimated: true` (else omitted) marks a stand-in: a manual `/compress` and gateway hygiene set `last_prompt_tokens` to 0 until the next turn, so while it is 0, the session has messages, and the newest compaction on the chain noted this same `messageCount`, `lastMessageTokenCount` is that compaction's `afterTokens` (Hermes' own estimate) |
+| `db.sessions.compactionInfo` | `{identity}` | `{hops, compactions?, exact?, live?, last?}` — `hops` is the compression-chain hop count. Without the `post_compaction` hook (below 0.22.3) the reply is `{hops}` alone, and in-place compactions are invisible: a documented undercount. With it (see "Compaction counts (`sessionCompacted`)"), `compactions = hops +` the in-place full compactions (`summarize`, `provider_native`) the ledger counted on every chain id; `exact` is true only when every chain segment started after the ledger's `trackingSince`, else the figure is a floor; `live: true` says the count rises when the next compaction lands; `last` is the newest event on the chain, `{kind, reason, inPlace, beforeTokens, afterTokens, atMs, messageCount}`, or `null`. The child maps an exact count to metric `compactions` and a floor to `hops` |
+| `db.chat.watermark` | `{identity}` | `{sessionId, watermark, dbPath, hermesHome, inflight:{active, platform}}` — Desktop→glasses mirror (#2513). `watermark` is `MAX(messages.id)` over the lane's LIVE transcript (the compression tip), `null` when empty; read on its own `mode=ro` connection (no write lock) — NOT `latest_message_row_id`, which is role/text-filtered and sits still on a tool-call-only tail. `inflight` is the tier-0 verdict for that tip (the adapter wraps the bare session_rpc handler to add it). `db.chat.history` accepts `afterId` (rows with `id > afterId`, applied BEFORE `limit`) and answers `rowIdsUnavailable:true` with no rows when the host's projection carries no row ids. Add-only since #7379: with `afterId`, an optional `order:"oldest"` returns the OLDEST rows past `afterId` (ascending, the first `limit`, then the oldest contiguous rows within `HISTORY_BYTE_BUDGET`) and adds `nextAfterId` while rows remain: the `afterId` for the next page (the last returned row's id, or the id of an oldest row that alone exceeds the budget, which is stepped past). Without `order` (or without `afterId`) the reply is the tail-anchored slice above with no `nextAfterId`; a bundle that predates `order` ignores it, so a caller treats a reply without `nextAfterId` as the last page. Both are read once per debounced WAL event, never on a timer |
 
 **Database ownership and compatibility (#2743).** `session_writer.py` uses
 `hermes_state_registry.acquire(path)` / `release(writer)`, verified on Hermes
@@ -186,8 +194,8 @@ The supported version floor is now 0.21.1 (#3147). The 0.21.0 engine
 (`29112bef099274229cadff79cdff7bf7b99c4b77`, the previous certified pin) has
 no safe public registry; it sits below the floor and the adapter refuses to
 start there. The `session_writer_unsupported` branch stays as defence in depth
-for a host without the registry, while reads remain available. Hermes 0.21.1 (`2237be355906fbe6065ce1815711eee52b2d646e`)
-0.21.3 (`345cd2b057a452236de401d3534b8502a7465e8d`) and the certified 0.21.5 engine (`f97608f178d1ffeca59860195ab7da295f7c8e5f`) ship
+for a host without the registry, while reads remain available. Hermes 0.21.1 (`2237be355906fbe6065ce1815711eee52b2d646e`),
+0.21.3 (`345cd2b057a452236de401d3534b8502a7465e8d`), 0.21.5 (`f97608f178d1ffeca59860195ab7da295f7c8e5f`), 0.22.1 (`297552a9d646119871391d202509822cd86330df`), 0.22.4 (`4d04303818b61bf3aa09278af48356315515965b`) 0.22.5 (`bf0203a794a07aac3ff764972ab9087baa4e4f4e`) 0.23.0 (`2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19`) 0.23.1 (`3b421578588243f920886e6fe79a6faa87ea026e`) and the certified 0.23.2 engine (`ae2a81ccc00e9b7c06301523e5bb09608397149c`) ship
 `hermes_state_registry`, so the same mutations run through the registry there. There is no standalone-writer or ambient `SessionStore._db`
 fallback. Missing/unserved stores report `session_store_unavailable` /
 `session_profile_unserved`; read probes report `session_schema_unsupported`
@@ -328,6 +336,28 @@ The adoption and takeover mechanics documented below describe dormant legacy
 implementation, not available shipping actions. Re-enabling them requires
 native context-refresh and cooperative ownership-release evidence.
 
+**Shared chats (Hermes 0.23+, on by default).** Hermes 0.23 runs
+every conversation in one gateway: Desktop, the TUI and `hermes chat` attach
+as viewers (`session.create` / `session.resume` / `prompt.submit`), share one
+event stream, and take no lease or turn marker. A chat continued on the
+glasses is then one conversation with one queue, so nothing needs to release
+ownership. Unless `platforms.ocuclaw.extra.sharedChats` turns it off (`false`,
+or the string `"false"`), AND with `ocuclaw-wearer` in `allow_admin_from` AND Hermes ≥ 0.23.0
+(`health.shared_chats_enabled`, read per call), the registered
+`foreign.sessions.adopt` door (`handle_foreign_adopt_gate`) runs the Continue
+here mechanics below instead of refusing, with three differences: the
+gateway's own LOCAL route rows (`session_key = agent:<ns>:local:dm:<id>`,
+source `local` or `desktop|cli|tui`; public key
+`hermes:<ns>:x:local:dm:<id>`) are adoptable beside external roots, the
+`desktop_busy` hold check is skipped, and `foreign.sessions.driver` answers
+`glasses_drive` with `shared: true` without reading Hermes's hold files.
+`gw.profiles.list` carries `sharedChats`; the bridge lifts it into
+`agentCatalogSnapshot.sharedChats`, and the runtime then advertises
+`foreignSessions.adopt=true`, `sharedChats=true` and `driverLock=false`,
+`desktopMirror=false` (desk turns reach the lane natively). The app offers
+Continue here only when it sees `sharedChats`, so an older plugin's adopt
+grant stays copy-only. Telegram/Discord/… rows stay read-only either way.
+
 All-platform session list/history survives. Foreign-session mutation is
 copy-only, plus the two view-state flags `read` and `hidden` — public
 `SessionDB` primitives upstream's REST applies to any session; they flip list
@@ -396,7 +426,9 @@ armed only while the current session is an adopted lane, ONE `fs.watch` on
 the DIRECTORY holding `state.db` filtered to `state.db-wal` (and `state.db`
 itself where WAL is refused — rollback journals write the main file; `-shm`
 is ignored because every READ moves it), 150 ms debounce → `db.chat.watermark`
-→ if `MAX(id)` moved, `db.chat.history {afterId}` → the rows land through the
+→ if `MAX(id)` moved, `db.chat.history {afterId, order:"oldest"}` (one page
+of 50, repeated while the reply names `nextAfterId`, at most 20 pages per
+read before a coalesced re-read, #7379) → the rows land through the
 gateway-commit path (`conversationState.addMessage`, user row `name="Desktop"`,
 `origin="desktop"`, ledger id `srv:<row id>`) → one Pages/entries broadcast.
 Idle profile = 1 watch, 0 timers, 0 SQL (`getSessionDriverDiagnostics().mirror`,
@@ -498,15 +530,17 @@ lane are **unix seconds** (hermes-native), same as the db lane.
 
 | Method | Params | Result |
 |---|---|---|
-| `gw.models.list` | `{}` | `{models:[{provider, id, name, contextWindow, reasoning}]}` — metadata from `CANONICAL_PROVIDERS` × `list_provider_models` × `get_model_info`, then missing enabled explicit configured provider/model pairs from primary, fallback and channel overrides. One config snapshot supplies references and provider filtering. Deduplication is by provider + ID; real metadata wins, seeded rows use ID as name and omit unknown context/capabilities. Optional metadata imports may be unavailable without losing configured pairs. No provider inference or live discovery. |
-| `gw.models.configured` | `{}` | `{default:{id, provider?}\|null, fallbacks:[{id, provider?}], channelOverrides:[{id, provider?}]}` — from config `model`(`.default`/`.provider`), the `fallback_providers` chain (`get_fallback_chain` — hermes has NO `model.fallbacks` key), and `platforms.ocuclaw.channel_overrides`, excluding explicitly disabled providers using the same config snapshot. The bridge reprojects into `config.agents.defaults.{model,models}`; fallbacks survive a missing/disabled primary. Hermes catalog projection excludes the implicit OpenClaw default when no primary exists; the shared mapper and existing unqualified-reference interpretation remain unchanged. Hermes has no imageModel/alias config so `imageModel` is OMITTED and `models` is `{}`. |
-| `gw.usage.status` | `{}` | `{updatedAt, providers:[{provider, displayName, windows:[{label, usedPercent, resetAt?}], unavailableReason?}]}` — `fetch_account_usage` per candidate provider (candidates = configured-default ∪ pool-credentialed, ∩ the 3 routable providers anthropic/openai-codex/openrouter). Only finite `usedPercent` windows cross the wire; absent percentages become an honest `unavailableReason`, never `0% used`. `resetAt` is unix seconds, omitted when Hermes has none; labels are Hermes-native prose, with one truth-preserving Codex correction: Hermes currently calls `primary_window` "Session" even when its reset is more than five hours away and therefore can only be the weekly allowance, so that proven case crosses as `Weekly`. The BRIDGE aligns labels to the `normalizeWindowKey` patterns (`(Current )session` → `5h`, `(Current )week(ly)` → `week`, others verbatim → slug keys) |
+| `gw.models.list` | `{ns?}` | `{models:[{provider, id, name, contextWindow, reasoning}]}` — Hermes `list_authenticated_providers` catalogs (including Nous/Codex), enriched with optional `get_model_info` metadata, then missing enabled explicit configured provider/model pairs from primary, fallback and channel overrides. Older engines fall back to `CANONICAL_PROVIDERS` × `list_provider_models`. One config snapshot supplies references and provider filtering. Deduplication is by provider + ID; real metadata wins, seeded rows use ID as name and omit unknown context/capabilities. Optional metadata imports may be unavailable without losing configured pairs. Discovery uses the configuration/authentication of the profile `ns` names (see "Profile-scoped reads" below) and cache-only/non-blocking catalogs where supported; custom endpoint probes are disabled. The app retains configured choices first and then available account models. |
+| `gw.models.configured` | `{ns?}` | `{default:{id, provider?}\|null, fallbacks:[{id, provider?}], channelOverrides:[{id, provider?}]}` — from the `ns` profile's config `model`(`.default`/`.provider`), the `fallback_providers` chain (`get_fallback_chain` — hermes has NO `model.fallbacks` key), and `platforms.ocuclaw.channel_overrides`, excluding explicitly disabled providers using the same config snapshot. The bridge reprojects into `config.agents.defaults.{model,models}`; fallbacks survive a missing/disabled primary. Hermes catalog projection excludes the implicit OpenClaw default when no primary exists; the shared mapper and existing unqualified-reference interpretation remain unchanged. Hermes has no imageModel/alias config so `imageModel` is OMITTED and `models` is `{}`. |
+| `gw.usage.status` | `{ns?}` | `{updatedAt, providers:[{provider, displayName, windows:[{label, usedPercent, resetAt?}], unavailableReason?}]}` — `fetch_account_usage` per candidate provider of the `ns` profile (candidates = configured-default ∪ pool-credentialed, ∩ the 3 routable providers anthropic/openai-codex/openrouter, plus the configured-default provider itself, so a provider plugin can report usage and any other provider still gets an honest `unavailableReason` row). Only finite `usedPercent` windows cross the wire; absent percentages become an honest `unavailableReason`, never `0% used`. `resetAt` is unix seconds, omitted when Hermes has none; labels are Hermes-native prose, with one truth-preserving Codex correction: Hermes currently calls `primary_window` "Session" even when its reset is more than five hours away and therefore can only be the weekly allowance, so that proven case crosses as `Weekly`. The BRIDGE aligns labels to the `normalizeWindowKey` patterns (`(Current )session` → `5h`, `(Current )week(ly)` → `week`, others verbatim → slug keys) |
+| *Profile-scoped reads* | | `gw.models.list`, `gw.models.configured` and `gw.usage.status` take an optional `ns`: the OcuClaw session namespace of the active session. The bridge derives it from the `sessionKey` the relay passes (only on Hermes); the relay keys its catalog and usage caches by it. A served multiplexed profile's read runs under `set_hermes_home_override(<served home>)`, so config, credential pool and account usage are that profile's. No `ns`, `main`, an unserved namespace, or a Hermes without the override reads the gateway's own home, as before. |
 | `gw.auth.status` | `{}` | `{providers:[{provider, profiles:[{type}]}]}` — from the persisted credential pool (`read_credential_pool`); credential-level `auth_type` maps `oauth`→`"oauth"`, `api_key`→`"token"` (pooled api-key entries ARE rotation members — the consumed semantic is pool size, and OcuClaw counts only oauth\|token); providers with zero pool entries are omitted |
-| `gw.agent.identity` | `{ns}` | `{agentId, name}` — `agentId` = PROFILE name (`ns` `main` ⇄ profile `default` mapping happens HERE, the single crossing point); `name` parsed from the profile's SOUL.md first line (`You are <name>, …` heuristic, bounded) else the profile name (default lane: "Hermes"). No emoji/avatar — hermes has no brand-asset source (consumers tolerate absence; the IDENTITY.md fallback probe then hits `gw.profiles.soul`) |
-| `gw.profiles.list` | `{}` | `{profiles:[{name, isDefault, displayName?, model?, provider?, description?, emoji?}], defaultProfile:"default", createSupported, settingsSupported:true}` — `profiles.list_profiles()` verbatim (`name` stays the routing key; optional `displayName` is presentation only; ProfileInfo carries model/provider from the profile's own config.yaml). `emoji` is OcuClaw's own key, read per profile from `platforms.ocuclaw.extra.emoji` in THAT profile's config.yaml (see "Config keys" → `extra.emoji`) and omitted when unset. `createSupported` is true only when this adapter booted with multiplex routing enabled. Existing served profiles remain configurable without multiplex, so `settingsSupported` is independently true. `adoptSupported` (#2509) is true when `platforms.ocuclaw.extra.allow_admin_from` lists `ocuclaw-wearer` — the bridge lifts it into `agentCatalogSnapshot.foreignSessionAdopt` → `families.sessions.foreignSessions.adopt`. |
-| `gw.profiles.create` | `{name, requestId?, setup?}` | `{status:"created"|"partial", profile:{id,name}, restartRequired:true, errorMessage?}` — native fresh profile creation, bundled skill seeding, safe alias creation. Optional setup is described below. The served-profile set stays adapter-construction-frozen until native restart. Multiplex-off and validation/collision failures reject. |
-| `gw.profiles.emoji.set` | `{profileId, emoji}` | `{status:"updated", profileId, emoji}` — writes only the selected routable profile's `platforms.ocuclaw.extra.emoji` key using Hermes's atomic config writer. `emoji:null` removes the key and restores the phone's first-letter fallback. This is never used for OpenClaw agents. |
-| `gw.profiles.settings.get` | `{profileId}` | `{status:"loaded", backend:"hermes", agentId, name, emoji, setup:{instructions,model,provider,workspace,blockedTools}}` — reads only the named served profile's SOUL.md and config.yaml. |
+| `gw.agent.identity` | `{ns}` | `{agentId, name, emoji?, avatar?, appearance?}` — `agentId` = PROFILE name (`ns` `main` ⇄ profile `default` mapping happens HERE, the single crossing point); `name` parsed from the profile's SOUL.md first line (`You are <name>, …` heuristic, bounded) else the profile name (default lane: "Hermes"). An explicit OcuClaw emoji overrides the native profile raster described below. |
+| `gw.profiles.list` | `{}` | `{profiles:[{name, isDefault, displayName?, model?, provider?, description?, emoji?, avatar?, appearance?}], defaultProfile:"default", createSupported, settingsSupported:true}` — `profiles.list_profiles()` verbatim (`name` stays the routing key; optional `displayName` is presentation only; ProfileInfo carries model/provider from the profile's own config.yaml). `emoji` is OcuClaw's own key, read per profile from `platforms.ocuclaw.extra.emoji` in THAT profile's config.yaml (see "Config keys" → `extra.emoji`) and omitted when unset. `createSupported` is true only when this adapter booted with multiplex routing enabled. Existing served profiles remain configurable without multiplex, so `settingsSupported` is independently true. `adoptSupported` (#2509) is true when `platforms.ocuclaw.extra.allow_admin_from` lists `ocuclaw-wearer` — the bridge lifts it into `agentCatalogSnapshot.foreignSessionAdopt`, which since the copy-only interim drives only the legacy driver lock and mirror. `sharedChats` is true when shared chats are on (`extra.sharedChats`, the admin grant and Hermes ≥ 0.23.0); the bridge lifts it into `agentCatalogSnapshot.sharedChats` → `families.sessions.foreignSessions.adopt` and `.sharedChats`. `autoRoute` (#6795) is true when the Auto agent host kill switch `extra.auto_agent` is not set off and the `ocuclaw_agent_router` auxiliary task registered; the bridge lifts it into `agentCatalogSnapshot.autoRoute` → `families.agents.autoRoute`. |
+| `gw.agents.route` | `{text, requestId?, fallbackAgentRef?}` | `{status:"ok", agentRef, reason:"named"\|"router"\|"fallback"\|"single", latencyMs, requestId?}`, or `{status:"unavailable", error:"auto_agent_off"}` while the host kill switch is set off — Auto agent (#6795, add-only; older plugins answer method-not-found and the app never sends it without `families.agents.autoRoute`). Candidates are the served, enrolled profiles (`_routable_profiles`). One candidate answers `single` with no model call. A prompt whose first one to three words before a pause name exactly one candidate (id, display name or a `previous_names` entry, case-insensitive) answers `named`. Otherwise one tool-less call on the `ocuclaw_agent_router` auxiliary task (inherits `group_router`, 40 output tokens, 4 s budget; each candidate's id, display name and description cut to 280 characters, the prompt to 1,000) must answer exactly one candidate id; a timeout, an error, `none` or any other answer is `fallback` to `fallbackAgentRef` while it is still a candidate, else `default`. The log keeps the picked id, the reason and the latency, never the prompt. The relay's app message is `ocuclaw.agents.route {requestId, text, fallbackAgentRef?}` → `ocuclaw.agents.route.result {requestId, status:"ok"\|"error", agentRef?, reason?, latencyMs?, errorCode?, errorMessage?}`. |
+| `gw.profiles.create` | `{name, requestId?, setup?}` | `{status:"created"|"partial", profile:{id,name}, restartRequired:true, errorMessage?}` — native fresh profile creation, bundled skill seeding, safe alias creation. `profile.id` is the normalized slug; `profile.name` is the name as typed (≤80), kept in the creation receipt as `displayName` and served back as `gw.profiles.list`'s `displayName` when native Hermes has none. Optional setup is described below. The served-profile set stays adapter-construction-frozen until native restart. Multiplex-off rejects plainly; validation/collision failures reject with `error.errorCode`: `invalid_name` (empty, or native validation fails), `reserved_agent_id` (`default`), `agent_already_exists` (the profile exists and this is not a replay of the request that made it; message `A profile named <name> already exists.`). |
+| `gw.profiles.emoji.set` | `{profileId, emoji}` | `{status:"updated", profileId, emoji}` — writes only the selected routable profile's `platforms.ocuclaw.extra.emoji` key using Hermes's atomic config writer. `emoji:null` removes the key and restores native-avatar sync, with a first-letter fallback when no raster is available. This is never used for OpenClaw agents. |
+| `gw.profiles.settings.get` | `{profileId}` | `{status:"loaded", backend:"hermes", agentId, name, emoji, setup:{instructions,model,provider,workspace,blockedTools}, terminalBackend?}` — reads only the named served profile's SOUL.md and config.yaml. `terminalBackend` is the profile's `terminal.backend` when set (omitted otherwise); the relay refuses LiveUI picture files when it is not `local`, because the agent's paths are then not this host's (LiveUI V2 A6). |
 | `gw.profiles.settings.set` | `{profileId, emoji, setup, producedAtMs, expiresAtMs}` | the same snapshot with `status:"updated"` and `restartRequired:false` — replaces OcuClaw-owned SOUL, model/provider, starting folder, managed tool-group blocks, and icon while preserving unrelated config keys and unrelated disabled toolsets. Transaction-capable hosts require the `setup.blockedToolsRevision` from GET; a stale revision rejects the entire save before SOUL/config writes. Managed effective blocks are read only. The profile id/name is immutable. |
 
 ### Hermes phone management
@@ -661,6 +695,45 @@ operation identity instead of interpreting the action as a profile selection.
 #### Approval policy
 
 Profile administration includes remembered rules and approval mode settings.
+
+##### Asks other agents (#6797)
+
+Three operations, added on Hermes 0.22.5+ where OcuClaw registers its
+`ocuclaw-agents` delegation backend (`delegation_handoffs.py`). Their capability
+rows report `supported:false` on an older host, which the phone takes as "hide
+the setting". `handoffs.restore` only narrows: it is answered even where the
+backend is not registered, though its row follows the same flag.
+
+| Operation | Scope | Payload `handoffs` | Result `handoffs` |
+|---|---|---|---|
+| `handoffs.read` | profile | `{}` | `{available, enabled, backend, replaces, agents:[{id, name, description?, allowed}], applyTiming:"new_chat"}` |
+| `handoffs.set` | profile | `{enabled, agents:[id], confirmReplace?}` | the same view after the write |
+| `handoffs.restore` | gateway (`profileId:"default"`) | `{profiles:[id]}` | `{restored:[id], applyTiming:"new_chat"}` |
+
+`agents` in a read lists every served, enrolled agent other than the selected one;
+`allowed` marks the ones it may ask. `backend` is the selected agent's current
+`delegation.backend` (`default` when unset). `replaces` names the backend that
+turning the switch on would replace (or did replace), when it is not `default`.
+
+`handoffs.set {enabled:true}` writes, in that agent's own `config.yaml`,
+`delegation.backend: ocuclaw-agents`, `delegation.backends.ocuclaw-agents.agents`
+(each `{name, description?}`, descriptions copied from `profile.yaml` so the
+`delegate_task` schema is the same bytes for the same config) and
+`delegation.backends.ocuclaw-agents.previous` (the backend it replaced). Every
+listed agent must be served and enrolled now (`agent_not_enrolled` otherwise).
+Replacing a backend other than `default` needs `confirmReplace` equal to its name
+(`replace_unconfirmed` otherwise). `{enabled:false}` restores `previous` and
+removes OcuClaw's block. A managed install refuses with `managed`. Changes apply
+from the agent's next new chat, as Hermes pins a session's backend with its tools.
+
+`handoffs.restore` turns the switch off in each named profile that still selects
+`ocuclaw-agents`, served or not. It is the phone's fix for the doctor's
+`delegation_backend_stranded` fault (`profiles_report.py`).
+
+At route time the backend re-checks the live enrollment set for both the asking
+agent and the target, refuses asking oneself, and returns
+`{profile, label}`; with no `agent` the task takes the default route.
+Uninstall restores the previous backend in every profile.
 
 ##### Existing MCP connections and channel health
 
@@ -931,6 +1004,8 @@ resumes that profile; a different request cannot configure an existing profile.
 `partial` means the profile exists but some settings are not saved: retry setup
 before offering restart. Profile creation is distinct from activation.
 | `gw.profiles.soul` | `{profile}` | `{content}` — `get_profile_dir(name)/SOUL.md` (the same source as `GET /api/profiles/{name}/soul`); unknown profile ⇒ plain error (NOT `-32601` — a bad agentId must not latch `workspaceIdentityFilesUnsupported` for the whole connection) |
+| `gw.starmap.graph` | `{profile}` | `{status:"ok"\|"unsupported"\|"error", nodes:[NODE], links:[{a, b}], errorCode?}` — the Star Map sky for one profile (`""`/`main` = default; same served-AND-enrolled gate and `get_profile_dir` resolution as `gw.profiles.soul`). Python runs upstream `agent.learning_graph.build_learning_graph()` under `set_hermes_home_override(<profile home>)` and owns the projection (`star_map_rpc.py`). NODE = `{id, kind:"skill"\|"memory", group, name, text, description, createdAtMs, uses, by, stale, pinned, importance, source}`, every key present. Skills: `group` = category made display-ready (`-`/`_`→space, first letter upper; `skills`/`""`→`Learned`, ≤40); `description` = SKILL.md frontmatter `description` (best effort, ≤200); `createdAtMs` = `skills/.usage.json` `created_at`, else `first_seen_at`, else `null` (the graph's `timestamp` is last activity, never creation); `uses` = `useCount`; `by` = `agent`\|`learn`\|`user` as upstream says, anything else (`installed`, null) ⇒ `installed`; `stale` = `state=="stale"`; archived skipped. Memories: `group` `Memory` (MEMORY.md) or `About you` (USER.md); `name` = title (≤80); `text` = the entry's whole first line (≤280); `createdAtMs:null`, `by:""`, `uses:0`. `importance:0` and `source:""` always. This one method carries **ms**, not seconds: it is already the phone's shape. Caps: ≤400 nodes (drop oldest last activity, then least used), ≤800 links, links only between returned ids, no self links or duplicate pairs. No `agent.learning_graph` (or no home override) ⇒ `status:"unsupported"`. Never throws: refusals are `status:"error"` with `errorCode` `profile_not_served`\|`profile_not_found`, failures `graph_failed`\|`graph_malformed`\|`starmap_failed`; `nodes`/`links` are `[]` whenever status is not ok |
+| `gw.starmap.forget` | `{profile, id, kind:"skill"\|"memory", text}` | `{status:"ok", action:"removed"\|"archived"}` \| `{status:"error", errorCode, message?}` \| `{status:"unsupported"}` — forget one star of `gw.starmap.graph`'s sky (same profile gate). Deterministic, exact text, refuse rather than guess; runs under `set_hermes_home_override(<profile home>)` (`star_map_rpc.forget_star`). Memory (`id` = `memory:<source>:<index>[:<fp>]`): rebuild the graph; the card at that id must still show `text` (its first line, ≤280), and exactly one MEMORY.md/USER.md entry must hold the card body (`entry[:1200]`), else `stale`/`ambiguous`; then `load_on_disk_store().remove(target, entry, matched_entry=entry)` (0.21.1: `remove(target, entry)`; both lock and re-read) ⇒ `removed`. Skill (`id` = name): a non-archived skill node must exist (else `stale`); `agent.learning_mutations.delete_node(id)` archives it (`hermes curator restore <name>` undoes) ⇒ `archived`; its refusal maps to `pinned`, `protected` (built-in, hub-installed, protected, read-only), `not_found`, else `forget_failed`. Bad id (empty, >160, kind/id form disagree)/kind/text ⇒ `bad_request`. No learning graph, memory store or `agent.learning_mutations` ⇒ `unsupported`. Never throws; other codes `profile_not_served`\|`profile_not_found`\|`forget_failed`; `message` is one human line ≤200 |
 | `gw.skills.status` | `{}` | `{skills:[{name, description}]}` — `get_skill_commands()` rows; additionally filtered by `skills.platform_disabled.ocuclaw` (the scan's implicit platform scope is unset on this lane, so the per-platform filter is applied explicitly); the bridge synthesizes `eligible:true` (hermes filters disabled at scan) |
 | `gw.commands.list` | `{}` | `{commands:[{name, description, category, source, instantSend, noTrailingSpace, busyPolicy, argsHint?, aliases?, subcommands?}]}` — COMMAND_REGISTRY rows filtered by `_is_gateway_available(cmd, _resolve_config_gates())` (every non-`cli_only` command, plus `cli_only` commands whose `gateway_config_gate` dotpath is truthy — the INVERSE of the TUI's `commands.catalog` filter, which drops `gateway_only` because it serves the CLI); two lane-local suppressions (`start`, `topic` — platform plumbing, not addressable from the composer); `_iter_plugin_command_entries()` appended as `source:"plugin"` rows (name-deduped). `name` is PRE-SLUGIFIED (lstrip `/`, `_`→`-`, lowercased) and IS the literal wire token, so `translateHermesSkillSlash` never has to rewrite a palette selection. `busyPolicy` is registry-native and is display state, not a filter. Skills are NOT included — they ride `gw.skills.status`. Absent/older hermes or a config-read failure ⇒ `{commands: []}` / gates closed. The bridge shapes these into the OpenClaw `commands.list` CommandEntry vocabulary (`/`-prefixed `textAliases`, `scope:"text"`, `acceptsArgs = !!argsHint`, category mapping `Session`→`session` / `Configuration`→`options` / `Info`→`status` / `Tools & Skills`→`tools`, `subcommands`→a single optional `args[0].choices`) |
 
@@ -945,12 +1020,78 @@ timeout is 10 s for the listing and 60 s for a transcription.
 
 | Method | Params | Result |
 |---|---|---|
-| `stt.capabilities.list` | `{}` | `{providers:[{id, displayName, available, unavailableReason, models, defaultModel, supportsLanguage, supportsPrompt}]}` — one row per Hermes STT backend the operator can pick. Sources, in wire order: hermes's own `BUILTIN_STT_PROVIDERS` (ids never enumerated locally), then `stt.providers.<name>: type: command` rows, then `agent.transcription_registry.list_providers()`. `unavailableReason` is `null` whenever `available` is true; `defaultModel` may be `null` (xai takes no model parameter, deepinfra resolves a live catalog) but when non-null is ALWAYS a member of `models`; `models` may be `[]` |
-| `stt.transcribe` | `{provider, model?, language?, prompt?, audio:{format:"wav", sampleRateHz:16000, channels:1, path}}` — `provider` required, the id the phone picked from the listing; `model`/`language`/`prompt` nullable and blank-tolerant (both mean "unset"); `audio.path` is the control-link spill file. | `{success, transcript, provider, error}` — Hermes's own transcribe envelope, values untouched, with its two optional keys filled: `provider` keeps whatever backend Hermes says actually ran, falling back to the pick; `error` is `null` on success and never empty on failure. NEVER raises: every refusal, provider error and unexpected exception comes back as `success:false` |
+| `stt.capabilities.list` | `{}` | `{streamProtocolVersion?, providers:[{id, displayName, available, unavailableReason, models, defaultModel, supportsLanguage, supportsPrompt, streaming, streamingUnavailableReason}]}` — one row per Hermes STT backend the operator can pick. Sources, in wire order: hermes's own `BUILTIN_STT_PROVIDERS` (ids never enumerated locally), then `stt.providers.<name>: type: command` rows, then `agent.transcription_registry.list_providers()`. `unavailableReason` is `null` whenever `available` is true; `defaultModel` may be `null` (xai takes no model parameter, deepinfra resolves a live catalog) but when non-null is ALWAYS a member of `models`; `models` may be `[]`. Live words: `streamProtocolVersion:1` is present ONLY when this Hermes ships `tools.transcription_streaming` (0.22+); `streaming`/`streamingUnavailableReason` are below |
+| `stt.transcribe` | `{provider, model?, language?, prompt?, streamId?, audio:{format:"wav", sampleRateHz:16000, channels:1, path}}` — `provider` required, the id the phone picked from the listing; `model`/`language`/`prompt` nullable and blank-tolerant (both mean "unset"); `audio.path` is the control-link spill file. `streamId` is set only by Node, for a live session it opened itself (never copied from a phone frame). | `{success, transcript, provider, error}` — Hermes's own transcribe envelope, values untouched, with its two optional keys filled: `provider` keeps whatever backend Hermes says actually ran, falling back to the pick; `error` is `null` on success and never empty on failure. NEVER raises: every refusal, provider error and unexpected exception comes back as `success:false` |
+| `stt.stream.open` | `{streamId, path, provider, model, language, prompt}` — `path` is the relay's staged upload WAV, still being appended | `{opened:true}` or `{opened:false, reason}`. Never raises. Node timeout 5 s |
+| `stt.stream.cancel` | `{streamId}` | `{cancelled: bool}` — best effort and idempotent; an unknown id returns `false` |
 
-The relay additionally supports progressive **phone-to-relay uploads**. This is
-independent of provider streaming: Python still receives exactly one complete WAV
-through `stt.transcribe`, and the phone still reveals one whole final transcript.
+Parent → child, registered in the Node child's `linkMethods`:
+
+| Method | Params | Result |
+|---|---|---|
+| `stt.stream.partial` | `{streamId, text}` — `text` is the FULL partial so far, not a delta | `null`. Node drops it when the id is unknown or the take has committed |
+
+**Live words (Hermes 0.22+).** Live words show partial text on the glasses while the wearer talks. They are
+optional and additive: the phone still gets exactly one final result, the
+`stt.transcribe` result (relayed as the upload commit result). Partials are
+non-final previews that the final replaces. Every failure on the live path
+ends in the same batch transcription the lane always ran.
+
+- **Listing.** Each row carries `streaming` and `streamingUnavailableReason`
+  (`null` when `streaming` is true). `streaming` is true only when the module
+  exists, the row is `available`, and the provider can open a live session
+  with the credentials Hermes holds now. Built-ins `openai`, `xai` and
+  `elevenlabs` (the module's `STREAMING_PROVIDERS`) are judged by read-only
+  probes that mirror Hermes's own live wires: openai needs a direct key (the
+  Nous-managed gateway proxies only the REST audio API), xai needs an API key
+  (sign-in alone is not enough). Plugins stream when `streaming_capable` is
+  true. The listing never calls Hermes's `streaming_available` (it goes
+  through `_get_provider`), never connects and never installs. Reasons are
+  short and wearer-facing: `Needs Hermes 0.22 or newer`; `Needs your own
+  OpenAI key in Hermes. The Nous subscription only transcribes after you
+  finish.`; `Needs your own xAI API key in Hermes. xAI sign-in only
+  transcribes after you finish.`; `<displayName> transcribes after you
+  finish` (any non-streaming provider, command rows included); `Set up this
+  provider in Hermes first` (a streaming provider that is unavailable).
+- **Open.** The path guard mirrors the spill guard (parent in the temp-dir
+  candidate set, never a request-named directory) with the narrower basename
+  prefix `ocuclaw-stt-upload-`, and also requires the named path to be a
+  regular file and not a symlink. The file is opened read-only
+  (`O_NOFOLLOW`) and is never claimed, renamed or deleted by this RPC. Then
+  the transcribe lane's own gates run (STT enabled, dispatchable, available)
+  plus the listing's live verdict, so a batch-only pick is refused with the
+  words the settings screen showed. Hermes gets
+  `open_streaming_session(on_partial, stt_config=<overlay>)`, where the
+  overlay is the transcribe lane's language/prompt overlay plus
+  `provider:<pick>` and `streaming:true`. The batch `model` is NOT forwarded:
+  live wires have their own model (`stt.openai.streaming_model`, default
+  `gpt-live-transcribe`). A feeder thread tails the file from byte 44, about
+  every 50 ms, pushing only whole 16-bit samples.
+- **Transcribe with `streamId`.** The session is taken out of the table, the
+  spill file is claimed exactly as before, then the feeder drains the file to
+  its final size (Node closed it before calling) and the session is
+  finalized (at most 10 s). A non-empty success returns
+  `{success:true, transcript, provider, error:null}`, and the claimed spill is
+  still deleted. Anything else (provider mismatch, drain or finalize failure,
+  empty or failed final) cancels the session and runs the unchanged batch
+  path on the same claimed file. An unknown or expired `streamId` is plain
+  batch; an older Python ignores the param, which is also batch.
+- **Partials.** Coalesced per stream: latest text wins, at most one request
+  in flight, at least ~100 ms apart, never sent once finalize or cancel has
+  begun. Fire-and-forget from the event loop; every error is swallowed.
+- **Limits.** At most 4 open sessions; each is cancelled 200 s after open.
+  Sessions leave the table on finalize or cancel, and all are cancelled when
+  the adapter disconnects or the child exits. A cancel can overtake its own
+  open (Node cancels an open that timed out on the link): a cancel for an id
+  not in the table leaves a tombstone that refuses a later open of that id,
+  and a cancel that lands while Hermes is still opening cancels the session
+  as soon as it attaches.
+
+The relay additionally supports progressive **phone-to-relay uploads**. Python
+still receives exactly one complete WAV through `stt.transcribe`. When live
+words are on, the relay also opens a live session on the staged upload and
+forwards partials to the phone; the final transcript is still the one commit
+result.
 The relay advertises `uploadProtocolVersion:1` in its successful
 `ocuclaw.voice.hermes.stt.capabilities.snapshot` only when its upload lane is installed.
 An absent or unknown version selects the legacy batch frame before capture starts.
@@ -1200,12 +1341,85 @@ get both `true` — `language` is a formal keyword of
 `TranscriptionProvider.transcribe` and the dispatcher forwards `prompt` through
 `**extra`; the ABC carries no capability metadata to read.
 
+## TTS lane (read replies aloud)
+
+Child → parent RPCs behind the phone's "Read replies aloud". Python side:
+`tts_rpc.py` (in-process Hermes calls, off the event loop via
+`asyncio.to_thread`). Node side: `extensions/ocuclaw/src/runtime/tts-lane.ts`,
+which the phone reaches with `ocuclaw.voice.tts.capabilities.get` and
+`ocuclaw.voice.tts.speak`. The phone cuts a reply into sentence-sized pieces
+and asks for one clip per piece; the relay holds no speech state. Node timeout
+is 10 s for the listing and 60 s for a clip.
+
+| Method | Params | Result |
+|---|---|---|
+| `gw.tts.capabilities` | `{}` | `{active, providers:[{id, label, available, voices:[], voice?, unavailableReason?}]}`. One row: the provider `tts.provider` names in Hermes's config (default `edge`). `available` is Hermes's own passive check (`check_tts_requirements`, which never installs). `voice` is the configured voice when the config names one. Raises when the config or the speech tool cannot be read; Node maps that to the snapshot's `status:"error"`, and no link to `status:"offline"` |
+| `gw.tts.speak` | `{text, outputPath, voice?}`. `text` is at most 800 characters after trimming. `outputPath` is a file the relay named: a direct child of a system temp directory whose name starts with `ocuclaw-tts-` | `{success:true, provider, path}` or `{success:false, provider?, error:{code, message}}`. `code` is `invalid_request`, `text_too_long` or `speak_failed`. NEVER raises |
+
+Rules:
+
+- **Hermes's configured provider speaks, always.** Upstream ignores a per-call
+  provider on purpose, so the listing names one provider and the phone offers
+  no switch on Hermes (`canChoose:false` in the app snapshot). `voice` is
+  passed through only for built-in ElevenLabs, the one place Hermes accepts a
+  per-call voice.
+- **Audio never rides the link as base64.** Hermes writes the clip to
+  `outputPath` (or the same stem with another extension, when the provider
+  writes a different format); `path` in the result is always on that stem.
+  The relay reads the file, sniffs its format, sends the bytes to the phone
+  and deletes it. A failed or raising call deletes whatever it left.
+- **Nothing else is written.** A path that is not a relay speech file is
+  refused before the tool runs. No chat, session or store is touched.
+
+The agent can turn read aloud on or off for the wearer with the settings tools
+(`get_ocuclaw_settings`, `set_ocuclaw_setting`; see the phone tools lane):
+`read_aloud` takes `off | voice | always` and `read_aloud_paused` takes
+`on | off`. The tools cannot pick the service or the voice.
+
+### Settings tools
+
+The settings an agent may change live on the phone, and so does the list of
+them. `get_ocuclaw_settings` (`tools.getPhoneSettings`) makes the relay send
+the phone `ocuclaw.settings.agent.get` (`requestId`); the phone answers
+`ocuclaw.settings.agent.snapshot` (`requestId`, `settings`: rows of `name`,
+`value`, `allowed`, `confirm`). `set_ocuclaw_setting`
+(`tools.setPhoneSetting`) sends `ocuclaw.settings.agent.set` (`requestId`,
+`name`, `value`, both text; a boolean crosses as `on` or `off`) and the phone
+answers `ocuclaw.settings.agent.result`: `ok: true` with `name`, `value` and
+`previous`, or `ok: false` with a `code` and an optional `message`. A setting
+whose row says `confirm` waits for the wearer's tap on the glasses; the phone
+gives up after 45 s. A phone that predates the tools ignores the frames and
+each tool returns `settings_timeout`.
+
+### Show the Bot Screen tool
+
+`show_bot_screen` (`tools.showBotScreen`, Hermes only, #7571 follow-up) is for
+"show your computer on my glasses", "start the bot screen". It is an action,
+not a stored setting, so it is its own tool rather than a settings row. The
+relay sends the phone `ocuclaw.botscreen.show` (`requestId`); the phone opens
+the glasses' Bot Screen page and, when the screen is installed and off, starts
+it through its own Start path (`ocuclaw.botscreen.start`, then the parent's
+`botScreen.start`: Hermes's own start, never an install and never a lower
+memory floor). It answers `ocuclaw.botscreen.show.result` (see the Bot Screen
+lane). The tool returns `{state, started, opened}` or a coded error. A status
+that says the screen is up is asked again too (`botScreen.start` answers
+`already` for a running screen), since a phone's status may predate Hermes's
+idle stop. The page never covers a recording, a review, a question or typing
+(`opened:false`). This widens what the agent may do: on a gateway host Hermes's
+own `computer_use` starts an off screen only with `bot_desktop.auto_start` on
+(default off); this tool starts it whatever that says, with no confirm, on the
+wearer's ask (Matt, 2026-11-15). The description allows it only when the user
+asks and tells the agent not to begin computer use for it. The tool is not tied
+to the calling agent's profile: the phone shows and starts the screen of the
+profile it has selected.
+
 ## Visible command settings lane (sanctioned policy — 2026-07-08)
 
 Silent per-session override RPCs are retired. The settings UI still exposes
 model, thinking-effort, and reasoning-display controls, but the Hermes path
 implements them as ordinary visible command turns sent through this adapter's
-own session via `dispatch.send`. Hermes owns parsing, validation, warnings,
+own session via `dispatch.send` (except reasoning display, which is silent;
+see below). Hermes owns parsing, validation, warnings,
 confirmation text, transcript visibility, and persistence semantics.
 
 The phone/WebUI still sends `setSessionModelConfig` to the runtime. The
@@ -1229,7 +1443,7 @@ host API returns `unsupported`.
 
 **Fallback on `unsupported` (#2934).** `GatewayRunner.apply_session_options`
 ships only in upstream PR #92187; no tagged Hermes release carries it (checked
-through 0.21.5 / v2026.9.24). When the adapter answers `unsupported`, the
+through 0.23.2 / v0.23.2). When the adapter answers `unsupported`, the
 runtime applies the same patch through Hermes's session-scoped slash commands
 as visible conversation turns, in this order: `/model <id> [--provider <p>]`,
 `/reasoning <effort>` (`reasoning_effort:""` → `/reasoning reset`; effort off
@@ -1238,9 +1452,20 @@ is `/reasoning none`, because `/reasoning off` hides the display), then
 with a reason. The `sessions.patch` result carries `fallback: "slash_commands"`
 and `structured: null`. Any other non-accepted status is still an error.
 
-Presentation-only `reasoningLevel` changes still use visible `/reasoning
-show|hide|clamp|full` commands. A deliberate one-turn model action still uses
-visible `/model ... --once`. `verboseLevel` and `elevatedLevel` remain no-ops.
+**Reasoning display is silent (2026-10-23).** A presentation-only
+`reasoningLevel` change (`on`/`off`; anything else is rejected) no longer sends
+a visible `/reasoning show|hide` turn, whose "Reasoning display: ON/OFF" reply
+cluttered the chat. The runtime calls `profile.options.apply` with
+`{ns, options:{show_reasoning:true|false}}` for the session's profile. The
+adapter writes `display.platforms.ocuclaw.show_reasoning`, the same key native
+`/reasoning show|hide` saves, and answers with the profile's resolved readback.
+The patch is applied only when that readback's `reasoningLevel` matches; an
+adapter refusal surfaces its `error`. Hermes re-resolves the key per turn, so
+no restart is needed, and a busy session does not block the write. Like the
+native command, this is a profile-wide display setting, not a session one.
+
+A deliberate one-turn model action still uses visible `/model ... --once`.
+`verboseLevel` and `elevatedLevel` remain no-ops.
 
 `dispatch.send` may still carry per-turn riders such as `thinking` for
 Even-AI turns; those are turn metadata, not silent session override storage.
@@ -1296,7 +1521,7 @@ One `post_api_request` produces TWO frames with deliberately different jobs.
 - `activity` is the STATUS-BAR frame. It carries a derived headline or nothing:
   `{state:"thinking", origin:"thinking", category:"thinking", phase:"update",
   runId, sessionKey, thinkingSummarySource, summary?}`.
-  `_derive_thinking_headline` picks the first CLOSED `**bold**` span in the
+  `_derive_thinking_headline` picks the LAST CLOSED `**bold**` span in the
   reasoning (`bold`), else a `reasoning_details[]` entry typed
   `reasoning.summary` that is genuinely one short line (`summary`), else
   nothing (`detail`). A headline is one markdown-free line, ≤80 chars.
@@ -1305,6 +1530,23 @@ One `post_api_request` produces TWO frames with deliberately different jobs.
   the client honours an explicit source and would otherwise select the whole
   reasoning blob verbatim and paint truncated prose at summary rank. With no
   key at all it falls through to its generic "Thinking..." label.
+- A `detail` frame also carries headline MATERIAL for a runtime that can cut
+  its own headline. Add-only: a reader that does not know these keys ignores
+  them, and neither is a detail-bearing key from the list above.
+  - `thinkingProse`: the last 600 characters of this model call's reasoning,
+    whitespace as written, taken before the 8000-char frame cap. Present
+    whenever the frame's source is `detail`.
+  - `thinkingSummaryLong`: the first `reasoning.summary` entry that was turned
+    down only for being multi-line or over 80 chars, its first 400 characters.
+    Absent when there is no such entry.
+
+  A `bold` or `summary` frame carries neither key. While plain-prose
+  reasoning streams, each sentence the model finishes also goes out on a
+  `detail` frame with `thinkingProse` and `thinkingLive: true`. The runtime
+  shows a headline cut from it when its `headline` switch is on (the default
+  on a Hermes host) and the sentence is about a step, and drops the frame
+  otherwise; the `post_api_request`
+  frame that follows carries the same material without `thinkingLive`.
 - `thinking` is the BODY frame and carries the cumulative reasoning text. It
   never carries `summary`.
 - Provider/model are NOT used to assert that a provider emits summaries;
@@ -1320,16 +1562,142 @@ Tool activity frames carry `toolPhase:"start"` (from `pre_tool_call`) and
 `toolPhase` is the signal a client needs to know a running tool finished, so a
 reasoning headline can be held back while a tool label is still true.
 
+### Tool start extras (`purpose`, `search_files` `query`)
+
+Both are add-only on the `pre_tool_call` (`toolPhase:"start"`) frame.
+
+- `purpose`: a top-level string, never inside `args`. It is the `purpose` the
+  model wrote on a `terminal` call while "Explain commands" is on (see
+  "Plain-English approval cards"), read from the approval store by tool call
+  id WITHOUT consuming it, so an approval card for the same call still gets
+  it. One plain line, URL credentials redacted, at most 120 chars. Absent when
+  the setting is off, the call recorded none, or the record went stale.
+- `args.query` on a `search_files` frame: Hermes names the search pattern
+  `pattern`, which the argument allow list omits. The adapter copies it to
+  `query`, redacted and capped at 512 chars (then `...[truncated]`) like every
+  other argument string, unless the call already has a `query` or the pattern
+  is blank or not a string. `args.pattern` itself still goes out as
+  `"[omitted]"`.
+
+### Pre-tool sentence (`origin:"narration"`, from `post_api_request`)
+
+When one model call returns visible `content` together with at least one tool
+call, the adapter sends the sentence as an activity frame from
+`post_api_request`:
+
+`{state:"thinking", origin:"narration", category:"narration", phase:"update",
+summary, runId, sessionKey, turnId?, modelCallSeq?}`
+
+`summary` is the content with whitespace collapsed, cut at 600 chars; the
+runtime owns shortening, ranking and whether the wearer sees it. `turnId` is
+the hook's `turn_id` when it has one. No frame when the call asked for no
+tool, when the content is empty or Hermes' `(empty)` placeholder, or when the
+content carries inline reasoning markup (`<think>` and the other names in
+Hermes' `agent/think_scrubber.py`). OcuClaw turns only (the shared
+turn-context filter on `platform`).
+
+Order: Hermes fires `post_api_request` in response intake and runs the call's
+tools afterwards (`agent/turn_response_intake.py`, then
+`agent/turn_tool_round.py`; read at 0.23.1), so this frame precedes every
+`pre_tool_call` frame of the same model call. Within the handler it follows
+that call's thinking frames. `post_api_request` is a timeout-bounded hook: a
+callback Hermes abandons at `plugins.hook_callback_timeout` loses that
+guarantee.
+
+### Delegation routes (`delegation`, #6794)
+
+A `delegate_task` tool frame names who the work went to when Hermes 0.23's
+delegation routes say so (`delegation_routes.py`). Add-only: a frame without
+route data carries no `delegation` key, and readers that do not know the key
+ignore it (`RelayActivityDelegationProtocolTest.anOldReaderIgnoresDelegation`).
+
+- **Start** (`pre_tool_call`): `{routes:[{label, kind}], tasks}` from the call's
+  arguments. `subagent_start` carries no route in 0.23, so the arguments are the
+  only source while the call runs. A task's route is its `agent` or `profile`
+  parameter (`kind:"profile"`) or its `option` parameter (`kind:"model"`);
+  `tasks` counts every task in the call, labelled or not.
+- **End** (`post_tool_call`): each result entry's `route` (from `results` and a
+  background dispatch's `inline_results`) as `{label, kind, backend, model?,
+  provider?, durationMs?, status}`. `kind` is `"profile"` for the
+  `profile_routes` and `ocuclaw-agents` backends, else `"model"`; `status` is
+  `ok`, `error` or `refused` (a route the backend refused).
+- **Background calls**: a call that returns `{status:"dispatched",
+  mode:"background"}` has no routes in its result. The adapter ties each child
+  to its task by goal (`subagent_start`) and, as each child stops
+  (`subagent_stop`), sends its route with status and time: a closing tool frame
+  of the dispatching call (`toolPhase:"end"`, its run and `toolCallId`) whose
+  `delegation` adds `background: true` and has no `model` (only the result
+  entry has it). The results reach the chat as a turn Hermes starts itself
+  ("[ASYNC DELEGATION BATCH COMPLETE …]"). The adapter opens a run for it in
+  `pre_llm_call` (run id `helper-<hex>`, a lifecycle start and no user row), so
+  its reply streams like any turn's; nothing opens while another turn holds the
+  chat. The app credits the chat's first reply after the ones it had when the
+  route came back, not the dispatching run's own reply: by that reply's run from
+  its first streamed row, or by the reply once committed when it has no run
+  (an older adapter). The frame arrives after its run ended; readers take it
+  before their run guards.
+
+At most 8 routes; a label over 64 characters or a model over 96 is dropped, and
+a result over 512 KiB is not read. The relay turns the start into the glasses
+header ("Asking planner…", "Sub-agent → fast…", "Asking planner + 1…"); the app
+keeps the end as the credit line under that run's reply and the Home card's
+Handoff row.
+
+### Model call ordinal (`modelCallSeq`)
+
+Headline and tool activity frames carry `modelCallSeq`: the 1-based ordinal,
+within the run, of the model call the frame belongs to. A logical call is one
+`api_request_id` (its retries share it), numbered in `pre_api_request` order.
+A headline frame (streamed or from `post_api_request`) names the call whose
+reasoning produced it; the stream hooks name a call only by `iteration`, the
+same turn counter `pre_api_request` carries as `api_call_count`. A tool frame
+(start and end, and its plan snapshot) names the call that requested the
+tool: the call that started last when the tool started. A pre-tool sentence
+frame names the call that wrote it. A frame the adapter
+cannot place (no `pre_api_request` seen for its call, the lifecycle start)
+carries no `modelCallSeq`. The glasses keep a headline on the bar through the
+tools of its own call and let a tool label take the bar only for a newer call.
+
 ### Reasoning deltas (`on_stream_*`, 0.20.5+, opt-in)
 
 Registered ONLY when the host has the hooks AND
 `plugins.stream_reasoning_deltas: true` is already in the config at startup.
+Fresh OcuClaw setup defaults an unset key to true, announces the gateway-wide
+scope, and preserves saved values. The setup tool uses
+`{operation:"enable_stream_reasoning_deltas", confirm:true, defaultsOnly:true}`;
+an existing value returns `reason:"existing_choice"` without a write (true
+returns `already_enabled`). Updates still require an explicit yes before
+enabling it. Cloudways setup uses the Hermes config CLI and verifies readback
+before proceeding to the same pending gateway restart as its other settings.
 Registering any `on_stream_*` hook flips hermes's process-wide
 `_has_stream_consumers`, which changes the provider call shape for every
 surface on that gateway — so an operator who did not opt in sees no transport
 change. The key is read ONCE, at registration; upstream's own
 `stream_reasoning_deltas_enabled()` re-reads config on every call, which is not
 a per-delta budget.
+
+**State and enable from the app (profile-options lane).** Add-only on the
+existing link methods; the key is gateway-wide, so every profile on one
+gateway reads the same answer and `ns` does not select it.
+
+- `profile.options.get` `{ns?}` readback gains `liveReasoning`:
+  `"on"` (key true and this process registered the hooks), `"restart"` (key
+  true, but this process booted before it was written), `"off"` (somebody
+  saved false), `"unset"` (nobody chose) or `"unavailable"` (this Hermes has no
+  reasoning-delta hooks). The field is absent when the gateway config cannot
+  be read.
+- `profile.options.apply` `{ns?, options:{live_reasoning:true}}` writes
+  `plugins.stream_reasoning_deltas: true` through the setup tool's own writer
+  (`defaultsOnly` false, so a saved `false` is replaced). The option may ride
+  alone or with other options; alone, the profile's config is not rewritten.
+  The result is the usual `{status:"accepted", …readback}` plus
+  `liveReasoningResult` (`"written"`, `"already_enabled"`,
+  `"config_unwritable"`, `"unavailable"` on a host without the hooks, which
+  writes nothing, or `"ignored"`) and `restartRequired` (true exactly when the
+  readback says `"restart"`). Both are absent when the patch did not carry
+  `live_reasoning`. The lane turns the key on only: any value but a real
+  `true` writes nothing and answers `"ignored"`. After a successful write the
+  next readback says `"restart"` until the gateway restarts.
 
 - `kind == "reasoning"` only. `kind == "text"` is rejected on the handler's
   first line: the streaming transport already renders content deltas, and
@@ -1376,16 +1744,19 @@ kind of message from its answer. On a host whose hook vocabulary has
 `on_interim_message`, the adapter registers it, tags the commit that carries
 the sentence, and stamps that commit with the sentence's ORIGIN time.
 
-**There is no status-bar rung.** The adapter used to emit
-`{state:"thinking", origin:"narration", category:"narration", summary:…}` for
-each sentence. #1619 retired it: with a real model hermes commits the interim
-AFTER the tool activity frame, so the narration rung lost arbitration on every
-single turn — 12 real-model dumps (pet sim-d, gpt-5.6-sol) contained zero
-`origin:"narration"` frames, and the matching `agentProgressNotes: status`
-setting value was indistinguishable from `off` while silently deleting the
-sentence. A note now goes to the conversation, at its origin position, or
-nowhere. `origin:"narration"` is a retired activity origin; no producer emits
-it.
+**This hook sends no status-bar frame.** The adapter used to emit
+`{state:"thinking", origin:"narration", category:"narration", summary:…}` from
+this hook for each sentence. #1619 retired that: with a real model hermes
+commits the interim AFTER the tool activity frame, so the narration rung lost
+arbitration on every single turn — 12 real-model dumps (pet sim-d,
+gpt-5.6-sol) contained zero `origin:"narration"` frames, and the matching
+`agentProgressNotes: status` setting value was indistinguishable from `off`
+while silently deleting the sentence. The hook's remaining jobs are tagging
+the sentence and correcting a commit that beat it. The runtime shows a tagged
+note as a live work-panel row and drops its conversation page: a note is
+never durable conversation history. The `origin:"narration"` activity frame
+is now sent from `post_api_request` instead, where it is ahead of the tools
+(see "Pre-tool sentence" above).
 
 The hook filters on `surface`, NOT `platform` — stream hooks spell it that
 way, and the shared turn-context filter (which reads `platform`) is vacuous
@@ -1437,6 +1808,26 @@ Tool-progress bubbles use the same routing field with
 the minted message id to that arm. The Node runtime treats the eventual commit
 as ephemeral and never adds it to settled conversation history. This matters
 because Hermes can flush the editable progress bubble after the final reply.
+
+#### Plugin messages (`post_message`, Hermes 0.22.3+)
+
+A Hermes plugin's `ctx.post_message(text)` reaches `send()`, and its
+`handle.edit(text)` reaches `edit_message()`, from `gateway.plugin_messages`.
+The send carries the same `_interim_send` marker as commentary and no key of
+its own, so the adapter tells it apart by the calling module, checked before
+`send()` first awaits. A plugin message never touches the ledger: it is not a
+slash command's reply, not the turn's open message and not narration. It is
+emitted as an uncorrelated `message` with its own `id` and
+`pluginMessage:true`, and the adapter keeps that id (the newest 64) so an edit
+finds it. The relay copies `pluginMessage:true` onto the ledger entry, and the
+app never takes such an entry for the reply of the turn it lands in: a tool's
+status line usually arrives before the turn streams a word. An edit is a
+`message` with `{edit:true, pluginMessage:true, id, role:"assistant", content}`
+and no `originAtMs`; the consumer
+replaces the text of the message with that `id` where it sits, and adds it as
+a new message when it no longer holds one (the session was reloaded since).
+Any other `edit_message()` id is a StreamConsumer edit, bound by
+`DispatchLedger.note_edit` as before.
 
 #### `originAtMs` — when the model wrote it (#1619)
 
@@ -1497,6 +1888,9 @@ every lane it touches. It rides:
 - `message_retag_event` — names the commit being corrected.
 - `uncorrelated_message_event` — no ledger record, so the caller passes the id
   it minted for that send (or mints one).
+- `viewer_prompt_message_event` — the prompt row of a viewer turn (see the D9
+  table); the adapter mints its id.
+- `message_edit_event` — names the plugin message whose text it replaces.
 
 **Why it matters.** The Node consumer reads `data.id` and gives the display
 entry `idSource:"server"`. Without it a hermes commit is `derived`, and ONE
@@ -1531,12 +1925,223 @@ carries it. Without the flag a consumer treats every runId-carrying commit as
 turn end and tears the turn down mid-flight on any agent that writes more than
 one message per turn.
 
+### Run signals (`runSignal`)
+
+Parent → child event `runSignal` carries the glasses status lens's run spans:
+model calls (K9), context compaction (W1), subagents (H4) and retry waits
+(K6). The child relay pairs them (`run-signals.ts`) and sends each to the app
+as `ocuclaw.run.signal`; older apps drop the unknown type. The bookkeeping is
+`run_signals.py`; the hook wiring is in `adapter.py`.
+
+Payload: `{signal, phase, sessionKey, runId?, spanId, atMs, ...}`.
+
+- `signal` is `model_call`, `compaction`, `subagent` or `retry_wait`.
+- `phase` is `start` or `end`. Every end follows the start it pairs with.
+- `sessionKey` is the dispatch record's public key. For a subagent it is the
+  PARENT's session.
+- `runId` is the dispatch record's run id. It is left out when the record
+  names none.
+- `spanId` pairs a start with its end and is unique within the run (rules
+  below).
+- `atMs` is epoch ms on the host clock, taken when the hook ran.
+- `outcome` is on ends only. model_call: `completed` or `error`. compaction:
+  `completed` or `failed`. subagent: `ok`, `error`, `timeout`, `killed` or
+  `unknown`.
+- `provider` and `model` are on a model_call start, when Hermes names them.
+- `label` is on a subagent start: the child's role (`child_role`, e.g. `leaf`).
+- `reason`, `attempt` and `maxAttempts` are on a retry_wait start.
+
+| Signal | Start | End |
+|---|---|---|
+| `model_call` | `pre_api_request`, once per physical attempt | `post_api_request` (`error` when the response carries a provider error, else `completed`), or `api_request_error` (`error`, every failed attempt, retried or not) |
+| `retry_wait` | `api_request_error`, when the engine will back off (below) | none from the adapter: the relay ends it when the run's next model_call starts, or when the run ends |
+| `compaction` | `pre_auxiliary_call` with `aux_task: "compression"` | `post_auxiliary_call` (`failed` when the attempt raised) |
+| `subagent` | `subagent_start`, routed by `parent_session_id` and `parent_turn_id` | `subagent_stop`: `child_status` completed → `ok`, failed or error → `error`, timeout → `timeout`, interrupted → `killed`, anything else → `unknown` |
+
+`spanId` rules:
+
+- model_call: Hermes mints `api_request_id` (`<turn_id>:api:<n>`) once per
+  logical call, and every retry of the call reuses it. Attempt 1 uses the id;
+  attempt n uses `<id>#n`. Without the id the adapter rebuilds the same shape
+  from `turn_id` and `api_call_count`.
+- retry_wait: `<the failed attempt's spanId>:wait`.
+- compaction: the auxiliary call's own `aux-<uuid>`, with `#n` for attempt n
+  (`retry_count` is the auxiliary attempt's 0-based index). Without an id:
+  `compaction:<turn_id>:<started_at in ms>`.
+- subagent: `child_session_id`, the one id both hooks carry. When it is
+  missing, `child_subagent_id` opens the span, and the relay ends it with the
+  parent run.
+
+Routing. A start routes like tool activity (`_turn_activity_context`): the
+platform filter first, then background-review forks, then the SessionDB row,
+an OcuClaw session key and an OcuClaw turn in flight (a slash head and a
+pre-reset carrier are dropped). A start that does not route opens nothing. A
+start that routes counts as turn activity, as a tool hook does: it refreshes
+the turn's idle clock, and it can promote a queued dispatch (with its
+lifecycle-start frame) at the first model call's start. An end only ends a
+span this adapter opened, so a foreign platform, a turn-less call or a second
+end sends nothing. An agent makes one main-loop model call at
+a time, so a session's new model_call start first ends its still-open attempt
+as `error`: some recoveries resend the call without `api_request_error` (an
+error recovered before classification, a truncated response).
+
+When a retry_wait opens. All of these must hold:
+
+- `retryable` is `true`.
+- `reason` is one whose recovery is a backoff sleep: `rate_limit`,
+  `upstream_rate_limit`, `overloaded`, `server_error`, `timeout` and `unknown`
+  (`turn_api_error.settle_unrecovered_error` → `compute_error_backoff`), and
+  `invalid_response` (`turn_response_check.retry_invalid_response` →
+  `jittered_backoff`). Other reasons are repaired and resent at once,
+  compressed, or end in a fallback or a terminal error.
+- Attempts remain: `retry_count + 1 < max_retries`. `retry_count` is the
+  failed attempt's 0-based index (the hook fires before the engine adds one)
+  and `max_retries` is the attempt budget (`agent.api_max_retries`, default 3;
+  the retry loop runs while `retry_count < max_retries`). So
+  `attempt = retry_count + 2`, the attempt the wait leads to, and
+  `maxAttempts = max_retries`.
+
+Floor and feature detection. The five hooks are probed against
+`hermes_cli.plugins.VALID_HOOKS` and never registered blind, and a start/stop
+pair is wired whole or not at all. `pre_api_request`, `subagent_start` and
+`subagent_stop` are in the 0.21.1 floor's vocabulary (`v2026.9.7`).
+`pre_auxiliary_call` and `post_auxiliary_call` arrived in 0.21.5
+(`v2026.9.24`), so a 0.21.1–0.21.4 host shows no compaction. There is no
+feature token: the lens draws whatever frames arrive and never branches on
+what could arrive. `_setup_status()` reports
+`hermesHooks.auxiliaryCallHooksAvailable`, so a missing compaction row is
+explainable from one receipt. Model-call ends and retry waits ride
+`post_api_request` and `api_request_error`, which are always registered.
+
+Cost. All five are observers, and Hermes ignores what they return. The
+model-call and auxiliary hooks run under Hermes's hook timeout; the subagent
+pair runs inline to completion. Registering `pre_api_request` makes Hermes
+build its hook payload (a sanitized copy of the request) for EVERY main-loop
+model call on the gateway, any platform. The handler drops a foreign platform
+before any lookup; an OcuClaw call costs one SessionDB row read, as
+`post_api_request` already does. The auxiliary pair makes Hermes build a
+payload for every auxiliary call (titling, vision, MoA and the rest); the
+handler returns on its first line unless `aux_task` is `compression`.
+
+What a Hermes run signal does not say:
+
+- No wait time. Hermes tells plugins neither how long it will sleep nor when
+  the next attempt starts, so a Hermes retry_wait never carries `waitMs` or
+  `retryAtMs`, and the adapter never estimates one.
+- A retry_wait is a forecast. `api_request_error` fires before the engine
+  picks its recovery. Credential-pool rotation, an eager fallback to another
+  provider or the free-tier cooldown cut (main) can replace the sleep with an
+  immediate next call or end the turn. The next model_call start ends the wait
+  at once (the relay's outcome `retrying`), and the run's end ends it too.
+- The Z.AI coding-overload path raises the attempt budget after the hook
+  fires, so a wait past the reported budget opens no retry_wait, and
+  `maxAttempts` can be the budget before the raise.
+- The auto-recovery ladder that parks a turn after its budget is spent
+  (`auto_recover_after_exhaustion`, 0.21.5+) opens no retry_wait: the last
+  failed attempt reports no attempts left.
+- `subagent_stop` fires on the parent's thread once per child when
+  `delegate_task` collects the batch, so a child that finished early shows
+  running until its batch is collected.
+- compaction is one span per auxiliary provider attempt, and its outcome is
+  that attempt's. A compaction outside an OcuClaw turn (no parent turn, so no
+  `session_id`) is dropped.
+
+The child relay also reads every `model_call` start for its card build
+tracker (`card-build-phases.ts`): a model call inside a program card build
+is taken to be writing, fixing or checking the card, and the app gets the
+phase as `ocuclaw.card.build`. Nothing new crosses this link for it; the
+tracker's other inputs are the card tools' activity frames, the reasoning
+headlines the relay already resolves from thinking frames (the frame's `note`),
+and the relay's own ask, request and card-response edges.
+
+### Sessions gone (`sessionsGone`)
+
+Where the host's hook vocabulary has `on_session_delete` (0.22.3+; absent
+0.22.0-0.22.2), the adapter registers it as an observer. It fires once, after
+the delete or archive has committed, in the process that committed it. Each
+call sends backend event `sessionsGone`:
+`{ns, ids, reason, origin}`.
+
+- `ids`: every native session id that went (`session_id` plus
+  `deleted_ids`), sorted. The rows no longer exist, so the child maps them to
+  public keys from the rows its own `sessions.list` answers carried (`id` and
+  `lineageRootId`). An id it never listed maps to nothing; the frame then
+  only refreshes the picker.
+- `reason`: Hermes's own (`delete`, `archive`, `empty_sweep`, `prune`,
+  `ghost_prune`, `profile_repair`), passed through.
+- `origin`: `ocuclaw` while OcuClaw's own phone delete tells plugins
+  (session_writer), else `hermes`. The relay already cleaned up its own
+  deletes and ignores `ocuclaw` frames.
+- `ns`: the namespace of the store's profile. A delete in the gateway's own
+  profile maps to the adapter's namespace; another profile maps through
+  `namespace_for_profile` and is sent only while this gateway serves or
+  drains it. A store outside every profile sends nothing.
+
+Process-local by design (phase 1). Desktop and dashboard single deletes and
+archives, a TUI on the shared gateway and the gateway's own prune commit in
+the gateway process, so they reach the adapter. `hermes sessions
+delete|prune|archive`, the classic CLI's `/exit --delete` and a standalone
+dashboard's bulk deletes commit elsewhere: Hermes loads the plugin there too
+(lazy discovery), but no adapter is live, so the hook does nothing and the
+picker catches up on its next fetch.
+
+The relay coalesces frames for 250 ms, drops its 5 s session cache and
+re-broadcasts the list. For each mapped key that a fresh exact-key read no
+longer finds, it forgets the chat's per-session state, unless `reason` is
+`archive`. An archived chat keeps its row on the exact-key path
+(`include_archived`), so an archived open chat stays open. When the open chat
+is really gone, the relay opens a new chat and sends `sessionSwitchApplied`
+with `previousSessionGone: true`; the glasses say "Session gone" once.
+
+### Compaction counts (`sessionCompacted`)
+
+Hermes compacts in place by default (`compression.in_place: true`), so the
+session id, and with it the compression chain, does not change, and a hop
+count stays 0. On 0.22.3+ the `post_compaction` hook fires once per committed
+compaction on every path (in-turn, `/compress`, gateway hygiene, micro
+summaries, tool-result prunes, provider-native), in the process that
+compacted and in that session's profile scope. `compaction_ledger.py` counts
+each one in `<HERMES_HOME>/state/ocuclaw.compactions.json`: per Hermes
+session id, `full` (in-place `summarize` and `provider_native`), `micro`,
+`prune`, `rotatedIn` (already a chain hop) and the newest event. The hook
+runs inside the commit window with the lease held and under Hermes's hook
+timeout, so it only bumps memory; a timer thread merges the deltas into the
+file under a lock within about a second, and at exit. `trackingSince` is when
+the profile's ledger was armed (plugin load on a host with the hook, or the
+first event); a session that started earlier may hold uncounted compactions,
+so its total is a floor (`exact: false`). Evicting an old entry (more than
+5,000 sessions) moves `trackingSince` past it.
+
+For an OcuClaw chat, the gateway also sends parent → child event
+`sessionCompacted`, from a worker thread, for every kind:
+
+`{sessionKey, sessionId, kind, reason, inPlace, counted, beforeTokens, afterTokens}`
+
+- `sessionKey` is the public key (`hermes:<ns>:<chatId>`); a foreign session
+  sends nothing.
+- `kind` is `summarize`, `micro_summarize`, `prune_tool_results` or
+  `provider_native`; `reason` is Hermes's trigger (`manual`, `pre_api`,
+  `post_tool`, `overflow`, `gateway_hygiene`, `between_turns`,
+  `proactive_prune`, `provider`, `unknown`).
+- `counted` is true when the event added to the total.
+- tokens are Hermes's figures, `null` when it had none.
+
+The child re-reads the active session's context at once and re-anchors open
+Live UI surfaces (K17) on any kind. A CLI process counts into the same file
+but has no adapter, so it sends nothing.
+
 ## Session-control lane
 
 Hermes 0.20 exposes native platform approval delivery and resolution seams.
 The adapter implements `send_exec_approval`, mirrors each request to the
-glasses approval HUD, and resolves its FIFO head through Hermes'
+glasses approval HUD, and resolves it through Hermes'
 `resolve_gateway_approval`. It does not inspect private approval queues.
+`send_exec_approval` carries no entry id, so at mirror time the adapter reads
+the public `list_gateway_approvals(session_key)` (Hermes enqueues before it
+notifies) and keeps the entry's `request_id` when exactly one unclaimed entry,
+or exactly one with the same command, is open (#4983). The resolve then passes
+`request_id=` so it lands on that prompt; with no id, or a resolver without the
+parameter, it resolves the session's FIFO head, as before.
 `post_approval_response` reconciles resolutions made through Hermes' typed
 fallback so the mirrored HUD clears exactly once.
 
@@ -1548,9 +2153,416 @@ only Once and Deny; ordinary requests expose Session only when Hermes marks
 that scope available. Permanent approval remains absent from the glasses
 decision set.
 
+Plain-English approval cards (approval_explain.py). Where the host has request
+middleware (0.21.5), `llm_request` middleware adds an optional `purpose` string
+to the `terminal` tool schema on OcuClaw turns only, and `tool_request`
+middleware pops it on every platform before Hermes's hooks, guardrails,
+approvals and execution run, so they see exactly the arguments they saw
+before. `pre_approval_request` ties the approval to its tool call. The
+`approval` backend event then carries `request.purpose` (at most 120 chars,
+one plain line) and `ocuclawApprovalContext` `{purpose,userMessage,
+assistantText,thinkingText}`; blanks are omitted, and Node never forwards the
+context to clients. The shared explainer in Node writes the card's sentence
+through child → parent RPC `approval.llm.complete`
+`{messages,maxTokens?,temperature?,timeoutMs?}` → `{text}` or `{error}`,
+answered with the plugin's `ctx.llm` (no model or provider override). Where
+the host has `register_auxiliary_task`, the call passes
+`task="ocuclaw_approval_explain"`, the plugin's "OcuClaw approval explainer"
+row, which inherits Hermes' `approval` task: by default the smart-approvals
+model writes the sentence, and a model pinned under
+`auxiliary.ocuclaw_approval_explain` receives the command and its context.
+Live view refresh (`liveui.llmRecipe`) passes `task="ocuclaw_liveui_refresh"`
+the same way, and a recipe's own `model` still wins. On an older host neither
+task exists and no `task=` is sent. `approvals.read` reports
+`explainerTaskRegistered`; when it is true the snapshot also has
+`fields.explainerModel` (`inherit` or a `provider|model` key, over the four
+leaves `auxiliary.ocuclaw_approval_explain.{provider,model,base_url,api_key}`),
+`explainerModels` (`inherit` first, then the Learning panel's model list),
+`explainerModelsTruncated`, `approvalModel` (`provider|model` or `main`) and
+`customExplainerRoute`. An update to a model key needs
+`confirmations: ["explainerModel"]` and clears the task's base URL and key;
+`inherit` writes provider `auto` and empty model, base URL and key (Hermes'
+"Follow Approval") and needs none. A model outside `explainerModels` fails
+`model_unavailable`. The child pushes the wearer's "Explain commands" setting through
+child → parent RPC `approval.explain.setting` `{enabled}` → `{ok,enabled}`
+at relay start and on each change. While it is off, the parent adds no
+`purpose` schema field and the event carries no `request.purpose` or
+`ocuclawApprovalContext`; the strip middleware stays on. On until pushed; an
+older parent answers method-not-found and the child ignores it. None of this
+changes an approval decision.
+
+Saved card AI review (card_review.py). The phone's AI review of a saved
+programmable card runs in the shared Node reviewer, which writes its staged
+calls (glance, outline, five details, and a fix when an Accept needs one)
+through child → parent RPC `program_card.review.llm.complete`
+`{messages,maxTokens?,temperature?,timeoutMs?,callId?}` → `{text,model?,provider?,imageModel?,usage?,stopReason?}` or
+`{error}`. `usage` is `{inputTokens?,outputTokens?,costUsd?}` from the
+completion (finite and non-negative); `stopReason` is `length` or `stop` when
+the host reports a finish reason. On Hermes only a `length` stop reason marks
+an answer cut off: Hermes 0.22.5 sends no `max_tokens` on most routes and its
+output tokens include reasoning, so a full budget says nothing (OpenClaw, which
+enforces the budget, also treats output that filled `maxTokens` as cut off).
+A complete answer is never counted as cut off. A cut-off answer that does not
+parse gets one repair at a larger budget (outline 4000, detail and fix 8000)
+with a "use fewer, shorter edits" hint, then fails as `model_truncated`. The
+call counts in the `ocuclaw_card_review` row of `health.usage` `tasks`. The parent answers with the plugin's `ctx.llm` (at most 4 messages,
+262144 characters each, 8000 tokens, a 300 s deadline). Where the host has
+`register_auxiliary_task`, the call passes `task="ocuclaw_card_review"`, the
+plugin's "OcuClaw card review" row, so a model pinned under
+`auxiliary.ocuclaw_card_review` writes the review. An older parent answers
+method-not-found, and the review stops with that error.
+Message content accepts the existing strings or at most 16 text/`image_url`
+parts. Images must be inline `data:image/png;base64,...` URLs: no remote URLs,
+other MIME types or content block types. The parent permits at most six PNGs
+and 1.5 MiB of decoded PNG data across the call, rejecting bad base64 or an
+exceeded bound before `ctx.llm`. When the completion reports its actual
+provider and model, `imageModel:{provider,model,input}` describes that exact
+route through Hermes' public image routing API. Its identities retain up to
+160 characters, separately from the 80-character display fields; a longer or
+missing identity is unknown and text-only. These response facts do not
+override the auxiliary task's provider, model or trust policy.
+The shared reviewer allows at least 45 s for the first look (75 s with asks),
+180 s for the outline, 150 s per detail/fix, and 360 s for the whole review
+including format repairs. A route whose recent calls ran slower gets 1.5 times
+its slowest of the last 8 calls per stage (a timed-out call counts as its
+deadline), at most 120 s, 300 s and 240 s, and the whole review gets the same
+extra time, at most 600 s. Host waiting updates every 30 s never renew these
+deadlines. The Node link allows the requested model deadline plus 2 s for
+transport; the outer reviewer
+remains authoritative. Phone reconnects read state and do not replay starts.
+`program_card.review.llm.cancel` `{callId}` → `{cancelled:boolean}` cancels
+only that pending review call (including a call queued in the host). An old
+parent without cancellation keeps its already bounded call; no request is
+retried. Late results cannot update a stopped or replaced review. Cancellation
+is best effort at the provider boundary; a remote server or synchronous SDK
+worker may finish after local cancellation.
+
+Task setup proposals use `task.proposal.llm.complete/cancel` with the same
+bounded completion and exact-call cancellation transport. They have their own
+call registry, purpose `ocuclaw.task.proposal`, and optional auxiliary task
+`ocuclaw_task_proposal` ("OcuClaw Task setup"). The relay requests at most 2600
+tokens and 120 seconds. Calls are tool-free; they cannot create a Task, grant
+access or change a schedule. The phone must preview/apply the returned candidate
+to its draft, then separately approve the existing Task Save. See
+`docs/liveui/task-result-proposals.md` for the app frames and lifecycle.
+
+A new Task read from the owner's words (#7112, `ocuclaw.task.words.*`) rides the
+same `task.proposal.llm.complete/cancel` method, call registry, purpose and
+auxiliary task: to the parent it is one more Task setup call, so no parent
+change or new method is needed. The relay requests at most 1200 tokens and 30
+seconds. The call is tool-free and saves nothing; the phone fills its New Task
+sheet from the answer and the owner still approves the existing Task Save.
+
+Agent drafts ("New agent → Describe it") use `agent.draft.llm.complete/cancel`
+with the same bounded completion and exact-call cancellation transport, their
+own call registry and purpose `ocuclaw.agent.draft`, and no auxiliary task: the
+call runs on the host's main model. The relay requests at most 900 tokens and
+60 seconds. Calls are tool-free and create nothing; the app shows the returned
+name, two alternative names and instructions, and creates the agent only through
+the existing agent-create lane.
+
+Program card frame step (card_frame.py). The shared Node runtime asks for a
+card's frame art through child → parent RPC `program_card.frame.llm.complete`
+`{messages,maxTokens?,temperature?,timeoutMs?,reasoning?,callId?}` →
+`{text,model?,provider?,imageModel?,usage?,stopReason?}` or `{error,failure?}`,
+the review lane's shapes and transport. The reply is one ```` ```js ```` code
+block; the call is tool-free. It has its own call registry, purpose
+`ocuclaw.card.frame`, and optional auxiliary task `ocuclaw_card_frame`
+("OcuClaw card frame art", defaults `timeout` 300 s, `no_progress_timeout`
+300 s and `reasoning_effort` medium, no `inherit_from`), so a model pinned under
+`auxiliary.ocuclaw_card_frame` writes the art; with no pick, or on a host without
+`register_auxiliary_task`, it runs on the main model. `reasoning` is the call's
+effort (`minimal`, `low`, `medium` or `high`; the wearer's frame detail, and
+`minimal`/`low` for the idea and paint-world calls). `ctx.llm` takes no effort
+per call, so the parent runs `low`/`minimal` on `ocuclaw_card_frame_quick`
+("OcuClaw card frame art (Quick)", `reasoning_effort` low) and `high` on
+`ocuclaw_card_frame_detailed` ("OcuClaw card frame art (Detailed)",
+`reasoning_effort` high, `timeout` and `no_progress_timeout` 420 s); both
+`inherit_from` `ocuclaw_card_frame`, so they follow its model pick, and are
+registered only on a host that takes `defaults` and `inherit_from`. Any other
+effort, or a level whose task is not registered, runs on `ocuclaw_card_frame`.
+No model or provider override is sent. The parent
+takes at most 4 text-only system/user messages and 40000 characters across them
+(no image parts), clamps `maxTokens` to 16000 (the art script is 5-10 KB of JS
+after 2-5k reasoning tokens; the review lane keeps 8000) and the deadline to
+420 s (a Detailed frame; the review lane keeps 300 s). The Node link waits for
+the deadline plus 2 s and sends only those four efforts. A cut-off reply is marked
+only by `stopReason: "length"` where the host reports a finish reason; Hermes
+0.22.5's `ctx.llm` result reports none, and its OpenAI and Codex routes do not
+forward `max_tokens`, so on those routes the provider's own output limit bounds
+the reply and the caller should treat a missing closing fence as cut off.
+`program_card.frame.llm.cancel` `{callId}` → `{cancelled:boolean}` cancels only
+that pending frame call. An older parent answers method-not-found.
+
+Painted game frames (#7160) are gone: game frames are drawn by script only. The
+parent no longer answers `program_card.frame.image.ready`, `.paint` or `.read`;
+a Node runtime from before the removal that asks hears method-not-found and draws
+the frame by script, as it did on a parent from before the methods.
+
+Saved-card icon pick (card_icon.py). For a wearer without Jev, the shared Node
+runtime asks the host model which Library icon names a saved card through
+child → parent RPC `program_card.icon.llm.complete`
+`{messages,maxTokens?,temperature?,timeoutMs?,callId?}` →
+`{text,model?,provider?,usage?,stopReason?}` or `{error,failure?}`, the review
+lane's shapes and transport. The messages are exactly one system message (the
+icon list) and one user message (the card's name and description); the reply is
+one icon id or `none`, and the call is tool-free. It has its own call registry,
+purpose `ocuclaw.card.icon`, and optional auxiliary task `ocuclaw_card_icon`
+("OcuClaw card icon", default `timeout` 20 s, `inherit_from: title_generation`),
+so by default it follows the session-title model and an operator can pin
+another under `auxiliary.ocuclaw_card_icon`; on a host without
+`register_auxiliary_task` it runs on the main model. No model or provider
+override is sent. The parent takes at most 12000 characters across the two
+messages and clamps `maxTokens` to 1000. `program_card.icon.llm.cancel`
+`{callId}` → `{cancelled:boolean}` cancels only that pending call. An older
+parent answers method-not-found, and the child keeps the keyword icon.
+
+Review failures may additionally carry `failure={kind,origin,retryable,retryAtMs?}`.
+Kinds are `rate_limited`, `overloaded`, `auth_required`, `quota_exhausted`,
+`timeout`, `cancelled`, `local_busy`, `lab_budget_exhausted`, and `unknown`.
+Origin is `provider`, `native`, `relay`, `lab`, or `unknown`; a bare HTTP 429
+does not prove provider attribution. Only allowlisted metadata crosses this
+boundary, never exception messages, response bodies or arbitrary headers.
+`retryAtMs` is a validated absolute timestamp derived from Retry-After or reset
+metadata; missing/invalid reset data gets bounded local backoff in the reviewer.
+Old peers retain the existing `error` string fallback. The review and each failed
+idea include sanitized `failure`; review replies may include `retryAtMs` plus
+`serverNowMs` so the phone can show the remaining delay despite clock offset.
+
+The shared gate covers the host's default review route, across cards and phones,
+including Retry, Again and new stage calls, and survives process restart. It never
+queues an automatic call. An elapsed cooldown only enables another manual action.
+An existing call can finish while the gate is active. Original stage/operation
+deadlines and cancellation fences remain authoritative. A terminal review keeps
+failed explanation identities after outlining, including an all-failed review;
+individual Retry can recover these without regenerating the outline. A first
+successful retry changes that failed review to a partial `done` review.
+
+MCP in program cards (card_mcp.py; reads, and writes since #6111). The shared
+Node engine owns the gate, the wearer's yes, the write grants and per-send
+prompt, the limits and `pick`; the parent only lists and calls, through
+Hermes's own MCP client, so no token, URL or second connection is made. Three
+child → parent RPCs:
+
+- `program_card.mcp.list` `{}` → `{ok:true, writes:true, servers:[{name,
+  connected, granted?, writes?, reason?, fix?, tools:[{name, description,
+  inputSchema, annotations}]}]}` or `{ok:false,
+  reason}` (`unsupported`, `failed`, `no_servers`). One row per enabled server
+  in `mcp_servers` (at most 32, sorted). `connected` is whether Hermes's MCP
+  client has a live session for it. `granted` is whether the server is in
+  `plugins.entries.ocuclaw.mcp_allowlist` (left out when that is unreadable);
+  the engine reads a card switch without the grant as off. `tools` are the
+  tools that client knows for
+  it (at most 200), after the server's own `tools.include`/`tools.exclude`.
+  `annotations` carries `readOnlyHint`, `destructiveHint`, `idempotentHint` and
+  `openWorldHint` as booleans when known; `readOnlyHint` is true only when the
+  server marks the tool read-only and Hermes recorded it so at discovery (its
+  own trust gate's fact). Descriptions are one line of at most 300 characters;
+  a schema over 16 KB as compact JSON (as the engine measures it), or past a
+  640 KB listing budget, goes out as `null`.
+  Hermes has no public listing API, so this reads its MCP client's state
+  (`tools.mcp_tool` ledgers) behind a feature check, not a version pin: any
+  missing piece answers `unsupported` and logs one warning. Top-level
+  `writes: true` says this parent runs a card's granted write; a parent before
+  #6111 leaves it out and the engine answers every write and
+  `request_card_mcp_write` with `off`. A server whose `trust` is not `full`
+  (Hermes would ask its own approval before a write tool) or that declares
+  `tool_costs` or `spend_limit` (Hermes would ask past the budget) lists
+  `writes: false, reason: "host_blocked"` and a one-line `fix` for the owner:
+  its reads still work, its writes are refused.
+- `program_card.mcp.call` `{server, tool, args, timeoutMs, write?,
+  ownerWrite?}` → `{ok:true,
+  structured?, text?, isError?, truncated?}` or `{ok:false, code}`
+  (`not_allowed`, `timeout`, `busy`, `failed`). The documented `ctx.call_mcp`
+  runs on the parent's own 4-thread pool with the call's deadline (1–30 s;
+  default 10 s), answered at most 1 s after it. Its envelope maps as:
+  `structuredContent` → `structured`; `result` text → `text` (a `result` that
+  is the structured content itself → `structured`); `{ok:false}` → `isError`,
+  except a TimeoutError → `timeout`; a result over 64 KB → `truncated` with no
+  payload. A server missing from `plugins.entries.ocuclaw.mcp_allowlist`
+  (PermissionError) → `not_allowed`. A call without `write: true` is a read:
+  so is a tool the listing would not offer as
+  a read (read-only by both facts above, not destructive, inside the server's
+  filter), and one the owner marked "Treat as a write" (`ownerWrite: true`).
+  `write: true` is a write the engine already checked (grant, gesture, prompt
+  or auto-send, caps; the engine sends a 15 s deadline): the parent still
+  refuses (`not_allowed`) a tool outside the server's filter or unknown to the
+  client, a `destructiveHint` tool, and a `host_blocked` server. A write runs
+  once. Hermes's client (checked at v2026.9.21, v0.22.5 and main) never replays
+  a call that may have reached the server: a session expiry or a stdio child
+  that died mid-call answers "outcome uncertain"; it retries only a 401 or a
+  child that was dead before dispatch. A timed-out write reads `timeout`, which
+  the engine records as `unknown` ("may have sent"). A malformed request, no `ctx.call_mcp`, or any other failure →
+  `failed`; more than 16 calls at once → `busy`. Arguments and results are
+  never logged.
+- `program_card.mcp.allow` `{server, allow}` → `{ok:true}` or `{ok:false,
+  code}` (`invalid`, `busy`, `failed`, `profile_unavailable`,
+  `primary_runtime_required`). The owner's per-server switch adds the server to,
+  or takes it off, `plugins.entries.ocuclaw.mcp_allowlist` in the Primary
+  Runtime's config.yaml, the way `input.prediction.model.allow` writes its
+  policy: the raw document under the optional-setup lock, every other key and
+  entry kept, saved without default stripping, read back. Idempotent; an
+  unchanged list writes nothing. `ctx.call_mcp` reads the list on every call, so
+  no restart is needed.
+
+Main profile only: under a profile multiplexer the listing and calls resolve
+servers in the gateway's current scope, so another profile's servers are a
+known gap. A lazy (`lazy: true`) server that has not started yet reads
+`connected:false` with no tools. An older parent answers method-not-found;
+the child reads that as `unsupported` and cards read nothing.
+
+Waiting on you (#4979, human_input_waiting.py). Where the host's hook
+vocabulary has both `on_human_input_request` and `on_human_input_resolved`
+(0.21.6+), the parent registers them as observers and advertises feature token
+`human_input_waiting`. They fire for every prompt that blocks an agent on a
+person: kind `approval`, `clarify` or `sudo`. OcuClaw chats are skipped (they
+keep their own cards). Both hooks run on the blocked agent thread, so they only
+copy fields and arm a timer; every Hermes read happens on the timer thread.
+
+- Surface: a messaging chat uses the hook's `platform` (`discord`, ...). A
+  local or other non-messaging platform (local turns report `platform="local"`)
+  uses the session row's `source`, read by `session_id`: `desktop`, `tui`,
+  `cli` (`oneshot` reads as `cli`). The title comes from the same row.
+- The wearer's switches apply before the grace timer: a muted surface sends
+  nothing. A wait shows after a 15 s grace; one resolved inside it sends
+  nothing. A TTL backstop drops a wait whose resolve never came, at the
+  prompt's timeout plus 60 s (approvals: `approvals.timeout`, default 300 s;
+  clarify: `clarify.timeout` or `agent.clarify_timeout`, default 3600 s,
+  unlimited capped at 24 h; sudo: 120 s).
+- At grace time the parent reads the pending entry for choices: approvals
+  through `tools.approval.list_gateway_approvals(session_key)`, questions
+  through `tools.clarify_gateway.get_pending_for_session(session_key,
+  include_choice_prompts=True)`. The hook `request_id` is not stored on either
+  entry, so the match is by content: the approval whose command matches the
+  hook's prompt, else the oldest one no other open wait took; the session's
+  oldest pending question (one agent thread asks one question at a time).
+
+Each visible change sends backend event `waiting`:
+
+```json
+{"items":[{"requestId":"…","kind":"approval","surface":"desktop",
+  "sessionTitle":"…"|null,"preview":"…","startedAtMs":0,"timeoutAtMs":0,
+  "answerable":false,"choices":["once","session","deny"],"multiSelect":false}],
+ "cleared":{"requestId":"…","outcome":"once"}}
+```
+
+`items` is always the full list of shown waits, oldest first (`[]` when none).
+`preview` is the hook's redacted prompt on one line, at most 240 chars.
+`cleared` rides only the snapshot caused by a shown wait ending; its `outcome`
+is the hook's, or `expired` for the TTL backstop. `choices`/`multiSelect` are
+omitted when there are none (sudo, or no pending entry found). A clarify raised
+in a turn that used the bot's screen carries `botScreen:true` (#5151), else no
+`botScreen`. Approval choices
+are Hermes' words, filtered by `allow_session`/`allow_permanent`/
+`smart_denied`. `answerable` = answer setting on AND the pending entry was
+found (answer it with `waiting.answer`, below). A sudo wait's pending entry is
+the gateway's open viewer password prompt (`gateway.session_sudo_prompt`, which
+only Desktop and TUI turns open): the wait is answerable only while its session
+has exactly one open prompt that no other wait took. An item whose
+session row was read also carries `session`
+`{id,sessionKey:native|null,source,lineageRootId}` (#4981), the same fields as
+a session-list row. It is for the relay only: the relay derives the chat's
+public key with `deriveHermesPublicKey` (the session list's rule) and sends the
+app `sessionKey` (on 0.22.1 a local chat reads `hermes:main:x:local:dm:local-<id>`,
+because its row's native key is platform-shaped) instead, never `session`, so
+the glasses picker can mark that row. The relay broadcasts it to every client as frame
+`ocuclaw.waiting` `{type,items,cleared?}`, keeps the last `items`, and sends a
+connecting client one `{type,items}` when that list is non-empty.
+
+Explanations (#4985). While the wearer's "Explain commands" setting is on
+(`approval.explain.setting`, the same switch as the OcuClaw approval card), an
+approval item also carries a relay-only `explain` block:
+
+```json
+{"explain":{"command":"…","description":"…","userMessage":"…"}}
+```
+
+`command` is the hook's redacted prompt whole (line breaks kept, unlike
+`preview`); a command over 2000 chars is not sent. `description` is Hermes'
+description of the matched pending entry (its risk labels joined with "; "),
+at most 500 chars, when there is one. `userMessage` is the chat's newest active
+user message (one indexed read of the transcript's last 24 rows through
+`SessionDB.get_messages(latest=True)`), tail-clipped to 600 chars, for local
+chats only (`desktop`, `tui`, `cli`): in a messaging chat the last sender may
+not be the wearer, and the explainer trusts this text as the wearer's. The
+parent re-sends the list when the setting changes it. The relay never forwards
+`explain` to the app. For each approval it has not seen, it runs the shared
+explainer once (`approval.llm.complete`, so the parent's "OcuClaw approval
+explainer" task) with `command`, `description` as `warningLines`, and
+`userMessage`, and sends every client frame
+`ocuclaw.waiting.explanation` `{type,requestId,state:"pending"|"done",sentence?}`:
+`pending` when the model call starts, `done` with the sentence, or `done`
+without one when none came after a `pending`. Nothing is sent while the
+setting is off, and nothing for a `requestId` no longer in the latest list (a
+late sentence is dropped). A connecting client gets, after the list, each open
+approval's `pending` or `done`-with-sentence frame.
+
+Child → parent RPC `waiting.settings` `{show,answer,surfaces:{name:bool}}` →
+`{ok,supported,availableSurfaces}` carries the stored `waitingOnYou` setting.
+`surfaces` holds explicit choices only (names `^[a-z0-9_-]{1,32}$`, at most
+32); a missing surface follows the default: `desktop`, `tui`, `cli` on, every
+other surface off. Defaults (`show` on, `answer` off) apply until the first
+push. `supported` says both hooks are registered on this host.
+`availableSurfaces` lists the messaging platforms whose gateway adapters are
+live in this process (`GatewayRunner.adapters`, sorted), without non-messaging
+lanes (`api_server`, `webhook`, `local`, ...) or `ocuclaw`. The child pushes it
+at relay start and on each change; the parent then re-sends `waiting` when the
+visible list changed or is non-empty, so a restarted relay gets the open waits
+back. An older parent answers method-not-found and the child reads
+`supported:false`.
+
+Child → parent RPC `waiting.answer` (#4983) answers one shown wait from the
+glasses:
+
+```json
+{"requestId":"…","choice":"once"|"session"|"always"|"deny","reason":"…"}
+{"requestId":"…","answer":"<label>"}
+```
+
+`requestId` is the item's. Approvals send `choice` (Hermes' words; it must be
+one of the item's `choices`); `reason` is optional, kept only with `deny`,
+trimmed to 500 chars. Clarify sends `answer`: one choice label, or for
+multi-select a JSON-array string of labels (the `clarify.resolve` shape). Sudo
+sends `answer`: the password exactly as typed, never trimmed; blank is
+`bad_request`. The result is always a dict, never an error, for a refusal:
+
+```json
+{"requestId":"…","status":"answered"|"already_answered"|"refused",
+ "reason":"answer_off"|"not_answerable"|"choice_not_allowed"|
+          "bad_request"|"unsupported"|"unavailable",
+ "kind":"approval"|"clarify"|"sudo","choice":"once"}
+```
+
+`reason` rides only `refused`; `kind` whenever the wait is known; `choice`
+only on an answered approval. Checks, in order: no `requestId` → `bad_request`;
+answer setting off → `answer_off`; no open wait with that id (it already
+resolved) → `already_answered`; not shown, its surface muted,
+or no pending entry found → `not_answerable` (a sudo with no open viewer
+prompt included; before this release sudo was always refused as `sudo`); a missing `choice`/`answer` →
+`bad_request`; a choice outside `choices` → `choice_not_allowed`. An approval
+then re-reads `list_gateway_approvals(session_key)`: its entry gone →
+`already_answered`. It resolves with
+`resolve_gateway_approval(session_key, choice, reason=…, request_id=<entry id>)`,
+never the session's FIFO head: a Hermes whose resolver takes no `request_id`
+(probed once with `inspect.signature`) → `unsupported`; a 0 return →
+`already_answered`. A question resolves with
+`resolve_gateway_clarify(<clarify id>, answer)`; False → `already_answered`.
+A sudo re-reads the session's open viewer prompt (gone or changed →
+`already_answered`) and settles it with `session_sudo_prompt.resolve({"id":
+<prompt id>, "result": {"value": answer}})`; False → `already_answered`, an
+exception → `unavailable`. It then publishes `request.cancel` with reason
+`resolved` to the session's viewers so Desktop or the TUI withdraws its own
+password card. The password is never logged, stored, or sent anywhere else.
+Each answer logs one INFO line, `approved from glasses` or `answered from
+glasses`, with surface, chat title, kind and choice (never the prompt or the
+answer). The list updates from Hermes' own resolved hook. There is no profile
+check: Hermes session rows carry no profile and both queues are process-wide,
+keyed by session key and entry id; `profile_mismatch` is reserved.
+
 Hermes `clarify` requests use the shared adaptive glasses Question surface.
 The parent emits backend event `clarify` with
-`{id,sessionKey,question,choices,multiSelect,allowOther,deadlineSec,expiresAtMs}`. Pretext
+`{id,sessionKey,question,choices,multiSelect,allowOther,deadlineSec,expiresAtMs,botScreen?}`
+(`botScreen:true` only for a screen ask, #5151: see "Bot Screen lane"). Pretext
 chooses a compact checklist, packed pages, or a single-item reel once when the
 prompt arrives. Single choices resolve as their label; multi-select choices
 resolve as a JSON-array string through child → parent RPC `clarify.resolve`.
@@ -1559,7 +2571,7 @@ calls `mark_awaiting_text(id)` so the next voice/text message answers that exact
 pending request. Dismissal and expiry send no answer.
 
 OcuClaw-owned rows in `db.sessions.list` additionally carry
-`agentStatus:{working,needsYou,failed,observedAtMs,unknown?}` and an internal
+`agentStatus:{working,needsYou,failed,observedAtMs,unknown?,facePhase?,facePhaseObservedAtMs?}` and an internal
 `attention:{sessionKey,runActive,clarify,approvals}` snapshot. These are read-only
 observations: working comes from the adapter's dispatch ledger, pending questions
 from the stock public `get_pending_for_session` API, and approvals from the
@@ -1567,6 +2579,8 @@ adapter's existing native approval mirror. A set native response event clears
 attention immediately, even before the waiting tool removes its entry. Observer
 failures report `unknown:true` without failing the native list or changing a turn.
 Foreign transcript rows do not receive an OcuClaw live-status claim.
+
+Optional `facePhase` is `thinking` or `working`, observed from actual reasoning, tool, or reply events for that session’s current ledger turn. Generic lifecycle/queued activity does not establish thinking. `facePhaseObservedAtMs` is the original event time: refreshing the session list never renews it. Phase observations expire after 15 seconds, are withheld while blocked or awaiting approval, and cannot cross runs or sessions. Terminal and superseded runs cannot revive a face through delayed events. Older clients ignore these fields; older hosts retain work/idle fallback.
 
 The bridge preserves status through session-list diffs; both sides fingerprint
 the status fields and observation timestamp. Home refreshes while visible even
@@ -1689,7 +2703,18 @@ a TTL'd `idempotency_key → record` dedup index.
   attach as `rider`s, the one merged turn runs on the carrier's runId, and
   riders resolve with terminal activity only (never a duplicate commit).
   Slash-while-busy keeps its own pending record (bypass commands never
-  queue — they cancel-close). Steer is never assumed: absorption is
+  queue — they cancel-close). The commands hermes answers INLINE on a busy
+  session without touching the running turn — `/steer` (`/s`), `/queue`
+  (`/q`) and `/btw` (#5150, the Bot Screen's voice) — mark that record
+  `inline_reply`: the dispatch's `handle_message` await carries it in the
+  delivery context, so their one reply (sent inside that await) closes the
+  record where it waits (terminal activity) and goes out as its own
+  uncorrelated `message`, never into the running head's open message, and
+  the record never promotes into a phantom turn. `/btw`'s later answer, sent
+  from a task that copied the context, finds it closed and is uncorrelated
+  too. If hermes runs the command as a turn after all (`on_processing_start`
+  for it), the mark clears and its sends are that turn's. Steer is never
+  assumed for a plain text dispatch: absorption is
   unobservable and hermes falls back to queue semantics in several paths —
   under actual steer a pending record becomes a janitor-closed phantom
   (accepted residual; waiter consumers carry their own timeouts).
@@ -1742,6 +2767,23 @@ a TTL'd `idempotency_key → record` dedup index.
   parent — both sides reset together; in-flight runs are lost (hermes
   semantics, spec §Error Handling). The child emits `disconnected` on link
   EOF so run-waiters reject instead of hanging.
+- **Viewer turns (Hermes 0.22.3+):** a prompt typed in Hermes Desktop or the
+  TUI on a glasses chat runs as a bare `MessageEvent` (no dispatch, no channel
+  prompt, no `on_processing_*`), marked by Hermes's `viewer_turn` context
+  variable. `pre_llm_call` sees the marker and, before asking the relay for
+  its context: emits the prompt as a `message` user row
+  `{sessionIdentity, role:"user", author:"Desktop", origin:"desktop",
+  content, id}` with NO runId (a runId'd commit is a turn boundary on the
+  consumer, which renders the row "• Desktop: …"); opens an `active` record
+  (`runId: viewer-<hex>`, `viewer_turn`) only when the session has no open
+  record; and emits its lifecycle start. The reply's sends then stream and
+  commit under that record, and `on_session_end` closes it like any turn. A
+  viewer record never feeds the first-run phone-turn candidate.
+  `liveui.prompt` gets `viewerTurn:true`: the relay adds a one-line glasses
+  notice (fragment kind `viewer_turn`) and takes neither the queued prompt
+  ownership ticket nor a pending surface decision, which belong to a glasses
+  send. Hosts without the marker (0.22.1) keep the old path: the reply arrives
+  uncorrelated and the prompt is not shown.
 - **Retired foreign turns:** adoption and send-via-origin no longer use this
   ledger; copy-to-glasses creates a new OcuClaw session and future turns run
   as ordinary minted-lane turns.
@@ -1862,25 +2904,41 @@ capability that can never fire. The probe is
 `v2026.8.3` (0.20.0); all four exist at `v2026.8.19` (0.20.5).
 
 The adapter passes `OCUCLAW_HERMES_FEATURES` — a comma-separated subset of
-`interim_hook,stream_hooks,session_read_state` — in the Node child's
+`interim_hook,stream_hooks,session_read_state,human_input_waiting` — in the Node child's
 environment. A token means "this adapter build ACTUALLY REGISTERED the
 producing hook, OR will serve the advertised lane, on THIS host", not "the
 host could support it": a client row that reads active for a hook nobody
-registered is a claim the wearer cannot check. `interim_hook` and
-`stream_hooks` are the hook kind; `session_read_state` is the lane kind — it
+registered is a claim the wearer cannot check. `interim_hook`,
+`stream_hooks` and `human_input_waiting` (both `on_human_input_*` hooks,
+0.21.6+) are the hook kind; `session_read_state` is the lane kind — it
 registers nothing and is feature-detected from the running hermes's sessions
 schema + `SessionDB` primitives (see "Session read/hidden state"). On a
 0.20.0 host the value is empty. `_setup_status()` reports `hermesHooks`
-`{interimMessageAvailable, streamHooksAvailable, streamReasoningDeltas,
-registered[]}` plus the SIBLING key `sessionReadState` (not a hook, so not a
-member of `hermesHooks`) so an inactive row is explainable from one receipt.
+`{interimMessageAvailable, streamHooksAvailable, auxiliaryCallHooksAvailable,
+postCompactionHookAvailable, sessionDeleteHookAvailable, streamReasoningDeltas,
+streamReasoningDeltasOffer,
+registered[]}` plus the
+SIBLING key `sessionReadState` (not a hook, so not a member of `hermesHooks`)
+so an inactive row is explainable from one receipt.
 
-## Liveui lane (W12 — render_glasses_ui glue)
+The run-signal hooks (`pre_api_request`, `subagent_start`/`subagent_stop`,
+`pre_auxiliary_call`/`post_auxiliary_call`) are probed the same way, against
+`VALID_HOOKS`, and a pair is registered whole or not at all. They add no
+token: see "Run signals (`runSignal`)". `post_compaction` (0.22.3+) is probed
+the same way and adds no token either; `compactionInfo`'s `live` says it is
+wired, and `_setup_status()` reports `hermesHooks.postCompactionHookAvailable`.
+See "Compaction counts (`sessionCompacted`)". `on_session_delete` (0.22.3+) is
+probed the same way and adds no token either: see "Sessions gone
+(`sessionsGone`)".
 
-The `render_glasses_ui` tool is registered by the Python parent only after
-the child advertises its descriptor in `link.hello.payload.liveui.tools[]`.
-Python never hand-copies the JSON Schema; it passes the child-provided schema
-to `ctx.register_tool`. Session identity is task-local:
+## Liveui lane (W12 — LiveUI tool glue)
+
+Each LiveUI tool is registered by the Python parent only after the child
+advertises its descriptor in `link.hello.payload.liveui.tools[]`. Python never
+hand-copies the JSON Schema; it passes the child-provided schema to
+`ctx.register_tool`. `compose_glasses_ui` is the only model render tool:
+LiveUI V1's `render_glasses_ui` tool is retired, no longer advertised or
+registered, and absent from `provides_tools`. Session identity is task-local:
 `get_session_env("HERMES_SESSION_KEY")` supplies the session key for render
 and prompt glue. The model never supplies a session-key argument. Python sees
 the native Hermes key (`agent:<ns>:ocuclaw:dm:<chatId>`); the child converts it
@@ -1892,10 +2950,11 @@ Parent → child RPCs:
 
 | Method | Params | Result |
 |---|---|---|
-| `liveui.render` | `{callId, sessionKey, args, hostOriginated?}` | `{result, content:[{type:"text", text:<JSON result>}]}` — Node owns the per-call listen window and consumes Layer A `createGlassesUiToolHandler` unchanged. An agent call that would open a new surface in a session no app client is on is refused with `session_not_viewed` (#3209); `hostOriginated: true` (the managed first-run welcome only) skips that refusal. |
+| `liveui.render` | `{callId, sessionKey, args, hostOriginated?}` | `{result, content:[{type:"text", text:<JSON result>}]}` — Node owns the per-call listen window and consumes Layer A `createGlassesUiToolHandler` unchanged. No model tool calls it since `render_glasses_ui` retired; its one caller is the gateway's managed first-run welcome, which sends `hostOriginated: true`. A call without that flag that would open a new surface in a session no app client is on is refused with `session_not_viewed` (#3209). |
+| `liveui.compose` | `{callId, sessionKey, args}` | `{result, content:[{type:"text", text:<JSON result>}]}` — LiveUI V2 `compose_glasses_ui` (K6, K7). `args` is `{records?, validateOnly?, refresh?, inputs?}`: `refresh` (V1's recipe, interval, limits and `onError`, with `targets` mapping each input key to a JSON Pointer into the recipe output) and `inputs` (the typed `data` keys it fills) come together and attach a refresh to the painted surface, or with no `records` to the composed surface on top (slice 12, T7, T9); inputs nested inside `refresh` are moved up and reported as an `inputs_moved` repair. It is the only model render tool. Hermes registers one schema per tool name for the whole process, so it is registered once for every session, and every session is V2. Only a call that reaches the child with no session key gets `{status:"refused", code:"not_a_v2_session"}`. A session's records go through the relay's own fold, compile and repair, as inline records do, and paint when the call lands; the result is `{status:"painted"|"valid"|"not_painted"|"attached", mode, frame, placed, repairs, drops, surfaceId?, reason?, refresh?:{status:"started"|"held"|"refused"|"valid", code?, host?}, inputs?}`. No listen window: Python waits the 10 s non-render link budget and sends no `liveui.abort`. Switched off by the owner, the child throws `liveui_disabled`, as `liveui.render` does. |
 | `liveui.abort` | `{callId?, sessionKey?, reason?}` | `{status:"accepted", aborted}` — aborts matching active render calls; Python sends this when the Hermes tool worker sees the cooperative interrupt flag or the render link deadline fires. |
-| `liveui.prompt` | `{sessionKey}` | `{context|null, fragments:[...], fragmentsConcatenated, ephemeralOnly:true, promptOwner:"ocuclaw"|"even-ai"|null, neuralSessionNamesEnabled:boolean}` — Node composes Channel-2 state and previews owed voicemail into a plugin-generated JSON fence for Hermes `pre_llm_call`, which injects only into the current user message. `promptOwner` names the turn's prompt owner (dispatch rider or queued ownership ticket); Python marks an `"even-ai"` turn so `pre_tool_call` can veto `clarify` on it (#7). `neuralSessionNamesEnabled` is the phone's session-name toggle recorded at send (default `true`); when `false`, Python writes Hermes's instant first-message title at `llm` provenance so Hermes makes no title model call for that chat (see `session_title_hold.py`). |
-| `liveui.promptAck` | `{sessionKey, ackToken}` | `{status:"accepted", consumed:boolean}` — Python sends the token returned by `liveui.prompt` only after receiving a prompt context that contains voicemail, so transport timeouts do not consume owed voicemail silently and ack cannot consume entries outside that preview. |
+| `liveui.prompt` | `{sessionKey}` | `{context|null, fragments:[...], fragmentsConcatenated, ephemeralOnly:true, voicemailAckToken|null, feedbackAckToken|null, promptOwner:"ocuclaw"|"even-ai"|null, neuralSessionNamesEnabled:boolean}` — Node composes Channel-2 state and previews owed voicemail and render-refusal feedback into a plugin-generated JSON fence for Hermes `pre_llm_call`, which injects only into the current user message. A `reply_language` fragment (#4823) carries the app language of the OcuClaw send that queued this turn (`clientDisplaySignals.replyLanguage`, kept on that turn's ownership ticket); English adds it only once, when a chat comes back to it, and a turn without one (an older phone, a slash command, Even AI) gets none. `promptOwner` names the turn's prompt owner (dispatch rider or queued ownership ticket); Python marks an `"even-ai"` turn so `pre_tool_call` can veto `clarify` on it (#7). `neuralSessionNamesEnabled` is the phone's session-name toggle recorded at send (default `true`); when `false`, Python writes Hermes's instant first-message title at `llm` provenance so Hermes makes no title model call for that chat (see `session_title_hold.py`). |
+| `liveui.promptAck` | `{sessionKey, ackToken?, feedbackAckToken?}` | `{status:"accepted", consumed:boolean, feedbackConsumed:boolean}` — Python sends each token returned by `liveui.prompt` (`voicemailAckToken` as `ackToken`, `feedbackAckToken` as itself) only after receiving a prompt context whose `fragments` lists that fragment (`voicemail`, `feedback`), so transport timeouts do not consume owed entries silently and ack cannot consume entries outside that preview. No owed fragment, no ack call. |
 
 Child → parent RPCs:
 
@@ -1929,9 +2988,9 @@ Without a parseable OcuClaw session key the tool fails closed and the link is
 never touched. `linkTimeoutMs` is the CHILD's budget (ADR-0006: the child owns
 the wait); the parent waits that plus a margin, and 15 s when it is absent.
 
-### The three descriptors
+### The descriptors
 
-The list carries three entries as of #2803, built by
+The list carries eleven entries, built by
 `PHONE_TOOL_DESCRIPTOR_BUILDERS` in `hermes-phone-tools-bridge.ts` and
 serialised by `buildHermesPhoneToolsHelloPayload()`. Hello order is
 registration order, and it is APPEND only: the adapter keys registered tools by
@@ -1942,8 +3001,21 @@ method name, so reordering or renaming one is a wire break.
 | `get_current_location` | `tools.getCurrentLocation` | 10 000 |
 | `get_evenrealities_device_info` | `tools.getDeviceInfo` | 10 000 |
 | `set_session_title` | `tools.setSessionTitle` | absent |
+| `write_glasses_card` | `tools.writeGlassesCard` | 15 000 |
+| `save_glasses_card` | `tools.saveGlassesCard` | 10 000 |
+| `ask_glasses_card` | `tools.askGlassesCard` | 60 000 |
+| `glasses_card_command` | `tools.glassesCardCommand` | 15 000 |
+| `edit_glasses_card` | `tools.editGlassesCard` | 15 000 |
+| `look_glasses_card` | `tools.lookGlassesCard` | 25 000 |
+| `glasses_card_draft` | `tools.glassesCardDraft` | 209 000 |
+| `request_card_mcp_write` | `tools.requestCardMcpWrite` | 72 000 |
+| `request_host_command` | `tools.requestHostCommand` | 67 000 |
+| `request_card_setup` | `tools.requestCardSetup` | 225 000 |
+| `get_ocuclaw_settings` | `tools.getPhoneSettings` | 5 000 |
+| `set_ocuclaw_setting` | `tools.setPhoneSetting` | 65 000 |
+| `show_bot_screen` | `tools.showBotScreen` | 50 000 |
 
-The two tools that reach the phone declare 10 000 ms; the adapter then waits
+Location and device info declare 10 000 ms; the adapter then waits
 that plus its margin, 15 s in practice. The split is deliberate: the child's
 own deadline always fires first, so on silence the agent reads the handler's
 `location_timeout` or `device_info_timeout` rather than a bare link timeout
@@ -1955,6 +3027,38 @@ Name, description and JSON Schema for each descriptor are single-sourced from
 the same constants the OpenClaw registration hands `api.registerTool`. The
 agent therefore reads one tool on both hosts, and the Python parent never
 hand-copies a schema.
+
+Card studio speech (#6881) is add-only on this list. `ask_glasses_card` takes an optional `say`
+(2 to 3 sentences on how the agent will build the card, each starting with its action since
+2026-11-13), and the ask shape in the
+turn's program-card prompt (`PROGRAM_CARD_ASK_SHAPE_FOR_HERMES`) shows it in its example
+arguments. `write_glasses_card`, `edit_glasses_card` and `look_glasses_card` take an optional
+first `speck` string (about 50 characters) that the handler takes before it validates the call
+and hands to the build's speech (`noteSpeck`); the phone's card never sees it. An older adapter
+forwards both as ordinary arguments, and an older plugin's schema simply lacks them.
+
+Changing a saved card (#6888) is add-only on this list too. `ask_glasses_card` takes an optional
+`savedCard` (the saved card's name or id), named apart from the answer's `change` (the wearer's
+change words). A clear name asks to change that card, and the yes opens it as a draft whose
+hand-off rides the answer as `cardChange`; an unclear name answers `which_card` (or
+`no_saved_card`) with `matches` and shows nothing. The ask shape in the turn's program-card prompt
+says how to name the card. An older adapter forwards `savedCard` as an ordinary argument, and an
+older plugin's schema simply lacks it. The `cardChange` hand-off may carry `firstSaved`, the
+1-based number of its first saved ask in `lines`, and `edit_glasses_card` takes an optional
+`replaces` (those line numbers the change replaces) that the handler takes before it validates.
+At Done the relay sends the phones `ocuclaw.program_card.change.saved` (`appId`, `draftId`,
+`revision`, `name`, `sourceHash`); an older phone ignores the type.
+
+"Ask my agent" (#7187) is add-only as well. A phone send may carry `cardCheck: {appId}`, naming
+the saved card the wearer asked about and nothing about the fault. The relay gives it to the turn
+that send starts: the send's ownership ticket carries the ask, and the `liveui.prompt` that takes
+that ticket reads it, once (never a viewer turn, and never an Even AI turn). A refused send, a
+chat reset or the chat's next send drops it, and it lapses after a minute with no turn. A build
+that takes the ask's ticket without being its turn (a turn the host started between the send and
+its own build) reads the ask in its place, as it would that send's reply language. That one
+`liveui.prompt` adds a `program_card_check_ask` fragment: the host's own Card check for that card,
+codes, names and times only. A relay that does not read `cardCheck` takes a plain send,
+and an older adapter passes the fragment through as it does any other.
 
 ### Session-key discipline
 
@@ -1984,6 +3088,9 @@ which is what makes "same answer as OpenClaw" true rather than aspirational.
 | `get_current_location` | `location_access_disabled`, `app_not_connected`, `location_timeout`, `location_unavailable`, `location_aborted` |
 | `get_evenrealities_device_info` | `glasses_not_connected`, `device_info_timeout`, `device_unavailable`, `device_info_aborted` |
 | `set_session_title` | `missing_field`, `invalid_type`, `title_empty`, `title_too_long`, `no_user_message_yet`, `no_active_session`, `session_not_renamable`, `session_title_unavailable` |
+| `get_ocuclaw_settings` | `invalid_input`, `phone_not_connected`, `settings_timeout`, `settings_aborted` |
+| `set_ocuclaw_setting` | `invalid_input`, `unknown_setting`, `invalid_value`, `declined`, `confirm_unavailable`, `confirm_timeout`, `not_available`, `phone_not_connected`, `settings_timeout`, `settings_aborted` |
+| `show_bot_screen` | `invalid_input`, `memory`, `not_installed`, `no_screen`, `start_failed`, `start_unavailable`, `status_unknown`, `phone_not_connected`, `show_timeout`, `show_aborted` |
 
 The first two differ on their not-connected code (`app_not_connected` against
 `glasses_not_connected`) because their OpenClaw handlers do. The title guard
@@ -2010,6 +3117,44 @@ drain and no `agent_end` subscription of its own.
 | `tools.getCurrentLocation` | `{sessionKey, params}` | The location handler's JSON, or `{error, code}` returned verbatim. Handler budget 10 s. |
 | `tools.getDeviceInfo` | `{sessionKey, params}` | The device-info handler's JSON, or `{error, code}` returned verbatim. Handler budget 10 s. |
 | `tools.setSessionTitle` | `{sessionKey, params}` | `{status:"accepted"}`, the same body OpenClaw's `execute` returns, or `{error, code}`. The relay mirrors the title into the Hermes SessionDB and rebroadcasts the session list; this glue writes neither again. |
+| `tools.glassesCardCommand` | `{sessionKey, params}` | OpenClaw's `glasses_card_command` body: `{ok, ...card}` after the press, or `{ok:false, error}` (`no_client`, `card_not_open`, `timeout`, `requires_hermes_session_key`, `even_ai_session`). A success carries no `error` key. Handler budget 15 s. |
+| `tools.editGlassesCard` | `{sessionKey, params}` | OpenClaw's `edit_glasses_card` body, the same shape and codes as the command. The open card reaches the model through `liveui.prompt` as a `program_card_open` fragment. Handler budget 15 s. |
+| `tools.lookGlassesCard` | `{sessionKey, params, modelInput?, model?}` | A headless test of the open card on a phone copy, bounded to 12 steps and six pictures. The child owns 25 s; the phone owns 10 s. `modelInput` and `model` come from observed host model context, never the model's tool arguments. Missing image capability fails closed to text with `pictures not delivered`. The shared runner/report/narration/receipt contract is in `../ocuclaw/PROTOCOL.md`. |
+| `tools.requestCardMcpWrite` | `{sessionKey, params}` | OpenClaw's `request_card_mcp_write` body: `{answer, uses?, error?, reason?, fix?, next}` (`allowed`, `declined`, `no_answer`, `off`, `invalid`). The shared engine checks the uses against a fresh tool list and asks the wearer on the glasses; it answers `off` until the phone has `programCardsMcpWritesV1` and the parent lists `writes: true`. A foreign or missing session key answers `off` and shows nothing. |
+| `tools.requestHostCommand` | `{sessionKey, params}` | OpenClaw's `request_host_command` body: `{answer, tool?, error?, next}` (`added`, `declined`, `no_answer`, `off`, `invalid`). The shared engine checks the command and asks the owner on the glasses or the phone. A foreign or missing session key answers `off` and shows nothing. |
+| `tools.requestCardSetup` | `{sessionKey, params}` | OpenClaw's `request_card_setup` body (#7186): `{answer, server?, needs?, parts?, error?, next}` (`on`, `allowed`, `not_now`, `kept_off`, `no_answer`, `no_glasses`, `busy`, `needs_switch`, `nothing_waiting`, `no_card`, `declined`, `failed`, `invalid`). The shared engine shows one request on the glasses (Allow, Not now, Keep it off) for a card switch, a server's Use in cards, or the open card's waiting uses; nothing changes without the wearer's Allow, and a switch is then saved through `optional.setup` (`diagnostics.preview` then `diagnostics.apply`), the phone switch's own path. A foreign, missing or Even AI session key answers `no_answer` and shows nothing. |
+
+For Look, the adapter observes the public `pre_api_request` provider/model and
+fences it to the current session run. A missing route, a later run or a route
+that Hermes does not send images to stays text-only. The child returns text
+and PNG image blocks; the adapter preserves them in Hermes' native
+`{_multimodal:true,content:[text,image_url...],text_summary}` envelope.
+`text_summary` retains the measurements and problems and explicitly says
+`pictures not delivered`, including when the engine selects that fallback.
+Other phone tools retain their existing JSON text results. The Look bridge
+checks the encoded result with 16 KiB of space reserved below the 1 MiB link
+line cap, returning `look_payload_too_large` before history is echoed to the
+phone or transport can truncate it. A refused result records undelivered
+pictures in that history too.
+
+Saved-card review uses the same optional Look report fields described in
+`../ocuclaw/PROTOCOL.md`, including the optional original-write identity used to
+bind stored asks to the actual reporting card and client. It adds no control-link
+or saved-data field. The auxiliary model request preserves bounded text
+and validated PNG image blocks as native message content. Review pictures
+also require an exact provider/model/carrier pixel-canary certificate; tool
+result delivery alone does not qualify this separate auxiliary carrier.
+Without that certificate, or when Hermes selects its text route, the review
+keeps its measured text report and records `visualReview: false` with the
+reason pictures were not delivered.
+
+The optional `programCardsLiveCaptureV1` capability enables SDK-accepted live
+pictures and command captures through these same native multimodal envelopes.
+They retain requested/current card, sequence and frame identities and explicit
+partial/superseded/card_changed results. They do not count as a headless Look or
+replace its test history. `pressing` detail names the declared command; older
+phones continue to receive `checking`. The full capture contract is in
+`../ocuclaw/PROTOCOL.md`.
 
 The SessionDB half of that mirror depends on the host's session writer. Hermes
 2026.9.7 (Hermes Agent 0.21.1, the certified pin) and newer accept the write
@@ -2136,6 +3281,7 @@ one host document while assembling its already-gated diagnostic bundle:
 | Method | Params | Result |
 |---|---|---|
 | `connectionHealth.snapshot` | `{}` | exact passive `ocuclaw.connection-health-snapshot` v1 document, or `ocuclaw.connection-health-error` v1 |
+| `taskOutput.snapshot` | `{jobIds: string[]}` (at most 8) | `ocuclaw.task-output-snapshot` v1 document (below) |
 
 The Python parent runs the same collect → `derive_snapshot` seam as
 `hermes ocuclaw status --json`. It never enters doctor, probes a route, mutates
@@ -2144,13 +3290,46 @@ error document; the child never fabricates health. OpenClaw has no parent
 method and attaches no `connection-health.json`.
 
 `producer.hermesSource` has exactly three advisory states. `certified-source`
-means package `0.21.5` and a complete clean checkout at the certified
-`v2026.9.24` commit; `drifted` means a complete inspectable checkout differs;
+means package `0.23.2` and a complete clean checkout at the certified
+`v0.23.2` commit; `drifted` means a complete inspectable checkout differs;
 `unknown` covers shallow/non-Git installs, missing objects or package metadata,
 timeouts, and any inspection ambiguity, including partial/promisor clones. The
 observed/certified short commits, shallow result, and cache timestamp use the
 existing additive `evidence[]` seam. No snapshot
 or doctor exit code depends on provenance.
+
+### Task output document (#6892, spec #6875 ruling #6596 r12)
+
+The same report asks for the Task output of the Tasks the wearer used inside
+its History window (up to 3), by their Hermes job ids:
+`taskOutput.snapshot {jobIds}` answers
+
+```json
+{"contract": "ocuclaw.task-output-snapshot", "contractVersion": 1,
+ "jobs": [{"jobId": "j1",
+           "result": {"status": "failed", "headline": "…", "body": "…", "card": {…},
+                      "createdAtMs": 1790000000000, "truncated": false},
+           "cronLog": {"text": "…", "atMs": 1790000000000}}]}
+```
+
+One entry per safe, distinct job id asked (at most 8). `result` is the job's
+newest kept Task Result (`task_results.py`), its body cut to its first 4,096
+characters, or null. `cronLog` is the last 8 KB of the job's newest cron run
+output file (`cron/output/<jobId>/`, never the page watch's
+`monitor_last_output.txt`), only when that newest result is a failed run; else
+null. Read-only (`task_output.py`): it acks nothing. Node redacts the body and
+the log (the host-text redactor, then the report's code-safe secret pass) and
+keeps 4 KB of the body before anything goes into the report. The OpenClaw lane
+answers the same method in-process from its own Task Results, with no cron log.
+An older parent answers method-not-found; Node then sends the report without
+Task output (the run facts and Run Records still ride).
+
+SECURITY-RULED (#6596): a Debug Report may hold, for the cards and Tasks the
+wearer used inside the report's History window, … Task Run Records and Task
+output (latest Task Result body up to 4 KB, redacted; Hermes cron log only for
+a failed run, last 8 KB), only in a report the wearer chooses to send, only
+after the code-safe secret pass, and only to the existing debug upload and
+triage services. Nothing new listens or is reachable.
 
 ## Presence lane (#1317 — phone connect/disconnect, contract #1273 §9)
 
@@ -2183,7 +3362,7 @@ Parent → child RPC:
 
 | Method | Params | Result |
 |---|---|---|
-| `presence.snapshot` | none | `{relayListening, authenticatedAppCount, clientVersions[], lastTransitionAt, device:{connected,batteryPercent,charging,inCase,observedAt}}` — the narrow public-safe projection, built by the relay supervisor. Device facts come from the freshest authenticated app readiness snapshot; `charging` is explicit SDK truth or null. Wear, Ring1, client identity, and raw readiness never cross this seam. Debug clients never count. |
+| `presence.snapshot` | none | `{relayListening, authenticatedAppCount, clientVersions[], lastTransitionAt, device:{connected,batteryPercent,charging,inCase,observedAt}, programCards}` — the narrow public-safe projection, built by the relay supervisor. Device facts come from the freshest authenticated app readiness snapshot; `charging` is explicit SDK truth or null. Wear, Ring1, client identity, and raw readiness never cross this seam. Debug clients never count. `programCards` is true while any connected app advertises `programCardsV1` (LiveUI > Settings > Staging), false when none does, and null when the relay cannot be asked. The parent keeps it out of the receipt and uses it only to show the five program card tools (`write_glasses_card`, `save_glasses_card`, `ask_glasses_card`, `glasses_card_command`, `edit_glasses_card`) to the model; null hides them. |
 
 The app republishes readiness after every authoritative 20-second device read,
 even when the values are unchanged, so `device.observedAt` remains real
@@ -2245,6 +3424,149 @@ first tick. A push answered `sent:0` is due again on the next tick, not after
 one-way digest); when that changes, deliveries the old pairing acked are
 pending again. Unwatching cancels that watch's pending deliveries.
 Contract: "Moments (#3051)" → "Robustness (#3052)".
+
+## Bot Screen lane (#5146 — Hermes's Bot Screen, watch-only)
+
+Hermes runs a Bot Screen per profile: Xvnc on
+`<HERMES_HOME>/bot-desktop/rfb.sock` (mode 0600, no VNC password, shared).
+The child reads that socket itself, as one more shared viewer
+(`extensions/ocuclaw/src/tools/bot-screen/`). It never sends input, clipboard
+or a size change: the RFB writer refuses every client message but
+SetPixelFormat (0), SetEncodings (2) and FramebufferUpdateRequest (3). Control
+is `lease.json` in the same folder, read by the child every 250 ms while a view
+is open; Hermes's `on_change` is in-process only, so the file is the shared
+truth. While a view is open on a running screen the child touches
+`bot-desktop/activity` at most once a minute (Hermes's own bridge does the
+same), and never after the last view closes.
+
+`bot_screen.py` probes the bot-desktop internals (`tools.bot_desktop.lease`,
+`.runtime`, `.thumbnail`). A missing or changed one turns that fact off: no
+socket means "unsupported", no lease module means "control unknown". Nothing
+starts, stops, installs or drives the screen.
+
+Hello keys (`link.hello.ack` config, both absent on a Hermes without a Bot
+Screen):
+
+| Key | Value |
+|---|---|
+| `botScreenSocket` | The served profile's socket path, named even while the screen is off. |
+| `botScreenProbe` | `{lease, status, snapshot, start}` booleans: which internals passed the probe. `start` (add-only, #7571 follow-up): Hermes has `runtime.start` and this parent answers `botScreen.start`; an older child ignores it, an older parent sends none. |
+
+Child → parent RPC:
+
+| Method | Params | Result |
+|---|---|---|
+| `botScreen.status` | `{}` | `{v:1, state, screen:{w,h}\|null, placement, running}`; `state` is `running`, `off`, `missing` (not installed, or placed in a terminal sandbox whose image lacks the desktop packages, #6019), `sandboxed` (placed in the terminal backend, no socket on this host), `unsupported` or `unknown` (`code:"status_failed"`). Optional `need` says why the gateway host can have no screen: `memory` (off, and Hermes's status carries a start `blocker`, its free-memory floor `bot_desktop.min_free_memory_mb`) or `host` (missing, and Hermes's `runtime.installable()` is false: unprivileged, no sudo); `host:"cloudways"` rides beside a `need` on a Cloudways host. Optional `rootless` (#7571) rides beside `need:"host"` only: `ready` (OcuClaw's no-admin install, `hermes ocuclaw bot-screen install`, can run on this Cloudways host) or `memory` (it could, but Hermes's own memory check would refuse to start the screen); `need` stays `host` so an older phone keeps its card. Only the word crosses, never Hermes's blocker sentence. Never the display, socket, pid, install command or browser path. |
+| `botScreen.snapshot` | `{maxW, maxH, color?, profileId?}` (clamped to 16…720 × 16…450; with `color:true`, 16…512 × 16…320) | `{v:1, w, h, gray:<base64 8-bit grey>}`, plus `rgb:<base64 w×h×3 bytes, red, green, blue>` when `color:true` was asked (sent only while an open view's latest want asked for colour; Node treats a missing or wrong-length `rgb` as a grey-only picture), or `{v:1, gray:null, reason:"off"\|"grab_failed"\|"decode_failed"\|"unsupported"}`. Only for a `sandboxed` screen, on demand with a 100 ms start-to-start floor, one capture in flight, and a 1 s retry after failure. No capture queue. |
+| `botScreen.start` | `{profileId?}` | #7571 follow-up: the wearer's Start button and `show_bot_screen`. Starts an installed gateway screen that is `off` with Hermes's own `tools.bot_desktop.runtime.start(wait_seconds=15)`, on a worker inside the admitted profile's runtime scope. `{v:1, ok:true, state:"running", already?:true}`, or `{v:1, ok:false, code, state}` with `code` one of `memory` (Hermes's free-memory floor; never lowered, and Hermes is not even asked when its status already names the blocker), `missing`, `unsupported`, `sandboxed` (a terminal-sandbox screen is never started here: its start may build a container), `unknown`, `start_failed` (Hermes tried; only the word crosses, never its sentence or launcher log), or `profile_unavailable`. Never installs, stops or drives the screen. Hermes's own `start.lock` keeps two starts to one launcher. |
+
+Selected-profile routing (#5284): a new parent advertises `config.botScreenProfileRouting:true`
+and registers `botScreen.route {profileId}`. It resolves the **admitted**, served profile
+and returns `{v:1, profileId, socket, probe}` to the Node child only. Paths never reach
+the phone. An unavailable, unenrolled or invalid profile returns
+`{v:1, state:"unknown", gray:null, code:"profile_unavailable"}`; a missing runtime scope
+returns `profile_scope_unavailable`. No fallback to default. `status` and `snapshot`
+also accept `profileId` and execute in that profile's Hermes runtime/terminal scope;
+admission is rechecked after capture. Omitting `profileId` preserves the old parent RPC.
+
+The Node child resolves each phone's profile from **that client's selected session**,
+never another client's active chat or a profile supplied in a screen message. It creates
+an isolated source for that client, anchors all its RPCs to the profile and checks
+`botScreen.route` again before each outbound batch. The default profile still owns
+pairing, credentials and the relay. New screen replies carry `profileId` (`default`
+for namespace `main`). A profile change sends `ocuclaw.botscreen.reset {v:1,profileId}`
+before the new source's replies, disposes the old source and drops late async replies.
+The app clears pixels, lease, targets, steps and pending point/voice review, and rejects
+replies belonging to another profile. Unscoped legacy replies are accepted only for
+default. Existing control is not released or transferred by changing the viewed agent.
+
+The four backend hint events below also carry `profileId` from the tool's ambient
+Hermes runtime. They go only to phones selecting that profile; an unscoped legacy
+event belongs to default. This includes Peek even with no viewer open.
+
+Parent → child events (`backend.event`, #5147, #5148, #5151):
+
+| Name | Payload | Meaning |
+|---|---|---|
+| `botScreenTarget` | `{v:1, rect:[x,y,w,h], kind:"element"\|"point", at:<ms>}` | Where the bot's next `computer_use` pointer action (`click`, `double_click`, `right_click`, `middle_click`, `drag`, `scroll`, `set_value`) lands, in screen pixels, sent from `pre_tool_call` for any platform's turn. `element` is that element's bounds from the session's last capture; `point` is its `coordinate` as `[x,y,1,1]`; a drag names its destination. `post_tool_call` keeps a capture (JSON text, or the multimodal summary) only when it is the whole running screen at its own size with no `bounds_scale`; any other capture is forgotten. Cut to the screen; nothing is sent when the target does not resolve. Never a label, role or app name. |
+| `botScreenStep` | `{v:1, tool:"computer_use", action, label?, app?, keys?, chars?, direction?:"up"\|"down"\|"left"\|"right", at:<ms>}` | What each `computer_use` call is about to do (#5148), for the Bot Screen view's caption, sent from `pre_tool_call` for any platform's turn, next to any target. `action` is one of the schema's 14 actions; any other call sends nothing. `label` is the element's label from the session's last kept capture: the element it names (a drag: `to_element`), or for a coordinate (a drag: `to_coordinate`) the smallest element whose bounds hold the point; one line, at most 60 characters, left out when unknown or empty. `app` is the call's own `app` (not `screen` or `desktop`), else that element's, else the capture's; at most 40 characters. `keys` (a `key` step) only for a named key (`return`, `escape`, `tab`, arrows, `f1`–`f24`, …) or a shortcut with a modifier other than shift, in `[A-Za-z0-9+_-]{1,32}`; a printable key, bare or with shift, is typing and sends `chars:1` instead. `chars` (a `type` step) counts the code points of `text`, never the text; a `set_value` step names its element, never the value. The kept capture now also holds each element's label and app and the capture's app (from the JSON's `app`/elements, or the summary's `app=` header and each element line's label repr and `[app]`), in memory only, never a role or window title; they reach only the phone's Bot Screen view. The `activity` lane's `args` for `computer_use` always carry `text` and `value` as `"[omitted]"`. |
+| `botScreenElements` | `{v:1, elements:[{rect:[x,y,w,h], label?}], at:<wall ms>}` | The bot's last capture, for the glasses' head pointer to snap to (#5155), sent from `post_tool_call` right after the capture is kept or forgotten, for any platform's turn. Only for a `computer_use` call that captured (`action:"capture"` or `capture_after`); any other call sends nothing. When the capture is kept: every element with bounds, in element-index order, each cut to the screen (one wholly off it is dropped), with its `label` when it has one (one line, at most 60 characters); at most 100 elements (`ELEMENTS_MAX`). When the capture is forgotten (a window capture, `bounds_scale`, unreadable, the screen not running or another size) `elements` is `[]`, so the glasses drop stale targets. Never a role, app, window title or pixel. |
+| `botScreenRun` | `{v:1, at:<ms>}` | A turn started using the screen (#5151): sent from `pre_tool_call` on the first `computer_use` call of a turn, for any platform's turn, once a turn. A turn is the hook's `turn_id`; on a host whose tool hooks name none, each `pre_llm_call` starts one. A background review fork's calls are not a turn. Ids and times only, in the parent's memory (`bot_screen.ScreenTurns`). |
+
+App wire (phone ↔ relay, phone clients only; a backend without a Bot Screen
+answers `open` and `status.get` with `state:"unsupported"`):
+
+| Type | Direction | Body |
+|---|---|---|
+| `ocuclaw.botscreen.open` / `.close` | phone → relay | `{viewer:"glasses"\|"phone"}`. The first open starts the stream; the last close (or the client going) ends it. |
+| `ocuclaw.botscreen.status.get` | phone → relay | `{}`; answered once, without opening a view. |
+| `ocuclaw.botscreen.want` | phone → relay | `{viewer, n, w, h, view?, color?}` (w ≤ 960, h ≤ 600): send frame `n` at this size. `view:[x,y,w,h]` in screen pixels picks the part of the screen to show (Follow, Read); absent means the whole screen. `color:true` asks for a full-colour frame (`fmt:"png"`) when the picture has colour; anything else gets grey levels. Answered when the picture or the view changed since the last frame; a newer want replaces an unanswered one, and (#5148) one that waits while the picture is current hears `still`. A malformed view is ignored. |
+| `ocuclaw.botscreen.status` | relay → phone | `{v:1, state, screen, placement, need, host, rootless, control:"lease"\|"unknown", at}`; `state` adds `connecting` and `ended` (the screen went away while watched). `need` (`memory`\|`host`\|null) and `host` (`cloudways`\|null) are add-only: a phone that ignores them shows the plain `off`/`missing` card. `rootless` (`ready`\|`memory`\|null, beside `need:"host"` only, #7571) is add-only too: a phone that ignores it shows the `host` card. `startable` (boolean, add-only, #7571 follow-up) is true when the parent's probe found `start` and the relay can ask it: the phone then offers Start on an `off` screen. A phone that ignores it shows the plain `off` card; a relay or parent that predates it sends none, and the phone offers no Start. |
+| `ocuclaw.botscreen.start` | phone → relay | `{v:1, id}` (#7571 follow-up): start the selected profile's screen. The relay checks `botScreen.route` (the profile is admitted, and its probe says `start`; else `start_unavailable` without asking), then calls `botScreen.start {profileId}` with a 30 s wait. One start per client's profile at a time: a second ask joins the first. Any `profileId` in the message is ignored. |
+| `ocuclaw.botscreen.start.result` | relay → phone | `{v:1, profileId, id, ok, state?, already?, code?}`: the parent's answer, each field checked again (`code` one of the parent's words above, or `start_unavailable`, `start_unknown`, `invalid_request`; any other word reads `start_failed`). A fresh `status` follows to the client's views and status asks. |
+| `ocuclaw.botscreen.show` | relay → phone | `{requestId}` (#7571 follow-up): the agent's `show_bot_screen` (see the phone tools lane). The phone opens the glasses' Bot Screen page (not over a recording, a review, a question or typing) and, while the status is `startable` and `off`, `ended`, `running` or `connecting`, sends its own `ocuclaw.botscreen.start`. Broadcast to phone clients; an older phone ignores it and the tool returns `show_timeout` after 45 s. |
+| `ocuclaw.botscreen.show.result` | phone → relay | `{requestId, ok, state, started?, opened, code?}`: `ok` when the screen is up (`running` or `sandboxed`); `started` is false when Hermes found it running (`already`); `opened` is false when the glasses could not show the page now. `code` on a refusal: `memory`, `not_installed`, `no_screen`, `start_failed`, `start_unavailable`, `status_unknown`. Phone clients only. |
+| `ocuclaw.botscreen.lease` | relay → phone | `{v:1, known, holder:"agent"\|"human", mine, reason, epoch, since}`; sent on open and on every change. `mine` is true only when the lease names this runtime's viewer id, which never leaves the relay. A corrupt file reads as `human`, epoch -1, as Hermes reads it. |
+| `ocuclaw.botscreen.frame` | relay → phone | `{v:1, viewer, n, seq, w, h, data, screen, view:[x,y,w,h], dirty:[[x,y,w,h]…], at, source:"rfb"\|"snapshot", fmt?}`; without `fmt`, `data` is 16 grey levels on one fixed curve, packed two pixels a byte (left pixel in the high nibble): `view` (cut to the screen) letterboxed into `w`×`h`. With `fmt:"png"` (a `color:true` want, and the picture has colour), `data` is a base64 PNG, exactly `w`×`h`, 8-bit RGB (colour type 2, no alpha), each channel the box average over the same boxes, letterbox bars black; every other field is the same. A grey-only picture (an older Hermes helper with no `rgb`) answers a colour want without `fmt`. A sandboxed screen's grey snapshot fetched before colour was asked does not answer a colour want; the next fetch asks for colour. `view` and `dirty` are in screen pixels; a moved view, a new size and every snapshot carry the whole screen as dirty. |
+| `ocuclaw.botscreen.target` | relay → phone | `{v:1, rect:[x,y,w,h], kind:"element"\|"point", at}` (#5147): `botScreenTarget` cut to the screen, once to each phone with a view open, so Follow can cut there before the action lands. Nothing while no view is open; a malformed or off-screen target is dropped. |
+| `ocuclaw.botscreen.step` | relay → phone | `{v:1, tool:"computer_use", action, label?, app?, keys?, chars?, direction?, at}` (#5148): `botScreenStep`, each field checked again (`label` and `app` cut to one line of 60 and 40 characters; `keys` only on a `key` step and only when nameable; `chars` any count on a `type` step, exactly 1 on a `key` step without `keys`; `direction` only on a `scroll`), once to each phone with a view open. Other fields are dropped; a field that fails its check, or an action outside the schema, drops the step. Nothing while no view is open. |
+| `ocuclaw.botscreen.elements` | relay → phone | `{v:1, elements:[{rect:[x,y,w,h], label?}], at}` (#5155): `botScreenElements`, each field checked again (`elements` must be an array, else the message is dropped; each `rect` four integers with a positive width and height, cut to the screen, a malformed or wholly off-screen box dropped and the rest kept; `label` cut to one line of 60 characters, left out when empty; at most 100; `at` a finite number, else the message is dropped), once to each phone with a view open. Other fields are dropped. The last checked message is kept and sent to a phone when its view opens, so a wearer who opens the Bot Screen mid-run gets the last capture's elements; it is forgotten when the stream ends, the screen is no longer running, or the last view closes. Labels reach only the phone's Bot Screen view; traces count elements, never words. |
+| `ocuclaw.botscreen.still` | relay → phone | `{v:1, viewer, n}` (#5148): nothing changed since that view's last frame, so its picture is current; `n` is the waiting want's. Sent once a want has waited 1 s and again every 1 s while it waits; it never answers the want (the next change does). On the socket, "current" means a FramebufferUpdate came within 3 s: while a want waits, the relay probes once a second with a non-incremental 1×1 FramebufferUpdateRequest at (0,0), and a probe answer that changes no pixel sends no frame. A `sandboxed` screen hears it after an unchanged snapshot, paced to at most once a second; a failed fetch sends nothing. No `still` in any other state. |
+| `ocuclaw.botscreen.run` | relay → phone | `{v:1, at}` (#5151): `botScreenRun`, to every phone client, open view or not: the glasses' Peek ("The bot is using its screen") is how a view opens. Live only: never kept for a client that connects later, and one whose `at` is more than 30 s old is dropped. The phone shows Peek at most once every 30 s, only per its "Open on glasses when the bot uses it" setting (Off, Peek or Open). |
+
+Screen asks (#5151). While the screen runs, an OcuClaw chat's `pre_llm_call`
+context ends with `bot_screen.PROMPT_NOTE`, an `<ocuclaw_bot_screen_v1>` note
+asking the bot to call Hermes's `clarify` for a login, a 2FA or one-time code,
+a CAPTCHA or a payment, and to wait for the answer instead of ending its turn
+with a reply. Not on another platform, a background fork or an Even AI turn
+(clarify is vetoed there). The note needs no liveui context, and "running" is
+read at most once each 10 s. A `clarify` raised in a turn that used
+`computer_use` is a screen ask: the `clarify` event and its retained
+`attention.clarify` carry `botScreen:true`, the relay's `demand` frame carries
+`botScreen:true`, and the app shows it as the glasses' "Hermes · Needs you"
+card with a still of the screen as its picture, answered through the same
+`demand_response` as any clarify. A screen ask on another surface (Desktop,
+Discord) carries `botScreen:true` on its `waiting` item. A clarify with no
+screen use carries none and shows the usual question.
+
+Pixels stay in memory in the child, the relay and the phone: never the model,
+a transcript, a file or a trace. `glasses.lifecycle` traces (`bot_screen_*`)
+carry state, sizes, byte counts, dirty-box counts and a 12-hex hash, never a
+pixel, viewer id or lease reason. `bot_screen_target` says a target went and
+its kind, never where. `bot_screen_step` names the action and which fields went
+(`fields:"label,app"`), never a label, app, key or count; `bot_screen_still`
+carries counts only; `bot_screen_run` says a run went and to how many
+clients, or why it was dropped. Labels and app names live in the parent's
+memory and reach only the phone's Bot Screen view. A card's picture (Peek,
+Needs you) is a frame like any other, held by the glasses in memory only.
+
+**Approve with a view (#5152).** Hermes gates `computer_use` actions behind an
+approval (scope `cua:<action>:<mode>`), worded `Allow computer_use to perform
+\`<action>\`?` with the command `computer_use: <summary>`. A `type` summary
+quotes the text it types, and a `key` summary the keys. For such an approval
+the `approval` backend event's `request` changes:
+
+- `command` is `computer_use: <action>`, plus a nameable key or shortcut on a
+  `key` action and ` [foreground]` for a foreground delivery; never the summary.
+  Any command starting `computer_use:` is treated so, whatever the description.
+- `botScreen` is added: `{v:1, tool:"computer_use", mode:"background"|"foreground",
+  action?, label?, app?, rect?:[x,y,w,h], kind?:"element"|"point", field?:true,
+  keys?, direction?}`. The label, app and box are the gated call's own, from its
+  `pre_tool_call` step and target (a capture before it is needed). A `type` or
+  `key` call has no target: its box and label are its field's, the element the
+  bot last pointed at in that chat within 5 minutes (`field:true`), cleared by a
+  `focus_app`. No text, value or count.
+- `warningLines` is left out, and so are `purpose` and `ocuclawApprovalContext`:
+  the card gets no plain-English sentence.
+
+The native approval entry keeps Hermes's own command, so the decision resolves
+Hermes's pending approval as for any other. The session list's
+`attention.approvals` carry the same `command` and `botScreen`, and the Waiting
+on you `preview` of a `computer_use` approval on another surface is its command
+line without the summary. The relay passes `botScreen` to the app on
+`ocuclaw.approval.request` after checking each field (unknown fields dropped)
+and asks the explainer for no sentence. The glasses card opens the `glasses`
+viewer for a picture of the target; that picture stays in memory.
 
 ## Pairing-completion lane (#1322 — private Attempt binding)
 
@@ -2443,6 +3765,110 @@ boot, no port bind, readiness never announced) — the lane the bundle pytest
 drivers and echo probes use; production configs always carry the token
 (`validate_config` requires it).
 
+## Bot Screen native takeover and private input (#5156 / #5157)
+
+`botScreen.control` is an authenticated, enrollment-checked RPC into the selected
+profile's native Hermes Bot Desktop lease. Default still owns pairing and the relay.
+It does not enable host display capture (#5285). It requires a compatible Linux
+private Bot Desktop and fails closed for unsupported runtimes or unenrolled profiles.
+
+The app sends `ocuclaw.botscreen.control`, `v:1`, `id`, and `op` (`status`,
+`acquire`, `input`, `release`). Acquire requires the status `source` generation;
+input/release additionally require the human `epoch` and memory-only `resumeToken`.
+Input carries a strictly increasing `n`, one allowlisted `action` (`click`,
+`double_click`, `right_click`, `scroll_up`, `scroll_down`, `enter`, `tab`, `type`),
+full source-pixel `x`/`y` for pointer actions, and for `type` only printable ASCII
+`text` (1–1024 characters) and an explicit `enter` boolean. No clipboard, resize,
+raw RFB or arbitrary key action is accepted. RFB characters are X keysyms, including
+uppercase and punctuation; they are not unshifted physical US key codes.
+
+The relay supplies the trusted selected `profileId`, runtime/client `connectionId`,
+pairing identity, and acquisition `sessionKey`/optional current `clarifyId`.
+App authority overrides are ignored. Only a capability-bound release may explicitly
+name a retained old enrolled profile. Internal `cancel` invalidates an in-flight
+batch on drop/source change/timeout, and never releases human control.
+
+`ocuclaw.botscreen.control.result` returns public availability, source and lease
+`{known,holder,mine,epoch,reason,since}`, operation outcome, and owner-only opaque
+recovery capability/`nextN`. Native viewer IDs never leave the broker. Input outcomes
+may include ephemeral dispatched progress and uncertainty, without claiming that
+the destination application accepted the input. No automatic replay follows an
+unknown outcome. The broker reserves sequences/receipts before sending bytes and
+checks native ownership, source, enrollment and cancellation before each atomic key
+or pointer unit under the same cross-process lease lock used by Hermes Desktop.
+Native Desktop takeover immediately revokes this owner. Disconnect keeps the lease.
+
+Hand back grants the bot ordinary screen access again; there is no additional field
+clearing confirmation. Optional Continue sends only a generic completion to the
+acquisition chat/clarify context. The relay durably claims a release ID before that
+continuation, preventing duplicate dispatch after retry/restart. Continuation
+metadata is stripped before replies to the app. Draft text is never a continuation.
+
+Control requests/results and desktop capture/image frames are never diagnostic
+content, including protocol subscriptions and unredacted debug export. Control and
+`botScreen.snapshot` oversize markers contain only routing identifiers plus
+`truncated:true`: no `originalBytes`, `payloadHead`, image, input lengths or draft
+hashes. Private responses repeat their fixed method classification so late replies
+remain private after bounded request-ID history expires. Receivers refuse truncated
+requests before executing handlers. Invalid or
+unparsed frames log fixed reasons only. Private keyboard/review and retained human
+control suppress app renderer/SDK/console/automation content diagnostics while
+keeping both phone and glasses previews live. Native ownership metadata and
+at-most-once receipts contain no typed payload, text hash or character count.
+
+### Jev mode aim (app ↔ relay only)
+
+Jev mode (Matt, 2026-10-20) aims the wearer's pointer from spoken words while that
+wearer holds the screen. It is relay-local: no link method, and the parent sees
+nothing new. Its only host input is `platforms.ocuclaw.extra.botScreenJev`
+(`enabled`, `budgetMs`), projected by `_resolve_bot_screen_jev` as
+`{enabled, apiKey, budgetMs}`: only a literal `enabled: true` (or `"true"`) arms
+it, and a saved key alone never does. The key is the saved TypeSafe key, else the
+deployment-time `TYPESAFE_API_KEY`, and only an armed group carries it; `budgetMs`
+is forwarded only when finite, and the relay owns its clamp and default.
+
+The app sends `ocuclaw.botscreen.aim`, `v:1`, `id`, and `op`: `arm`, `disarm`,
+`aim` (`words`, optional `zoom`), `correct` (`aimId`, `words`, optional `zoom`) or
+`clear`. Every op except `disarm` and `clear` requires a fresh `botScreen.control`
+answer, for the selected profile, saying this client holds the human lease. `arm`
+starts a memory-only full-colour copy of the RFB screen; `disarm`, losing the
+lease, a profile switch or disconnect drops it and any aim. `aim` copies the newest
+colour frame, asks TypeSafe Jev (`jev-1.14.0`, image header on) for a box and a
+presence score, takes one 2x zoomed second look below 0.3 confidence, and checks
+the lease again before answering. `correct` resends the same frame with rejected
+guesses outlined (last magenta, earlier cyan) and the words so far. Aiming never
+sends input; the wearer's action word goes through `ocuclaw.botscreen.control`.
+
+`ocuclaw.botscreen.aim.result` carries the request `id`, the selected `profileId`,
+`ok`, and on success `aimId`, the point `x`/`y` and `box` in screen pixels, the
+frame `width`/`height`, `confidence`, `present`, `zoomed`, `turns` and `ms`;
+otherwise a fixed `code` (`not_in_control`, `jev_off`, `not_armed`, `no_frame`,
+`aim_expired`, `too_many_corrections`, `not_found`, `superseded`, `frame_size`,
+`invalid_request`, `failed`, `jev_<reason>`). No words or pixels come back. Both
+types are private in protocol subscriptions and every debug export mode.
+
+### Jev in program cards (app ↔ relay only)
+
+A programmable card may ask TypeSafe Jev the questions it declares. Like Jev mode
+it is relay-local: no link method, and the parent sees nothing new. Its only host
+input is `platforms.ocuclaw.extra.programCardsJev` (`enabled`), projected with the
+saved TypeSafe key like `botScreenJev`, except that it is on while unset: a
+missing block or `enabled` reads on, an explicit value wins (only `true` or
+`"true"` is on), and a disabled group carries no key. Without a key it cannot
+call. The phone's Jev in cards switch (permission `program_cards_jev`) writes the
+flag, and each card still needs the wearer's yes for its own Jev block.
+
+### MCP in program cards (host switch)
+
+A programmable card may read the owner's MCP tools (reads only). The host input
+is `platforms.ocuclaw.extra.programCardsMcp` (`enabled`), projected by
+`_resolve_program_cards_mcp` as `{enabled}`: a missing block or `enabled` reads
+on, an explicit value wins (only `true` or `"true"` is on), and there is no key
+or budget. `programCardsModel` (Models in cards) uses the same projection. The relay reads it once at child start. The phone's MCP in cards
+switch (permission `program_cards_mcp`) writes the flag. Each server still needs
+the owner's per-server switch (`program_card.mcp.allow`, above) and each card the
+wearer's yes for its own MCP block.
+
 ## Size cap and truncation (never split)
 
 Senders serialize each frame; a line exceeding `LINK_MAX_LINE_BYTES` is NOT
@@ -2519,9 +3945,11 @@ env name for it would be a remote way to widen the listener past loopback.
 | `allow_admin_from` | Hermes `gateway/slash_access.py`; OcuClaw bridges the env name `OCUCLAW_ALLOW_ADMIN_FROM` | `.env` via `OCUCLAW_ALLOW_ADMIN_FROM`, or `config.yaml` `extra.allow_admin_from` | Optional; **required for "Continue here"** (`/resume <tip> --all`) | env > yaml > unset | The wearer admin allow-list. Written as JSON (`["ocuclaw-wearer"]`) or a comma list (`ocuclaw-wearer`); either shape reaches Hermes' own `_coerce_id_list`. A non-empty list turns slash-command gating ON for the whole platform, which is safe only because `ocuclaw-wearer` is the only user id the adapter ever stamps. An empty list, a JSON object, or unparseable JSON is refused. |
 | `relayToken` | Host-generated Relay Credential; `adapter.py` bridge as `OCUCLAW_RELAY_TOKEN`; no `requires_env`, prompt, reveal, or return surface | `.env` via `OCUCLAW_RELAY_TOKEN` (the only supported source; no status, doctor, or setup surface reads a yaml secret) | **Required**; initial plugin bootstrap generates it on a provably fresh profile and validation refuses boot without it | env > unset | Downstream client auth token, constant-time checked and forwarded in `link.hello.ack`; reinstall/update/restart/re-pair preserve it, and only the locally confirmed all-device reset replaces it. |
 | `sonioxApiKey` | `adapter.py` bridge as `OCUCLAW_SONIOX_API_KEY`; deliberately absent from `requires_env` | `.env` via `OCUCLAW_SONIOX_API_KEY` (the only supported source) | Optional; required for Soniox STT only | env > unset | Credential for temporary-key mint; unset returns `soniox_temp_key_not_configured`. |
-| `typesafeApiKey` | `adapter.py` bridge as `OCUCLAW_TYPESAFE_API_KEY`; deliberately absent from `requires_env` | `.env` via `OCUCLAW_TYPESAFE_API_KEY` (the only supported source), saved by `hermes ocuclaw optional-setup save typesafe` or the phone's Add key page | Optional; required for silent input's smart word order only | env > unset | TypeSafe credential for the Jev ranker. Saving it IS the arming gesture: it turns `silentInputJev.enabled` on unless the operator wrote that flag by hand, and it outranks the deployment-time `TYPESAFE_API_KEY`, which never arms anything by itself. |
+| `typesafeApiKey` | `adapter.py` bridge as `OCUCLAW_TYPESAFE_API_KEY`; deliberately absent from `requires_env` | `.env` via `OCUCLAW_TYPESAFE_API_KEY` (the only supported source), saved by `hermes ocuclaw optional-setup save typesafe` or the phone's Add key page | Optional; required for the LiveUI Jev decider, Jev in program cards and the Bot Screen's Jev mode | env > unset | The one saved TypeSafe credential, shared by the LiveUI Jev decider, Jev in program cards and the Bot Screen's Jev mode. Silent input no longer uses Jev (Matt, 2026-10-31): it never ranks words with this key, and a stale `silentInputJev` block in `config.yaml` is ignored, never an error. Saving the key arms nothing: `liveuiJev.enabled` (the phone's LiveUI switch, permission `liveui_jev`), `programCardsJev.enabled` (the phone's Jev in cards switch, permission `program_cards_jev`) and `botScreenJev.enabled` (the app's Jev mode) are those consents. For each it outranks the deployment-time `TYPESAFE_API_KEY`, which never arms anything by itself and is the fallback once the saved key is removed. The phone can remove it (`credential.remove`). |
 | `stateDir` | `adapter.py` | `config.yaml` `extra.stateDir` | Optional, code-defaulted | yaml > code default | `$HERMES_HOME/ocuclaw`; Node runtime state directory. |
+| `phoneAddress` | `custom_route.py`, `adapter.py` | `config.yaml` `extra.phoneAddress` | Optional | yaml only | Custom network mode (#5208); unset means Tailscale. The adapter hands the value it loaded to the Node child, so the pairing control surface answers `custom_route` to a phone-code request by itself (#5219). Not a secret. |
 | `glassesUiLive` | `adapter.py` | `config.yaml` `extra.glassesUiLive` | Optional, code-defaulted | yaml > code default | `{}` merges with `httpEnabled:true`, `llmEnabled:true`, `httpHostPolicy:"owner-grants"`, and `tickModel:""` (Hermes `ctx.llm` selects the model). Shared/hosted operators set `httpHostPolicy:"operator-only"` to revoke phone host grants. |
+| `liveuiV2` | `adapter.py` | `config.yaml` `extra.liveuiV2` | Optional, code-defaulted | yaml > code default | `{}` resolves to `pictureFolders` unset (the agent workspace and the system temp folder). Title icons are not here: they are the wearer's LiveUI switch on the phone, and a leftover `titleIcons` key is ignored. Small loops are always on (a GIF or WebP picture's `liveui_picture` ready frames carry `loop: true`; `docs/design/liveui-research/v2/agent-pictures.md` A22), and a leftover `pictureLoops` key is ignored. A 3D model link's `liveui_picture` ready frames carry `model: true` (the bytes are a glass mesh v1, not a picture; `docs/design/liveui-research/v2/agent-pictures.md` A23), also with no flag. LiveUI V2's one block, the same shape as OpenClaw's (`docs/design/liveui-research/v2/SPEC.md` D3). `composed` and `presets` are retired and ignored: every chat is V2 and every Preset goes as its V2 form. They are still accepted so an existing setting loads. |
 | `renderGlassesUiTimeoutMs` | `adapter.py` | `config.yaml` `extra.renderGlassesUiTimeoutMs` | Optional | yaml > unset | Positive render-tool timeout override; unset/non-positive delegates to the child default. |
 | `externalDebugToolsEnabled` | `adapter.py` | `config.yaml` `extra.externalDebugToolsEnabled` | Optional, code-defaulted | yaml > code default | `true`; admit relay-token-authenticated debug clients and permit Debug Report assembly/local save. This is the access gate, not the app-side live-capture switch. |
 | `debugAutoArm` | `adapter.py` | `config.yaml` `extra.debugAutoArm` | Optional, code-defaulted | yaml > code default | `false`; normal phone capture stays local and folds on Submit. Developer hosts may set `true` to auto-arm the full app + relay preset; live tools can lease specific categories either way. |
@@ -2543,25 +3971,123 @@ env name for it would be a remote way to widen the listener past loopback.
 | `handshakeTimeoutS` | `adapter.py` | `config.yaml` `extra.handshakeTimeoutS` | Optional, code-defaulted | yaml > code default | `10`; parent-side hello wait, exported as `OCUCLAW_LINK_HANDSHAKE_TIMEOUT_MS`. |
 | `terminateGraceS` | `adapter.py` | `config.yaml` `extra.terminateGraceS` | Optional, code-defaulted | yaml > code default | `5`; SIGTERM-to-SIGKILL grace. |
 | `linkDebugStderr` | `adapter.py` | `config.yaml` `extra.linkDebugStderr` | Optional, code-defaulted | yaml > code default | `false`; when true, all child console/logger output reaches the durable gateway log. |
-| `emoji` | `models_rpc.py` | `config.yaml` `extra.emoji`, in **that profile's own** home | Optional | yaml > unset | The agent avatar glyph for this profile, forwarded as `gw.profiles.list[].emoji` and on to the phone's agent entry. Hermes has no emoji or avatar field; OcuClaw owns the value. Unset/blank/non-string → key absent, and the phone falls back to the first letter of the agent name (same fallback an emoji-less OpenClaw agent gets). |
+| `sharedChats` | `health.py` `shared_chats_enabled` | `config.yaml` `extra.sharedChats` | Optional, on by default | yaml > unset | Shared chats on Hermes ≥ 0.23.0: Continue here adopts a Desktop/CLI/TUI chat as one gateway conversation the glasses and the desk both drive, without the single-driver lock or the mirror. Needs `ocuclaw-wearer` in `allow_admin_from` too. Only `false` or `"false"` turns it off; read per call, so no restart beyond the config reload. |
+| `auto_agent` | `agent_router.py` `auto_agent_requested` | `config.yaml` `extra.auto_agent` (default profile) | Optional kill switch, on by default | yaml > unset | Auto agent (#6795): `gw.agents.route` picks which enrolled agent takes a new chat the wearer started on Auto, and `families.agents.autoRoute` is advertised once the `ocuclaw_agent_router` auxiliary task registered. Whether a wearer sees Auto is their own app switch (OcuClaw settings `autoAgent`, off by default). `false`, `0`, or `"false"`/`"off"`/`"no"`/`"0"` withdraws Auto for every wearer; the phone cannot set it. Read per call. |
+| `emoji` | `models_rpc.py` | `config.yaml` `extra.emoji`, in **that profile's own** home | Optional | Explicit OcuClaw glyph > native avatar | The OcuClaw-owned agent glyph for this profile, forwarded as `gw.profiles.list[].emoji` and `gw.agent.identity.emoji`. A configured glyph suppresses the native avatar in both replies. Unset/blank/non-string → key absent; clearing the glyph restores native-avatar sync. |
+| `avatar` | `models_rpc.py` | `assets/avatar.png`, `.jpg`, or `.webp`, in **that profile's own** home | Optional | Explicit OcuClaw glyph > native raster > letter fallback | Hermes Desktop's `profiles.get_asset` source, including its default coloured bot faces backfilled to PNG and user-picked images. Read-only sync on identity/catalog refresh, bounded to 128 KiB per file and 512 KiB total base64 per roster. Magic checks and profile-home confinement apply. Forwarded through `agents.list[].identity.avatar` to optional `avatarDataUri` in the app catalog, and through existing identity hash/blob transport for the active agent. Missing/unreadable/oversized assets retain the existing glyph fallback; a Desktop-only appearance not yet backfilled to a raster can use the separate structured `appearance` field. |
+| `appearance` | `models_rpc.py` | `profile.yaml` `ui_meta["hermes-bots"]`, in the routable profile’s own home | Optional | Explicit glyph/photo/pet > native animated face > static fallback | Bounded allowlisted `{shape, color, name}` descriptor, where `name` is the native profile identifier used for deterministic face seeds (not the relay namespace or display title). Classic shape/color defaults match Hermes. Shape-backed 160×160 raster backfills retain the descriptor; actual photos/pets and explicit OcuClaw glyphs suppress it. No arbitrary UI metadata is forwarded. The relay catalog carries `appearance` beside `avatarDataUri`; older clients ignore it and keep the raster/glyph fallback. Clients derive idle/thinking/working moods from fresh activity for that agent, rather than shipping animation frames through the gateway. |
 
 #### Phone diagnostics permissions
 
 The private optional-setup RPC supports `diagnostics.preview` with exactly one
-`permission` (`access` or `handoff`) and a boolean `allowed`, followed by an
-explicitly confirmed `diagnostics.apply` carrying its `operationId`. The preview
-is single-use, expires after 180 seconds, and is bound to the authenticated phone
-connection, Primary Runtime home and configuration revision. Disconnect clears it.
-Each save uses Hermes's supported config writer and changes only the selected
-`externalDebugToolsEnabled` or `allowDebugUpload` key. Ambiguous config, stale
-previews and unconfirmed writes fail closed; an uncertain write is never replayed.
+`permission` (`access`, `handoff`, `liveui_jev`, `program_cards_jev`,
+`program_cards_mcp` or `program_cards_model`) and a
+boolean `allowed`, followed by an explicitly confirmed `diagnostics.apply`
+carrying its `operationId`. The preview is single-use, expires after 180
+seconds, and is bound to the authenticated phone connection, Primary Runtime
+home and configuration revision. Disconnect clears it. Each save uses Hermes's
+supported config writer and changes only the selected
+`externalDebugToolsEnabled` or `allowDebugUpload` key, or, for `liveui_jev`
+(the LiveUI Jev switch), `program_cards_jev` (the Jev in cards switch),
+`program_cards_mcp` (the MCP in cards switch) and `program_cards_model` (the
+Models in cards switch), the nested
+`platforms.ocuclaw.extra.liveuiJev.enabled`,
+`platforms.ocuclaw.extra.programCardsJev.enabled`,
+`platforms.ocuclaw.extra.programCardsMcp.enabled` or
+`platforms.ocuclaw.extra.programCardsModel.enabled` flag; Hermes creates a missing
+map and keeps its siblings such as `budgetMs`. `access`/`handoff` default on
+and refuse a non-boolean value; the LiveUI Jev switch reads
+true only for a literal `true` or `"true"` (the adapter's rule) and reads a
+missing or malformed block as off. Silent input no longer uses Jev (Matt,
+2026-10-31): there is no `silent_input_jev` permission, so an older phone that
+previews it gets the same `rejected`/`invalid_request` answer as any unknown
+permission, and nothing is written. The card switches (`program_cards_jev`,
+`program_cards_mcp`, `program_cards_model`) read on while unset (a missing
+block or `enabled`), and an explicit value wins: only `true` or `"true"` is on. Ambiguous config, stale previews and unconfirmed writes fail
+closed; an uncertain write is never replayed.
 
-Saving neither restarts Hermes nor captures or sends a report. The change joins
+Saving neither restarts Hermes nor captures or sends a report. Card capability
+permissions (`program_cards_jev`, `program_cards_mcp`, `program_cards_model`) apply
+live: after config write/readback, the parent requests `program_cards.switches.apply`
+with `{jev: boolean, mcp: boolean, model: boolean}` (2 s timeout). The child changes
+the running engines and acknowledges those booleans. Only acknowledged flags enter
+active diagnostics; a missing ack or failed observation is `outcome_unknown` and an
+uncertain write never replays. These three permissions do not join restart review.
+Chat setup's "Tools for cards" (#7189) reads, and never writes: the parent requests
+`program_cards.tools.facts` with `{servers: boolean}` (2 s timeout, 7 s with `servers`).
+The child answers `{cards: boolean, mcp: boolean}`: whether a connected phone has cards
+on, and the MCP-in-cards switch. With `servers` it adds `{known: boolean, reason: string,
+servers: [{name, connected, cards}]}`, from one tool listing bounded at 5 s: each MCP
+server's name, whether it is connected and whether it is on for cards, and nothing else
+(no tool names, arguments, results, keys or tokens). A listing that did not come back is
+`known: false`. An older child's `-32601`, no answer or no link reads as unread: setup
+does not offer the extra, and says it could not read the servers.
+Each server the user then names is asked for on the glasses with `tools.requestCardSetup`
+from the host's own setup chat, which is no glasses session: the parent sends
+`{setup: true, params: {what: "mcp" | "server", server?, during: "setup"}}` and no
+`sessionKey`, only from a chat its setup tool accepts. The child asks for nothing else
+on that path, and an older child answers that no request was shown. Nothing turns on
+without the wearer's Allow.
+The Smart interfaces switch (`liveui_jev`) also applies live: after the save, the
+parent requests `liveui.jev.apply` with `{enabled: boolean}` (2 s timeout). No key
+crosses the link: the child turns the running decider on or off and, when it turns
+on with no key in its LiveUI group, uses the saved `typesafeApiKey` it already
+holds. It acknowledges `{enabled: boolean, keyed: boolean}`. Only an ack whose
+`enabled` matches the saved switch, and that is `keyed` when on, enters active
+diagnostics, and the parent then resolves its own `liveuiJev` group as a child
+start would. Any other answer (an older child's `-32601`, no answer, on with no
+usable key such as a key only in `TYPESAFE_API_KEY`) leaves the save `saved` and
+not active, so the snapshot's `activation.required` offers the restart as before.
+Other permissions retain their activation behavior. Their changes join
 pending Voice/Even AI saves in the existing **Review saved changes** flow, whose
 separate confirmation warns that restarting affects every profile. Snapshot
-diagnostics distinguish configured `access`/`handoff` from
-`activeAccess`/`activeHandoff`. Active values require a recent loaded-relay
-observation tied to the live gateway process; missing or stale evidence is null.
+diagnostics distinguish configured `access`/`handoff`/`liveuiJev`/`programCardsJev`/`programCardsMcp`
+from `activeAccess`/`activeHandoff`/`activeLiveuiJev`/`activeProgramCardsJev`/`activeProgramCardsMcp`
+(LiveUI Jev uses the `liveui.jev.apply` ack, or the child start when that fails; card capabilities use
+the live acknowledgement). `programCardsModel` / `activeProgramCardsModel` use
+the same saved/active pair. Active values
+require a recent loaded-relay observation tied to the live gateway process;
+missing or stale evidence is null. `liveuiJevKeyAvailable` is true when LiveUI
+Jev would find a TypeSafe key (the saved one, else `TYPESAFE_API_KEY`), so the
+phone never says "no key" while one is still used; a boolean, never the key.
+
+#### Jev key check (`jev.check`, #6938)
+
+The phone asks "does TypeSafe accept this key?" with `operation: "jev.check"`
+and no other field. The Node relay answers it on both runtimes, before the
+request reaches this parent: it is the process that loaded the key (the saved
+`typesafeApiKey` this parent projects, or a lane's resolved key). It sends one
+fixed question (no wearer text) to `api.typesafe.ai/v1/systemone` through the
+same Jev client and pool as the surface decision, with a 10 s budget, and
+replies `status: "ok"` with `jevCheck.result` = `working`, `key_rejected`
+(401/403), `unreachable` (network, timeout, 5xx, 429 or an unparsable answer),
+`no_key`, or `not_loaded` (a key is saved that the relay has not loaded: the
+check never tests a stale key in its place). To tell the last two apart the
+relay asks this parent for an ordinary `status` snapshot, which rides the
+reply. One check per phone connection and four in all may run at once; another
+answers `rejected`/`busy`. Neither the reply, the `glasses.lifecycle`
+`jev_key_check` debug row nor any log carries the key or the server's text.
+The relay keeps the last answer in `jev-check.json` in its state directory
+(`{"v":1,"result":…,"checkedAtMs":…}`) and deletes it when it starts, so a
+missing file means "not checked since the last load". The capability snapshot
+advertises `families.setup.jevCheck: true`. Old readers: an older relay's
+parser answers `rejected`/`invalid_request` (with `operation: "status"`), and
+the phone falls back to the loaded switch without a check.
+
+`credential.begin` also accepts `intent: "remove"`, for capability `typesafe`
+only and only while the key is on disk (absent answers `configuration_changed`).
+The follow-up is `credential.remove` with exactly `{requestId, operation,
+transactionId}`: single use, bound to the connection and configuration identity
+like a save, it removes `OCUCLAW_TYPESAFE_API_KEY` through Hermes's
+`remove_env_value` under the same receipt fence, reads `.env` back and answers
+`{status: "removed", code: "removed", snapshot}`. `credential.save` on a remove
+transaction, or `credential.remove` on a create/replace one, answers
+`transaction_invalid`; `credential.cancel` works for any intent. The running
+relay keeps the removed key until a restart: while a fresh observation says it is
+still loaded, the snapshot reports the capability `present: false, state:
+"not_configured"` with `activation.required: true`, and the existing restart
+drops it. The loaded-relay observation records which removable keys the relay
+holds as booleans only.
 The shared capability snapshot also advertises version-1 permission readback
 for Hermes only when both loaded flags are known booleans.
 
@@ -2657,6 +4183,147 @@ The existing `ocuclaw.liveui.status` snapshot also carries
 `httpHostPolicy`, `ownerGrants`, `tickAuth` (`ok`, `missing_key`, or
 `no_backend`), and optional `grantsInvalid`.
 
+### Connected model sites
+
+LiveUI's private model-site connection plane (#5299) is separate from optional
+setup. Both OpenClaw and Hermes terminate it in the shared Node service; it does
+not introduce a Python RPC, environment variable, agent tool or control-link
+credential delivery. In particular, optional setup's restart-delayed credential
+removal above does **not** apply: model-site saves and removals take effect in
+the running resolver immediately.
+
+The capability snapshot advertises `families.modelSites`:
+
+```json
+{
+  "commandsVersion": 1,
+  "generation": "opaque-runtime-generation",
+  "providers": ["sketchfab", "thingiverse", "myminifactory"],
+  "sourceMetadataVersion": 1
+}
+```
+
+Absent/zero command support means the phone must explain that connections are
+unsupported by this host; viewer controls remain phone-local and usable. The
+generation is opaque and contains no credential-derived data. Reconnect,
+generation change or selected-executor change retires pending phone state.
+
+On the paired private phone connection, requests are
+`{type:"ocuclaw.model_sites.request", requestId, operation, ...fields}`. No
+extra fields are accepted. `requestId`, transaction IDs and revisions are
+1–128 characters from `[A-Za-z0-9_-]`.
+
+| Operation | Additional fields | Behavior |
+| --- | --- | --- |
+| `status` | optional `provider` (defaults to `sketchfab`) | Return that provider's sanitized connection snapshot. |
+| `credential.begin` | `provider:"sketchfab"\|"thingiverse"\|"myminifactory"`, `intent:"create"\|"replace"\|"remove"`, `revision` | Check that provider's revision and issue a phone/executor-bound, one-use transaction expiring after 120 seconds. |
+| `credential.save` | `transactionId`, `credential` | Consume a create/replace transaction, verify the account through its provider, then atomically save and activate the new credential. A failed replacement preserves the old connection. |
+| `credential.remove` | `transactionId` | Consume a remove transaction and immediately remove the credential, invalidate its generation and cancel pending old-account work. |
+| `credential.cancel` | `transactionId` | Retire the transaction and cancel associated verification; a late verification cannot save. |
+
+Credential entry accepts bounded non-space printable ASCII (at most 4,096
+characters), stays masked and is cleared after completion/cancellation. The
+host never returns a saved credential. These operations are explicitly
+transactional: neither reconnect nor an uncertain result replays a credential
+write. A new attempt requires a fresh status and transaction. Disconnect also
+retires this phone's unfinished transactions and verification.
+
+Results have `type:"ocuclaw.model_sites.result"`, the matching `requestId` and
+`operation`, and `status: ok|saved|removed|cancelled|rejected|unsupported|outcome_unknown`.
+Only allowlisted codes and these optional objects cross the boundary:
+
+- `snapshot: {provider, state, revision, code?, account?}`. State is
+  `not_connected|checking|connected|needs_reconnect|temporarily_unavailable`.
+  Account is `{id, name, url?}` with a bounded ID/name and an optional canonical
+  HTTPS Sketchfab profile URL. No raw provider response is retained in results.
+- `transaction: {id, expiresAtMs, provider, intent}`. Provider is one of the three advertised IDs.
+
+The phone accepts only replies matching its outstanding request and operation.
+Service errors become fixed codes rather than exception messages. Codes
+distinguish stale/invalid transactions, reconnect, unavailable downloads, rate
+limits, provider outages, network refusal, unsupported formats, size/conversion
+failures, cancellation and unattended execution. Raw provider bodies, tokens,
+authorization headers and signed URLs never enter logs, bundles or agent
+results; private frame diagnostics contain only the family and a private mark.
+
+The executor stores the credential in
+`<stateDir>/model-sites/credentials-v1.json`, with directory mode `0700` and
+file mode `0600`, using an atomic revision-checked write. It is not ordinary
+plugin config, phone preferences or Hermes's inherited environment. Successful
+replacement invalidates old-account imports and signed URLs; failed
+replacement leaves the previous generation usable. Disconnect prevents late
+verification/download/conversion from installing credentials or a new mesh.
+Already-imported meshes remain governed by the normal cache lifecycle. Removing
+this local credential does not revoke it at the provider.
+
+Thingiverse and MyMiniFactory use separate `thingiverse-credentials-v1.json` and
+`myminifactory-credentials-v1.json` files in that same protected directory. They
+have independent revisions, pending transactions, health and import cancellation.
+The original Sketchfab file remains compatible. The phone checks the advertised
+`providers` list before offering connections; old hosts keep Sketchfab working.
+
+The two printing sites accept a provider-issued **OAuth access token**, obtained
+through the user's registered developer application. This iteration does not
+register an OAuth application, handle browser callbacks, or refresh expired tokens;
+expired access requires reconnecting. Passwords, client secrets and MyMiniFactory
+API keys are not supported credentials. Account verification uses
+`https://api.thingiverse.com/users/me` or
+`https://www.myminifactory.com/api/v2/user` with a Bearer header.
+
+Printing-site imports use exact `/things/<id>` and `/things/<id>/files` routes on
+the Thingiverse API, or `/api/v2/objects/<id>` and `/api/v2/objects/<id>/files` on
+MyMiniFactory. The first downloadable STL, OBJ, GLB, glTF, 3MF or PLY part within the size
+budget is displayed in provider order; multipart designs are not assembled.
+Thingiverse's exact `/files/<fileId>/download` may return one redirect: only that
+fixed API request receives auth, and its validated destination is fetched
+anonymously through the normal model guard. No scraping or purchased-content
+bypass is attempted. File permission failures remain download failures.
+
+Provider contracts: [Thingiverse's official SDK](https://github.com/makerbot/thingiverse-js),
+[Thingiverse's official endpoint wrapper](https://github.com/makerbot/thingiverse-php),
+[MyMiniFactory OpenAPI](https://github.com/MyMiniFactory/api-documentation/blob/master/myminifactory-api.yaml),
+and [MyMiniFactory OAuth instructions](https://github.com/MyMiniFactory/api-documentation/blob/master/oauth2-instructions.md).
+
+Three-site acceptance check: connect each account in LiveUI → Settings → 3D models
+on the same executor, then ask the agent to display one permitted model-page link
+from each site. Confirm the provider/creator/licence beside each rendered model.
+Disconnect one site and verify the other two still import; reconnect it and repeat.
+Run on OpenClaw and Hermes. Deterministic adapter/conversion tests do not substitute
+for real account entitlement, token expiry, provider availability or a phone/G2 ride.
+
+A canonical Sketchfab page in existing inline image `src` may resolve only during a
+wearer-initiated run on that executor. Ticks, cron, subagents and unplaceable
+runs cannot use the saved credential. Compose-tool calls currently lack a trusted
+originating run identity and are also refused; a concurrent wearer turn in the
+same session supplies no authority. The adapter reads only exact HTTPS
+`api.sketchfab.com/v3/me`, `/v3/models/<id>` and `/v3/models/<id>/download`
+endpoints. API responses are capped at 1 MiB and 8 seconds per request; API
+redirects are refused. Existing HTTP-disable, operator destination policy and
+socket-time SSRF checks still apply. The token is never sent to a CDN,
+redirect or external resource. The guarded model lane downloads an eligible
+GLB, else glTF ZIP, within the existing model/archive/conversion budgets.
+
+Ready model picture frames may carry additive `modelSource` metadata:
+
+| Field | Bound/meaning |
+| --- | --- |
+| `provider` | `"sketchfab"`, `"thingiverse"` or `"myminifactory"` |
+| `modelId` | 32 hexadecimal characters for Sketchfab; 1–16 decimal digits, without leading zero, for printing sites |
+| `title` | At most 200 characters |
+| `url` | Canonical `https://sketchfab.com/3d-models/<modelId>`, `https://www.thingiverse.com/thing:<modelId>` or `https://www.myminifactory.com/object/3d-print-<modelId>` |
+| `creator` | At most 160 characters |
+| `creatorUrl?` | At most 512 characters; ordinary HTTPS Sketchfab link |
+| `license` | At most 160 characters; unknown remains unknown |
+| `licenseUrl?` | At most 512 characters; ordinary HTTPS Sketchfab or Creative Commons link |
+| `attribution` | At most 1,000 characters |
+
+These values are sanitized text and canonical links, never markup or a signed
+download URL. Older clients ignore the extra field. The phone shows attribution
+with the model and full Source & licence details. Viewer preferences, pose,
+zoom and head samples stay on the phone and do not use this private plane.
+See `docs/design/liveui-research/v2/agent-pictures.md` A24 and ADR-0029 ruling 4a
+for the lifecycle, persistence and compatibility contract.
+
 ### Relay Credential generation marker
 
 Initial plugin bootstrap defines a provably fresh profile as having neither a
@@ -2699,6 +4366,28 @@ and `OPENCLAW_BUNDLE_DEFAULT_WS_PORT = 9000` in
 `extensions/ocuclaw/src/config/runtime-config.ts`. OpenClaw's separate
 fresh-install selector normally persists `47800`; an explicit configured port
 always wins in either backend.
+
+### Desktop setup activation
+
+`state/ocuclaw.serving.json` may include `setupConfigurationFingerprint`, a
+SHA-256 of the restart-sensitive, non-secret setup keys captured when the
+gateway constructs its adapter. Reconnects and plugin reloads retain that
+snapshot. It excludes credentials and unrelated Hermes metadata; file mtimes
+are never activation evidence. Readers require the profile, PID and available
+process-start identity to match the live gateway.
+
+`GET /setup-card` and setup-tool status expose `restartToFinish` with
+`reason: "configuration"` when that snapshot differs from the saved setup
+settings, including when installed and serving plugin versions are identical.
+Older receipts without the fingerprint remain unknown. The setup journey
+returns to `restart-and-relay-verification` until activation, while completed
+First-Run Proof remains completed. `status.setupSurface` identifies the live
+conversation surface for the Desktop restart handoff.
+
+The Desktop card offers its supported SDK restart action ahead of a waiting
+setup-chat label. An accepted action is not readiness: the card waits for the
+replacement gateway and cleared pending hint. Cancellation preserves the
+pending work, and completion retains the original setup conversation.
 
 ### Secret posture on rendered surfaces
 
@@ -2793,6 +4482,23 @@ auxiliary task rows, avoiding duplicated primary ledger counters. The response
 includes per-model totals and record coverage; `estimated` and `actual` are
 separate nullable amounts. Unknown auxiliary schema/read coverage is explicit.
 The model list caps at 100 while aggregate totals include every model.
+Where the host has `post_auxiliary_call` (0.22+), `usage` also carries
+`tasks: [{task,calls,attempts,failedAttempts,fallbacks,input,output,typicalMs,route}]`
+for OcuClaw's own background calls (`ocuclaw_approval_explain`,
+`ocuclaw_liveui_refresh`, `silent_input_prediction`, `ocuclaw_card_review`;
+the observer also counts `ocuclaw_card_model`, `ocuclaw_card_frame` and
+`ocuclaw_card_icon`, which
+the child does not yet forward), busiest first. Hermes
+records aux usage only inside an agent turn, so these are counted by the
+plugin's own observer into `state/ocuclaw.aux-usage.json` (per UTC day, 90 days) and
+are not part of `totals`. `calls` counts distinct `api_request_id`s;
+`fallbacks` counts requests answered on a different provider or model from
+their first attempt; `typicalMs` is the median successful attempt (null when
+none); `route` is the last answering `provider · model`, or `auto`. The
+observer reads no prompt or reply field. `tasks` is absent on an older host.
+Each attempt is also sent to the child as `aux.call`
+`{phase,task,requestId,attempt,provider,model[,ms,input,output,failed]}` for
+the relay-only `token.aux` debug category.
 
 Diagnostics execute the real native doctor or security audit in a separate
 process group with a 90-second parent and independent child-watchdog deadline.
@@ -2921,3 +4627,55 @@ an old live gateway. A CLI invocation observes its own loaded package.
 The shared health collector serves adapter/CLI/dashboard/support/setup/Cloudways/
 uninstall calls. Desktop's periodic POST /fleet/snapshot only publishes the
 presenter's fleet inventory; it never calls the connection-health collector.
+
+## Programmable card model calls (sessionless)
+
+The Node engine holds an exclusive built-in SQLite transaction for each Library's
+model storage. Only one gateway may enable model writes at a time for that root.
+Turning Models off fences pending continuations and releases the lock; the next
+owner reloads grants, usage, rate windows and threads. A process crash releases the
+OS lock. Node without built-in SQLite fails only Models closed. State includes
+`available` and `reason` (`library_in_use`, `unsupported_runtime`, or
+`storage_unavailable`). App deletion borrows the local lease or obtains a temporary
+one; a foreign owner causes a conflict before any app/grant/thread removal. Deleted
+app markers stop a stale open subscription from restoring its model grant.
+Each dispatched attempt reserves an `incompleteRequests` usage entry before
+native work. A missing receipt after crash/cancel/handoff remains incomplete;
+missing native cost sets `costUncertain`. Either blocks daily-cost-capped calls
+until the daily usage reset, while request caps retain all reserved attempts.
+Libraries that never enabled Models use a synchronous deletion guard without
+creating a SQLite database. A crash during this legacy deletion path leaves a
+fail-closed guard; it does not have SQLite's automatic crash recovery. A Library
+that has used Models requires SQLite support for guarded app deletion thereafter.
+
+Child → parent `program_card.model.complete` accepts `{callId, profileId, provider, model,
+messages, maxTokens, timeoutMs}`. `messages` includes the fixed host system framing,
+card instructions, bounded card-thread history and the new input: 2 to 44
+messages with at most 128 KiB of UTF-8 text in all, else `too_big`. The parent calls
+`ctx.llm.acomplete` with explicit provider/model, task `ocuclaw_card_model`, purpose
+`ocuclaw program card model` and the remaining timeout. It creates no agent/session.
+The task has `defaults={timeout:60}`, no inherited task, and belongs to
+`OCUCLAW_TASKS` for usage accounting. Replies contain text, actual provider/model,
+responseModel and inputTokens/outputTokens/costUsd. A different provider/model
+returns `model_changed` with usage and no answer; the Node engine pauses that use.
+A dated variant of the same approved model on the same provider is accepted.
+
+`profileId` comes from the authenticated connection's selected session (or the
+authoring tool's trusted session), never from a phone-supplied profile. The parent
+rejects unserved profiles, enters that home's native config/credential scope off
+the event loop, and carries its context into the owned completion task. A changed
+owner profile discards an in-flight result and writes no card memory.
+
+`program_card.model.cancel {callId, profileId}` cancels the same profile's owned await and acknowledges
+`{cancelled}`. A provider behind a thread may still bill; results are discarded.
+`program_card.model.models {profileId}` returns that profile's catalog with canonical
+refs and isMain. `program_card.model.allow {ref, profileId}` checks that catalog and appends
+native provider and bare-model overrides to this plugin's own trust allowlists,
+preserving unrelated entries and unrestricted policies. The engine independently
+locks the approved provider/model pair. Reasoning is read-only Hermes default.
+
+Phone `program_card_model` operations are open/prompt/cancel/close, decide/settings/
+resume/remove/reset/state/threads/models/check. Results/status and private models,
+check and transcript replies use the requesting connection's unicast only; public
+state excludes prompts, answers, instructions, schemas and transcript content.
+Memory belongs only to the LiveUI Library's program-card-model-threads-v1 tree.

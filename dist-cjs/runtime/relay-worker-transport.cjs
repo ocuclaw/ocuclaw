@@ -2,6 +2,7 @@ const http = require("node:http");
 const { monitorEventLoopDelay } = require("node:perf_hooks");
 const WebSocketModule = require("ws");
 const { APP_PROTOCOL, WORKER_FEATURES, estimateJsonByteLength, formatProtocolHelloAck, formatResumeAck, formatSendAck, normalizeRequestId, parseMessageType, parseNonNegativeRevision } = require("./relay-worker-protocol.cjs");
+const { RELAY_FRAME_MAX_JSON_DEPTH, exceedsJsonDepth, mayExceedJsonDepth } = require("../domain/json-depth.cjs");
 const { createWorkerMessageSendQueue } = require("./relay-worker-queue.cjs");
 const { createRelayWorkerHealthMonitor } = require("./relay-worker-health.cjs");
 const { createApprovalReplayCache } = require("./relay-worker-approval-replay-cache.cjs");
@@ -10,7 +11,10 @@ const { createRelayClientNudgeController } = require("./relay-client-nudge-contr
 const { RELAY_BIND_HOLDER_RETRY_DELAYS_MS, createRelayBindConflictError, describeRelayPortHolder, formatRelayPortHeldExhaustedMessage, formatRelayPortHeldRetryMessage, formatRelayPortListenerMessage } = require("./relay-bind-holder.cjs");
 const { relayClientKindForName } = require("./relay-client-names.cjs");
 const { constantTimeEqual } = require("../domain/constant-time-equal.cjs");
+const { LIVEUI_SURFACE_TYPE, isLiveUiPresetFrame, liveUiClientForm } = require("../domain/liveui-v2-client-forms.cjs");
+const { ACTIVITY_LABEL_FITS_CAPABILITY, activityFrameForAppWithoutLabelFits } = require("../domain/activity-label-client-form.cjs");
 const { PAIRING_CONTROL_MAX_REQUEST_BODY_BYTES, PAIRING_MAX_REQUEST_BODY_BYTES, isPairingControlPath, isPairingEndpointPath } = require("../domain/pairing/pairing-endpoint-address.cjs");
+const { ROUTE_PROBE_NONCE_PARAM, ROUTE_PROBE_PATH, checkRouteProbeNonce, createRouteProbeRateLimiter, routeProbeMac } = require("../domain/custom-route/route-probe.cjs");
 const { activeBackendDisplayName } = require("../gateway/backend-contract.cjs");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
 
@@ -27,12 +31,19 @@ const LIVENESS_MAX_MISSED_PINGS = 2;
 const CONTROL_QUEUE_MAX_DEFAULT = 1000;
 const TRANSACTIONAL_QUEUE_MAX_DEFAULT = 1000;
 
+const LIVEUI_PICTURE_TYPE = "liveui_picture";
+const PICTURE_LANE_BUFFER_BYTES = 65_536;
+const PICTURE_QUEUE_MAX = 1024;
+
 const LIVEUI_LANE_TYPES = new Set([
   "glasses_ui_render",
   "glasses_ui_surface_update",
   "glasses_ui_session_reset",
   "demand",
   "demand_dismiss",
+  LIVEUI_SURFACE_TYPE,
+
+  LIVEUI_PICTURE_TYPE,
 ]);
 
 const WS_DEFLATE_ENV = "OCUCLAW_RELAY_WS_DEFLATE";
@@ -45,7 +56,7 @@ const WS_DEFLATE_SERVER_OPTIONS = Object.freeze({
   threshold: 256,
 });
 
-function resolveWsDeflateEnabled(manifestDefault, envValue) {
+function resolveWsDeflateEnabled(manifestDefault     , envValue     ) {
   if (typeof envValue === "string") {
     const v = envValue.trim().toLowerCase();
     if (v === "0" || v === "off" || v === "false") return false;
@@ -56,7 +67,7 @@ function resolveWsDeflateEnabled(manifestDefault, envValue) {
 
 const DEFLATE_TOKEN = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
 
-function parseExtensionOffers(header) {
+function parseExtensionOffers(header     ) {
   if (typeof header !== "string" || !header.trim()) return null;
   const offers = [];
   for (const rawOffer of header.split(",")) {
@@ -66,7 +77,7 @@ function parseExtensionOffers(header) {
     for (const rawParam of parts.slice(1)) {
       const eq = rawParam.indexOf("=");
       const key = (eq === -1 ? rawParam : rawParam.slice(0, eq)).trim();
-      let value = eq === -1 ? true : rawParam.slice(eq + 1).trim();
+      let value      = eq === -1 ? true : rawParam.slice(eq + 1).trim();
       if (!DEFLATE_TOKEN.test(key) || params.has(key)) return null;
       if (value !== true) {
         if (value.length >= 2 && value.startsWith("\"") && value.endsWith("\"")) {
@@ -81,14 +92,14 @@ function parseExtensionOffers(header) {
   return offers;
 }
 
-function windowBitsAtLeast(value, min) {
+function windowBitsAtLeast(value     , min     ) {
   if (value === true) return true;
   if (!/^\d+$/.test(value)) return false;
   const bits = Number(value);
   return bits >= min && bits <= 15;
 }
 
-function acceptableDeflateOffer(params) {
+function acceptableDeflateOffer(params     ) {
   for (const [key, value] of params) {
     if (key === "server_no_context_takeover" || key === "client_no_context_takeover") {
       if (value !== true) return false;
@@ -107,7 +118,7 @@ function acceptableDeflateOffer(params) {
 const CHROMIUM_UA = /\b(?:Chrome|Chromium|HeadlessChrome)\/\d/;
 const APPLE_WEBKIT_UA = /\b(?:iPhone|iPad|iPod|Macintosh)\b/;
 
-function wsDeflateEligible({ extensionsHeader, userAgent, pmdQuery } = {}) {
+function wsDeflateEligible({ extensionsHeader, userAgent, pmdQuery }      = {}) {
   const offers = parseExtensionOffers(extensionsHeader);
   if (!offers) return false;
   const deflateOffers = offers.filter((offer) => offer.name === "permessage-deflate");
@@ -150,11 +161,11 @@ function createRelayWorkerTransport(options = {}) {
       ? Math.floor(options.listenRetryMaxAttempts)
       : 5;
 
-  const bindOptions = options;
+  const bindOptions      = options;
   const bindHolderRetryDelaysMs = Array.isArray(bindOptions.bindHolderRetryDelaysMs)
     ? bindOptions.bindHolderRetryDelaysMs
-        .filter((ms) => Number.isFinite(ms) && ms >= 0)
-        .map((ms) => Math.floor(ms))
+        .filter((ms     ) => Number.isFinite(ms) && ms >= 0)
+        .map((ms     ) => Math.floor(ms))
     : RELAY_BIND_HOLDER_RETRY_DELAYS_MS;
   const describeBindHolder =
     typeof bindOptions.describeBindHolder === "function"
@@ -165,7 +176,7 @@ function createRelayWorkerTransport(options = {}) {
   let httpServer = null;
   let wss = null;
 
-  let wssDeflate = null;
+  let wssDeflate      = null;
   let nextClientId = 1;
 
   const TOKEN_REJECT_LOG_WINDOW_MS = 60000;
@@ -208,7 +219,9 @@ function createRelayWorkerTransport(options = {}) {
   const sendBufferOverWaterSince = new Map();
   const sockets = new Set();
   const pendingHttp = new Map();
-  const cache = {
+
+  const routeProbeLimiter = createRouteProbeRateLimiter(now);
+  const cache      = {
     pages: null,
     entries: null,
     status: null,
@@ -225,7 +238,7 @@ function createRelayWorkerTransport(options = {}) {
   let health = null;
   let currentAgentAvatar = null;
   let nudgeController = null;
-  let approvalReplay = null;
+  let approvalReplay      = null;
 
   function isAppClient(clientId) {
     return (protocolState.get(clientId) || {}).clientKind === "app";
@@ -319,6 +332,10 @@ function createRelayWorkerTransport(options = {}) {
         coalescableByType: new Map(),
         postCoalescable: [],
         liveui: [],
+
+        liveuiSurfaceSlots: new Map(),
+
+        picture: [],
         bestEffort: [],
 
         streamDeltaSlots: new Map(),
@@ -338,6 +355,8 @@ function createRelayWorkerTransport(options = {}) {
       type === "ocuclaw.approval.request" ||
       type === "ocuclaw.approval.resolved" ||
       type === "ocuclaw.remote.control" ||
+
+      type === "ocuclaw.starmap.forgotten" ||
 
       type === "sonioxTemporaryKey" ||
       type === "sonioxTemporaryKeyError" ||
@@ -383,7 +402,9 @@ function createRelayWorkerTransport(options = {}) {
       type === APP_PROTOCOL.resumeAck ||
       type === APP_PROTOCOL.workerHealth ||
       type === APP_PROTOCOL.workerOperationReceived ||
-      type === APP_PROTOCOL.operationReceived
+      type === APP_PROTOCOL.operationReceived ||
+
+      type === "ocuclaw.evenai.performance"
     ) {
       q.control.push(frame);
       while (q.control.length > controlQueueMax()) {
@@ -413,8 +434,36 @@ function createRelayWorkerTransport(options = {}) {
       type === APP_PROTOCOL.debugConfigSnapshot
     ) {
       q.coalescableByType.set(type, frame);
+    } else if (type === LIVEUI_PICTURE_TYPE && parsedFrame && typeof parsedFrame.data === "string") {
+      if (q.picture.length >= PICTURE_QUEUE_MAX) {
+
+        emitDebug("worker_picture_frame_dropped", "warn", { clientId, queueDepth: q.picture.length });
+      } else {
+        q.picture.push(frame);
+      }
     } else if (LIVEUI_LANE_TYPES.has(type)) {
-      q.liveui.push(frame);
+
+      const slotKey = type === LIVEUI_SURFACE_TYPE && parsedFrame && !parsedFrame.manifest &&
+        !isLiveUiPresetFrame(parsedFrame) &&
+        typeof parsedFrame.surfaceId === "string" && parsedFrame.surfaceId
+        ? `${parsedFrame.sessionKey ?? ""}\u0000${parsedFrame.surfaceId}` : null;
+      const slot = slotKey ? q.liveuiSurfaceSlots.get(slotKey) : null;
+      if (slot) {
+        slot.frame = frame;
+      } else if (slotKey) {
+        const newSlot = { frame, key: slotKey };
+        q.liveuiSurfaceSlots.set(slotKey, newSlot);
+        q.liveui.push(newSlot);
+      } else {
+        if (type === LIVEUI_SURFACE_TYPE && parsedFrame && parsedFrame.manifest) {
+
+          const prefix = `${parsedFrame.sessionKey ?? ""}\u0000`;
+          for (const key of [...q.liveuiSurfaceSlots.keys()]) {
+            if (key.startsWith(prefix)) q.liveuiSurfaceSlots.delete(key);
+          }
+        }
+        q.liveui.push(frame);
+      }
     } else {
       const runId = streamRunId(parsedFrame);
 
@@ -446,24 +495,31 @@ function createRelayWorkerTransport(options = {}) {
     drainClientQueue(clientId);
   }
 
-  function streamRunId(parsed) {
+  function streamRunId(parsed     ) {
     const runId = parsed && typeof parsed.runId === "string" ? parsed.runId : "";
     return runId || null;
   }
 
-  function streamSlotKey(runId, parsed) {
+  function streamSlotKey(runId     , parsed     ) {
     const index = Number.isInteger(parsed?.messageIndex) && parsed.messageIndex > 0 ? parsed.messageIndex : 0;
     return `${runId}#${index}`;
   }
 
-  function takeBestEffortFrame(q) {
+  function takeBestEffortFrame(q     ) {
     const entry = q.bestEffort.shift();
     if (typeof entry === "string") return entry;
     if (q.streamDeltaSlots.get(entry.key) === entry) q.streamDeltaSlots.delete(entry.key);
     return entry.frame;
   }
 
-  function dropQueuedStreamDeltas(q, runId) {
+  function takeLiveuiFrame(q     ) {
+    const entry = q.liveui.shift();
+    if (typeof entry === "string") return entry;
+    if (q.liveuiSurfaceSlots.get(entry.key) === entry) q.liveuiSurfaceSlots.delete(entry.key);
+    return entry.frame;
+  }
+
+  function dropQueuedStreamDeltas(q     , runId     ) {
     for (const [key, slot] of q.streamDeltaSlots) {
       if (slot.runId !== runId) continue;
       q.streamDeltaSlots.delete(key);
@@ -472,7 +528,7 @@ function createRelayWorkerTransport(options = {}) {
     }
   }
 
-  function nextQueuedFrame(q) {
+  function nextQueuedFrame(q, bufferedAmount = 0) {
     if (q.control.length) return q.control.shift();
     if (q.transactional.length) return q.transactional.shift();
     if (q.coalescableByType.size) {
@@ -481,8 +537,11 @@ function createRelayWorkerTransport(options = {}) {
       return first[1];
     }
     if (q.postCoalescable.length) return q.postCoalescable.shift();
-    if (q.liveui.length) return q.liveui.shift();
+    if (q.liveui.length) return takeLiveuiFrame(q);
     if (q.bestEffort.length) return takeBestEffortFrame(q);
+    if (q.picture.length && !(Number.isFinite(bufferedAmount) && bufferedAmount >= PICTURE_LANE_BUFFER_BYTES)) {
+      return q.picture.shift();
+    }
     return null;
   }
 
@@ -494,7 +553,8 @@ function createRelayWorkerTransport(options = {}) {
         q.coalescableByType.size ||
         q.postCoalescable.length ||
         q.liveui.length ||
-        q.bestEffort.length)
+        q.bestEffort.length ||
+        q.picture.length)
     );
   }
 
@@ -520,7 +580,10 @@ function createRelayWorkerTransport(options = {}) {
             break;
           }
           q.pressureWarned = false;
-          ws.send(nextQueuedFrame(q));
+
+          const next = nextQueuedFrame(q, ws.bufferedAmount);
+          if (next === null) break;
+          ws.send(next);
         }
       } finally {
         q.draining = false;
@@ -536,7 +599,7 @@ function createRelayWorkerTransport(options = {}) {
     });
   }
 
-  function clearClientQueue(clientId) {
+  function clearClientQueue(clientId     ) {
     const q = outboundQueues.get(clientId);
     if (q && q.retryTimer !== null) clearTimeout(q.retryTimer);
     outboundQueues.delete(clientId);
@@ -548,11 +611,18 @@ function createRelayWorkerTransport(options = {}) {
       .map(([id]) => id);
   }
 
-  function broadcastApp(frame, options = {}) {
+  function activityFrameForClient(state                                  , frame        ) {
+    const readsLabelFits = Array.isArray(state.clientCapabilities) &&
+      state.clientCapabilities.includes(ACTIVITY_LABEL_FITS_CAPABILITY);
+    return readsLabelFits ? frame : activityFrameForAppWithoutLabelFits(frame);
+  }
+
+  function broadcastApp(frame, options      = {}) {
     const type = options.knownType !== undefined
       ? options.knownType
       : parseMessageType(frame);
-    const liveuiFrame = type === "glasses_ui_render" || type === "glasses_ui_surface_update"
+    const liveuiFrame = type === "glasses_ui_render" || type === "glasses_ui_surface_update" ||
+      type === LIVEUI_SURFACE_TYPE
       ? parseFrame(frame) : null;
     if (liveuiFrame) liveuiRenderErrors.record(liveuiFrame, connectedAppIds());
     const hasLedgerClient = type === APP_PROTOCOL.pages && [...protocolState.values()].some(
@@ -569,6 +639,20 @@ function createRelayWorkerTransport(options = {}) {
         state.clientCapabilities.includes("ledgerV1");
       if (type === APP_PROTOCOL.entries && !supportsLedgerV1) continue;
       if (type === APP_PROTOCOL.pages && suppressPagesForLedgerClients && supportsLedgerV1) continue;
+      if (type === LIVEUI_SURFACE_TYPE) {
+
+        const form = liveUiClientForm(liveuiFrame, state.clientCapabilities);
+        if (!form) continue;
+        enqueueFrame(clientId, JSON.stringify({ ...form, renderErrorClientId: clientId }), {
+          ...options,
+          knownType: form.type,
+        });
+        continue;
+      }
+      if (type === APP_PROTOCOL.activity) {
+        enqueueFrame(clientId, activityFrameForClient(state, frame), options);
+        continue;
+      }
 
       const outgoing = liveuiFrame
         ? JSON.stringify({ ...liveuiFrame, renderErrorClientId: clientId }) : frame;
@@ -690,7 +774,7 @@ function createRelayWorkerTransport(options = {}) {
     if (state.clientKind === "app" && nudgeController) {
       nudgeController.addClient(clientId);
     }
-    const identified = {
+    const identified      = {
       kind: "client.identified",
       clientId,
       clientKind: state.clientKind,
@@ -705,6 +789,10 @@ function createRelayWorkerTransport(options = {}) {
       workerEpoch: manifest.workerEpoch,
       connectedAtMs: now(),
     };
+    if (ws && ws.__ocuRemote && ws.__ocuRemote.address) {
+      identified.remoteAddress = ws.__ocuRemote.address;
+      identified.remotePort = ws.__ocuRemote.port;
+    }
 
     const pairingExchangeId =
       typeof parsed.pairingExchangeId === "string" ? parsed.pairingExchangeId : "";
@@ -774,6 +862,27 @@ function createRelayWorkerTransport(options = {}) {
       parsed = JSON.parse(raw);
     } catch {
       enqueueFrame(clientId, JSON.stringify({ type: "error", error: "Invalid JSON" }));
+      return;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      enqueueFrame(clientId, JSON.stringify({ type: "error", error: "Invalid message" }));
+      return;
+    }
+
+    if (
+      mayExceedJsonDepth(raw, RELAY_FRAME_MAX_JSON_DEPTH) &&
+      exceedsJsonDepth(parsed, RELAY_FRAME_MAX_JSON_DEPTH)
+    ) {
+      const deepRequestId =
+        parsed.type === APP_PROTOCOL.messageSend && typeof parsed.requestId === "string"
+          ? normalizeRequestId(parsed.requestId)
+          : null;
+      enqueueFrame(
+        clientId,
+        deepRequestId
+          ? formatSendAck(deepRequestId, "rejected", "Invalid message", "invalid_request")
+          : JSON.stringify({ type: "error", error: "Invalid message" }),
+      );
       return;
     }
 
@@ -948,6 +1057,16 @@ function createRelayWorkerTransport(options = {}) {
           ? liveuiRenderErrors.check(clientId, parsed, connectedAppIds())
           : { eligible: false, reason: "not_app_client" },
       } : {}),
+
+      ...(parsed.type === "liveui_state_report" || parsed.type === "glasses_ui_result" ? {
+        liveuiStateReportAuthority: isAppClient(clientId)
+          ? liveuiRenderErrors.checkSurface(
+            clientId,
+            parsed.type === "liveui_state_report" ? parsed.surface : parsed.surfaceId,
+            connectedAppIds(),
+          )
+          : { eligible: false, reason: "not_app_client" },
+      } : {}),
       operation: parseMessageType(parsed),
       workerEpoch: manifest.workerEpoch,
       queuedAtMs: now(),
@@ -955,8 +1074,63 @@ function createRelayWorkerTransport(options = {}) {
     });
   }
 
+  function answerRouteProbe(req     , url     , res     ) {
+    res.setHeader("cache-control", "no-store");
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    if (req.method !== "GET") {
+      res.statusCode = 405;
+      res.setHeader("allow", "GET");
+      res.end(JSON.stringify({ v: 1, error: "method-not-allowed" }));
+      return;
+    }
+    if (!routeProbeLimiter.take()) {
+      res.statusCode = 429;
+      res.setHeader("retry-after", "60");
+      res.end(JSON.stringify({ v: 1, error: "rate-limited" }));
+      return;
+    }
+    const values = url.searchParams.getAll(ROUTE_PROBE_NONCE_PARAM);
+    const nonce                       = values.length > 1
+      ? { ok: false, rejection: "invalid-characters" }
+      : checkRouteProbeNonce(values.length === 1 ? values[0] : null);
+    if (!nonce.ok) {
+      res.statusCode = 400;
+      res.end(JSON.stringify({ v: 1, error: `nonce-${nonce.rejection}` }));
+      return;
+    }
+    const credential = manifest && typeof manifest.relayToken === "string" ? manifest.relayToken : "";
+    if (!credential) {
+      res.statusCode = 503;
+      res.end(JSON.stringify({ v: 1, error: "unavailable" }));
+      return;
+    }
+    res.statusCode = 200;
+    res.end(JSON.stringify({ v: 1, mac: routeProbeMac(credential, nonce.nonce) }));
+  }
+
+  function parseRequestUrl(req     ) {
+    try {
+
+      return new URL(req.url || "/", "http://127.0.0.1");
+    } catch {
+      return null;
+    }
+  }
+
   function handleHttpRequest(req, res) {
-    const url = new URL(req.url || "/", "http://127.0.0.1");
+    const url = parseRequestUrl(req);
+    if (!url) {
+      req.resume();
+      res.writeHead(400, { "content-type": "text/plain; charset=utf-8", connection: "close" });
+      res.end("invalid request target");
+      return;
+    }
+    if (url.pathname === ROUTE_PROBE_PATH) {
+
+      req.resume();
+      answerRouteProbe(req, url, res);
+      return;
+    }
     const routes = (manifest.routes && manifest.routes.mainForwardedHttpPaths) || [];
     if (!routes.includes(url.pathname)) {
       res.statusCode = 404;
@@ -1092,6 +1266,7 @@ function createRelayWorkerTransport(options = {}) {
         type === APP_PROTOCOL.debugConfigSnapshot ||
         type === APP_PROTOCOL.approvalRequest ||
         type === APP_PROTOCOL.approvalResolved ||
+        type === APP_PROTOCOL.approvalExplanation ||
         shouldApplyNudgeStage
       ) {
         parsedFrame = parseFrame(message.frame);
@@ -1115,6 +1290,21 @@ function createRelayWorkerTransport(options = {}) {
             ? parsedFrame.id.trim()
             : null;
         if (approvalId && approvalReplay) approvalReplay.remove(approvalId);
+      }
+      if (type === APP_PROTOCOL.approvalExplanation) {
+
+        const approvalId =
+          parsedFrame && typeof parsedFrame.id === "string" && parsedFrame.id.trim()
+            ? parsedFrame.id.trim()
+            : null;
+        const explanation =
+          parsedFrame && typeof parsedFrame.explanation === "string" ? parsedFrame.explanation : "";
+        if (approvalId && explanation) {
+          approvalReplay?.amend(approvalId, (frame     ) => {
+            const request = parseFrame(frame);
+            return request ? JSON.stringify({ ...request, explanation }) : null;
+          });
+        }
       }
       if (type === APP_PROTOCOL.messageSendAck || type === APP_PROTOCOL.operationReceived) {
         const requestId = normalizeRequestId(parsedFrame && parsedFrame.requestId);
@@ -1164,7 +1354,10 @@ function createRelayWorkerTransport(options = {}) {
         broadcastApp(message.frame, { knownType: type });
       }
       if (message.target === "unicast" && message.clientId && clients.has(message.clientId)) {
-        enqueueFrame(message.clientId, message.frame);
+        const outgoing = type === APP_PROTOCOL.activity
+          ? activityFrameForClient(protocolState.get(message.clientId) || {}, message.frame)
+          : message.frame;
+        enqueueFrame(message.clientId, outgoing);
       }
       if (shouldApplyNudgeStage) {
         nudgeController.applyBroadcastInteractionStage(
@@ -1295,20 +1488,25 @@ function createRelayWorkerTransport(options = {}) {
         })
       : null;
     httpServer.on("upgrade", (req, socket, head) => {
-      let pmdQuery = null;
-      try {
-        pmdQuery = new URL(req.url || "/", "http://relay").searchParams.get("pmd");
-      } catch {}
+      const requestUrl = parseRequestUrl(req);
+      if (!requestUrl) {
+        socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        return;
+      }
+      const pmdQuery = requestUrl.searchParams.get("pmd");
       const target = wssDeflate && wsDeflateEligible({
         extensionsHeader: req.headers["sec-websocket-extensions"],
         userAgent: req.headers["user-agent"],
         pmdQuery,
       }) ? wssDeflate : wss;
 
-      target.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+      target.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req, requestUrl));
     });
-    wss.on("connection", (ws, req) => {
-      const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
+    wss.on("connection", (ws, req, requestUrl     ) => {
+
+      ws.on("error", (err) => {
+        logger.debug("relay worker WebSocket client error", err);
+      });
       const remoteAddress = (req.socket && req.socket.remoteAddress) || "unknown";
       if (!constantTimeEqual(requestUrl.searchParams.get("token"), manifest.relayToken)) {
         logTokenReject(remoteAddress);
@@ -1328,6 +1526,11 @@ function createRelayWorkerTransport(options = {}) {
 
       ws.__ocuMissedPings = 0;
       ws.on("pong", () => { ws.__ocuMissedPings = 0; });
+
+      ws.__ocuRemote = {
+        address: req.socket && typeof req.socket.remoteAddress === "string" ? req.socket.remoteAddress : null,
+        port: req.socket && Number.isInteger(req.socket.remotePort) ? req.socket.remotePort : null,
+      };
       protocolState.set(clientId, {
         protocolVersion: null,
         clientKind: "unknown",
@@ -1337,10 +1540,21 @@ function createRelayWorkerTransport(options = {}) {
       });
       ws.on("message", (data, isBinary) => {
         if (isBinary) return;
-        handleText(clientId, ws, data.toString());
-      });
-      ws.on("error", (err) => {
-        logger.debug("relay worker WebSocket client error", err);
+
+        try {
+          handleText(clientId, ws, data.toString());
+        } catch (err     ) {
+          logger.warn(
+            `[ocuclaw] relay worker dropped a frame it could not handle clientId=${clientId} error=${
+              err && err.name ? err.name : "Error"
+            }: ${err && err.message ? err.message : String(err)}`,
+          );
+          try {
+            enqueueFrame(clientId, JSON.stringify({ type: "error", error: "Invalid message" }));
+          } catch {
+
+          }
+        }
       });
       ws.on("close", (code, reason) => {
         clients.delete(clientId);
@@ -1374,7 +1588,7 @@ function createRelayWorkerTransport(options = {}) {
     await new Promise((resolve, reject) => {
       let attempt = 0;
       let holderAttempt = 0;
-      let holderStartedAtMs = null;
+      let holderStartedAtMs      = null;
       let settled = false;
       const onError = (err) => {
         if (settled) return;
@@ -1451,7 +1665,7 @@ function createRelayWorkerTransport(options = {}) {
             maxAttempts: bindHolderRetryDelaysMs.length,
             delayMs,
           });
-          const holderRetryTimer = setTimeout(tryListen, delayMs);
+          const holderRetryTimer      = setTimeout(tryListen, delayMs);
           if (typeof holderRetryTimer.unref === "function") holderRetryTimer.unref();
           return;
         }

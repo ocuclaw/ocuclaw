@@ -12,7 +12,7 @@ const UPLOAD_CAPTURE_PRESET_RELAY_ONLY = [
 
 const DEBUG_FOLD_CAPABLE_CLIENT_VERSION = "2.0.4";
 
-function parseReleaseVersion(value) {
+function parseReleaseVersion(value     ) {
   if (typeof value !== "string") return null;
   const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(value.trim());
   if (!match) return null;
@@ -21,7 +21,7 @@ function parseReleaseVersion(value) {
   return { parts, prerelease: match[4] || null };
 }
 
-function isFoldCapableClientVersion(value, floor = DEBUG_FOLD_CAPABLE_CLIENT_VERSION) {
+function isFoldCapableClientVersion(value     , floor = DEBUG_FOLD_CAPABLE_CLIENT_VERSION) {
   const actual = parseReleaseVersion(value);
   const required = parseReleaseVersion(floor);
   if (!actual || !required) return false;

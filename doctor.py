@@ -47,7 +47,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
-from . import tailnet_dial
+from . import custom_route, secret_access, tailnet_dial
 from .relay_verifier import RelayVerifyOutcome, verify_relay_credential
 from .serve import (
     normalize_dns_name,
@@ -77,6 +77,14 @@ CHECK_RELAY_APPLICATION = "credentialed-relay-verifier"
 #: The HTTPS-certificate precondition, checked only on a run that is about to
 #: propose the Serve command (#2672).
 CHECK_TAILNET_TLS_CERT = "tailnet-tls-cert"
+#: Custom route mode (#5209): the user's own front door, checked through the
+#: configured phone address with the credential-free route probe. In this mode
+#: CHECK_RELAY_APPLICATION authenticates on loopback only, never through the
+#: custom address.
+CHECK_CUSTOM_ROUTE = "custom-route"
+#: The custom check gets a little more than one default allowance: it does
+#: DNS, TCP, TLS and one small HTTP exchange in a single bounded pass.
+CUSTOM_ROUTE_TIMEOUT_S = 2.5
 
 RELAY_TOKEN_ENV = "OCUCLAW_RELAY_TOKEN"
 
@@ -112,6 +120,14 @@ OUTCOME_UNRESOLVED = "probe_name_unresolved"
 OUTCOME_CERT_AVAILABLE = "tls_cert_available"
 OUTCOME_CERT_UNAVAILABLE = "tls_cert_unavailable"
 OUTCOME_CERT_UNKNOWN = "tls_cert_unknown"
+#: One outcome per custom route reason code, e.g. ``custom_route_ok``.
+CUSTOM_ROUTE_OUTCOME_PREFIX = "custom_route_"
+CUSTOM_ROUTE_OUTCOMES = tuple(
+    CUSTOM_ROUTE_OUTCOME_PREFIX + reason for reason in custom_route.REASONS
+)
+#: The config-only checks failed during collection, so nothing was aimed at
+#: the route.
+OUTCOME_CUSTOM_ROUTE_SKIPPED = "probe_skipped_custom_route_wrong"
 
 PROBE_OUTCOME_CODES = (
     OUTCOME_REACHABLE,
@@ -133,7 +149,8 @@ PROBE_OUTCOME_CODES = (
     OUTCOME_RELAY_PROTOCOL_ERROR,
     OUTCOME_RELAY_UNKNOWN,
     OUTCOME_RELAY_NO_CREDENTIAL,
-)
+    OUTCOME_CUSTOM_ROUTE_SKIPPED,
+) + CUSTOM_ROUTE_OUTCOMES
 
 #: The only outcome that establishes a *negative* claim about the route: a
 #: check that ran, inside its window, and got a definite refusal.
@@ -204,6 +221,7 @@ def tailnet_front_door_check(
     timeout_s: float,
     *,
     socks5: Optional[Tuple[str, int]] = None,
+    nc_argv: Optional[Tuple[str, ...]] = None,
 ) -> str:
     """One bounded TLS handshake through the configured Serve route.
 
@@ -211,6 +229,8 @@ def tailnet_front_door_check(
     receipt (#2980). Without it a userspace host has no route to its own
     tailnet name and this check reports ``probe_failed`` on a route the phone
     reaches fine; through it the handshake is the same evidence it always was.
+    ``nc_argv`` is the receipt's CLI argv when the receipt says to dial through
+    ``tailscale nc`` instead (an adopted daemon with no SOCKS listener, #6482).
 
     This is the sanctioned check, and its shape is chosen as much for what it
     does *not* do as for what it does.
@@ -261,7 +281,9 @@ def tailnet_front_door_check(
 
     def worker() -> None:
         try:
-            answer.put(_front_door_handshake(host, port, timeout_s, socks5=socks5))
+            answer.put(
+                _front_door_handshake(host, port, timeout_s, socks5=socks5, nc_argv=nc_argv)
+            )
         except BaseException:  # noqa: BLE001 - the caller has already moved on
             answer.put(OUTCOME_FAILED)
 
@@ -281,15 +303,19 @@ def _front_door_handshake(
     timeout_s: float,
     *,
     socks5: Optional[Tuple[str, int]] = None,
+    nc_argv: Optional[Tuple[str, ...]] = None,
 ) -> str:
     """The blocking half of :func:`tailnet_front_door_check`."""
     deadline = time.monotonic() + timeout_s
     context = ssl.create_default_context()
+    # Only a mode that applies is passed on, so a dial double written before
+    # the nc mode keeps its exact call shape.
+    through: Dict[str, Any] = {} if socks5 is not None or not nc_argv else {"nc_argv": tuple(nc_argv)}
     try:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return OUTCOME_TIMEOUT
-        with tailnet_dial.dial(host, port, deadline, socks5=socks5) as raw:
+        with tailnet_dial.dial(host, port, deadline, socks5=socks5, **through) as raw:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return OUTCOME_TIMEOUT
@@ -550,16 +576,12 @@ def plan_cert_precheck(facts: Mapping[str, Any]) -> Optional[ProbeCheck]:
 
 
 def _read_relay_credential() -> str:
-    """Read the Relay Credential without putting it in facts or diagnostics."""
-    try:
-        from hermes_cli.config import get_env_value  # type: ignore
+    """Read the Relay Credential without putting it in facts or diagnostics.
 
-        value = get_env_value(RELAY_TOKEN_ENV)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    except Exception:  # noqa: BLE001 - supervised env is the supported fallback
-        pass
-    return str(os.environ.get(RELAY_TOKEN_ENV, "") or "").strip()
+    Only through Hermes (catalogue rule 11); ``get_secret`` covers the
+    supervised process environment on a single-profile gateway.
+    """
+    return secret_access.read_secret(RELAY_TOKEN_ENV)
 
 
 def credentialed_relay_check(
@@ -570,10 +592,11 @@ def credentialed_relay_check(
     verifier: Optional[Callable[..., RelayVerifyOutcome]] = None,
     clock: Callable[[], float] = time.monotonic,
     socks5: Optional[Tuple[str, int]] = None,
+    nc_argv: Optional[Tuple[str, ...]] = None,
 ) -> str:
     """Run Q12's verifier once and collapse it to a secret-free result code.
 
-    ``socks5`` reaches the verifier unchanged; see
+    ``socks5`` (or ``nc_argv``, #6482) reaches the verifier unchanged; see
     :func:`tailnet_front_door_check` for why a userspace host needs it.
     """
     credential_reader = (
@@ -629,18 +652,25 @@ def credentialed_relay_check(
     if remaining <= 0:
         return OUTCOME_RELAY_TIMEOUT
     try:
-        if socks5 is None:
+        if socks5 is not None:
             result = verifier(
                 address=address,
                 credential=credential,
                 timeout_s=remaining,
+                socks5=socks5,
+            )
+        elif nc_argv:
+            result = verifier(
+                address=address,
+                credential=credential,
+                timeout_s=remaining,
+                nc_argv=tuple(nc_argv),
             )
         else:
             result = verifier(
                 address=address,
                 credential=credential,
                 timeout_s=remaining,
-                socks5=socks5,
             )
     except Exception:  # noqa: BLE001 - no exception text crosses this boundary
         return OUTCOME_RELAY_UNKNOWN
@@ -649,13 +679,19 @@ def credentialed_relay_check(
 
 def _tailscale_socks5() -> Optional[Tuple[str, int]]:
     """The host receipt's loopback SOCKS5 proxy, or ``None``. Never raises."""
+    return _tailscale_dial_kwargs().get("socks5")
+
+
+def _tailscale_dial_kwargs() -> Dict[str, Any]:
+    """How the host receipt says to reach the tailnet: ``socks5``, ``nc_argv``
+    (an adopted daemon, #6482) or nothing (direct dial). Never raises."""
     try:
         from . import receipts as receipts_mod
 
         receipt = receipts_mod.read_tailscale_cli()
     except Exception:  # noqa: BLE001 - a broken receipt means direct dial
-        return None
-    return None if receipt is None else receipt.socks5
+        return {}
+    return tailnet_dial.receipt_dial_kwargs(receipt)
 
 
 def plan_probes(facts: Mapping[str, Any]) -> ProbePlan:
@@ -669,6 +705,8 @@ def plan_probes(facts: Mapping[str, Any]) -> ProbePlan:
     rather than being reported as a failed probe — which would read as a
     broken route.
     """
+    if custom_route_mode(facts):
+        return plan_custom_route_probes(facts)
     classification = facts.get("serveClassification")
     if classification not in SERVE_CLASSIFICATIONS:
         classification = TRISTATE_UNKNOWN
@@ -695,11 +733,12 @@ def plan_probes(facts: Mapping[str, Any]) -> ProbePlan:
         )
     # A userspace tailscaled (Cloudways) exposes a loopback SOCKS5 proxy and
     # records it in the host receipt; both probes dial through it or they
-    # cannot reach the tailnet at all (#2980). Read here, once per plan.
-    socks5 = _tailscale_socks5()
-    # The kwarg is added only when a proxy exists, so the positional contract
+    # cannot reach the tailnet at all (#2980). An adopted daemon with no SOCKS
+    # listener is dialled through `tailscale nc` instead (#6482). Read here,
+    # once per plan.
+    # The kwarg is added only when a mode applies, so the positional contract
     # the existing checks (and their test doubles) were written to is intact.
-    proxy_kwargs: Dict[str, Any] = {} if socks5 is None else {"socks5": socks5}
+    proxy_kwargs: Dict[str, Any] = _tailscale_dial_kwargs()
     checks = [
         ProbeCheck(
             name=CHECK_TAILNET_REACHABILITY,
@@ -736,6 +775,89 @@ def plan_probes(facts: Mapping[str, Any]) -> ProbePlan:
         checks=checks,
         skipped=skipped,
     )
+
+
+def loopback_relay_address(relay_port: Any) -> Optional[str]:
+    """The relay's own loopback WS address, the only target custom mode authenticates to."""
+    try:
+        port = int(relay_port)
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    return f"ws://{custom_route.LOOPBACK}:{port}"
+
+
+def plan_custom_route_probes(
+    facts: Mapping[str, Any],
+    *,
+    credential_reader: Optional[Callable[[], str]] = None,
+) -> ProbePlan:
+    """Custom route mode (#5209): one route check, one loopback verifier.
+
+    The route check walks the custom route table through the configured phone
+    address and proves identity with the credential-free route probe. The
+    credentialed relay verifier then runs against the relay's own loopback
+    port, never through the custom address: the Relay Credential must not be
+    sent through someone else's proxy.
+    """
+    reader = _read_relay_credential if credential_reader is None else credential_reader
+    raw_address = facts.get("customPhoneAddress")
+    relay_port = facts.get("serveRelayPort")
+    if facts.get("customRouteReason") in {
+        custom_route.REASON_ADDRESS_INVALID,
+        custom_route.REASON_CLOUDWAYS_HOST,
+    }:
+        return ProbePlan(
+            checks=[],
+            skipped=[
+                ProbeOutcome(CHECK_CUSTOM_ROUTE, OUTCOME_CUSTOM_ROUTE_SKIPPED, 0.0),
+                ProbeOutcome(CHECK_RELAY_APPLICATION, OUTCOME_CUSTOM_ROUTE_SKIPPED, 0.0),
+            ],
+        )
+
+    def run_route(allowance: float) -> str:
+        result = custom_route.bounded_check(
+            allowance,
+            credential_fn=reader,
+            raw_address=raw_address,
+            relay_port=relay_port,
+        )
+        return CUSTOM_ROUTE_OUTCOME_PREFIX + result.reason
+
+    checks = [
+        ProbeCheck(
+            name=CHECK_CUSTOM_ROUTE,
+            timeout_s=CUSTOM_ROUTE_TIMEOUT_S,
+            run=run_route,
+        )
+    ]
+    skipped: List[ProbeOutcome] = []
+    secrets = facts.get("secretsPresent")
+    relay_token_present = (
+        isinstance(secrets, Mapping) and secrets.get("relayToken") is True
+    )
+    loopback = loopback_relay_address(relay_port)
+    if relay_token_present and loopback is not None:
+        checks.append(
+            ProbeCheck(
+                name=CHECK_RELAY_APPLICATION,
+                timeout_s=PROBE_DEFAULT_TIMEOUT_S,
+                run=lambda allowance: credentialed_relay_check(
+                    loopback, allowance, credential_reader=reader
+                ),
+            )
+        )
+    else:
+        skipped.append(
+            ProbeOutcome(CHECK_RELAY_APPLICATION, OUTCOME_RELAY_NO_CREDENTIAL, 0.0)
+        )
+    return ProbePlan(checks=checks, skipped=skipped)
+
+
+def custom_route_mode(facts: Mapping[str, Any]) -> bool:
+    value = facts.get("customPhoneAddress")
+    return isinstance(value, str) and bool(value)
 
 
 def run_probes(
@@ -812,6 +934,16 @@ def _clear_probe_facts(facts: Mapping[str, Any]) -> Dict[str, Any]:
     updated["serveTlsCertAvailable"] = TRISTATE_UNKNOWN
     updated["serveFrontDoorTlsError"] = False
     updated["serveFrontDoorUnresolved"] = False
+    # Custom route mode (#5209). The config-only answers (a bad address, a
+    # Cloudways host) come from collection and stay; every network answer is
+    # re-earned.
+    if updated.get("customRouteReason") not in {
+        custom_route.REASON_ADDRESS_INVALID,
+        custom_route.REASON_CLOUDWAYS_HOST,
+    }:
+        updated["customRouteReason"] = None
+    updated["customRouteProbedAt"] = None
+    updated["customRouteApplicationReady"] = TRISTATE_UNKNOWN
     return updated
 
 
@@ -846,6 +978,8 @@ def apply_probe_outcomes(
     never looked" as "we looked recently" (#1273 §4).
     """
     updated = _clear_probe_facts(facts)
+    if custom_route_mode(facts):
+        return _apply_custom_route_outcomes(updated, outcomes, probed_at=probed_at)
 
     reachability = next(
         (o for o in outcomes if o.name == CHECK_TAILNET_REACHABILITY), None
@@ -906,6 +1040,42 @@ def apply_probe_outcomes(
 
     if observed:
         updated["serveProbedAt"] = probed_at
+    return updated
+
+
+def _apply_custom_route_outcomes(
+    updated: Dict[str, Any],
+    outcomes: List[ProbeOutcome],
+    *,
+    probed_at: Optional[str],
+) -> Dict[str, Any]:
+    """Fold the custom route check and the loopback verifier into facts.
+
+    Same stamping rule as the tailnet lane: ``customRouteProbedAt`` is set
+    only when a check actually produced an answer, so "we never looked" never
+    reads as "we looked recently".
+    """
+    route = next((o for o in outcomes if o.name == CHECK_CUSTOM_ROUTE), None)
+    application = next(
+        (o for o in outcomes if o.name == CHECK_RELAY_APPLICATION), None
+    )
+    observed = False
+    if route is not None and route.result_code.startswith(CUSTOM_ROUTE_OUTCOME_PREFIX):
+        reason = route.result_code[len(CUSTOM_ROUTE_OUTCOME_PREFIX):]
+        if reason in custom_route.REASONS and reason != custom_route.REASON_NOT_CHECKED:
+            updated["customRouteReason"] = reason
+            observed = True
+    if application is not None:
+        if application.result_code == OUTCOME_RELAY_ACCEPTED:
+            updated["customRouteApplicationReady"] = TRISTATE_YES
+            observed = True
+        elif application.result_code == OUTCOME_RELAY_REJECTED:
+            # On loopback there is no third party in the way: a rejection is
+            # this relay refusing this host's credential.
+            updated["customRouteApplicationReady"] = TRISTATE_NO
+            observed = True
+    if observed:
+        updated["customRouteProbedAt"] = probed_at
     return updated
 
 

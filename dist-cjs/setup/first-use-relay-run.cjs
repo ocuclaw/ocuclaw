@@ -20,7 +20,8 @@ const WAKE_PASSED = "The first-use test passed: the phone got a reply, the glass
 
 const WAKE_FULL_WRAP = "the full wrap: read references/wrap-feedback.md (wrap_feedback) and give every item in order, donation line last";
 
-const WAKE_WRAP_NO_EXEC = "The route and pairing are already verified, so run no probe commands for the wrap (no tailscale, openclaw or network checks); reading the skill's reference files is fine. Take facts from this chat and ocuclaw_setup, and write unknown for anything missing.";
+const WAKE_NEXT = "This chat runs setup through ocuclaw_setup next: call next now, say its `say` lines word for word and follow its input. Do not call first_use_begin, first_use_retry or first_use_confirm yourself, and give no other wrap-up.";
+const WAKE_WRAP_NO_EXEC ="The route and pairing are already verified, so run no probe commands for the wrap (no tailscale, openclaw or network checks); reading the skill's reference files is fine. Take facts from this chat and ocuclaw_setup, and write unknown for anything missing.";
 
 const FIRST_USE_RELAY_ARM_LINES = Object.freeze([
   "On your phone, in OcuClaw, send hello (any message works).",
@@ -99,6 +100,14 @@ function buildFirstUseWakeMessage(outcome     , detail      = {}) {
     default:
       throw new Error("setup-relay-ending-invalid");
   }
+
+  if (detail.viaNext === true) {
+    body = outcome === "passed"
+      ? [WAKE_PASSED, detail.linesShown === true
+        ? "The completion lines above are already shown in this chat, so do not repeat them."
+        : `Start your reply at once with these lines, one per line, word for word: ${quotedLines}`, WAKE_NEXT]
+      : [body[0], WAKE_NEXT];
+  }
   return [WAKE_HEADER, ...body, ...(footer ? [footer] : [])].join(" ");
 }
 
@@ -137,6 +146,9 @@ function createFirstUseRelayRun(deps     ) {
     });
   let run      = null;
   let setupSession      = null;
+
+  const viaNext = (sessionKey     ) => !!setupSession && setupSession.viaNext === true
+    && setupSession.setupSessionKey === sessionKey;
   const wakeRunIds      = new Set();
   const background      = new Set();
   let stopped = false;
@@ -203,7 +215,7 @@ function createFirstUseRelayRun(deps     ) {
     const linesShown = outcome === "passed" && r.relayRun.deliver !== true
       ? await showLines(r.relayRun.setupSessionKey, lines) : false;
     const message = buildFirstUseWakeMessage(outcome, { ...detail, stage, binding: firstUseBinding(r),
-      lines, linesShown, windowMs: windows.replyMs });
+      lines, linesShown, windowMs: windows.replyMs, viaNext: viaNext(r.relayRun.setupSessionKey) });
     await sendWake(r.relayRun.setupSessionKey, message, r.relayRun.deliver === true, r.attemptId);
   }
 
@@ -338,9 +350,13 @@ function createFirstUseRelayRun(deps     ) {
     running() { return !!run; },
 
     isWakeRun(runId     ) { return typeof runId === "string" && wakeRunIds.has(runId); },
+
     noteSetupSession(session     ) {
       if (!session?.setupSessionKey) return;
-      setupSession = { ...session, at: now() };
+      const viaNext = session.via === "next"
+        || (setupSession?.setupSessionKey === session.setupSessionKey && setupSession.viaNext === true);
+      const { via: _via, ...rest } = session;
+      setupSession = { ...rest, viaNext, at: now() };
     },
     setupSession() { return setupSession; },
 
@@ -359,7 +375,7 @@ function createFirstUseRelayRun(deps     ) {
         }
         if (stopped) return;
         log("first_use_pairing_wake", { connected });
-        await sendWake(session.setupSessionKey, buildFirstUseWakeMessage("phone-paired", { connected }), session.deliver === true, null);
+        await sendWake(session.setupSessionKey, buildFirstUseWakeMessage("phone-paired", { connected, viaNext: viaNext(session.setupSessionKey) }), session.deliver === true, null);
       })());
       return true;
     },
@@ -370,4 +386,4 @@ function createFirstUseRelayRun(deps     ) {
   return api;
 }
 
-module.exports = { createFirstUseRelayRun, buildFirstUseWakeMessage, firstUseSetupSessionFromContext, FIRST_USE_RELAY_ARM_LINES, FIRST_USE_RELAY_ARM_ACTION, FIRST_USE_RELAY_WELCOME_LINES, FIRST_USE_RELAY_REPLY_WINDOW_MS, FIRST_USE_RELAY_WELCOME_WINDOW_MS, FIRST_USE_RELAY_TICK_MS, FIRST_USE_RELAY_MAX_AUTO_RENDERS, FIRST_USE_RELAY_WAKE_RETRY_MS, FIRST_USE_RELAY_PAIRED_PHONE_WAIT_MS, FIRST_USE_RELAY_SETUP_SESSION_TTL_MS };
+module.exports = { FIRST_USE_RELAY_REPLY_WINDOW_MS, FIRST_USE_RELAY_WELCOME_WINDOW_MS, FIRST_USE_RELAY_TICK_MS, FIRST_USE_RELAY_MAX_AUTO_RENDERS, FIRST_USE_RELAY_WAKE_RETRY_MS, FIRST_USE_RELAY_PAIRED_PHONE_WAIT_MS, FIRST_USE_RELAY_SETUP_SESSION_TTL_MS, FIRST_USE_RELAY_ARM_LINES, FIRST_USE_RELAY_ARM_ACTION, FIRST_USE_RELAY_WELCOME_LINES, buildFirstUseWakeMessage, firstUseSetupSessionFromContext, createFirstUseRelayRun };

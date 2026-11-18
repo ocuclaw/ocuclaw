@@ -1,23 +1,65 @@
 manifest_version: 1
 name: ocuclaw
 kind: platform
-version: 2.1.2
+version: 2.2.0
 description: >
   OcuClaw platform adapter for the hermes gateway. Spawns the shared OcuClaw
   Node runtime (glasses/phone relay, Even-AI endpoint, liveui engine) as a
   supervised child and bridges it over an NDJSON-over-stdio control link.
 author: OcuClaw
+# Catalog admission (#6383). The SemVer floor is SUPPORTED_HERMES_MIN in
+# health.py and adapter.py (test_pin_coherence.py holds them together). Floor
+# only, as plugin-catalog rule 14 asks: the adapter's own gate keeps the upper
+# bound, so a too-new host still loads the plugin and shows the setup
+# diagnostic row instead of skipping it before import.
+requires_hermes: ">=0.21.4"
+
+# The optional keys a person brings, declared so Hermes knows them (catalogue
+# rule 11, #6402). `type: secret` values live in the profile's `.env` under
+# `env:`, never in config.yaml, and the plugin reads them only through
+# Hermes's `get_secret`. None is an install-time prompt. The Relay Credential
+# is not listed: OcuClaw generates it on first start, every paired phone
+# shares it, and the manifest never names it (test_hermes_020_contract).
+config_schema:
+  soniox_api_key:
+    type: secret
+    env: OCUCLAW_SONIOX_API_KEY
+    label: Soniox API key
+    description: Optional. Used for Soniox speech-to-text.
+  even_ai_token:
+    type: secret
+    env: OCUCLAW_EVEN_AI_TOKEN
+    label: Even AI token
+    description: Optional. The token for the Even AI endpoint.
+  typesafe_api_key:
+    type: secret
+    env: OCUCLAW_TYPESAFE_API_KEY
+    label: TypeSafe API key
+    description: Optional. One key for every Jev feature; TYPESAFE_API_KEY is the fallback.
 # Hermes discovers the optional full-page tab from dashboard/manifest.json.
 # The adjacent dashboard/README.md records the rejected frontend-toolchain
 # decision and the read-only SDK discipline.
 provides_tools:
-  - render_glasses_ui
   - get_glasses_ui_state
   - manage_liveui_templates
   - manage_liveui_tasks
+  - compose_glasses_ui
   - get_current_location
   - get_evenrealities_device_info
   - set_session_title
+  - write_glasses_card
+  - save_glasses_card
+  - ask_glasses_card
+  - glasses_card_command
+  - edit_glasses_card
+  - look_glasses_card
+  - glasses_card_draft
+  - request_card_mcp_write
+  - request_host_command
+  - request_card_setup
+  - get_ocuclaw_settings
+  - set_ocuclaw_setting
+  - show_bot_screen
   - ocuclaw_setup
 provides_hooks:
   - on_session_end
@@ -30,16 +72,17 @@ provides_hooks:
   # finalize_turn, so post_api_request and on_session_end never run. This is
   # the only signal left on that path, and every supported engine fires it.
   - api_request_error
+  # Observe the completed response before the native gateway display wrapper.
+  - post_llm_call
   # Registered ONLY on hosts whose hook vocabulary has it (0.20.5+). Hermes
   # 0.20 never consumes provides_hooks, so declaring it here is descriptive,
   # not a load-time promise; the adapter's register-time probe decides.
   - on_interim_message
-  # Registered only where the host has them AND the operator opted in with
+  # Registered only where the host has them AND setup or the operator saved
   # `plugins.stream_reasoning_deltas: true` — registering any on_stream_* hook
-  # changes the provider call shape for every surface on the gateway. Still an
-  # opt-in, but a GUIDED one: `/ocuclaw-setup` reports the key's state and
-  # offers to write it (`enable_stream_reasoning_deltas`, `confirm: true`
-  # required) rather than leaving it to a paragraph in the README.
+  # can change the provider call path for every surface on the gateway.
+  # Fresh setup defaults an unset key on and preserves saved choices;
+  # updates still offer it. Nothing writes the key during registration.
   - on_stream_start
   - on_stream_delta
   - on_stream_end
@@ -50,3 +93,40 @@ provides_hooks:
   # Scoped to one in-flight OcuClaw transcription by a contextvar — every
   # other transcription on the gateway passes through untouched.
   - pre_transcription
+  # Registered ONLY on hosts whose hook vocabulary has it. An observer: it
+  # ties an approval to its tool call so the glasses card can carry that
+  # call's purpose line. It never answers or changes the approval.
+  - pre_approval_request
+  # Run signals for the glasses status lens (`runSignal`): model-call,
+  # subagent and compaction spans. Observers only; none changes a provider
+  # call. Each is registered ONLY where the host's hook vocabulary has it, and
+  # a start/stop pair only whole: pre_api_request and the subagent pair are in
+  # the 0.21.1 floor, the auxiliary pair (compaction) arrived in 0.21.5.
+  # The auxiliary pair also counts OcuClaw's own auxiliary calls (explainer,
+  # live view refresh, input predictions): per-task counts, never the prompt.
+  - pre_api_request
+  - subagent_start
+  - subagent_stop
+  - pre_auxiliary_call
+  - post_auxiliary_call
+  # Registered ONLY on hosts whose hook vocabulary has both (0.21.6+).
+  # Observers: they list prompts that block an agent on another surface
+  # ("Waiting on you"). They never answer, delay or change a prompt.
+  - on_human_input_request
+  - on_human_input_resolved
+  # Registered ONLY on hosts whose hook vocabulary has it (0.22.3+). An
+  # observer: it counts each committed compaction, so the glasses and phone
+  # show an exact count, and tells the relay at once. It never changes one.
+  - post_compaction
+  # Registered ONLY on hosts whose hook vocabulary has it (0.22.3+). An
+  # observer: after a chat is deleted or archived on another surface, the
+  # glasses picker drops it at once. It never changes the delete.
+  - on_session_delete
+# Registered ONLY on hosts with request middleware (0.21.5+). Strips the
+# approval `purpose` field from tool calls on every platform, and adds it to
+# the tool schema on OcuClaw sessions while "Explain commands" is on.
+# `hermes plugins validate` fails a plugin that registers undeclared
+# middleware.
+provides_middleware:
+  - llm_request
+  - tool_request

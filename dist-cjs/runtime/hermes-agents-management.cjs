@@ -63,4 +63,4 @@ const AGENT_ERRORS                         = {
   setup_failed: "Setup could not finish. Check that Hermes is running, then try again.",
 };
 
-module.exports = { AGENT_OPERATIONS, AGENT_ERRORS, agentsRequest, agentsResult };
+module.exports = { AGENT_OPERATIONS, agentsRequest, agentsResult, AGENT_ERRORS };

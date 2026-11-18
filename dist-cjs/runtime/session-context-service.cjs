@@ -43,7 +43,7 @@ function persistModelContextWindowCache(cachePath, cache) {
   }
 }
 
-function isMethodNotFoundError(err) {
+function isMethodNotFoundError(err     ) {
   if (!err) return false;
   const code = err.code ?? (err.error && err.error.code);
   if (code === -32601 || code === "METHOD_NOT_FOUND") return true;
@@ -64,6 +64,9 @@ function createSessionContextService(opts) {
       ? opts.getActiveModelContextWindow
       : () => 0;
 
+  const isDraftSession =
+    typeof opts.isDraftSession === "function" ? opts.isDraftSession : () => false;
+
   let lastSnapshot = null;
 
   const modelContextWindowCachePath = resolveModelContextWindowCachePath(opts.stateDir);
@@ -72,11 +75,11 @@ function createSessionContextService(opts) {
 
   let compactionListUnsupported = false;
 
-  function requestCompactionList(sessionKey) {
+  function requestCompactionList(sessionKey     ) {
     if (compactionListUnsupported) return Promise.resolve(null);
     return gatewayBridge
       .request("sessions.compaction.list", { key: sessionKey })
-      .catch((err) => {
+      .catch((err     ) => {
         if (isMethodNotFoundError(err)) compactionListUnsupported = true;
         return null;
       });
@@ -106,10 +109,10 @@ function createSessionContextService(opts) {
         : null;
     if (!session) return broadcastUnknownSessionContext(sessionKey);
 
-    const contextTokens = Number.isFinite(session.totalTokens)
+    let contextTokens = Number.isFinite(session.totalTokens)
       ? Math.floor(session.totalTokens)
       : 0;
-    const contextTokensKnown = session.contextTokensKnown !== false;
+    let contextTokensKnown = session.contextTokensKnown !== false;
     const describeWindow = Number.isFinite(session.contextTokens)
       ? Math.floor(session.contextTokens)
       : 0;
@@ -133,12 +136,22 @@ function createSessionContextService(opts) {
       contextWindow = modelContextWindowCache.get(modelKey);
     }
 
+    if (!contextTokensKnown && session.messageCount === 0 && contextWindow > 0) {
+      contextTokens = 0;
+      contextTokensKnown = true;
+    }
+
     const compactionCountKnown =
       !!compactionResp && Array.isArray(compactionResp.checkpoints);
     const compactionCount = compactionCountKnown ? compactionResp.checkpoints.length : 0;
     const compactionKind = compactionResp && compactionResp.metric === "hops"
       ? "hops"
       : "compactions";
+
+    const compactionCountLive = compactionCountKnown && compactionResp.live === true;
+
+    const contextTokensEstimated =
+      contextTokensKnown && contextTokens > 0 && session.contextTokensEstimated === true;
 
     const snapshot = {
       type: "ocuclaw.session.context.snapshot",
@@ -149,6 +162,9 @@ function createSessionContextService(opts) {
       compactionCount,
       compactionCountKnown,
       compactionKind,
+
+      ...(compactionCountLive ? { compactionCountLive: true } : {}),
+      ...(contextTokensEstimated ? { contextTokensEstimated: true } : {}),
       runActive: !!getRunActive(),
       snapshotAtMs: nowMs(),
 
@@ -171,11 +187,12 @@ function createSessionContextService(opts) {
     } else if (modelKey && modelContextWindowCache.has(modelKey)) {
       contextWindow = modelContextWindowCache.get(modelKey);
     }
+    const emptyDraft = contextWindow > 0 && !!isDraftSession(sessionKey);
     const snapshot = {
       type: "ocuclaw.session.context.snapshot",
       sessionKey,
       contextTokens: 0,
-      contextTokensKnown: false,
+      contextTokensKnown: emptyDraft,
       contextWindow,
       compactionCount: 0,
       compactionCountKnown: false,

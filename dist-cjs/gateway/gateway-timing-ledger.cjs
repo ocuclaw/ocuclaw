@@ -111,6 +111,12 @@ function gatewayEventText(args) {
   return null;
 }
 
+function gatewayEventErrorReason(args                    )                {
+  if (!isObject(args.data)) return null;
+  const reason = (args.data                           ).reason;
+  return typeof reason === "string" ? reason.slice(0, 80) : null;
+}
+
 function isAgentGatewayEvent(args) {
   const kind = pickId(args.kind ?? args.type ?? args.eventType);
   if (kind === "agent") return true;
@@ -291,6 +297,7 @@ function createGatewayTimingLedger(opts = {}) {
       const stream = pickId(args.stream ?? args.channel);
       const phase = pickId(args.phase ?? args.state);
       const text = gatewayEventText(args);
+      const errorReason = gatewayEventErrorReason(args);
       const isLifecycleStart = stream === "lifecycle" && phase === "start";
 
       if (run && isLifecycleStart) {
@@ -317,6 +324,7 @@ function createGatewayTimingLedger(opts = {}) {
         rawAssistantChars:
           stream === "assistant" && text != null ? text.length : null,
         pendingRequests: requests.size,
+        ...(stream === "error" && errorReason != null ? { errorReason } : {}),
       };
       emit(
         CATEGORY_OPENCLAW_RUN,

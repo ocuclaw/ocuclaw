@@ -39,6 +39,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -50,7 +51,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, TextIO
 
-from . import uninstall_gate
+from . import delegation_handoffs, secret_access, uninstall_gate
+from .sender_approval import PAIRING_STORE_FILES
+from .task_page_watch import PAGES_DIRNAME, SCRIPT_NAME as PAGE_WATCH_SCRIPT_NAME
+from .task_reminders import REMINDERS_DIRNAME, SCRIPT_NAME as REMINDER_SCRIPT_NAME
 
 
 EXIT_OK = 0
@@ -70,6 +74,15 @@ SECRET_KEYS: Sequence[str] = (
     "OCUCLAW_TYPESAFE_API_KEY",
 )
 
+# Non-secret OcuClaw platform settings that setup writes to the profile env
+# file through Hermes's own writer. `cloudways_settings` writes
+# OCUCLAW_ALLOW_ADMIN_FROM for "Continue here", and the adapter seeds it into
+# `platforms.ocuclaw.extra` at gateway start. Left behind, a reinstall's
+# settings step read Continue here as already on and skipped it (#7560).
+# Same rule as the secrets: the profile file's line goes, a value only the
+# process environment sets is reported as externally supplied and kept.
+SETTING_ENV_KEYS: Sequence[str] = ("OCUCLAW_ALLOW_ADMIN_FROM",)
+
 # Exact files written beneath the adapter's default Node runtime stateDir.
 # Several names predate the Hermes lane, so the uninstall accepts only the
 # dedicated <HERMES_HOME>/ocuclaw directory rather than trusting an arbitrary
@@ -88,16 +101,40 @@ RUNTIME_STATE_FILES: Sequence[str] = (
     # Written by the Node runtime's saved-prompts store
     # (extensions/ocuclaw/src/runtime/saved-prompts-store.ts).
     "ocuclaw-saved-prompts.json",
+    "ocuclaw-saved-prompts.json.tmp",
     "ocuclaw-session-agents.json",
     "ocuclaw-session-pins.json",
     "ocuclaw-settings.json",
+    # The settings store's write sidecar, left by a crash mid-write.
+    "ocuclaw-settings.json.tmp",
     "ocuclaw-stable-prompts.json",
+    # setup_next.SETUP_NEXT_ANSWERS_FILENAME: the step machine's answers and
+    # moments, the wearer's first-message yes among them. Left behind, a
+    # reinstall's setup read it and said done without pairing.
+    "ocuclaw.setup-next.json",
     "session-agent-cache.json",
     "session-first-user-cache.json",
     "session-overrides.json",
     "session-title-cache.json",
 )
-RUNTIME_STATE_DIRS: Sequence[str] = ("internal-agent-runs",)
+# Moved-aside copies of an unreadable Node store file (#7315). The settings and
+# saved-prompts stores rename the file to `<name>.corrupt-<ms>` or
+# `<name>.v<version>-<ms>` before writing defaults
+# (extensions/ocuclaw/src/runtime/state-file-quarantine.ts). A settings copy
+# can hold the Even AI peer bearer token and forward secret, so uninstall
+# removes them, and a leftover copy would also keep the runtime dir alive. The
+# pattern is anchored to these three stores so a wearer's own look-alike file
+# (`ocuclaw-settings.json.backup`) stays.
+RUNTIME_QUARANTINE_PATTERN = re.compile(
+    r"(ocuclaw-settings|even-ai-settings|ocuclaw-saved-prompts)\.json\.(corrupt|v[^-/]*)-\d+"
+)
+RUNTIME_STATE_DIRS: Sequence[str] = (
+    "internal-agent-runs",
+    # task_reminders: one folder per fixed-text reminder Task (#5036).
+    REMINDERS_DIRNAME,
+    # task_page_watch: one folder per Task that watches a page (#5039).
+    PAGES_DIRNAME,
+)
 
 # Exact files written beneath <HERMES_HOME>/state by the Python adapter.
 #
@@ -109,15 +146,30 @@ RUNTIME_STATE_DIRS: Sequence[str] = ("internal-agent-runs",)
 # are OcuClaw-owned files even though no product state ever reaches them.
 PROFILE_STATE_FILES: Sequence[str] = (
     ".ocuclaw.relay-credential.json.lock",
+    # aux_usage.STORE_FILENAME, its write sidecar and its one moved-aside
+    # copy: OcuClaw's own per-task aux call counts (#5046).
+    ".ocuclaw.aux-usage.json.tmp",
+    "ocuclaw.aux-usage.corrupt.json",
+    "ocuclaw.aux-usage.json",
+    # compaction_ledger.STORE_FILENAME, its write sidecar, its merge lock and
+    # its one moved-aside copy: per-session compaction counts.
+    ".ocuclaw.compactions.json.tmp",
+    ".ocuclaw.compactions.lock",
+    "ocuclaw.compactions.corrupt.json",
+    "ocuclaw.compactions.json",
     # The Board store (board_watch.STORE_FILENAME) and the SQLite sidecars
     # that carry its name while a connection is open or was interrupted.
     "ocuclaw-board.db",
     "ocuclaw-board.db-journal",
     "ocuclaw-board.db-shm",
     "ocuclaw-board.db-wal",
+    # desktop_fleet.FILENAME: the Desktop presenter's owned machine inventory.
+    "ocuclaw-desktop-fleet.json",
     "ocuclaw.app-presence.json",
     "ocuclaw.cloudways-restart-pending.json",
     "ocuclaw.cloudways-setup.json",
+    # cloudways_setup.LOCK_FILENAME: one setup run at a time.
+    "ocuclaw.cloudways-setup.lock",
     "ocuclaw.desktop-credentials.json",
     "ocuclaw.desktop-credentials.lock",
     "ocuclaw.desktop-pairing-activation.json",
@@ -127,12 +179,26 @@ PROFILE_STATE_FILES: Sequence[str] = (
     "ocuclaw.first-run-proof.json",
     "ocuclaw.first-run-proof.lock",
     "ocuclaw.first-run-reply-delivery.json",
+    # receipts.GATEWAY_SENDER_GATE_FILENAME (the adapter's view for doctor).
+    "ocuclaw.gateway-sender-gate.json",
     # optional_setup.ACTIVE / optional_setup.LOCK.
     "ocuclaw.optional-active.json",
     "ocuclaw.optional-setup.lock",
     "ocuclaw.pairing-completion.json",
     "ocuclaw.relay-credential.json",
+    # receipts.SERVING_FILENAME: the version the gateway serves, for the
+    # Desktop card's restart-to-finish hint.
+    "ocuclaw.serving.json",
+    # task_away.STATE_FILENAME: when the glasses were last seen and which
+    # Task jobs OcuClaw paused while they were away (#5037).
+    "ocuclaw.task-away.json",
     "ocuclaw.tui-pairing-capability.json",
+    # The Task Result store (task_results.STORE_FILENAME, #5026) and the
+    # SQLite sidecars that carry its name.
+    "task_results.sqlite3",
+    "task_results.sqlite3-journal",
+    "task_results.sqlite3-shm",
+    "task_results.sqlite3-wal",
     # uninstall_gate.MARKER_FILENAME. Listed for completeness; removal skips
     # it in the bulk pass and deletes it last, once the plugin is gone, so a
     # failed run leaves OcuClaw off and the same command retryable (#3765).
@@ -141,7 +207,18 @@ PROFILE_STATE_FILES: Sequence[str] = (
 
 # Exact files written directly beneath <HERMES_HOME> (not its state dir).
 # restart_rpc.py keeps its restart-operation receipts there.
-HOME_STATE_FILES: Sequence[str] = ("ocuclaw-restart-receipts.json",)
+HOME_STATE_FILES: Sequence[str] = (
+    "ocuclaw-restart-receipts.json",
+    # Hermes' own pairing store files for the ocuclaw platform: the glasses
+    # approval pairing records (sender_approval.py), plus any request a
+    # refused glasses message left. No other platform writes these names.
+    *PAIRING_STORE_FILES,
+    # The scripts OcuClaw installs for Hermes' scheduler: one prints a
+    # reminder's text with no model call (task_reminders, #5036), the other
+    # reads a watched page's visible text (task_page_watch, #5039).
+    f"scripts/{REMINDER_SCRIPT_NAME}",
+    f"scripts/{PAGE_WATCH_SCRIPT_NAME}",
+)
 
 
 def _default_liveui_library_dir() -> Path:
@@ -480,26 +557,50 @@ def _remove_plugin_registry(document: Dict[str, Any]) -> bool:
     return changed
 
 
+#: Config entries keyed by OcuClaw's platform name. One list feeds both the
+#: removal and the ``configurationAbsent`` check, so the two cannot drift.
+#:
+#: The three ``*_toolsets`` records are Hermes's tool-picker save for the
+#: ``ocuclaw`` platform (``hermes_cli.tools_config._save_platform_tools``). They
+#: are written when anyone saves that platform's tools, OcuClaw's Board
+#: default-on included (``board_tools``: ``hermes tools enable kanban
+#: --platform ocuclaw``). They are keyed only by this platform, mean nothing
+#: without it, and left behind they hand a reinstall the old tool choices.
+OWNED_CONFIG_PATHS: Sequence[tuple[str, ...]] = (
+    ("platforms", PLUGIN_NAME),
+    ("display", "platforms", PLUGIN_NAME),
+    ("platform_toolsets", PLUGIN_NAME),
+    ("known_plugin_toolsets", PLUGIN_NAME),
+    ("known_builtin_toolsets", PLUGIN_NAME),
+)
+
+
+def _nested_present(document: Mapping[str, Any], keys: Sequence[str]) -> bool:
+    current: Any = document
+    for key in keys[:-1]:
+        current = current.get(key) if isinstance(current, Mapping) else None
+    return isinstance(current, Mapping) and keys[-1] in current
+
+
 def _without_ocuclaw_config(
     document: Mapping[str, Any],
 ) -> tuple[Dict[str, Any], bool]:
     updated = copy.deepcopy(dict(document))
     changed = False
-    changed |= _remove_nested(updated, "platforms", PLUGIN_NAME)
-    changed |= _remove_nested(updated, "display", "platforms", PLUGIN_NAME)
+    for keys in OWNED_CONFIG_PATHS:
+        changed |= _remove_nested(updated, *keys)
     changed |= _remove_plugin_registry(updated)
+    # "Asks other agents" (#6797): without OcuClaw, a profile still on the
+    # `ocuclaw-agents` delegation backend fails delegation closed. Put back
+    # the backend it replaced, in the same write as the rest.
+    updated, handoffs_changed = delegation_handoffs.switched_off(updated)
+    changed |= handoffs_changed
     return updated, changed
 
 
 def _config_absent(document: Mapping[str, Any]) -> bool:
-    platforms = document.get("platforms")
-    if isinstance(platforms, Mapping) and PLUGIN_NAME in platforms:
+    if any(_nested_present(document, keys) for keys in OWNED_CONFIG_PATHS):
         return False
-    display = document.get("display")
-    if isinstance(display, Mapping):
-        display_platforms = display.get("platforms")
-        if isinstance(display_platforms, Mapping) and PLUGIN_NAME in display_platforms:
-            return False
     plugins = document.get("plugins")
     if isinstance(plugins, Mapping):
         for key in ("enabled", "disabled"):
@@ -512,9 +613,25 @@ def _config_absent(document: Mapping[str, Any]) -> bool:
     return True
 
 
+def _runtime_quarantine_files(runtime_state_dir: Path) -> list[Path]:
+    """Moved-aside store copies in the runtime dir (``RUNTIME_QUARANTINE_PATTERN``)."""
+
+    try:
+        names = os.listdir(runtime_state_dir)
+    except OSError:
+        return []
+    return [
+        runtime_state_dir / name
+        for name in sorted(names)
+        if RUNTIME_QUARANTINE_PATTERN.fullmatch(name)
+    ]
+
+
 def _runtime_state_absent(runtime_state_dir: Path) -> bool:
-    return all(_path_absent(runtime_state_dir / name) for name in RUNTIME_STATE_FILES) and all(
-        _path_absent(runtime_state_dir / name) for name in RUNTIME_STATE_DIRS
+    return (
+        all(_path_absent(runtime_state_dir / name) for name in RUNTIME_STATE_FILES)
+        and all(_path_absent(runtime_state_dir / name) for name in RUNTIME_STATE_DIRS)
+        and not _runtime_quarantine_files(runtime_state_dir)
     )
 
 
@@ -664,13 +781,15 @@ _TAILSCALED_LOG_PREFIX = "tailscaled.log"
 def _cloudways_owned_present(layout: Any) -> bool:
     """Plugin-owned Cloudways evidence, never bare binaries.
 
-    ``~/bin/tailscale`` on its own may be the user's; the watchdog job and
-    script, this plugin's tgz install receipt, or a host CLI receipt naming
-    this provisioner are ours.
+    ``~/bin/tailscale`` on its own may be the user's; the runtime supervision
+    state, a leftover watchdog job or script, this plugin's tgz install
+    receipt, or a host CLI receipt naming this provisioner are ours.
     """
 
     from . import cloudways, receipts
 
+    if cloudways.read_hermes_state(layout) is not None:
+        return True
     if cloudways.find_watchdog_job(layout) is not None:
         return True
     if layout.script_path.exists() or layout.tgz_receipt.exists():
@@ -756,10 +875,59 @@ def _cloudways_route_handled(home: Path) -> bool:
         return False
 
 
+def _default_carry_on_remove() -> Optional[str]:
+    """Take setup's carry-on line out of ``~/.bashrc``. The file, when a line went.
+
+    The line runs ``hermes ocuclaw cloudways setup`` in the next WebUI
+    terminal, which after this command would set up a half-removed plugin.
+    The WebUI's shell is bash whatever shell runs this command, so the file is
+    ``$HOME/.bashrc`` either way. Raises ``OSError`` when a line is there and
+    could not be taken out.
+    """
+
+    from . import webui_terminal
+
+    env = dict(os.environ)
+    env["SHELL"] = "/bin/bash"
+    if not str(env.get("HOME") or "").strip():
+        env["HOME"] = str(Path.home())
+    if not webui_terminal.has_carry_on(env):
+        return None
+    if not webui_terminal.remove_carry_on(env):
+        raise OSError("setup's carry-on line could not be taken out")
+    return str(webui_terminal.startup_file(env))
+
+
+def _forget_carry_on(
+    remove_fn: Callable[[], Optional[str]], removed: Optional[list] = None
+) -> None:
+    """Best effort: a ``~/.bashrc`` that cannot be written never fails the uninstall.
+
+    The line stops by itself within a day (``webui_terminal.CARRY_ON_WINDOW_S``).
+    """
+
+    try:
+        gone = remove_fn()
+    except Exception:  # noqa: BLE001 - the line's own deadline still ends it
+        return
+    if gone and removed is not None:
+        # One line out of the file, never the file: named like `secret:<key>`.
+        removed.append(f"carry-on-line:{gone}")
+
+
+def _default_bot_screen_remove() -> Mapping[str, Any]:
+    """The no-admin Bot Screen install (#7571), when there is one; never raises."""
+    import io
+
+    from . import bot_screen_rootless
+
+    return bot_screen_rootless.remove(out=io.StringIO())
+
+
 def _default_cloudways_teardown(home: Path) -> Optional[Dict[str, Any]]:
     """Undo the Cloudways install when plugin-owned pieces exist, else None.
 
-    Runs while the gateway (and the watchdog's daemon) may still be up, so the
+    Runs while the gateway (and the daemon it keeps alive) may still be up, so the
     rollback's port-scoped ``serve ... off`` still reaches the daemon. The
     identity under ``~/.tailscale`` is purged unless a foreign install owns
     the host receipt (the rollback's own keep rule).
@@ -773,8 +941,10 @@ def _default_cloudways_teardown(home: Path) -> Optional[Dict[str, Any]]:
     report = dict(cloudways.rollback(layout, purge_identity=True))
     removed = list(report.get("removed") or [])
     preserved: Dict[str, str] = {}
+    # Only our `~/bin` download is ever ours to remove; the image's /usr/bin
+    # pair is not, whichever one the layout runs.
     binaries_removed = not report.get("binariesKept") and _path_absent(
-        layout.tailscaled
+        layout.bundled_tailscaled
     )
     note = _remove_tailscaled_log_dir(
         layout.legacy_supervisor_dir, removed, binaries_removed=binaries_removed
@@ -846,24 +1016,66 @@ def _strict_raw_config(home: Path) -> Dict[str, Any]:
 
 
 def _profile_env_key_present(home: Path, key: str) -> Optional[bool]:
+    """Whether [home]'s own secret store still sets [key]; None when unknown.
+
+    Read through Hermes's scope builder for that profile (catalogue rule 11),
+    never by parsing ``.env``, and without the process environment, which the
+    removal loop already reports as externally supplied. A symlinked ``.env``
+    is checked by path only: it is not a direct profile file, so the proof is
+    unknown rather than read through the link.
+    """
     path = home / ".env"
     if path.is_symlink() or _resolved(path) != path.expanduser().absolute():
         return None
-    try:
-        lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return None
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.startswith("export "):
-            stripped = stripped[7:].lstrip()
-        if stripped.startswith(f"{key}="):
-            return True
-    return False
+    value = secret_access.read_stored_secret(key, home)
+    return None if value is None else bool(value)
+
+
+def _remove_env_keys(
+    api: Any,
+    keys: Sequence[str],
+    *,
+    label: str,
+    removed: list[str],
+    failures: list[str],
+    externally_supplied: list[str],
+) -> None:
+    """Take [keys] out of the profile env file through Hermes's own writer.
+
+    A key that only the process environment sets (the container, the shell)
+    is not in the file, so Hermes's remover reports nothing removed; it is
+    named in ``externally_supplied`` and left to its owner. No value ever
+    enters the receipt, only ``<label>:<key>``.
+    """
+
+    for key in keys:
+        try:
+            before = api.get_env_value(key)
+            removed_from_profile = False
+            if before is not None:
+                removed_from_profile = bool(api.remove_env_value(key))
+            if api.get_env_value(key) is not None:
+                failures.append(f"{label}:{key}")
+            elif removed_from_profile:
+                removed.append(f"{label}:{key}")
+            elif before is not None:
+                externally_supplied.append(key)
+        except Exception:  # noqa: BLE001 - no value enters the receipt
+            failures.append(f"{label}:{key}")
+
+
+def _profile_env_keys_absent(
+    present_fn: Callable[[str], Optional[bool]], keys: Sequence[str]
+) -> bool:
+    """True only when the profile's own store provably sets none of [keys]."""
+
+    absent = True
+    for key in keys:
+        try:
+            absent = absent and present_fn(key) is False
+        except Exception:  # noqa: BLE001
+            absent = False
+    return absent
 
 
 def _try_profile_lock(home: Path) -> Any:
@@ -1173,6 +1385,8 @@ def run_uninstall(
     cloudways_teardown_fn: Optional[
         Callable[[Path], Optional[Mapping[str, Any]]]
     ] = None,
+    carry_on_remove_fn: Optional[Callable[[], Optional[str]]] = None,
+    bot_screen_remove_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
     liveui_library_dir: Optional[Path] = None,
     cancel: bool = False,
     input_fn: Any = input,
@@ -1252,6 +1466,17 @@ def run_uninstall(
         not _path_absent(desktop_pairing_plugin)
         and plugin_owned(desktop_pairing_plugin)
     )
+    from .setup_command_skill import (
+        remove_owned_skill as remove_setup_command_skill,
+        skill_owned as setup_command_skill_owned,
+        skill_path as setup_command_skill_path,
+    )
+
+    setup_command_skill = setup_command_skill_path(resolved_home)
+    owns_setup_command_skill = (
+        not _path_absent(setup_command_skill)
+        and setup_command_skill_owned(setup_command_skill)
+    )
     route_path = host_route_receipt_path
     route_owned = route_receipt_owned
     if route_owned is None:
@@ -1274,6 +1499,14 @@ def run_uninstall(
         )
     )
     marker = uninstall_gate.marker_path(resolved_home)
+    # Setup's line in ~/.bashrc starts setup in the next WebUI terminal. It
+    # goes with the rest, and already when a restart is asked for, so that
+    # restart never starts setup into a plugin on its way out.
+    take_out_carry_on = (
+        carry_on_remove_fn
+        if carry_on_remove_fn is not None
+        else _default_carry_on_remove
+    )
 
     # The gate is "OcuClaw is not running", not "the gateway is stopped"
     # (#3765). On Cloudways `hermes gateway stop` restarts the container, so
@@ -1286,6 +1519,7 @@ def run_uninstall(
         if gate["markerPresent"]:
             # Phase 1 already ran: never a second marker, only the same
             # instructions again.
+            _forget_carry_on(take_out_carry_on)
             _write_receipt(
                 _restart_required_receipt(gate, marker=marker, marker_written=False),
                 json_output=json_output,
@@ -1307,7 +1541,7 @@ def run_uninstall(
                 receipt = {"status": "cancelled", "reason": "confirmation_declined"}
                 _write_receipt(receipt, json_output=json_output, stdout=out)
                 return EXIT_PROBLEM
-        return _mark_pending(
+        code = _mark_pending(
             resolved_home,
             gate,
             acquire_lock=(
@@ -1316,6 +1550,9 @@ def run_uninstall(
             json_output=json_output,
             stdout=out,
         )
+        if code == EXIT_RESTART_REQUIRED:
+            _forget_carry_on(take_out_carry_on)
+        return code
     # A present marker is the operator's recorded consent from phase 1.
     consent_recorded = bool(gate["markerPresent"])
 
@@ -1413,6 +1650,7 @@ def run_uninstall(
                 _write_receipt(receipt, json_output=json_output, stdout=out)
                 return EXIT_PROBLEM
         _release_profile_lock(profile_lock)
+        _forget_carry_on(take_out_carry_on)
         _write_receipt(
             _restart_required_receipt(
                 gate, marker=marker, marker_written=marker_written
@@ -1442,9 +1680,10 @@ def run_uninstall(
     failures: list[str] = []
     externally_supplied_secret_keys: list[str] = []
 
-    # Cloudways first (#3765): the watchdog job, userspace tailscaled, its
-    # script, binaries, receipts and identity. The `hermes ocuclaw cloudways`
-    # verbs that could undo them vanish with the plugin, and the daemon is
+    # Cloudways first (#3765): the runtime supervision state (and any old
+    # watchdog job), userspace tailscaled, binaries, receipts and identity.
+    # The `hermes ocuclaw cloudways` verbs that could undo them vanish with
+    # the plugin, and the daemon is
     # still reachable now for the port-scoped Serve teardown. A failure keeps
     # the plugin (and this command) in place for a retry.
     teardown_cloudways = (
@@ -1460,21 +1699,46 @@ def run_uninstall(
         removed.extend(str(item) for item in cloudways_report.get("removed") or ())
         if not cloudways_report.get("ok"):
             failures.append("cloudways-teardown")
+    # #7571: the no-admin Bot Screen install in the user's home folder, and only
+    # the PATH links that point into it. `hermes ocuclaw bot-screen remove` goes
+    # with the plugin, so this is the last way to take it away.
+    remove_bot_screen = (
+        bot_screen_remove_fn
+        if bot_screen_remove_fn is not None
+        else _default_bot_screen_remove
+    )
+    bot_screen_report = remove_bot_screen()
+    removed.extend(str(item) for item in bot_screen_report.get("removed") or ())
+    failures.extend(str(item) for item in bot_screen_report.get("failures") or ())
+    _forget_carry_on(take_out_carry_on, removed)
 
-    for key in SECRET_KEYS:
+    # #6797: every secondary still on `ocuclaw-agents` gets its previous
+    # delegation backend back; the default profile's restore rides the main
+    # config write below. A failure names the profile and keeps the run
+    # retryable, because a stranded backend fails that agent's delegation.
+    for name, profile_home in delegation_handoffs.profile_homes(resolved_home)[1:]:
         try:
-            before = api.get_env_value(key)
-            removed_from_profile = False
-            if before is not None:
-                removed_from_profile = bool(api.remove_env_value(key))
-            if api.get_env_value(key) is not None:
-                failures.append(f"secret:{key}")
-            elif removed_from_profile:
-                removed.append(f"secret:{key}")
-            elif before is not None:
-                externally_supplied_secret_keys.append(key)
-        except Exception:  # noqa: BLE001 - no secret value enters the receipt
-            failures.append(f"secret:{key}")
+            if delegation_handoffs.restore_home(profile_home):
+                removed.append(f"delegation-backend:{name}")
+        except Exception:  # noqa: BLE001 - reported by profile name only
+            failures.append(f"delegation-backend:{name}")
+
+    _remove_env_keys(
+        api,
+        SECRET_KEYS,
+        label="secret",
+        removed=removed,
+        failures=failures,
+        externally_supplied=externally_supplied_secret_keys,
+    )
+    _remove_env_keys(
+        api,
+        SETTING_ENV_KEYS,
+        label="setting",
+        removed=removed,
+        failures=failures,
+        externally_supplied=externally_supplied_secret_keys,
+    )
 
     state_root = resolved_home / "state"
     for name in PROFILE_STATE_FILES:
@@ -1485,6 +1749,8 @@ def run_uninstall(
         _remove_file(resolved_home / name, removed, failures)
     for name in RUNTIME_STATE_FILES:
         _remove_file(runtime / name, removed, failures)
+    for path in _runtime_quarantine_files(runtime):
+        _remove_file(path, removed, failures)
     for name in RUNTIME_STATE_DIRS:
         _remove_dir(runtime / name, removed, failures)
 
@@ -1508,6 +1774,8 @@ def run_uninstall(
             removed,
             failures,
         )
+    if owns_setup_command_skill:
+        remove_setup_command_skill(resolved_home, removed, failures)
     if owns_pairing_widget:
         _remove_file(pairing_widget, removed, failures)
     if owns_desktop_pairing_plugin:
@@ -1521,21 +1789,44 @@ def run_uninstall(
 
     route: Dict[str, Any]
     classification = observed.get("serveClassification")
-    if classification == "absent" and route_owned and route_path is not None:
-        owned_route_path = Path(route_path)
+    # The route is provably off in two cases only: this run read the port and
+    # found no route on it, or the Cloudways rollback above turned our route
+    # off through its own daemon (and then removed the receipt itself). Any
+    # other answer keeps the route state: a live route must be removed with
+    # the printed narrow command first (ADR-0026), never forgotten here.
+    route_turned_off = bool(
+        cloudways_report is not None and cloudways_report.get("serveRouteRemoved")
+    )
+    route_state_removable = route_path is not None and (
+        (classification == "absent" and bool(route_owned)) or route_turned_off
+    )
+    owned_route_path = Path(route_path) if route_path is not None else None
+    if route_state_removable and owned_route_path is not None:
         _remove_file(owned_route_path, removed, failures)
         # `receipts.route_receipt_lock` serializes on a sidecar next to the
         # receipt precisely so it survives the receipt being replaced by
         # rename. That makes it an owned OcuClaw file the receipt removal would
         # otherwise strand; it holds no state, so it goes with its receipt.
+        # The rollback removes the receipt but not this sidecar (#7560).
         _remove_file(owned_route_path.with_suffix(".lock"), removed, failures)
         route = (
-            {"action": "receipt_removed", "reason": "route_absent"}
+            {
+                "action": "receipt_removed",
+                "reason": "route_removed" if route_turned_off else "route_absent",
+            }
             if _path_absent(owned_route_path)
             else {"action": "receipt_remove_failed", "reason": "filesystem_error"}
         )
     elif classification == "absent":
         route = {"action": "absent", "reason": "no_live_route"}
+    elif (
+        route_owned
+        and owned_route_path is not None
+        and not _path_absent(owned_route_path)
+    ):
+        # Ours, but the route could not be read (no reachable tailscale, for
+        # one): it may still be live, so its receipt stays, and says so.
+        route = {"action": "preserved", "reason": "route_not_proven_off"}
     else:
         route = {"action": "preserved", "reason": "ownership_not_proven"}
 
@@ -1544,21 +1835,30 @@ def run_uninstall(
         if profile_secret_present_fn is not None
         else lambda key: _profile_env_key_present(resolved_home, key)
     )
-    profile_secrets_absent = True
-    for key in SECRET_KEYS:
-        try:
-            profile_secrets_absent = (
-                profile_secrets_absent and profile_secret_present(key) is False
-            )
-        except Exception:  # noqa: BLE001
-            profile_secrets_absent = False
-
     owned_state_checks = {
-        "profileSecretsAbsent": profile_secrets_absent,
+        "profileSecretsAbsent": _profile_env_keys_absent(
+            profile_secret_present, SECRET_KEYS
+        ),
+        "profileSettingsAbsent": _profile_env_keys_absent(
+            profile_secret_present, SETTING_ENV_KEYS
+        ),
+        # Only once the route is provably off; a kept receipt for a route
+        # that may still be live is reported under `route`, not failed here.
+        "managedServeRouteStateAbsent": (
+            not route_state_removable
+            or owned_route_path is None
+            or (
+                _path_absent(owned_route_path)
+                and _path_absent(owned_route_path.with_suffix(".lock"))
+            )
+        ),
         "profileStateAbsent": _profile_state_absent(resolved_home),
         "homeStateAbsent": _home_state_absent(resolved_home),
         "runtimeStateAbsent": runtime_clean,
         "setupBundleAbsent": _path_absent(setup_bundle) if owns_setup_bundle else True,
+        "setupCommandSkillAbsent": (
+            _path_absent(setup_command_skill) if owns_setup_command_skill else True
+        ),
         "pairingWidgetAbsent": (
             _path_absent(pairing_widget) if owns_pairing_widget else True
         ),
@@ -1773,6 +2073,12 @@ def run_uninstall(
             **(
                 {"setupBundle": "preserved_foreign"}
                 if not _path_absent(setup_bundle) and not owns_setup_bundle
+                else {}
+            ),
+            **(
+                {"setupCommandSkill": "preserved_foreign"}
+                if not _path_absent(setup_command_skill)
+                and not owns_setup_command_skill
                 else {}
             ),
             **(

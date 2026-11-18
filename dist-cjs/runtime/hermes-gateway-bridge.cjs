@@ -1,10 +1,19 @@
+const { normalizeAgentAppearance } = require("../domain/agent-appearance.cjs");
+
+const { randomUUID } = require("node:crypto");
+const { LINK_MAX_LINE_BYTES } = require("./hermes-control-link.cjs");
+
 const { METHOD_NOT_FOUND_CODE } = require("../gateway/backend-contract.cjs");
 const { managementRequest, validManagementRequest, managementResult } = require("./hermes-management.cjs");
+const { withStarterCards } = require("./hermes-starter-kinds.cjs");
 const { createHermesInputPredictionTranslators } = require("./hermes-input-prediction-bridge.cjs");
 const { discardLinkSpillFile, writeLinkSpillFile } = require("./link-attachment-spill.cjs");
 const { buildAgentRequestParams } = require("../gateway/gateway-bridge.cjs");
+const { createStarMapForgetError, createStarMapUnsupportedError, isStarMapMethodNotFound, normalizeStarMapGraph, parseStarMapForgetParams } = require("../domain/star-map.cjs");
 const { DEFAULT_HERMES_NAMESPACE, deriveHermesPublicKey, isAdoptableHermesSessionKey, isForeignHermesSessionKey, isHermesSessionKey, mintedHermesSessionKey, parseHermesPublicKey } = require("./hermes-session-keys.cjs");
 const { normalizeHermesActivityToolPayload } = require("./hermes-activity-tool-shim.cjs");
+const { LINK_PROGRAM_CARD_ICON_LLM_COMPLETE_METHOD } = require("../tools/program-card-icon-model.cjs");
+const { LINK_PROGRAM_CARD_MCP_ALLOW_METHOD, LINK_PROGRAM_CARD_MCP_CALL_METHOD, LINK_PROGRAM_CARD_MCP_LIST_METHOD } = require("./program-card-mcp-hosts.cjs");
 
 const LINK_DB_METHODS = Object.freeze({
   sessionsList: "db.sessions.list",
@@ -23,7 +32,7 @@ const LINK_DB_METHODS = Object.freeze({
 
 const HERMES_FEATURE_TOKEN_SESSION_READ_STATE = "session_read_state";
 
-function normalizeHermesFeatureTokenSet(raw) {
+function normalizeHermesFeatureTokenSet(raw     ) {
   const source = Array.isArray(raw)
     ? raw
     : typeof raw === "string"
@@ -45,6 +54,16 @@ const DB_READ_TIMEOUT = Object.freeze({ timeoutMs: LINK_DB_READ_TIMEOUT_MS });
 const LINK_ADOPT_TIMEOUT_MS = 20_000;
 const ADOPT_TIMEOUT_MS = Object.freeze({ timeoutMs: LINK_ADOPT_TIMEOUT_MS });
 
+const LINK_AGENTS_ROUTE_TIMEOUT_MS = 8_000;
+const AGENTS_ROUTE_TIMEOUT = Object.freeze({ timeoutMs: LINK_AGENTS_ROUTE_TIMEOUT_MS });
+const AGENT_ROUTE_REASONS = new Set(["named", "router", "fallback", "single"]);
+
+const LINK_AGENT_DESCRIBE_TIMEOUT_MS = 60_000;
+const AGENT_DESCRIBE_TIMEOUT = Object.freeze({ timeoutMs: LINK_AGENT_DESCRIBE_TIMEOUT_MS });
+const AGENT_DESCRIPTION_SET_MAX_CHARS = 280;
+
+const AGENT_DESCRIBE_MAX_PROFILES = 4;
+
 const LINK_BACKEND_EVENT_METHOD = "backend.event";
 
 const LINK_DISPATCH_METHOD = "dispatch.send";
@@ -59,11 +78,20 @@ const LINK_GW_METHODS = Object.freeze({
   profilesList: "gw.profiles.list",
   profilesCreate: "gw.profiles.create",
   profilesEmojiSet: "gw.profiles.emoji.set",
+
+  agentsRoute: "gw.agents.route",
+
+  profilesDescriptionSet: "gw.profiles.description.set",
+  profilesDescriptionAuto: "gw.profiles.description.auto",
   profilesSettingsGet: "gw.profiles.settings.get",
   profilesSettingsSet: "gw.profiles.settings.set",
   profilesSoul: "gw.profiles.soul",
   skillsStatus: "gw.skills.status",
   commandsList: "gw.commands.list",
+
+  starMapGraph: "gw.starmap.graph",
+
+  starMapForget: "gw.starmap.forget",
 });
 
 const LINK_FOREIGN_METHODS = Object.freeze({
@@ -75,6 +103,45 @@ const LINK_FOREIGN_METHODS = Object.freeze({
 });
 
 const LINK_APPROVAL_RESOLVE_METHOD = "approval.resolve";
+
+const LINK_APPROVAL_LLM_COMPLETE_METHOD = "approval.llm.complete";
+const APPROVAL_LLM_LINK_TIMEOUT_MS = 7500;
+
+const LINK_PROGRAM_CARD_REVIEW_LLM_COMPLETE_METHOD = "program_card.review.llm.complete";
+
+const PROGRAM_CARD_REVIEW_LLM_MAX_MS = 300_000;
+const PROGRAM_CARD_REVIEW_LLM_LINK_GRACE_MS = 2000;
+
+const LINK_PROGRAM_CARD_FRAME_LLM_COMPLETE_METHOD = "program_card.frame.llm.complete";
+const PROGRAM_CARD_FRAME_LLM_MAX_MS = 420_000;
+const PROGRAM_CARD_FRAME_LLM_REASONING = Object.freeze(["minimal", "low", "medium", "high"]);
+
+function cardReviewUsage(raw     ) {
+  if (!raw || typeof raw !== "object") return null;
+  const usage      = {};
+  for (const key of ["inputTokens", "outputTokens", "costUsd"]) {
+    const value = raw[key];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) usage[key] = value;
+  }
+  return "inputTokens" in usage || "outputTokens" in usage ? usage : null;
+}
+
+const PROGRAM_CARD_MCP_LIST_LINK_TIMEOUT_MS = 10_000;
+const PROGRAM_CARD_MCP_CALL_MAX_MS = 30_000;
+const PROGRAM_CARD_MCP_CALL_LINK_GRACE_MS = 2000;
+const PROGRAM_CARD_MCP_ALLOW_LINK_TIMEOUT_MS = 10_000;
+
+const LINK_APPROVAL_EXPLAIN_SETTING_METHOD = "approval.explain.setting";
+const APPROVAL_EXPLAIN_SETTING_LINK_TIMEOUT_MS = 5000;
+
+const LINK_WAITING_SETTINGS_METHOD = "waiting.settings";
+const WAITING_SETTINGS_LINK_TIMEOUT_MS = 5000;
+const WAITING_SETTINGS_SURFACE_RE = /^[a-z0-9_-]{1,32}$/;
+const WAITING_SETTINGS_SURFACES_MAX = 32;
+
+const LINK_WAITING_ANSWER_METHOD = "waiting.answer";
+const WAITING_ANSWER_LINK_TIMEOUT_MS = 10000;
+const WAITING_ANSWER_REASON_MAX_CHARS = 500;
 const LINK_CLARIFY_RESOLVE_METHOD = "clarify.resolve";
 const LINK_CLARIFY_AWAIT_TEXT_METHOD = "clarify.await_text";
 const LINK_SESSION_METHODS = Object.freeze({
@@ -91,6 +158,9 @@ const LINK_PROFILE_METHODS = Object.freeze({
 const LINK_ATTACHMENT_INLINE_MAX_CHARS = 262144;
 
 const DENIED_SESSION_SOURCES = Object.freeze(["tool", "cron", "subagent"]);
+
+const SESSIONS_GONE_EVENT = "sessionsGone";
+const NATIVE_ID_INDEX_MAX = 4096;
 
 function methodNotFoundError(method) {
   const err = new Error(`method not found: ${method || "<missing>"}`);
@@ -234,7 +304,7 @@ const HERMES_COMMAND_CATEGORY = Object.freeze({
   "Tools & Skills": "tools",
 });
 
-function sessionOptionsFallbackCommands(options) {
+function sessionOptionsFallbackCommands(options     ) {
   const commands = [];
   if (hasOwn(options, "model")) {
     const model = String(options.model || "").trim();
@@ -256,10 +326,16 @@ function sessionOptionsFallbackCommands(options) {
   return commands;
 }
 
-const REASONING_DISPLAY_TO_HERMES_COMMANDS = Object.freeze({
-  off: Object.freeze(["/reasoning hide"]),
-  on: Object.freeze(["/reasoning show", "/reasoning clamp"]),
-  "on.full": Object.freeze(["/reasoning show", "/reasoning full"]),
+function isQuietSettingsCommand(command        ) {
+  return /^\/fast (on|off)$/.test(command);
+}
+
+const QUIET_RUN_TTL_MS = 60_000;
+const QUIET_RUN_MAX = 64;
+
+const REASONING_DISPLAY_TO_SHOW_REASONING = Object.freeze({
+  off: false,
+  on: true,
 });
 
 function toFiniteNumber(value) {
@@ -271,6 +347,50 @@ function cleanNonEmptyString(value) {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed ? trimmed : null;
+}
+
+const PROFILE_CREATE_ERROR_CODES = new Set([
+  "agent_already_exists",
+  "invalid_name",
+  "reserved_agent_id",
+]);
+
+function profileCreateError(error     , name        ) {
+  const message = typeof error?.message === "string" ? error.message : "";
+  const tagged = cleanNonEmptyString(error?.errorCode);
+  let code = tagged && PROFILE_CREATE_ERROR_CODES.has(tagged) ? tagged : null;
+  if (!code) {
+    if (/^A profile named .+ already exists\.$|^Profile already exists\b/.test(message)) {
+      code = "agent_already_exists";
+    } else if (/name is reserved|choose a name other than default/i.test(message)) {
+      code = "reserved_agent_id";
+    } else if (/^That name can't be used for an agent\b|^Enter a name for the agent\b/.test(message)) {
+      code = "invalid_name";
+    } else if (
+      error?.code === "link_request_timeout" ||
+      error?.delivery === "not_sent" ||
+      error?.delivery === "uncertain"
+    ) {
+      code = "backend_unavailable";
+    }
+  }
+  if (!code) return error;
+  const text =
+    code === "agent_already_exists" && !/^A profile named /.test(message)
+      ? `A profile named ${name} already exists.`
+      : code === "reserved_agent_id" && !/name is reserved/i.test(message)
+        ? "This profile name is reserved. Choose another name."
+        : code === "backend_unavailable"
+          ? "Hermes is not reachable right now. Try again in a moment."
+          : message;
+  return Object.assign(new Error(text), { code });
+}
+
+function profileReadParams(params) {
+  const parsed = parseHermesPublicKey(
+    params && typeof params.sessionKey === "string" ? params.sessionKey : "",
+  );
+  return parsed && parsed.namespace ? { ns: parsed.namespace } : {};
 }
 
 function hasOwn(object, field) {
@@ -457,6 +577,11 @@ function mapListRow(row) {
     ...(unread === null ? {} : { unread }),
     ...(hidden === null ? {} : { hidden }),
   };
+
+  const source = derived.kind === "foreign"
+    ? cleanNonEmptyString(row.createdSource) ?? cleanNonEmptyString(row.source)
+    : null;
+  if (source) Reflect.set(mapped, "source", source);
   if (typeof row.preview === "string" && row.preview) {
     mapped.preview = row.preview;
   }
@@ -488,7 +613,7 @@ const COMPACTION_SUMMARY_OPENERS = Object.freeze([
 const MERGED_SUMMARY_DELIMITER =
   "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]";
 
-function contentTextForSummaryClassification(content) {
+function contentTextForSummaryClassification(content         ) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   const parts = [];
@@ -500,14 +625,14 @@ function contentTextForSummaryClassification(content) {
   return parts.join("\n\n");
 }
 
-function startsWithSummaryOpener(text) {
+function startsWithSummaryOpener(text     ) {
   for (const opener of COMPACTION_SUMMARY_OPENERS) {
     if (text.startsWith(opener)) return true;
   }
   return false;
 }
 
-function classifyCompactionSummary(content) {
+function classifyCompactionSummary(content         ) {
   const text = contentTextForSummaryClassification(content).replace(/^\s+/, "");
   if (!text) return null;
 
@@ -557,9 +682,9 @@ function shapeConversationMessages(rawMessages, limit) {
 }
 
 function shapeConversationEntry(
-  msg,
-  role,
-  content,
+  msg     ,
+  role     ,
+  content     ,
 ) {
   const shaped = { role, content };
   if (typeof msg.id === "string" || typeof msg.id === "number") {
@@ -580,7 +705,7 @@ function shapeConversationEntry(
   return shaped;
 }
 
-function splitSearchSnippet(rawSnippet, query) {
+function splitSearchSnippet(rawSnippet         , query         ) {
   const snippet = typeof rawSnippet === "string" ? rawSnippet : "";
   const open = snippet.indexOf(">>>");
   const close = open >= 0 ? snippet.indexOf("<<<", open + 3) : -1;
@@ -631,6 +756,59 @@ function createHermesGatewayBridge(opts) {
   const sessionReadStateSupported = () =>
     hermesFeatureTokens.has(HERMES_FEATURE_TOKEN_SESSION_READ_STATE);
 
+  const quietRuns = new Map                ();
+  function markQuietRun(runId        ) {
+    const now = Date.now();
+    for (const [id, at] of quietRuns) {
+      if (now - at <= QUIET_RUN_TTL_MS && quietRuns.size < QUIET_RUN_MAX) break;
+      quietRuns.delete(id);
+    }
+    quietRuns.set(runId, now);
+  }
+
+  function isQuietRunEvent(name        , payload     ) {
+    if (name !== "message" && name !== "streaming" && name !== "activity") return false;
+    const runId = payload && typeof payload === "object" ? payload.runId : null;
+    if (typeof runId !== "string" || !quietRuns.has(runId)) return false;
+    if (name === "activity" && payload.origin === "lifecycle" &&
+      (payload.phase === "end" || payload.phase === "error")) {
+      quietRuns.delete(runId);
+    }
+    return true;
+  }
+
+  const publicKeyByNativeId = new Map();
+  function rememberNativeIds(row     , publicKey        ) {
+    for (const value of [row.id, row.lineageRootId]) {
+      const id = cleanNonEmptyString(value);
+      if (!id) continue;
+      publicKeyByNativeId.delete(id);
+      publicKeyByNativeId.set(id, publicKey);
+    }
+    while (publicKeyByNativeId.size > NATIVE_ID_INDEX_MAX) {
+      publicKeyByNativeId.delete(publicKeyByNativeId.keys().next().value);
+    }
+  }
+  function withGoneSessionKeys(payload     ) {
+    if (!payload || typeof payload !== "object") return payload;
+    const ids = Array.isArray(payload.ids)
+      ? payload.ids.filter((id     ) => typeof id === "string" && id)
+      : [];
+    const sessionKeys           = [];
+    let unmappedIds = 0;
+    for (const id of ids) {
+      const key = publicKeyByNativeId.get(id);
+      if (!key) {
+        unmappedIds += 1;
+        continue;
+      }
+      if (!sessionKeys.includes(key)) sessionKeys.push(key);
+
+      if (payload.reason !== "archive") publicKeyByNativeId.delete(id);
+    }
+    return { ...payload, ids, sessionKeys, unmappedIds };
+  }
+
   async function prepareAttachments(params, linkParams) {
     if (params && Array.isArray(params.attachments) && params.attachments.length > 0) {
       const prepared = await attachmentTransport.prepare(params.attachments);
@@ -644,7 +822,7 @@ function createHermesGatewayBridge(opts) {
 
   const sendChains = new Map();
 
-  function serializeSend(sessionKey, issue) {
+  function serializeSend(sessionKey     , issue     ) {
     const key = typeof sessionKey === "string" && sessionKey ? sessionKey : "";
     const previous = sendChains.get(key) || Promise.resolve();
     const run = previous.then(issue);
@@ -661,7 +839,7 @@ function createHermesGatewayBridge(opts) {
     return run;
   }
 
-  function issueRequest(method, linkParams) {
+  function issueRequest(method     , linkParams     ) {
     let pending;
     try {
       pending = Promise.resolve(link.request(method, linkParams));
@@ -674,13 +852,14 @@ function createHermesGatewayBridge(opts) {
     return pending;
   }
 
-  async function stageAndIssue(params, method, linkParams) {
+  async function stageAndIssue(params     , method     , linkParams     ) {
     const prepared = await prepareAttachments(params, linkParams);
     return { prepared, pending: issueRequest(method, linkParams) };
   }
 
   async function dispatchTurn(params) {
     const runId = runIdFactory();
+    if (params && params.quiet === true) markQuietRun(runId);
     const route = routeDispatchSessionKey(params && params.sessionKey);
     const dispatchParams = {
       runId,
@@ -756,6 +935,185 @@ function createHermesGatewayBridge(opts) {
   const translators = {
 
     ...createHermesInputPredictionTranslators({ link }),
+
+    async [LINK_APPROVAL_LLM_COMPLETE_METHOD](params      = {}) {
+      const source = params && typeof params === "object" ? params : {};
+      const linkParams      = {
+        messages: Array.isArray(source.messages) ? source.messages : [],
+        timeoutMs: APPROVAL_LLM_LINK_TIMEOUT_MS - 500,
+      };
+      if (Number.isFinite(source.maxTokens)) linkParams.maxTokens = source.maxTokens;
+      if (Number.isFinite(source.temperature)) linkParams.temperature = source.temperature;
+      const result      = await link.request(LINK_APPROVAL_LLM_COMPLETE_METHOD, linkParams, {
+        timeoutMs: APPROVAL_LLM_LINK_TIMEOUT_MS,
+        signal: source.signal,
+      });
+      if (result && typeof result.text === "string") return { text: result.text };
+      const reason = result && typeof result.error === "string" ? result.error : "no text";
+      throw new Error(`approval explain ${reason}`);
+    },
+
+    async [LINK_PROGRAM_CARD_REVIEW_LLM_COMPLETE_METHOD](params      = {}, method = LINK_PROGRAM_CARD_REVIEW_LLM_COMPLETE_METHOD,
+      { maxMs = PROGRAM_CARD_REVIEW_LLM_MAX_MS, reasoning = false }                                          = {}) {
+      const source = params && typeof params === "object" ? params : {};
+      const timeoutMs = Number.isFinite(source.timeoutMs)
+        ? Math.max(1000, Math.min(maxMs, source.timeoutMs))
+        : PROGRAM_CARD_REVIEW_LLM_MAX_MS;
+      const linkParams      = {
+        callId: randomUUID(),
+        messages: Array.isArray(source.messages) ? source.messages : [],
+        timeoutMs,
+      };
+      if (reasoning && PROGRAM_CARD_FRAME_LLM_REASONING.includes(source.reasoning)) linkParams.reasoning = source.reasoning;
+      if (Number.isFinite(source.maxTokens)) linkParams.maxTokens = source.maxTokens;
+      if (Number.isFinite(source.temperature)) linkParams.temperature = source.temperature;
+      if (source.signal?.aborted) throw Object.assign(new Error("card review cancelled"), { code: "model_cancelled" });
+      if (new TextEncoder().encode(JSON.stringify(linkParams)).byteLength > LINK_MAX_LINE_BYTES - 1024) {
+        throw Object.assign(new Error("card review payload exceeds the Hermes link limit"), { code: "look_payload_too_large" });
+      }
+
+      const cancel = () => {
+        try {
+          Promise.resolve(link.request(method.replace(/complete$/, "cancel"), { callId: linkParams.callId }, { timeoutMs: 2000 }))
+            .catch(() => {});
+        } catch {  }
+      };
+      source.signal?.addEventListener("abort", cancel, { once: true });
+      let result     ;
+      try {
+        result = await link.request(method, linkParams, {
+          timeoutMs: timeoutMs + PROGRAM_CARD_REVIEW_LLM_LINK_GRACE_MS,
+          signal: source.signal,
+        });
+      } finally {
+        source.signal?.removeEventListener("abort", cancel);
+      }
+      if (result && typeof result.text === "string") {
+        return { text: result.text,
+          ...(typeof result.model === "string" && result.model ? { model: result.model.slice(0, 160) } : {}),
+          ...(typeof result.provider === "string" && result.provider ? { provider: result.provider.slice(0, 80) } : {}),
+          ...(Array.isArray(result.modelInput) ? { modelInput: result.modelInput.filter((kind     ) => kind === "text" || kind === "image") } : {}),
+
+          ...(typeof result.stopReason === "string" && /^[a-z_]{1,32}$/.test(result.stopReason) ? { stopReason: result.stopReason } : {}),
+          ...(cardReviewUsage(result.usage) ? { usage: cardReviewUsage(result.usage) } : {}),
+          ...(typeof result.imageModel?.provider === "string" && result.imageModel.provider.length <= 160 &&
+            typeof result.imageModel?.model === "string" && result.imageModel.model.length <= 160 ? { imageModel: {
+              provider: result.imageModel.provider, model: result.imageModel.model,
+              input: Array.isArray(result.imageModel.input) ? result.imageModel.input.filter((kind     ) => kind === "text" || kind === "image") : [],
+            } } : {}),
+        };
+      }
+      const reason = result && typeof result.error === "string" ? result.error : "no text";
+      throw Object.assign(new Error(["timeout", "TimeoutError", "APITimeoutError"].includes(reason) ? "card review timeout" : "card review failed"), {
+        code: ["timeout", "TimeoutError", "APITimeoutError"].includes(reason) ? "model_timeout" : "model_error",
+
+        failure: result?.failure,
+        name: reason === "RateLimitError" ? reason : "Error",
+      });
+    },
+    async "task.proposal.llm.complete"(params      = {}) {
+      return translators[LINK_PROGRAM_CARD_REVIEW_LLM_COMPLETE_METHOD](params, "task.proposal.llm.complete");
+    },
+
+    async "agent.draft.llm.complete"(params      = {}) {
+      return translators[LINK_PROGRAM_CARD_REVIEW_LLM_COMPLETE_METHOD](params, "agent.draft.llm.complete");
+    },
+
+    async [LINK_PROGRAM_CARD_FRAME_LLM_COMPLETE_METHOD](params      = {}) {
+      return translators[LINK_PROGRAM_CARD_REVIEW_LLM_COMPLETE_METHOD](params, LINK_PROGRAM_CARD_FRAME_LLM_COMPLETE_METHOD,
+        { maxMs: PROGRAM_CARD_FRAME_LLM_MAX_MS, reasoning: true });
+    },
+
+    async [LINK_PROGRAM_CARD_ICON_LLM_COMPLETE_METHOD](params      = {}) {
+      return translators[LINK_PROGRAM_CARD_REVIEW_LLM_COMPLETE_METHOD](params, LINK_PROGRAM_CARD_ICON_LLM_COMPLETE_METHOD);
+    },
+
+    async [LINK_PROGRAM_CARD_MCP_LIST_METHOD]() {
+      return link.request(LINK_PROGRAM_CARD_MCP_LIST_METHOD, {}, { timeoutMs: PROGRAM_CARD_MCP_LIST_LINK_TIMEOUT_MS });
+    },
+    async "program_card.model.complete"(params     ) { return link.request("program_card.model.complete", params, { timeoutMs: 62000 }); },
+    async "program_card.model.cancel"(params     ) { return link.request("program_card.model.cancel", params, { timeoutMs: 2000 }); },
+    async "program_card.model.models"(params     ) { return link.request("program_card.model.models", params, { timeoutMs: 10000 }); },
+    async "program_card.model.allow"(params     ) { return link.request("program_card.model.allow", params, { timeoutMs: 10000 }); },
+
+    async [LINK_PROGRAM_CARD_MCP_CALL_METHOD](params      = {}) {
+      const source = params && typeof params === "object" ? params : {};
+      const timeoutMs = Number.isFinite(source.timeoutMs)
+        ? Math.max(1000, Math.min(PROGRAM_CARD_MCP_CALL_MAX_MS, source.timeoutMs))
+        : 10_000;
+      return link.request(
+        LINK_PROGRAM_CARD_MCP_CALL_METHOD,
+        {
+          server: typeof source.server === "string" ? source.server : "",
+          tool: typeof source.tool === "string" ? source.tool : "",
+          args: source.args && typeof source.args === "object" && !Array.isArray(source.args) ? source.args : {},
+          timeoutMs,
+          ...(source.write === true ? { write: true } : {}),
+          ...(source.ownerWrite === true ? { ownerWrite: true } : {}),
+        },
+        { timeoutMs: timeoutMs + PROGRAM_CARD_MCP_CALL_LINK_GRACE_MS },
+      );
+    },
+
+    async [LINK_PROGRAM_CARD_MCP_ALLOW_METHOD](params      = {}) {
+      const source = params && typeof params === "object" ? params : {};
+      return link.request(
+        LINK_PROGRAM_CARD_MCP_ALLOW_METHOD,
+        { server: typeof source.server === "string" ? source.server : "", allow: source.allow === true },
+        { timeoutMs: PROGRAM_CARD_MCP_ALLOW_LINK_TIMEOUT_MS },
+      );
+    },
+
+    async [LINK_APPROVAL_EXPLAIN_SETTING_METHOD](params      = {}) {
+      const enabled = !(params && params.enabled === false);
+      return link.request(
+        LINK_APPROVAL_EXPLAIN_SETTING_METHOD,
+        { enabled },
+        { timeoutMs: APPROVAL_EXPLAIN_SETTING_LINK_TIMEOUT_MS },
+      );
+    },
+
+    async [LINK_WAITING_SETTINGS_METHOD](params      = {}) {
+      const source = params && typeof params === "object" ? params : {};
+      const rawSurfaces =
+        source.surfaces && typeof source.surfaces === "object" && !Array.isArray(source.surfaces)
+          ? source.surfaces
+          : {};
+      const surfaces      = {};
+      for (const name of Object.keys(rawSurfaces).sort()) {
+        if (Object.keys(surfaces).length >= WAITING_SETTINGS_SURFACES_MAX) break;
+        if (!WAITING_SETTINGS_SURFACE_RE.test(name)) continue;
+        if (typeof rawSurfaces[name] !== "boolean") continue;
+        surfaces[name] = rawSurfaces[name];
+      }
+      return link.request(
+        LINK_WAITING_SETTINGS_METHOD,
+        { show: source.show !== false, answer: source.answer === true, surfaces },
+        { timeoutMs: WAITING_SETTINGS_LINK_TIMEOUT_MS },
+      );
+    },
+
+    async [LINK_WAITING_ANSWER_METHOD](params      = {}) {
+      const source = params && typeof params === "object" ? params : {};
+      const requestId = cleanNonEmptyString(source.requestId);
+      const choice = cleanNonEmptyString(source.choice);
+      const answer =
+        typeof source.answer === "string" && source.answer.trim() ? source.answer : null;
+      if (!requestId) throw new Error("waiting.answer requires requestId");
+      if (!choice === !answer) throw new Error("waiting.answer requires exactly one of choice or answer");
+      const forwarded      = { requestId };
+      if (choice) {
+        forwarded.choice = choice;
+        const reason = cleanNonEmptyString(source.reason);
+        if (reason) forwarded.reason = reason.slice(0, WAITING_ANSWER_REASON_MAX_CHARS);
+      } else {
+        forwarded.answer = answer;
+      }
+      return link.request(LINK_WAITING_ANSWER_METHOD, forwarded, {
+        timeoutMs: WAITING_ANSWER_LINK_TIMEOUT_MS,
+      });
+    },
+
     async agent(params) {
       return dispatchTurn(params);
     },
@@ -826,7 +1184,7 @@ function createHermesGatewayBridge(opts) {
       return ack;
     },
 
-    async "clarify.resolve"(params) {
+    async "clarify.resolve"(params     ) {
       const id = cleanNonEmptyString(params && params.id);
       const response = cleanNonEmptyString(params && params.response);
       if (!id) throw new Error("clarify.resolve requires id");
@@ -843,7 +1201,7 @@ function createHermesGatewayBridge(opts) {
       return result;
     },
 
-    async "clarify.await_text"(params) {
+    async "clarify.await_text"(params     ) {
       const id = cleanNonEmptyString(params && params.id);
       if (!id) throw new Error("clarify.await_text requires id");
       const result = await link.request(LINK_CLARIFY_AWAIT_TEXT_METHOD, { id });
@@ -858,9 +1216,12 @@ function createHermesGatewayBridge(opts) {
       return result;
     },
 
-    async "models.list"() {
+    async "models.list"(params) {
 
-      const result = await link.request(LINK_GW_METHODS.modelsList, {});
+      const result = await link.request(
+        LINK_GW_METHODS.modelsList,
+        profileReadParams(params),
+      );
       const rawRows =
         result && Array.isArray(result.models) ? result.models : [];
       const models = [];
@@ -885,9 +1246,12 @@ function createHermesGatewayBridge(opts) {
       return { models };
     },
 
-    async "config.get"() {
+    async "config.get"(params) {
 
-      const result = await link.request(LINK_GW_METHODS.modelsConfigured, {});
+      const result = await link.request(
+        LINK_GW_METHODS.modelsConfigured,
+        profileReadParams(params),
+      );
       const defaultRef = buildModelRef(result && result.default);
       const fallbacks = [];
       for (const bucket of [
@@ -908,9 +1272,12 @@ function createHermesGatewayBridge(opts) {
       return { config: { agents: { defaults } } };
     },
 
-    async "usage.status"() {
+    async "usage.status"(params) {
 
-      const result = await link.request(LINK_GW_METHODS.usageStatus, {});
+      const result = await link.request(
+        LINK_GW_METHODS.usageStatus,
+        profileReadParams(params),
+      );
       const updatedAt =
         result && Number.isFinite(result.updatedAt)
           ? Math.floor(result.updatedAt * 1000)
@@ -974,7 +1341,9 @@ function createHermesGatewayBridge(opts) {
       );
       const ns = parsed ? parsed.namespace : DEFAULT_HERMES_NAMESPACE;
       const result = await link.request(LINK_GW_METHODS.agentIdentity, { ns });
-      const identity = {};
+      const identity
+
+        = {};
       if (result && typeof result.agentId === "string") {
         identity.agentId = result.agentId;
       }
@@ -984,6 +1353,8 @@ function createHermesGatewayBridge(opts) {
       if (result && typeof result.emoji === "string" && result.emoji.trim()) {
         identity.emoji = result.emoji;
       }
+      const appearance = !identity.emoji && normalizeAgentAppearance(result && result.appearance);
+      if (appearance) identity.appearance = appearance;
       if (result && typeof result.avatar === "string" && result.avatar.trim()) {
         identity.avatar = result.avatar;
       }
@@ -1003,10 +1374,18 @@ function createHermesGatewayBridge(opts) {
         const displayName = cleanNonEmptyString(profile.displayName);
 
         const emoji = cleanNonEmptyString(profile.emoji);
+        const avatar = cleanNonEmptyString(profile.avatar);
+        const appearance = !emoji && normalizeAgentAppearance(profile.appearance);
+
+        const description = cleanNonEmptyString(profile.description);
         const row = {
           id: name,
           name: displayName || name,
-          ...(emoji ? { identity: { emoji } } : {}),
+          ...(emoji || avatar || appearance ? { identity: {
+            ...(emoji ? { emoji } : {}), ...(avatar ? { avatar } : {}), ...(appearance ? { appearance } : {}),
+          } } : {}),
+          ...(description ? { description } : {}),
+          ...(description && profile.descriptionAuto === true ? { descriptionAuto: true } : {}),
         };
         const model = cleanNonEmptyString(profile.model);
         if (model) {
@@ -1029,23 +1408,26 @@ function createHermesGatewayBridge(opts) {
 
         foreignSessionAdopt: result && result.adoptSupported === true,
 
+        sharedChats: result && result.sharedChats === true,
+
+        autoRoute: result && result.autoRoute === true,
+
         ...(result && result.desktopFleet ? { hermesFleet: result.desktopFleet } : {}),
       };
     },
 
-    async "profiles.create"(params) {
+    async "profiles.create"(params     ) {
       const name = cleanNonEmptyString(params && params.name);
-      if (!name) throw new Error("profile name is required");
+      if (!name) {
+        throw Object.assign(new Error("Enter a name for the agent."), { code: "invalid_name" });
+      }
       let result;
       try {
         result = await link.request(LINK_GW_METHODS.profilesCreate, {
           name, ...(params?.setup != null ? { setup: params.setup, requestId: params.requestId } : {}),
         });
-      } catch (error) {
-        if (/choose a name other than default/i.test(error?.message || "")) {
-          throw Object.assign(new Error("This profile name is reserved. Choose another name."), { code: "invalid_name" });
-        }
-        throw error;
+      } catch (error     ) {
+        throw profileCreateError(error, name);
       }
       if (!result || !["created", "partial"].includes(result.status)) {
         const message = cleanNonEmptyString(result && result.error);
@@ -1068,7 +1450,7 @@ function createHermesGatewayBridge(opts) {
       };
     },
 
-    async "profiles.emoji.set"(params) {
+    async "profiles.emoji.set"(params     ) {
       const profileId = cleanNonEmptyString(params && params.profileId);
       if (!profileId) throw new Error("profile id is required");
       const rawEmoji = params && params.emoji;
@@ -1095,28 +1477,111 @@ function createHermesGatewayBridge(opts) {
       };
     },
 
-    async "hermes.management"(params) {
+    async "agents.route"(params     ) {
+
+      const text = typeof params?.text === "string" ? params.text : "";
+      const fallbackAgentRef = cleanNonEmptyString(params && params.fallbackAgentRef);
+      const requestId = cleanNonEmptyString(params && params.requestId);
+      const result = await link.request(LINK_GW_METHODS.agentsRoute, {
+        text,
+        ...(requestId ? { requestId } : {}),
+        ...(fallbackAgentRef ? { fallbackAgentRef } : {}),
+      }, AGENTS_ROUTE_TIMEOUT);
+      if (!result || result.status !== "ok") {
+        const code = cleanNonEmptyString(result && result.error) || "route_failed";
+        throw Object.assign(new Error("Auto could not pick an agent."), { code });
+      }
+      const agentRef = cleanNonEmptyString(result.agentRef);
+      const reason = AGENT_ROUTE_REASONS.has(result.reason) ? result.reason : null;
+      if (!agentRef || !reason) throw Object.assign(new Error("Hermes returned an invalid route."), { code: "route_failed" });
+      const latencyMs = Number.isFinite(result.latencyMs) && result.latencyMs >= 0 ? Math.round(result.latencyMs) : 0;
+      return { agentRef, reason, latencyMs };
+    },
+
+    async "profiles.description.set"(params     ) {
+
+      const profileId = cleanNonEmptyString(params && params.profileId);
+      if (!profileId) throw Object.assign(new Error("Choose an agent."), { code: "invalid_agent_id" });
+      const description = typeof params?.description === "string" ? params.description.trim() : "";
+      if (description.length > AGENT_DESCRIPTION_SET_MAX_CHARS) {
+        throw Object.assign(new Error("Keep it to one or two sentences."), { code: "invalid_description" });
+      }
+      const result = await link.request(LINK_GW_METHODS.profilesDescriptionSet, { profileId, description });
+      const id = cleanNonEmptyString(result && result.profile && result.profile.id);
+      if (!result || result.status !== "updated" || id !== profileId) {
+        throw Object.assign(new Error("Hermes did not save the description."), { code: "update_failed" });
+      }
+      return {
+        status: "updated",
+        agentId: id,
+        description: typeof result.description === "string" ? result.description : "",
+      };
+    },
+
+    async "profiles.description.auto"(params     ) {
+
+      const profileIds = Array.isArray(params?.profileIds)
+        ? Array.from(new Set(params.profileIds.map(cleanNonEmptyString).filter(Boolean))).slice(0, AGENT_DESCRIBE_MAX_PROFILES)
+        : [];
+      if (!profileIds.length) throw Object.assign(new Error("Choose an agent."), { code: "invalid_agent_id" });
+      const result = await link.request(LINK_GW_METHODS.profilesDescriptionAuto, { profileIds }, AGENT_DESCRIBE_TIMEOUT);
+      if (!result || result.status !== "ok" || !Array.isArray(result.results)) {
+        throw Object.assign(new Error("Hermes could not write the descriptions."), { code: "describe_failed" });
+      }
+      const results = [];
+      for (const row of result.results) {
+        const agentId = cleanNonEmptyString(row && row.profileId);
+        if (!agentId || !profileIds.includes(agentId)) continue;
+        const ok = row.ok === true && typeof row.description === "string" && !!row.description.trim();
+        results.push({
+          agentId,
+          ok,
+          ...(ok ? { description: row.description.trim() } : {}),
+          ...(!ok && typeof row.reason === "string" && row.reason ? { reason: row.reason } : {}),
+        });
+      }
+      return { status: "ok", results };
+    },
+
+    async "hermes.management"(params     ) {
       const identity = managementRequest(params);
       if (!validManagementRequest(identity)) throw new Error("Invalid Hermes management request");
       const result = await link.request(LINK_GW_METHODS.hermesManagement, identity, DB_READ_TIMEOUT);
-      return managementResult(identity, result);
+      const out = managementResult(identity, result);
+
+      if (identity.operation === "automations.starters" && Array.isArray(out?.automations?.starters)) {
+        out.automations.starters = withStarterCards(out.automations.starters);
+      }
+      return out;
     },
 
-    async "optional.setup"(params) {
+    async "optional.setup"(params     ) {
       return link.request("gw.optional.setup", params, DB_READ_TIMEOUT);
     },
 
-    async "optional.setup.disconnect"(params) {
+    async "tts.capabilities"() {
+      return link.request("gw.tts.capabilities", {}, { timeoutMs: 10_000 });
+    },
+
+    async "tts.speakFile"(params     ) {
+      return link.request("gw.tts.speak", {
+        text: params?.text,
+        outputPath: params?.outputPath,
+        ...(params?.voice ? { voice: params.voice } : {}),
+      }, { timeoutMs: 60_000 });
+    },
+
+    async "optional.setup.disconnect"(params     ) {
       return link.request("gw.optional.setup.disconnect", { context: { connectionId: params?.connectionId } }, DB_READ_TIMEOUT);
     },
 
-    async "profiles.settings.get"(params) {
+    async "profiles.settings.get"(params     ) {
       const profileId = cleanNonEmptyString(params && params.profileId);
       if (!profileId) throw new Error("profile id is required");
       return link.request(LINK_GW_METHODS.profilesSettingsGet, { profileId });
     },
 
-    async "profiles.settings.set"(params) {
+    async "profiles.settings.set"(params     ) {
       const profileId = cleanNonEmptyString(params && params.profileId);
       if (!profileId) throw new Error("profile id is required");
       return link.request(LINK_GW_METHODS.profilesSettingsSet, {
@@ -1161,6 +1626,78 @@ function createHermesGatewayBridge(opts) {
         });
       }
       return { skills };
+    },
+
+    async "starmap.graph"(params     ) {
+
+      const requested = cleanNonEmptyString(params && params.agentId) || "";
+      const profile = requested.toLowerCase() === "main" ? "" : requested;
+      let result     ;
+      try {
+        result = await link.request(LINK_GW_METHODS.starMapGraph, { profile }, DB_READ_TIMEOUT);
+      } catch (err) {
+        if (isStarMapMethodNotFound(err)) throw createStarMapUnsupportedError("gw.starmap.graph");
+        throw err;
+      }
+      if (!result || typeof result !== "object") {
+        const err      = new Error("star map reply was not an object");
+        err.code = "starmap_bad_reply";
+        throw err;
+      }
+      if (result.status === "unsupported") throw createStarMapUnsupportedError("hermes host");
+
+      const failed =
+        result.status === "error" ||
+        (result.error !== undefined && result.error !== null && result.error !== false);
+      if (failed) {
+        const code =
+          result.errorCode ??
+          result.code ??
+          (result.error && typeof result.error === "object" ? result.error.code : undefined);
+        if (code === "unsupported" || code === METHOD_NOT_FOUND_CODE) {
+          throw createStarMapUnsupportedError("hermes host");
+        }
+        const err      = new Error("star map read failed");
+        err.code = typeof code === "string" && code.trim() ? code.trim() : "starmap_failed";
+        throw err;
+      }
+      if (result.status !== undefined && result.status !== "ok") {
+        const err      = new Error("star map read failed");
+        err.code = "starmap_failed";
+        throw err;
+      }
+      const graph = normalizeStarMapGraph(result);
+      return { backend: "hermes", nodes: graph.nodes, links: graph.links };
+    },
+
+    async "starmap.forget"(params     ) {
+
+      const parsed = parseStarMapForgetParams(params);
+      if (!parsed) throw createStarMapForgetError("bad_request");
+      const profile = parsed.agentId.toLowerCase() === "main" ? "" : parsed.agentId;
+      let result     ;
+      try {
+        result = await link.request(
+          LINK_GW_METHODS.starMapForget,
+          { profile, id: parsed.id, kind: parsed.kind, text: parsed.text },
+          DB_READ_TIMEOUT,
+        );
+      } catch (err) {
+        if (isStarMapMethodNotFound(err)) throw createStarMapUnsupportedError("gw.starmap.forget");
+        throw err;
+      }
+      if (!result || typeof result !== "object") throw createStarMapForgetError("forget_failed");
+      if (result.status === "unsupported") throw createStarMapUnsupportedError("hermes host");
+      if (result.status === "error") {
+        const code = typeof result.errorCode === "string" ? result.errorCode.trim() : "";
+        if (code === "unsupported") throw createStarMapUnsupportedError("hermes host");
+        const message = typeof result.message === "string" ? result.message : undefined;
+        throw createStarMapForgetError(code || "forget_failed", message);
+      }
+      if (result.status === "ok" && (result.action === "removed" || result.action === "archived" || result.action === "turned_off")) {
+        return { action: result.action };
+      }
+      throw createStarMapForgetError("forget_failed");
     },
 
     async "commands.list"() {
@@ -1266,7 +1803,7 @@ function createHermesGatewayBridge(opts) {
       return response;
     },
 
-    async "sessions.adopt"(params) {
+    async "sessions.adopt"(params     ) {
       const sourceKey = cleanNonEmptyString(params && params.key);
       if (!sourceKey) throw new Error("sessions.adopt requires key");
       if (!isAdoptableHermesSessionKey(sourceKey)) {
@@ -1274,7 +1811,7 @@ function createHermesGatewayBridge(opts) {
           "sessions.adopt requires a Desktop, CLI or TUI Hermes source key",
         );
       }
-      const linkParams = {
+      const linkParams      = {
         identity: keyToIdentity(sourceKey),
         publicKey: sourceKey,
       };
@@ -1284,7 +1821,7 @@ function createHermesGatewayBridge(opts) {
         linkParams,
         ADOPT_TIMEOUT_MS,
       );
-      const response = {
+      const response      = {
         status: cleanNonEmptyString(result && result.status) || "accepted",
         key: copiedSessionPublicKey(result && result.session, ""),
         adoptedFrom: sourceKey,
@@ -1303,7 +1840,7 @@ function createHermesGatewayBridge(opts) {
       return response;
     },
 
-    async "sessions.driver"(params) {
+    async "sessions.driver"(params     ) {
       const key = cleanNonEmptyString(params && params.key);
       if (!key) throw new Error("sessions.driver requires key");
       const result = await link.request(LINK_FOREIGN_METHODS.driver, {
@@ -1354,6 +1891,7 @@ function createHermesGatewayBridge(opts) {
         const mapped = mapListRow(row);
         if (mapped) {
           sessions.push(mapped);
+          rememberNativeIds(row, mapped.key);
           if (row.attention && row.attention.sessionKey === mapped.key) {
             dispatchBackendEvent("sessionAttention", row.attention);
           }
@@ -1362,7 +1900,7 @@ function createHermesGatewayBridge(opts) {
       return { sessions };
     },
 
-    async "sessions.attention"(params) {
+    async "sessions.attention"(params     ) {
       const key = cleanNonEmptyString(params && params.key);
       if (!key || !parseHermesPublicKey(key)) throw new Error("sessions.attention requires a Hermes key");
 
@@ -1370,11 +1908,11 @@ function createHermesGatewayBridge(opts) {
       return { status: "observed" };
     },
 
-    async "sessions.search"(params) {
+    async "sessions.search"(params     ) {
       const query =
         params && typeof params.query === "string" ? params.query.trim() : "";
       if (!query) throw new Error("sessions.search requires a query");
-      const linkParams = { query };
+      const linkParams      = { query };
       const limit = toFiniteNumber(params && params.limit);
       if (limit !== null && limit > 0) linkParams.limit = Math.floor(limit);
       const result = await link.request(LINK_DB_METHODS.sessionsSearch, linkParams, DB_READ_TIMEOUT);
@@ -1473,6 +2011,7 @@ function createHermesGatewayBridge(opts) {
         initial: !!(params && params.initial === true),
       };
       const commands = [];
+      let showReasoning                 = null;
       if (hasOwn(params, "model") || hasOwn(params, "modelProvider")) {
         const modelText =
           params && params.model != null ? String(params.model).trim() : "";
@@ -1529,11 +2068,10 @@ function createHermesGatewayBridge(opts) {
           params && params.reasoningLevel != null
             ? String(params.reasoningLevel).trim().toLowerCase()
             : "";
-        const displayCommands = REASONING_DISPLAY_TO_HERMES_COMMANDS[raw];
-        if (!displayCommands) {
+        if (!hasOwn(REASONING_DISPLAY_TO_SHOW_REASONING, raw)) {
           throw new Error(`unsupported reasoning level: ${raw || "<blank>"}`);
         }
-        commands.push(...displayCommands);
+        showReasoning = REASONING_DISPLAY_TO_SHOW_REASONING[raw];
       }
       let structured = null;
       let structuredFallback = null;
@@ -1568,11 +2106,29 @@ function createHermesGatewayBridge(opts) {
         const ack = await dispatchTurn({
           message: command,
           sessionKey: params && params.key,
+
+          ...(isQuietSettingsCommand(command) ? { quiet: true } : {}),
         });
         if (ack.status && ack.status !== "accepted") {
           throw new Error(ack.error || `settings command ${ack.status}`);
         }
         results.push(ack);
+      }
+      let reasoningApplied = null;
+      if (showReasoning !== null) {
+
+        const profile = await link.request(LINK_PROFILE_METHODS.optionsApply, {
+          ns: keyToIdentity(target.publicKey).ns,
+          options: { show_reasoning: showReasoning },
+        });
+        if (profile && profile.status && profile.status !== "accepted" && profile.error) {
+          throw new Error(profile.error);
+        }
+        if (!profile || (profile.status && profile.status !== "accepted") ||
+          profile.reasoningLevel !== String(params.reasoningLevel).trim().toLowerCase()) {
+          throw new Error("Hermes reasoning visibility could not be confirmed; reopen settings to refresh native state");
+        }
+        reasoningApplied = { reasoningLevel: profile.reasoningLevel };
       }
       return {
         ok: true,
@@ -1580,8 +2136,8 @@ function createHermesGatewayBridge(opts) {
         results,
         structured,
         ...(structuredFallback ? { fallback: structuredFallback } : {}),
-        ...(structured && structured.effective
-          ? { applied: structured.effective }
+        ...(reasoningApplied || (structured && structured.effective)
+          ? { applied: { ...(structured?.effective || {}), ...reasoningApplied } }
           : {}),
       };
     },
@@ -1598,7 +2154,7 @@ function createHermesGatewayBridge(opts) {
       });
     },
 
-    async "chat.history"(params) {
+    async "chat.history"(params     ) {
       const limit = toFiniteNumber(params && params.limit);
 
       const afterId = toFiniteNumber(params && params.afterId);
@@ -1607,6 +2163,10 @@ function createHermesGatewayBridge(opts) {
 
         ...(limit !== null && limit > 0 ? { limit: Math.floor(limit) } : {}),
         ...(afterId !== null && afterId >= 0 ? { afterId: Math.floor(afterId) } : {}),
+
+        ...(afterId !== null && afterId >= 0 && params && params.order === "oldest"
+          ? { order: "oldest" }
+          : {}),
       };
       const result = await link.request(LINK_DB_METHODS.chatHistory, linkParams, DB_READ_TIMEOUT);
       const messages = shapeConversationMessages(
@@ -1616,14 +2176,17 @@ function createHermesGatewayBridge(opts) {
 
       const rawTotal = result ? result.total : undefined;
       const total = rawTotal == null ? null : toFiniteNumber(rawTotal);
+      const rawNextAfterId = result ? result.nextAfterId : undefined;
+      const nextAfterId = rawNextAfterId == null ? null : toFiniteNumber(rawNextAfterId);
       return {
         messages,
         ...(total !== null && total >= 0 ? { total: Math.floor(total) } : {}),
         ...(result && result.rowIdsUnavailable === true ? { rowIdsUnavailable: true } : {}),
+        ...(nextAfterId !== null && nextAfterId >= 0 ? { nextAfterId: Math.floor(nextAfterId) } : {}),
       };
     },
 
-    async "chat.watermark"(params) {
+    async "chat.watermark"(params     ) {
       const key = cleanNonEmptyString(params && params.sessionKey);
       if (!key) throw new Error("chat.watermark requires sessionKey");
       const result = await link.request(
@@ -1660,13 +2223,27 @@ function createHermesGatewayBridge(opts) {
       const contextTokensKnown = lastTurn !== null && lastTurn >= 0;
       const totalTokens = contextTokensKnown ? Math.floor(lastTurn) : 0;
 
+      const contextTokensEstimated =
+        contextTokensKnown && result.lastMessageTokenCountEstimated === true;
+
+      const rawWindow = result ? result.contextWindow : undefined;
+      const window = rawWindow == null ? null : toFiniteNumber(rawWindow);
+      const contextTokens = window !== null && window > 0 ? Math.floor(window) : 0;
+
+      const rawCount = result ? result.messageCount : undefined;
+      const messageCount = rawCount == null ? null : toFiniteNumber(rawCount);
+
       const rawCost = result ? result.costUsd : undefined;
       const costUsd = rawCost == null ? null : toFiniteNumber(rawCost);
       return {
         session: {
           totalTokens,
-          contextTokens: 0,
+          contextTokens,
           contextTokensKnown,
+          ...(contextTokensEstimated ? { contextTokensEstimated: true } : {}),
+          ...(messageCount !== null && messageCount >= 0
+            ? { messageCount: Math.floor(messageCount) }
+            : {}),
           ...(costUsd !== null && costUsd >= 0 ? { costUsd } : {}),
         },
       };
@@ -1677,24 +2254,37 @@ function createHermesGatewayBridge(opts) {
         identity: keyToIdentity(params && params.key),
       }, DB_READ_TIMEOUT);
       const hops = toFiniteNumber(result && result.hops);
-      const count = hops !== null && hops > 0 ? Math.floor(hops) : 0;
+
+      const compactions = toFiniteNumber(result && result.compactions);
+      const counted = compactions !== null && compactions >= 0;
+      const total = counted ? compactions : hops;
+      const count = total !== null && total > 0 ? Math.floor(total) : 0;
 
       const checkpoints = [];
       for (let i = 0; i < count; i += 1) checkpoints.push({});
-      return { checkpoints, metric: "hops" };
+      return {
+        checkpoints,
+        metric: counted && result.exact === true ? "compactions" : "hops",
+
+        ...(counted && result.live === true ? { live: true } : {}),
+      };
     },
   };
 
   const listeners = new Map();
 
   function dispatchBackendEvent(name, payload) {
+
+    if (isQuietRunEvent(name, payload)) return;
     const set = listeners.get(name);
     if (!set || set.size === 0) return;
 
-    const normalized = normalizeHermesDisplayEventPayload(
-      name,
-      normalizeBackendEventPayload(payload),
-    );
+    const normalized = name === SESSIONS_GONE_EVENT
+      ? withGoneSessionKeys(payload)
+      : normalizeHermesDisplayEventPayload(
+        name,
+        normalizeBackendEventPayload(payload),
+      );
     for (const listener of Array.from(set)) {
       try {
         listener(normalized);
@@ -1806,4 +2396,4 @@ function createHermesGatewayBridge(opts) {
   return { bridge, dispatchBackendEvent };
 }
 
-module.exports = { LINK_DB_METHODS, LINK_DB_READ_TIMEOUT_MS, LINK_BACKEND_EVENT_METHOD, LINK_DISPATCH_METHOD, LINK_GW_METHODS, LINK_FOREIGN_METHODS, LINK_APPROVAL_RESOLVE_METHOD, LINK_CLARIFY_RESOLVE_METHOD, LINK_CLARIFY_AWAIT_TEXT_METHOD, LINK_SESSION_METHODS, LINK_PROFILE_METHODS, LINK_ATTACHMENT_INLINE_MAX_CHARS, DENIED_SESSION_SOURCES, alignUsageWindowLabel, normalizeBackendEventPayload, translateHermesSkillSlash, createHermesGatewayBridge, COMPACTION_SUMMARY_OPENERS, MERGED_SUMMARY_DELIMITER, classifyCompactionSummary };
+module.exports = { LINK_DB_METHODS, HERMES_FEATURE_TOKEN_SESSION_READ_STATE, LINK_DB_READ_TIMEOUT_MS, LINK_ADOPT_TIMEOUT_MS, LINK_AGENTS_ROUTE_TIMEOUT_MS, LINK_AGENT_DESCRIBE_TIMEOUT_MS, AGENT_DESCRIPTION_SET_MAX_CHARS, AGENT_DESCRIBE_MAX_PROFILES, LINK_BACKEND_EVENT_METHOD, LINK_DISPATCH_METHOD, LINK_GW_METHODS, LINK_FOREIGN_METHODS, LINK_APPROVAL_RESOLVE_METHOD, LINK_APPROVAL_LLM_COMPLETE_METHOD, LINK_PROGRAM_CARD_REVIEW_LLM_COMPLETE_METHOD, LINK_PROGRAM_CARD_FRAME_LLM_COMPLETE_METHOD, LINK_APPROVAL_EXPLAIN_SETTING_METHOD, LINK_WAITING_SETTINGS_METHOD, LINK_WAITING_ANSWER_METHOD, LINK_CLARIFY_RESOLVE_METHOD, LINK_CLARIFY_AWAIT_TEXT_METHOD, LINK_SESSION_METHODS, LINK_PROFILE_METHODS, LINK_ATTACHMENT_INLINE_MAX_CHARS, DENIED_SESSION_SOURCES, SESSIONS_GONE_EVENT, normalizeBackendEventPayload, alignUsageWindowLabel, collapseHermesCommandConfirmation, translateHermesSkillSlash, COMPACTION_SUMMARY_OPENERS, MERGED_SUMMARY_DELIMITER, classifyCompactionSummary, createHermesGatewayBridge };

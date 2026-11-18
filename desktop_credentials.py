@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-import os
 import secrets
 import time
 from pathlib import Path
 from typing import Any
 
+from . import secret_access
 from .receipts import receipt_state_lock, resolve_receipt_home, state_dir, write_json_receipt
 
 REQUEST_FILE = "ocuclaw.desktop-credentials.json"
@@ -28,10 +28,9 @@ def _home() -> Path:
 
 
 def _presence() -> dict[str, bool]:
-    from hermes_cli.config import get_env_value, invalidate_env_cache
-
-    invalidate_env_cache()
-    return {name: bool(str(get_env_value(key) or "").strip()) for name, key in FIELDS.items()}
+    # Through Hermes (catalogue rule 11), rebuilt from the profile's files now.
+    home = secret_access.profile_home()
+    return {name: secret_access.secret_present(key, home) for name, key in FIELDS.items()}
 
 
 def _read(home: Path) -> dict[str, Any] | None:
@@ -116,17 +115,14 @@ def validate_value(name: str, value: Any) -> str:
 
 
 def _saved_value(key: str) -> str:
-    """The on-disk `.env` value, never the value this process loaded.
+    """The saved value, never the value this process loaded.
 
     Inside the gateway `os.environ` holds the LOADED key; re-entering it to
-    revert a pending `.env` change must still be written (#3357).
+    revert a pending `.env` change must still be written (#3357). A read with
+    an explicit home rebuilds the profile's scope from its files now, so the
+    saved value wins and the process environment is only the fallback.
     """
-    from hermes_cli import config
-    config.invalidate_env_cache()
-    reader = getattr(config, "get_env_value_prefer_dotenv", None)
-    if reader is None:  # Hermes without the helper: the same precedence by hand.
-        return str(config.load_env().get(key) or os.environ.get(key) or "").strip()
-    return str(reader(key) or "").strip()
+    return secret_access.read_secret(key, secret_access.profile_home())
 
 
 def env_value_matches(name: str, value: str) -> bool:
@@ -140,10 +136,9 @@ def write_env_value(name: str, value: str) -> None:
     none (the terminal wizard without a receipt home). Raises `save_failed`
     when the read-back disagrees, so a silent no-op never counts as saved.
     """
-    from hermes_cli.config import invalidate_env_cache, load_env, save_env_value
+    from hermes_cli.config import save_env_value
     save_env_value(FIELDS[name], value)
-    invalidate_env_cache()
-    if load_env().get(FIELDS[name]) != value:
+    if (secret_access.read_stored_secret(FIELDS[name]) or "") != value:
         raise ValueError("save_failed")
 
 

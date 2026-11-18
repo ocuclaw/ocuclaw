@@ -29,11 +29,19 @@ def _host_lock(directory):
         target.unlink()
 
 
+class RouteUnavailable(ValueError):
+    """``route_unavailable``; ``tailscale`` names a plain Tailscale cause, if any."""
+
+    def __init__(self, tailscale=None):
+        super().__init__("route_unavailable")
+        self.tailscale = tailscale
+
+
 def observe(home):
     cli = planner.resolve_host_cli()
     if not planner._valid_cli(cli):
-        raise ValueError("route_unavailable")
-    node, _ = serve._run_json(cli + ("status", "--json"), timeout_s=serve.READ_TIMEOUT_S)
+        raise RouteUnavailable(planner.host_cli_problem())
+    node, node_code = serve._run_json(cli + ("status", "--json"), timeout_s=serve.READ_TIMEOUT_S)
     graph, _ = serve._run_json(cli + ("serve", "status", "--json"), timeout_s=serve.READ_TIMEOUT_S)
     own = node.get("Self") if isinstance(node, dict) else None
     host = serve.normalize_dns_name(own.get("DNSName")) if isinstance(own, dict) else None
@@ -41,7 +49,7 @@ def observe(home):
     if (not host or node.get("BackendState") != "Running" or own.get("Online") is not True
             or not own.get("ID") or not isinstance(graph, dict) or not isinstance(context, dict)
             or planner.resolve_host_cli() != cli):
-        raise ValueError("route_unavailable")
+        raise RouteUnavailable(planner.tailscale_problem(node_code, node))
     return {"cli": tuple(cli), "node": {key: own.get(key) for key in
             ("ID", "PublicKey", "DNSName", "TailscaleIPs")}, "host": host,
             "port": context.get("relayPort"), "context": context, "graph": graph}
@@ -101,7 +109,8 @@ class OptionalRouteRpc:
             if operation == "route.preview":
                 operation_id = secrets.token_urlsafe(24)
                 row = {"owner": owner, "revision": revision, "expires": now + 120,
-                       "used": False, "observed": None, "cancelled": cancelled}
+                       "used": False, "observed": None, "cancelled": cancelled,
+                       "tailscale": None, "routeOwner": None}
                 with self.state_lock:
                     while len(self.rows) >= 64:
                         self.rows.pop(next(iter(self.rows)))
@@ -112,8 +121,10 @@ class OptionalRouteRpc:
                     state, reason = (("preview", "route_absent") if decision.state == "approval_required"
                                      else ("ready", "route_matches") if decision.state == "verified_noop"
                                      else ("refused", "route_conflict"))
-                except Exception:
+                    row["routeOwner"] = decision.owner
+                except Exception as error:
                     state, reason = "unknown", "route_unavailable"
+                    row["tailscale"] = getattr(error, "tailscale", None)
                 if cancelled.is_set():
                     state, reason = "refused", "context_changed"
                 row["state"], row["reason"] = state, reason
@@ -124,6 +135,7 @@ class OptionalRouteRpc:
                     "reason": "context_changed", "observed": None})
             if operation == "route.status":
                 # Status is read-only, including after an ambiguous command outcome.
+                row["tailscale"] = None
                 try:
                     fresh = self.observer(home)
                     old = row["observed"]
@@ -132,8 +144,9 @@ class OptionalRouteRpc:
                     row["state"], row["reason"] = (("ready", "route_matches") if ready else
                         ("unknown", "apply_unconfirmed") if row["used"] else
                         (row["state"], row["reason"]) if fresh == old else ("refused", "context_changed"))
-                except Exception:
+                except Exception as error:
                     row["state"], row["reason"] = "unknown", "route_unavailable"
+                    row["tailscale"] = getattr(error, "tailscale", None)
                 return self._response(operation_id, row)
             if row["used"] or row["state"] != "preview":
                 return self._response(operation_id, {**row, "state": "refused", "reason": "context_changed"})
@@ -170,7 +183,13 @@ class OptionalRouteRpc:
     def _response(operation_id, row):
         observed = row.get("observed") or {}
         host = observed.get("host")
-        return {"operationId": operation_id, "expiresAtMs": int(row["expires"] * 1000),
-                "state": row["state"], "reason": row["reason"], "host": host,
-                "agentUrl": planner._agent_url(host), "relayPort": observed.get("port"),
-                "tailnetOnly": True, "requestVerified": False}
+        response = {"operationId": operation_id, "expiresAtMs": int(row["expires"] * 1000),
+                    "state": row["state"], "reason": row["reason"], "host": host,
+                    "agentUrl": planner._agent_url(host), "relayPort": observed.get("port"),
+                    "tailnetOnly": True, "requestVerified": False}
+        # Additive names for the phone's problem copy; released phones ignore them.
+        if row["reason"] == "route_unavailable" and row.get("tailscale"):
+            response["tailscale"] = row["tailscale"]
+        if row["state"] == "refused" and row["reason"] == "route_conflict" and row.get("routeOwner"):
+            response["owner"] = row["routeOwner"]
+        return response

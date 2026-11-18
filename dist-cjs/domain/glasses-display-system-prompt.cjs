@@ -33,6 +33,25 @@ const BEAT_TAG_LINES =
   "                            Never split a list, a name, a number, or a\n" +
   "                            phrase that must read as one unit.";
 
+const SPECK_TAG_LINES =
+  "  <speck:M/>               — Speck, the little character beside your words, shows\n" +
+  "                            feeling M. Use this exact self-closing tag.\n" +
+  "                            Use it whenever a reply carries real feeling (most\n" +
+  "                            chatty replies do); skip it for plain facts.\n" +
+  "                            At the very start of a reply: how he opens (at most one).\n" +
+  "                            Between two sentences: he reacts there and keeps that\n" +
+  "                            face while the next sentence shows (at most two).\n" +
+  "                            In a longer reply, also react where the feeling\n" +
+  "                            turns (a setback, a win, a punchline), not by habit.\n" +
+  "                            At the very end: how he signs off (at most one).\n" +
+  "                            Never inside a sentence, a list, a name or a number.\n" +
+  "                            M must be one of: amused impressed curious sympathetic\n" +
+  "                            sheepish proud playful confident worried excited\n" +
+  "                            surprised relieved grateful frustrated puzzled determined\n" +
+  "                            Good: \"<speck:sympathetic/>I'm so sorry. That's a hard morning.\"\n" +
+  "                            Good: \"I checked the whole fridge. <speck:amused/>Just ketchup.\"\n" +
+  "                            Bad:  \"The capital is <speck:confident/>Canberra.\"";
+
 const SHARED_RULES =
   "Most messages need NO display markup. Use it only where it adds real warmth,\n" +
   "surprise, care, playfulness, or pacing. Keep each span short. Never mark\n" +
@@ -46,12 +65,14 @@ function composeGlassesDisplaySystemPrompt(opts) {
   const emoji = !!(opts && opts.emoji);
   const pace = !!(opts && opts.pace);
   const beat = !!(opts && opts.beat);
-  if (!emoji && !pace && !beat) return "";
+  const speck = !!(opts && opts.speck);
+  if (!emoji && !pace && !beat && !speck) return "";
 
   const tagLines = [];
   if (emoji) tagLines.push(EMOJI_TAG_LINES);
   if (pace) tagLines.push(PACE_TAG_LINES);
   if (beat) tagLines.push(BEAT_TAG_LINES);
+  if (speck) tagLines.push(SPECK_TAG_LINES);
 
   const parts = [INTRO, tagLines.join("\n"), SHARED_RULES];
   if (emoji) parts.push(ALLOWLIST_BLOCK);
@@ -59,4 +80,4 @@ function composeGlassesDisplaySystemPrompt(opts) {
   return `<glasses_display>\n${parts.join("\n\n")}\n</glasses_display>`;
 }
 
-module.exports = { composeGlassesDisplaySystemPrompt };
+module.exports = { SPECK_TAG_LINES, composeGlassesDisplaySystemPrompt };

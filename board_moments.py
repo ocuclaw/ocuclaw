@@ -931,7 +931,7 @@ def ack(params: Any) -> dict:
     if not isinstance(params, dict) or set(params) != {"deliveryId", "state"}:
         return {"ok": False, "error": "invalid_params"}
     delivery, state = params["deliveryId"], params["state"]
-    if not isinstance(delivery, str) or not _ID.match(delivery) or state not in ACK_STATES:
+    if not isinstance(delivery, str) or not _ID.fullmatch(delivery) or state not in ACK_STATES:
         return {"ok": False, "error": "invalid_params"}
 
     now = int(time.time())

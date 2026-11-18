@@ -7,11 +7,34 @@ const WAKE_OUTBOX_CAP = 64;
 const DEFAULT_AGENT_TURN_BUSY_DECAY_MS = 180_000;
 
 const SURFACE_UUID_PATTERN = /^su-[a-z0-9]{4,24}$/i;
-const WAKE_RESULT_ENUM = new Set(["selected", "back"]);
+
+const LIVEUI_V2_SURFACE_PATTERN = /^ui-[a-z0-9]{1,24}$/i;
+
+const LIVEUI_V2_REF_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,63}$/;
+
+const LIVEUI_V2_PAGE_REF_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,63}#(?:0|[1-9][0-9]{0,3})$/;
+
+const WAKE_RESULT_ENUM = new Set(["selected", "back", "action"]);
 
 function sanitizeWakeToken(value) {
   const raw = String(value == null ? "" : value);
-  return SURFACE_UUID_PATTERN.test(raw) ? raw : "invalid";
+  return SURFACE_UUID_PATTERN.test(raw) || LIVEUI_V2_SURFACE_PATTERN.test(raw) ? raw : "invalid";
+}
+
+function sanitizeWakeRef(value         ) {
+  return typeof value === "string" && LIVEUI_V2_REF_PATTERN.test(value) ? value : "invalid";
+}
+
+function isWakeRefToken(value         )                  {
+  return typeof value === "string" && LIVEUI_V2_REF_PATTERN.test(value);
+}
+
+function isWakeRowRefToken(value         )                  {
+  return isWakeRefToken(value) || (typeof value === "string" && LIVEUI_V2_PAGE_REF_PATTERN.test(value));
+}
+
+function sanitizeWakeRowRef(value         ) {
+  return isWakeRowRefToken(value) ? value : "invalid";
 }
 
 function sanitizeWakeResult(value) {
@@ -28,6 +51,24 @@ function buildWakeMessage(ref) {
   const eventId = coerceInt(ref && ref.eventId);
   const itemIndex = coerceInt(ref && ref.itemIndex);
   const queuedAtMs = coerceInt(ref && ref.queuedAtMs);
+  if (ref && ref.liveuiV2 === true) {
+
+    const refs =
+      result === "action"
+        ?
+          `action=${sanitizeWakeRef(ref.action)}${typeof ref.row === "string" ? ` row=${sanitizeWakeRowRef(ref.row)} itemIndex=${itemIndex}` : ""}`
+        : result === "selected"
+          ? `row=${sanitizeWakeRowRef(ref.row)} itemIndex=${itemIndex}`
+          : "";
+    return [
+      "[ocuclaw glasses-ui wake] Plugin-generated notification - NOT the wearer speaking.",
+      `The wearer tapped a composed glasses surface (origin=gesture). refs: surfaceId=${surfaceUuid}`,
+      `eventId=${eventId} result=${result}${refs ? ` ${refs}` : ""} queuedAtMs=${queuedAtMs}.`,
+
+      "The tap and the values it carried are in this turn's LiveUI context (its tap line):",
+      "answer from them. If no tap line is there, read them with get_glasses_ui_state.",
+    ].join(" ");
+  }
   return [
     "[ocuclaw glasses-ui wake] Plugin-generated notification - NOT the wearer speaking.",
     `The wearer tapped a parked glasses surface (origin=gesture). refs: surfaceUuid=${surfaceUuid}`,
@@ -37,7 +78,11 @@ function buildWakeMessage(ref) {
   ].join(" ");
 }
 
-function createAgentTurnTracker(deps = {}) {
+function agentTurnSlot(sessionKey        ) {
+  return sessionKey.replace(/^agent:[^:]+:/, "");
+}
+
+function createAgentTurnTracker(deps      = {}) {
   const now = typeof deps.now === "function" ? deps.now : Date.now;
   const onChange = typeof deps.onChange === "function" ? deps.onChange : () => {};
   const busyDecayMs = Number.isFinite(deps.busyDecayMs)
@@ -48,11 +93,11 @@ function createAgentTurnTracker(deps = {}) {
   const runBySession = new Map();
   const runIdCap = Number.isFinite(deps.runIdCap) ? deps.runIdCap : 64;
 
-  function normalizeKey(sessionKey) {
-    return sessionKey.replace(/^agent:[^:]+:/, "");
+  function normalizeKey(sessionKey     ) {
+    return agentTurnSlot(sessionKey);
   }
 
-  function noteRun(sessionKey, runId) {
+  function noteRun(sessionKey     , runId     ) {
     if (typeof sessionKey !== "string" || !sessionKey) return;
     if (typeof runId !== "string" || !runId.trim()) return;
     const key = normalizeKey(sessionKey);
@@ -71,7 +116,7 @@ function createAgentTurnTracker(deps = {}) {
     }
   }
 
-  function runIdFor(sessionKey) {
+  function runIdFor(sessionKey     ) {
     if (typeof sessionKey !== "string" || !sessionKey) {
       return { runId: null, active: false, atMs: null, ambiguous: false };
     }
@@ -86,14 +131,14 @@ function createAgentTurnTracker(deps = {}) {
     };
   }
 
-  function refreshBusy(sessionKey) {
+  function refreshBusy(sessionKey     ) {
     const key = normalizeKey(sessionKey);
     if (!isBusy(sessionKey)) {
       const entry = runBySession.get(key);
       if (entry) {
 
         const at = now();
-        const liveEntries = Array.from(entry.live.entries());
+        const liveEntries      = Array.from(entry.live.entries());
         for (const [id, lastSeen] of liveEntries) {
           if (at - lastSeen >= busyDecayMs) entry.live.delete(id);
         }
@@ -104,14 +149,14 @@ function createAgentTurnTracker(deps = {}) {
     lastSeenBySession.set(key, now());
   }
 
-  function markBusy(sessionKey, runId = null) {
+  function markBusy(sessionKey     , runId      = null) {
     if (typeof sessionKey !== "string" || !sessionKey) return;
     refreshBusy(sessionKey);
     if (runId) noteRun(sessionKey, runId);
     onChange(sessionKey, true);
   }
 
-  function onActivity(sessionKey, phase, runId = null) {
+  function onActivity(sessionKey     , phase     , runId      = null) {
     if (typeof sessionKey !== "string" || !sessionKey) return;
     if (phase === "end") {
 
@@ -133,7 +178,7 @@ function createAgentTurnTracker(deps = {}) {
     onChange(sessionKey, true);
   }
 
-  function isBusy(sessionKey) {
+  function isBusy(sessionKey     ) {
     if (typeof sessionKey !== "string" || !sessionKey) return false;
     const key = normalizeKey(sessionKey);
     const lastSeen = lastSeenBySession.get(key);
@@ -148,14 +193,14 @@ function createAgentTurnTracker(deps = {}) {
   return { markBusy, onActivity, isBusy, noteRun, runIdFor };
 }
 
-function pickHookRunId(source) {
+function pickHookRunId(source     ) {
   if (!source || typeof source !== "object") return null;
   const raw = source.runId;
   return typeof raw === "string" && raw.trim() ? raw.trim() : null;
 }
 
-function readAgentRunId(relayLike, sessionKey, hookCtx, hookEvent) {
-  let tracked = null;
+function readAgentRunId(relayLike     , sessionKey     , hookCtx     , hookEvent     ) {
+  let tracked      = null;
   try {
     if (relayLike && typeof relayLike.currentAgentRunId === "function") {
       const snapshot = relayLike.currentAgentRunId(sessionKey);
@@ -181,10 +226,12 @@ function readAgentRunId(relayLike, sessionKey, hookCtx, hookEvent) {
   return { runId: null, runIdSource: null, runIdActive: false, runIdAmbiguous: false };
 }
 
-function createGlassesWakeController(deps = {}) {
+function createGlassesWakeController(deps      = {}) {
   const dispatchWake = typeof deps.dispatchWake === "function" ? deps.dispatchWake : null;
   const isAgentTurnBusy =
     typeof deps.isAgentTurnBusy === "function" ? deps.isAgentTurnBusy : () => false;
+
+  const isTapOwed = typeof deps.isTapOwed === "function" ? deps.isTapOwed : () => null;
   const emitLifecycle =
     typeof deps.emitLifecycle === "function" ? deps.emitLifecycle : () => {};
   const now = typeof deps.now === "function" ? deps.now : Date.now;
@@ -195,6 +242,8 @@ function createGlassesWakeController(deps = {}) {
   const inFlightBySession = new Map();
   const lastWakeAtBySession = new Map();
   const outbox = [];
+
+  const deferredBySession = new Map();
 
   function pushOutbox(entry) {
     outbox.push(entry);
@@ -214,6 +263,14 @@ function createGlassesWakeController(deps = {}) {
 
       origin: typeof ref.origin === "string" ? ref.origin : "gesture",
       queuedAtMs: coerceInt(ref.queuedAtMs),
+
+      ...(ref.liveuiV2 === true
+        ? {
+            liveuiV2: true,
+            ...(ref.action !== undefined ? { action: sanitizeWakeRef(ref.action) } : {}),
+            ...(ref.row !== undefined ? { row: sanitizeWakeRowRef(ref.row) } : {}),
+          }
+        : {}),
     };
   }
 
@@ -222,7 +279,13 @@ function createGlassesWakeController(deps = {}) {
     return { dispatched: false, reason };
   }
 
-  function onParkedGesture(ref) {
+  function deferUntilTurnEnd(refs     , reason        ) {
+    deferredBySession.set(agentTurnSlot(refs.sessionKey), refs);
+    emitLifecycle("wake_deferred", "debug", { reason, ...refs });
+    return { dispatched: false, reason: "deferred_until_turn_end" };
+  }
+
+  function onParkedGesture(ref, { released = false } = {}) {
     const refs = refsOnly(ref || {});
     if (!dispatchWake) {
 
@@ -246,14 +309,18 @@ function createGlassesWakeController(deps = {}) {
     if (!sessionKey) return suppress("no_session", refs);
     if (isAgentTurnBusy(sessionKey)) {
 
+      if (refs.liveuiV2 === true) return deferUntilTurnEnd(refs, "turn_busy");
+
       return suppress("absorbed_by_active_turn", refs);
     }
+
+    deferredBySession.delete(agentTurnSlot(sessionKey));
     if (inFlightBySession.has(sessionKey)) {
       emitLifecycle("wake_coalesced", "debug", refs);
       return { dispatched: false, reason: "coalesced_into_inflight_wake" };
     }
     const lastWakeAt = lastWakeAtBySession.get(sessionKey);
-    if (Number.isFinite(lastWakeAt) && now() - lastWakeAt < wakeCooldownMs) {
+    if (!released && Number.isFinite(lastWakeAt) && now() - lastWakeAt < wakeCooldownMs) {
       return suppress("cooldown", refs);
     }
 
@@ -265,7 +332,12 @@ function createGlassesWakeController(deps = {}) {
     const attempt = () => Promise.resolve(dispatchWake(payload));
     const flight = attempt()
       .catch(() => attempt())
-      .then(() => {
+      .then((ack) => {
+
+        if (refs.liveuiV2 === true && ack && typeof ack === "object" && ack.sessionState === "busy") {
+          deferUntilTurnEnd(refs, "host_busy");
+          return;
+        }
         emitLifecycle("wake_dispatched", "debug", { ...refs, idempotencyKey });
       })
       .catch((err) => {
@@ -293,7 +365,21 @@ function createGlassesWakeController(deps = {}) {
     return outbox.splice(0, outbox.length);
   }
 
-  return { onParkedGesture, peekWakeOutbox, drainWakeOutbox };
+  function onAgentTurnIdle(sessionKey         ) {
+    if (typeof sessionKey !== "string" || !sessionKey) return null;
+    const slot = agentTurnSlot(sessionKey);
+    const refs = deferredBySession.get(slot);
+    if (!refs) return null;
+    deferredBySession.delete(slot);
+
+    if (refs.eventId !== null && isTapOwed(refs.sessionKey, refs.eventId) === false) {
+      return suppress("tap_already_read", refs);
+    }
+    emitLifecycle("wake_deferred_released", "debug", refs);
+    return onParkedGesture(refs, { released: true });
+  }
+
+  return { onParkedGesture, onAgentTurnIdle, peekWakeOutbox, drainWakeOutbox };
 }
 
-module.exports = { createGlassesWakeController, createAgentTurnTracker, readAgentRunId, buildWakeMessage, sanitizeWakeToken, GLASSES_WAKE_ENABLED_ORIGINS };
+module.exports = { GLASSES_WAKE_ENABLED_ORIGINS, DEFAULT_WAKE_COOLDOWN_MS, WAKE_OUTBOX_CAP, DEFAULT_AGENT_TURN_BUSY_DECAY_MS, LIVEUI_V2_REF_PATTERN, LIVEUI_V2_PAGE_REF_PATTERN, sanitizeWakeToken, sanitizeWakeRef, isWakeRefToken, isWakeRowRefToken, sanitizeWakeRowRef, buildWakeMessage, createAgentTurnTracker, readAgentRunId, createGlassesWakeController };

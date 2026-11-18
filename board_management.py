@@ -9,6 +9,7 @@ never the active profile's home as the board root. No path, SQL or native
 exception text reaches the phone.
 """
 import base64
+from datetime import datetime
 from functools import lru_cache
 import hashlib
 import hmac
@@ -27,7 +28,7 @@ OPERATIONS = {"board.status", "board.boards", "board.lanes", "board.cards", "boa
               "board.watch", "board.watch.rule", "board.watch.rules", "board.policy", "board.policy.set",
               "board.create", "board.receipt",
               "board.verdict", "board.comment", "board.tools.enable", "board.decompose", "board.action",
-              "board.maintenance", "board.export", "board.export.part", "board.artifact", "board.artifact.part"}
+              "board.maintenance", "board.export", "board.export.part", "board.artifact", "board.artifact.part", "board.acknowledge"}
 #: #3947: ``board.watch.rule`` sets a rule (a watch by worker) in OcuClaw's
 #: own store, like ``board.watch``; ``board.watch.rules`` reads this
 #: profile's rules on every board.
@@ -53,7 +54,7 @@ OPERATIONS = {"board.status", "board.boards", "board.lanes", "board.cards", "boa
 #: #3044: ``board.artifact`` and ``board.artifact.part`` open one card artifact
 #: (``board_artifacts``). They are reads: the copy lands in OcuClaw's own temp
 #: area, like an export's archive, and Hermes is never written.
-WRITES = {"board.watch", "board.watch.rule", "board.policy.set", "board.create", "board.verdict", "board.comment",
+WRITES = {"board.watch", "board.watch.rule", "board.policy.set", "board.create", "board.verdict", "board.comment", "board.acknowledge",
           "board.tools.enable", "board.decompose", "board.action", "board.export", "board.export.part"}
 #: #3053: the moment policy's read and write, profile-scoped, no board.
 POLICY_OPERATIONS = {"board.policy", "board.policy.set"}
@@ -64,7 +65,7 @@ READS = OPERATIONS - WRITES
 #: carry an operation key (#3055).
 TARGETED = {"board.lanes", "board.cards", "board.card", "board.timeline", "board.watch", "board.watch.rule",
             "board.create",
-            "board.receipt", "board.verdict", "board.comment", "board.decompose", "board.action",
+            "board.receipt", "board.verdict", "board.comment", "board.decompose", "board.action", "board.acknowledge",
             "board.maintenance", "board.export", "board.export.part", "board.artifact", "board.artifact.part"}
 #: #3063: the maintenance section's own operations, worded for it.
 MAINTENANCE_OPERATIONS = {"board.maintenance", "board.export", "board.export.part"}
@@ -76,13 +77,13 @@ CREATE_OPERATIONS = {"board.create", "board.receipt"}
 #: #3060: the operation whose refusals are worded for a split.
 DECOMPOSE_OPERATIONS = {"board.decompose"}
 #: Writes whose failure after the receipt may have reached Hermes: never a guess.
-UNCERTAIN_WRITES = {"board.create", "board.verdict", "board.comment", "board.decompose", "board.action"}
+UNCERTAIN_WRITES = {"board.create", "board.verdict", "board.comment", "board.decompose", "board.action", "board.acknowledge"}
 
 #: Every Board capability key, in report order. Later tickets flip their own
 #: key; none may add a key without updating the contract.
 CAPABILITY_KEYS = (
     "browse", "passive_moments", "wake", "agent_tools", "create", "comment",
-    "approve", "request_changes", "answer_and_unblock", "make_ready", "reassign",
+    "approve", "request_changes", "answer_and_unblock", "make_ready", "edit", "reassign",
     "set_model", "retry", "archive", "dependencies", "watch", "maintenance", "artifact_open",
 )
 
@@ -115,7 +116,7 @@ UNSUPPORTED_KEYS = ("answer_and_unblock", "wake")
 #: stock call behind its own state guard and an OcuClaw receipt; each has its
 #: own contract tests on both pins and none follows another key.
 #: ``make_ready`` (#3707) is the same shape: stock ``specify_triage_task`` (no
-#: fields), triage only, present on every pin (0.21.1 .. 0.21.5).
+#: fields), triage only, present on every pin (0.21.1 .. 0.23.2).
 #: ``maintenance`` (#3063) opens Settings › Board › Maintenance; each of its
 #: actions (diagnostics, export, reclaim) has its own gate under it
 #: (``board_maintenance.gates``) and its own contract tests on both pins.
@@ -125,7 +126,7 @@ UNSUPPORTED_KEYS = ("answer_and_unblock", "wake")
 #: handed over in parts. It is on only while that stock helper takes a board
 #: (``board_artifacts.supported``); its contract tests run on every pin.
 CERTIFIED_KEYS = ("browse", "passive_moments", "create", "comment", "approve", "request_changes",
-                  "make_ready", "reassign", "set_model", "retry", "archive", "watch", "dependencies", "maintenance",
+                  "make_ready", "edit", "reassign", "set_model", "retry", "archive", "watch", "dependencies", "maintenance",
                   "artifact_open")
 
 #: Board certification is a fact about installed code, not a version label:
@@ -157,6 +158,58 @@ CERTIFIED_ENGINES = {
         "tag": "v2026.9.24", "commit": "f97608f178d1ffeca59860195ab7da295f7c8e5f",
         "fingerprint": "6c51376e70700941522441dd66399f80b3a61812bf34d35d89028bf4065c96cb",
     },
+    # The bundle's certified baseline from 0.22.1 until 0.22.4. Its kanban store runs
+    # workers in the gateway and adds the owner pause that Board Reclaim honours
+    # (kanban_owner_recovery); the Board contract suites run on this pin in
+    # the hermes-board 0.22.1 lane. Board certification is Matt's call on the pin-bump PR.
+    "0.22.1": {
+        "tag": "v0.22.1", "commit": "297552a9d646119871391d202509822cd86330df",
+        "fingerprint": "e20b1bc8c670e5e172cb6a8891d70af47120bcfc0f2803a683e577313de076f8",
+    },
+    # The bundle's certified baseline from 0.22.4 until 0.22.5. Its kanban store
+    # differs from 0.22.1 only in code Board never calls: the dispatcher's
+    # stale-claim sweep (release_stale_claims) now checks owner_reclaim_blocked,
+    # and an unused age helper is gone. The owner pause Board reads
+    # (owner_reclaim_paused) keeps its meaning. The Board contract suites run on
+    # this pin in the hermes-board 0.22.4 lane.
+    "0.22.4": {
+        "tag": "v0.22.4", "commit": "4d04303818b61bf3aa09278af48356315515965b",
+        "fingerprint": "699a445d584d3a4eaf9cb0fb6e8f33dd7bc6466a0beb0296058b7b922807433c",
+    },
+    # The bundle's certified baseline from 0.22.5 (Matt, 2026-10-23) until
+    # 0.23.0. No kanban module changed from 0.22.4, so the fingerprint is
+    # 0.22.4's. The Board contract suites run on this pin in the hermes-board 0.22.5 lane.
+    "0.22.5": {
+        "tag": "v0.22.5", "commit": "bf0203a794a07aac3ff764972ab9087baa4e4f4e",
+        "fingerprint": "699a445d584d3a4eaf9cb0fb6e8f33dd7bc6466a0beb0296058b7b922807433c",
+    },
+    # The bundle's certified baseline from 0.23.0 until 0.23.1. Its kanban store differs from
+    # 0.22.5 in code Board does not depend on: a stale-claim reclaim records the
+    # owner's reclaim reason, block_task fires its dependency hook after the
+    # transaction like every other kind, and log GC and the init lock moved to
+    # shared helpers. The Board contract suites run on this pin in
+    # the hermes-board 0.23.0 lane.
+    "0.23.0": {
+        "tag": "v0.23.0", "commit": "2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19",
+        "fingerprint": "3063a7372451e7d1264e7434bf576e107290883fcc3716602c85755978718002",
+    },
+    # The bundle's certified baseline from 0.23.1 until 0.23.2. Neither fingerprinted kanban
+    # module changed from 0.23.0, so the fingerprint is 0.23.0's. The Board
+    # contract suites run on this pin in the hermes-board 0.23.1 lane.
+    "0.23.1": {
+        "tag": "v0.23.1", "commit": "3b421578588243f920886e6fe79a6faa87ea026e",
+        "fingerprint": "3063a7372451e7d1264e7434bf576e107290883fcc3716602c85755978718002",
+    },
+    # The bundle's certified baseline from 0.23.2. Its kanban store differs from
+    # 0.23.1 only in an optional ``expect_assignee`` guard on claim_task and
+    # claim_review_task (a claim also fails when the card was reassigned). It
+    # defaults to off and Board never passes it, so every kanban call Board makes
+    # behaves as on 0.23.1. The Board contract suites run on this pin in the
+    # hermes-board 0.23.2 lane.
+    "0.23.2": {
+        "tag": "v0.23.2", "commit": "ae2a81ccc00e9b7c06301523e5bb09608397149c",
+        "fingerprint": "acf3b2fa0c9098ae2b11884f2b69a4a2abde5434df19ed3bfa9666f7d4d681ba",
+    },
 }
 
 #: The columns Board reads (a subset: extra native columns are fine).
@@ -176,7 +229,7 @@ REQUIRED_COLUMNS = {
 #: hold, and then enables exactly what a certified engine enables:
 #:
 #: 1. its version is inside the adapter's own support range
-#:    (``health.hermes_version_supported``: 0.21.1 <= v < 0.22.0). The same
+#:    (``health.hermes_version_supported``: 0.21.4 or newer, no ceiling). The same
 #:    gate starts the adapter, so a build outside it (an unstamped Hermes
 #:    checkout reports ``0.0.0``) never reaches Board at all;
 #: 2. the structural probe passes: every stock name Board calls exists and
@@ -290,6 +343,11 @@ TIMELINE_TEXT = {"blocked": "reason", "changes_requested": "reason",
                  "review_requested": "summary", "completed": "summary",
                  # #3058: the loop breaker's block keeps its reason, like any block.
                  "block_loop_detected": "reason"}
+#: Hermes 0.22.1 runs workers inside the gateway and books each run's plumbing
+#: as these events. They are not card history: the timeline, its total and the
+#: loop breaker's "newest event" leave them out. A literal SQL condition.
+TIMELINE_HIDDEN = ("owner_admitted", "worker_bound", "worker_result")
+_SHOWN = "COALESCE(kind, '') NOT IN (" + ", ".join(f"'{k}'" for k in TIMELINE_HIDDEN) + ")"
 
 MESSAGES = {
     "invalid_request": "This Board request is not valid.",
@@ -362,6 +420,7 @@ DECOMPOSE_MESSAGES = {
 
 #: #3059: the same codes, worded for a card action (Reassign, Set model, Retry, Archive).
 ACTION_MESSAGES = {
+    "edit_unsupported": "Editing cards isn't supported by this Hermes.",
     "invalid_request": "Hermes couldn't make this change. Check the card and try again.",
     "invalid_target": "That card is no longer available.",
     "stale_target": "This card changed since you opened it. Look again before changing it.",
@@ -543,6 +602,10 @@ def board_capabilities(engine=None, tools=None) -> list:
             from . import board_artifacts
             rows.append({"key": key, "enabled": True} if board_artifacts.supported()
                         else {"key": key, "enabled": False, "code": "unsupported"})
+        elif key == "edit" and certified and key in CERTIFIED_KEYS:
+            from .board_actions import edit_supported
+            rows.append({"key": key, "enabled": True} if edit_supported()
+                        else {"key": key, "enabled": False, "code": "unsupported"})
         elif key in CERTIFIED_KEYS:
             rows.append({"key": key, "enabled": True} if certified
                         else {"key": key, "enabled": False, "code": "uncertified"})
@@ -716,7 +779,7 @@ def list_boards(root: Path) -> list:
 def _target(root: Path, payload: dict):
     """``(slug, db, meta)`` for an existing board named by the payload."""
     slug = payload.get("slug")
-    if not isinstance(slug, str) or not _SLUG.match(slug):
+    if not isinstance(slug, str) or not _SLUG.fullmatch(slug):
         raise BoardReadError("invalid_request")
     db, meta = board_paths(root, slug)
     if slug != DEFAULT_BOARD and not db.parent.is_dir():
@@ -744,7 +807,7 @@ def _read(db: Path, body):
         conn.close()
 
 
-def read_lanes(root: Path, payload: dict) -> dict:
+def read_lanes(root: Path, payload: dict, home=None, rpc=None) -> dict:
     slug, db, meta = _target(root, payload)
 
     def body(conn):
@@ -753,10 +816,13 @@ def read_lanes(root: Path, payload: dict) -> dict:
             key = status if isinstance(status, str) and _STATUS.match(status) else "unknown"
             counts[key] = counts.get(key, 0) + int(count)
         needs_you = conn.execute(f"SELECT COUNT(*) FROM tasks t WHERE {_NEEDS_YOU}").fetchone()[0]
+        from .board_unknown import unknown_cards, readable_homes
+        unknown = len(unknown_cards(conn, readable_homes(rpc, home)))
+        needs_you += unknown
         failed = conn.execute(f"SELECT COUNT(*) FROM tasks t WHERE {_FAILED}").fetchone()[0]
-        return counts, int(needs_you), int(failed), _file_identity(db)
+        return counts, int(needs_you), int(failed), _file_identity(db), unknown
 
-    counts, needs_you, failed, identity = _read(db, body)
+    counts, needs_you, failed, identity, unknown = _read(db, body)
     lanes = [{"status": s, "count": counts.get(s, 0), "known": True} for s in LANE_ORDER]
     lanes += [{"status": s, "count": counts[s], "known": False}
               for s in sorted(counts) if s not in LANE_ORDER]
@@ -764,7 +830,7 @@ def read_lanes(root: Path, payload: dict) -> dict:
     # #3055: the board instance (the #3044 anchor), so a new card binds to the board the wearer saw.
     return {"target": {"slug": slug, "name": _metadata(slug, meta)["name"]},
             "anchor": board_anchor(root, identity), "lanes": lanes, "needsYou": needs_you, "failed": failed,
-            "total": total}
+            "total": total, "unknownCount": unknown}
 
 
 def _filter_sql(filter_):
@@ -832,7 +898,7 @@ def decode_cursor(cursor, *, profile: str, slug: str, filter_: str, identity: li
 def _card(row) -> dict:
     status = row["status"] if isinstance(row["status"], str) and _STATUS.match(row["status"]) else "unknown"
     card = {"id": _clean(row["id"], 64), "title": _clean(row["title"], 200) or "Untitled",
-            "state": status, "priority": int(row["pr"]), "createdAt": int(row["created_at"] or 0)}
+            "state": status, "priority": int(row["pr"]), "createdAt": _epoch(row["created_at"])}
     assignee = _clean(row["assignee"], 64)
     if assignee:
         card["assignee"] = assignee
@@ -840,8 +906,8 @@ def _card(row) -> dict:
         card["runOutcome"] = row["outcome"] if row["outcome"] in RUN_OUTCOMES else "other"
     # #3599: how long the running card has run; left out when unknown. List rows only
     # (the card sheet carries it on latestRun).
-    started = row["started_at"] if "started_at" in row.keys() else None
-    if status == "running" and isinstance(started, int) and started > 0:
+    started = _epoch(row["started_at"] if "started_at" in row.keys() else None)
+    if status == "running" and started > 0:
         card["runStartedAt"] = started
     if status == "review":
         card["attention"] = "needs_review"
@@ -852,7 +918,7 @@ def _card(row) -> dict:
     return card
 
 
-def read_cards(root: Path, payload: dict, profile: str) -> dict:
+def read_cards(root: Path, payload: dict, profile: str, home=None, rpc=None) -> dict:
     if set(payload) - {"slug", "filter", "cursor", "limit"}:
         raise BoardReadError("invalid_request")
     slug, db, meta = _target(root, payload)
@@ -864,33 +930,39 @@ def read_cards(root: Path, payload: dict, profile: str) -> dict:
 
     def body(conn):
         conn.row_factory = sqlite3.Row
+        from .board_unknown import unknown_cards, readable_homes
+        unknown = unknown_cards(conn, readable_homes(rpc, home))
+        actual_where, actual_args = where, list(args)
+        if filter_ == "needs_you" and unknown:
+            actual_where = f"({where}) OR t.id IN ({','.join('?' for _ in unknown)})"
+            actual_args += list(unknown)
         identity = _file_identity(db)
         after = None
         if payload.get("cursor") is not None:
             after = decode_cursor(payload["cursor"], profile=profile, slug=slug,
                                   filter_=filter_, identity=identity)
-        total = conn.execute(f"SELECT COUNT(*) FROM tasks t WHERE {where}", args).fetchone()[0]
+        total = conn.execute(f"SELECT COUNT(*) FROM tasks t WHERE {actual_where}", actual_args).fetchone()[0]
         sql = (
             "SELECT t.id, t.title, t.status, COALESCE(t.priority, 0) AS pr, t.created_at,"
             " t.assignee, t.block_kind,"
             f" {_LATEST_OUTCOME} AS outcome,"
             " (SELECT r.started_at FROM task_runs r WHERE r.task_id = t.id"
             "  ORDER BY r.id DESC LIMIT 1) AS started_at"
-            f" FROM tasks t WHERE {where}"
+            f" FROM tasks t WHERE ({actual_where})"
         )
-        params = list(args)
+        params = list(actual_args)
         if after is not None:
             sql += (" AND (COALESCE(t.priority, 0) < ? OR (COALESCE(t.priority, 0) = ?"
                     " AND (t.created_at > ? OR (t.created_at = ? AND t.id > ?))))")
             params += [after[0], after[0], after[1], after[1], after[2]]
         sql += " ORDER BY pr DESC, t.created_at ASC, t.id ASC LIMIT ?"
         rows = conn.execute(sql, [*params, limit + 1]).fetchall()
-        return identity, int(total), rows
+        return identity, int(total), rows, unknown
 
-    identity, total, rows = _read(db, body)
+    identity, total, rows, unknown = _read(db, body)
     page = rows[:limit]
     result = {"target": {"slug": slug, "name": _metadata(slug, meta)["name"]},
-              "cards": _with_watch([_card(r) for r in page], profile, slug), "total": total}
+              "cards": _with_watch([{**_card(r), **({"outcomeUnknown": True} if r["id"] in unknown else {})} for r in page], profile, slug), "total": total}
     if len(rows) > limit:
         last = page[-1]
         result["nextCursor"] = encode_cursor({
@@ -952,6 +1024,27 @@ def _int(value, default=0) -> int:
         return default
 
 
+def _epoch(value, default=0) -> int:
+    """Epoch seconds from a timestamp cell, read as Hermes 0.22's ``_to_epoch``
+    reads it: int, float, numeric text or ISO-8601 text (some real stores hold
+    text in these integer columns, Hermes #97455). ``default`` when the cell is
+    empty or unreadable."""
+    if value is None:
+        return default
+    try:
+        if isinstance(value, (int, float)):
+            return int(value)
+        text = str(value).strip()
+        if not text:
+            return default
+        try:
+            return int(text)
+        except ValueError:
+            return int(datetime.fromisoformat(text).timestamp())
+    except (ValueError, OverflowError, OSError):
+        return default
+
+
 def _columns(conn, table: str) -> set:
     return {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
 
@@ -961,7 +1054,7 @@ def _card_target(root: Path, payload: dict, keys: set):
         raise BoardReadError("invalid_request")
     slug, db, meta = _target(root, payload)
     card_id = payload.get("id")
-    if not isinstance(card_id, str) or not _CARD_ID.match(card_id):
+    if not isinstance(card_id, str) or not _CARD_ID.fullmatch(card_id):
         raise BoardReadError("invalid_request")
     return slug, db, meta, card_id
 
@@ -1007,7 +1100,7 @@ def artifact_descriptor(row):
     if not name:
         return None
     item = {"id": _int(row["id"]), "name": name, "size": max(0, _int(row["size"])),
-            "createdAt": max(0, _int(row["created_at"]))}
+            "createdAt": max(0, _epoch(row["created_at"]))}
     kind = _decoded(row["content_type"])
     if isinstance(kind, str) and _CONTENT_TYPE.match(kind.strip().lower()):
         item["contentType"] = kind.strip().lower()
@@ -1033,11 +1126,11 @@ def _comment_pairs(conn, card_id: str) -> dict:
         detail = _payload(event["payload"])
         author = str(detail.get("author") or "").strip()
         length = _int(detail.get("len"), -1)
-        at = _int(event["created_at"])
+        at = _epoch(event["created_at"])
         k = start
-        while k < len(comments) and _int(comments[k]["created_at"]) <= at:
+        while k < len(comments) and _epoch(comments[k]["created_at"]) <= at:
             c = comments[k]
-            if (str(_decoded(c["author"]) or "") == author and _int(c["created_at"]) >= at - 60
+            if (str(_decoded(c["author"]) or "") == author and _epoch(c["created_at"]) >= at - 60
                     and 0 < _int(c["len"]) <= length):
                 pairs[event["id"]] = c["id"]
                 start = k + 1
@@ -1048,8 +1141,8 @@ def _comment_pairs(conn, card_id: str) -> dict:
 
 def _timeline(conn, card_id: str, before, limit: int):
     """One page, newest first, keyset on ``task_events.id`` (native
-    ``list_events`` is unpaged)."""
-    sql = "SELECT id, run_id, kind, payload, created_at FROM task_events WHERE task_id = ?"
+    ``list_events`` is unpaged). Hermes' run plumbing (TIMELINE_HIDDEN) is left out."""
+    sql = f"SELECT id, run_id, kind, payload, created_at FROM task_events WHERE task_id = ? AND {_SHOWN}"
     params = [card_id]
     if before is not None:
         sql += " AND id < ?"
@@ -1068,7 +1161,7 @@ def _timeline(conn, card_id: str, before, limit: int):
     entries = []
     for row in page:
         kind = row["kind"] if isinstance(row["kind"], str) and _STATUS.match(row["kind"]) else "other"
-        entry = {"id": int(row["id"]), "kind": kind, "at": max(0, _int(row["created_at"]))}
+        entry = {"id": int(row["id"]), "kind": kind, "at": max(0, _epoch(row["created_at"]))}
         if row["run_id"] is not None:
             entry["runId"] = _int(row["run_id"])
         if kind == "commented":
@@ -1096,11 +1189,12 @@ def _block_loop(conn, card_id: str):
     """#3058: the stock loop breaker's outcome, or None. A card that blocked
     again for the same cause after an unblock (``BLOCK_RECURRENCE_LIMIT``) goes
     to ``triage`` with a ``block_loop_detected`` event instead of ``blocked``.
-    It shows while that event is the card's newest (comments aside): the card
-    is no longer a question to answer, and the sheet says why it is in triage.
+    It shows while that event is the card's newest (comments and run plumbing
+    aside: 0.22.1 books ``worker_result`` after the block): the card is no
+    longer a question to answer, and the sheet says why it is in triage.
     ``{kind?, reason?}``: the block's kind and its (redacted) reason."""
     row = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND kind != 'commented'"
-                       " ORDER BY id DESC LIMIT 1", [card_id]).fetchone()
+                       f" AND {_SHOWN} ORDER BY id DESC LIMIT 1", [card_id]).fetchone()
     if row is None or _decoded(row["kind"]) != "block_loop_detected":
         return None
     payload = _payload(row["payload"])
@@ -1133,7 +1227,7 @@ def _card_detail(conn, card_id: str) -> dict:
     if card["state"] == "blocked" and isinstance(block_kind, str) and _STATUS.match(block_kind):
         card["blockKind"] = block_kind
     if row["completed_at"] is not None:
-        card["completedAt"] = max(0, _int(row["completed_at"]))
+        card["completedAt"] = max(0, _epoch(row["completed_at"]))
     if optional:
         result = _prose(row["result"], PROSE_MAX)
         if result:
@@ -1163,7 +1257,7 @@ def _card_detail(conn, card_id: str) -> dict:
         status = _decoded(run["status"])
         latest = {"id": int(run["id"]),
                   "status": status if isinstance(status, str) and _STATUS.match(status) else "unknown",
-                  "startedAt": max(0, _int(run["started_at"]))}
+                  "startedAt": max(0, _epoch(run["started_at"]))}
         outcome = _decoded(run["outcome"])
         if outcome is not None:
             latest["outcome"] = outcome if outcome in RUN_OUTCOMES else "other"
@@ -1174,7 +1268,7 @@ def _card_detail(conn, card_id: str) -> dict:
         if summary:
             latest["summary"] = summary
         if run["ended_at"] is not None:
-            latest["endedAt"] = max(0, _int(run["ended_at"]))
+            latest["endedAt"] = max(0, _epoch(run["ended_at"]))
         card["latestRun"] = latest
     card["parents"] = _related(conn, "SELECT t.id, t.title, t.status FROM task_links l"
                                      " JOIN tasks t ON t.id = l.parent_id WHERE l.child_id = ?", card_id)
@@ -1184,12 +1278,12 @@ def _card_detail(conn, card_id: str) -> dict:
     return card
 
 
-def read_card(root: Path, payload: dict, profile: str) -> dict:
+def read_card(root: Path, payload: dict, profile: str, home=None, rpc=None) -> dict:
     """One card and its first timeline page, in one read transaction. With an
     ``anchor`` (a deep link) the store must still be the one it named."""
     slug, db, meta, card_id = _card_target(root, payload, {"slug", "id", "anchor"})
     anchor = payload.get("anchor")
-    if anchor is not None and (not isinstance(anchor, str) or not _ANCHOR.match(anchor)):
+    if anchor is not None and (not isinstance(anchor, str) or not _ANCHOR.fullmatch(anchor)):
         raise BoardReadError("invalid_request")
 
     def body(conn):
@@ -1199,10 +1293,20 @@ def read_card(root: Path, payload: dict, profile: str) -> dict:
         if anchor is not None and not hmac.compare_digest(anchor, current):
             raise BoardReadError("stale_target")
         card = _card_detail(conn, card_id)
+        from . import board_unknown
+        target = board_unknown.binding(conn, card_id, home)
+        if target and target["status"] == "unknown":
+            card["outcomeUnknown"] = True
+            card["unknownTarget"] = board_unknown.token(target, current)
+            card["canAcknowledge"] = board_unknown.owner(rpc, home) is not None
+        elif card_id in board_unknown.unknown_cards(conn, board_unknown.readable_homes(rpc, home)):
+            # Shared Board visibility never grants another profile write authority.
+            card["outcomeUnknown"] = True
         # #3059: the More menu's guards read the same snapshot as the sheet.
         from .board_actions import card_facts
         facts = card_facts(conn, card_id)
-        total = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", [card_id]).fetchone()[0]
+        total = conn.execute(f"SELECT COUNT(*) FROM task_events WHERE task_id = ? AND {_SHOWN}",
+                             [card_id]).fetchone()[0]
         timeline, last = _timeline(conn, card_id, None, TIMELINE_DEFAULT)
         return identity, current, card, facts, int(total), timeline, last
 
@@ -1247,7 +1351,8 @@ def read_timeline(root: Path, payload: dict, profile: str) -> dict:
             raise BoardReadError("stale_target")
         if conn.execute("SELECT 1 FROM tasks WHERE id = ?", [card_id]).fetchone() is None:
             raise BoardReadError("invalid_target")
-        total = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", [card_id]).fetchone()[0]
+        total = conn.execute(f"SELECT COUNT(*) FROM task_events WHERE task_id = ? AND {_SHOWN}",
+                             [card_id]).fetchone()[0]
         timeline, last = _timeline(conn, card_id, before, limit)
         return identity, int(total), timeline, last
 
@@ -1336,7 +1441,7 @@ def write_rule(root: Path, payload: dict, profile: str) -> dict:
         raise BoardReadError("invalid_request")
     slug, db, meta = _target(root, payload)
     assignee, mode = payload.get("assignee"), payload.get("mode")
-    if not isinstance(assignee, str) or not _RULE_ASSIGNEE.match(assignee):
+    if not isinstance(assignee, str) or not _RULE_ASSIGNEE.fullmatch(assignee):
         raise BoardReadError("invalid_request")
     if not isinstance(mode, str) or mode not in board_watch.RULE_MODES:
         raise BoardReadError("invalid_request")
@@ -1415,7 +1520,7 @@ def handle_board(identity: dict, payload, rpc=None) -> dict:
         worded = VERDICT_MESSAGES
     if operation == "board.comment":
         worded = COMMENT_MESSAGES
-    if operation == "board.action":
+    if operation in {"board.action", "board.acknowledge"}:
         worded = ACTION_MESSAGES
     if operation in MAINTENANCE_OPERATIONS:
         worded = MAINTENANCE_MESSAGES
@@ -1437,7 +1542,9 @@ def handle_board(identity: dict, payload, rpc=None) -> dict:
     # #3061: whether Hermes' kanban agent tools are on for OcuClaw, for the served
     # profile. Every answer carries the same agent_tools row; status carries the view.
     home = _profile_home(rpc, identity["profileId"])
-    tools = board_tools.view(home, certified)
+    # Matt, 2026-11-13: on by default. The first Board answer for a profile turns
+    # the tools on once (board_tools.apply_default); later answers only read.
+    tools = board_tools.apply_default(home, certified) or board_tools.view(home, certified)
     board = {"engine": dict(engine), "capabilities": board_capabilities(engine, tools)}
     if operation == "board.status":
         board["agentTools"] = tools
@@ -1496,11 +1603,11 @@ def handle_board(identity: dict, payload, rpc=None) -> dict:
         elif operation == "board.lanes":
             if set(payload) - {"slug"}:
                 return fail("invalid_request")
-            board.update(read_lanes(root, payload))
+            board.update(read_lanes(root, payload, _profile_home(rpc, identity["profileId"]), rpc))
         elif operation == "board.cards":
-            board.update(read_cards(root, payload, identity["profileId"]))
+            board.update(read_cards(root, payload, identity["profileId"], _profile_home(rpc, identity["profileId"]), rpc))
         elif operation == "board.card":
-            board.update(read_card(root, payload, identity["profileId"]))
+            board.update(read_card(root, payload, identity["profileId"], _profile_home(rpc, identity["profileId"]), rpc))
         elif operation == "board.watch":
             board.update(write_watch(root, payload, identity["profileId"], board["capabilities"]))
         elif operation == "board.watch.rule":
@@ -1528,6 +1635,9 @@ def handle_board(identity: dict, payload, rpc=None) -> dict:
             # #3059: the server enforces the action's own capability again right before the write.
             from . import board_actions
             board.update(board_actions.act(root, payload, identity["profileId"], board["capabilities"]))
+        elif operation == "board.acknowledge":
+            from . import board_unknown
+            board.update(board_unknown.acknowledge(root, payload, identity["profileId"], rpc, _profile_home(rpc, identity["profileId"])))
         elif operation in MAINTENANCE_OPERATIONS:
             # #3063: each maintenance action checks its own gate under `maintenance`.
             from . import board_maintenance

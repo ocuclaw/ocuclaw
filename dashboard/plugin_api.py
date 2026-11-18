@@ -48,12 +48,19 @@ GLASSES_STATE_STALE_AFTER_MS = 30_000
 DEVICE_STATE_STALE_AFTER_MS = 120_000
 DEVICE_STATE_CLOCK_SKEW_MS = 60_000
 PLATFORM_RECEIPT_EMPIRICAL_TTL_S = 300.0
-SETUP_GUIDE_VERSION = "2026-09-29 (1.3.26-hermes)"
+SETUP_GUIDE_VERSION = "2026-10-28 (1.3.27-hermes)"
 
 _LEG_ORDER = (
     ("hermesGateway", "Hermes gateway"),
     ("ocuclawRelay", "OcuClaw relay"),
     ("tailnetRoute", "Private tailnet route"),
+    ("phoneApp", "Phone app"),
+)
+# #5209: the user's own private network takes the route slot.
+_CUSTOM_LEG_ORDER = (
+    ("hermesGateway", "Hermes gateway"),
+    ("ocuclawRelay", "OcuClaw relay"),
+    ("customRoute", "Your private route"),
     ("phoneApp", "Phone app"),
 )
 _SETUP_STATES = {"configured", "incomplete", "invalid", "unavailable", "unsupported", "unknown"}
@@ -75,21 +82,26 @@ def _warn_push_off_once(reason: str) -> None:
 
 
 def _ws_upgrade_authorized(ws: WebSocket) -> bool:
-    """Delegate to Hermes's canonical upgrade gate, failing closed on drift."""
+    """Delegate to Hermes's canonical upgrade gate, failing closed on drift.
+
+    Every supported Hermes (0.21.1 through 0.22.4) defines the gate in
+    ``hermes_cli.web_server_chat``, where Hermes's own Kanban dashboard plugin
+    reads it; ``hermes_cli.web_server`` never re-exported it.
+    """
 
     try:
-        web_server = importlib.import_module("hermes_cli.web_server")
+        web_server = importlib.import_module("hermes_cli.web_server_chat")
     except Exception:
-        _warn_push_off_once("hermes_cli.web_server unavailable")
+        _warn_push_off_once("hermes_cli.web_server_chat unavailable")
         return False
     auth = getattr(web_server, "_ws_auth_ok", None)
     if not callable(auth):
-        _warn_push_off_once("hermes_cli.web_server._ws_auth_ok unavailable")
+        _warn_push_off_once("hermes_cli.web_server_chat._ws_auth_ok unavailable")
         return False
     try:
         return bool(auth(ws))
     except Exception:
-        _warn_push_off_once("hermes_cli.web_server._ws_auth_ok failed")
+        _warn_push_off_once("hermes_cli.web_server_chat._ws_auth_ok failed")
         return False
 
 
@@ -128,6 +140,7 @@ def _load_bundle_modules() -> Tuple[Any, ...]:
                     "desktop_fleet",
                     "conversation_resolver",
                     "models_rpc",
+                    "setup_bootstrap",
                 )
             )  # type: ignore[return-value]
         except ImportError:
@@ -159,6 +172,7 @@ def _load_bundle_modules() -> Tuple[Any, ...]:
             "desktop_fleet",
             "conversation_resolver",
             "models_rpc",
+            "setup_bootstrap",
         )
     )  # type: ignore[return-value]
 
@@ -178,13 +192,28 @@ def _load_bundle_modules() -> Tuple[Any, ...]:
     desktop_fleet,
     conversation_resolver,
     models_rpc,
+    setup_bootstrap,
 ) = _load_bundle_modules()
 
 
 _PAIRING_LOCK = threading.Lock()
 _PAIRING_SESSION: Optional[Dict[str, Any]] = None
-_PAIRING_OPS = frozenset({"state", "approve", "deny", "cancel"})
-_PAIRING_PHASE_ORDER = {"qr": 0, "words": 1, "deciding": 2, "outcome": 3}
+_PAIRING_OPS = frozenset({"state", "create", "approve", "deny", "cancel"})
+# `qr` is the manual phase's wire name, kept so older window copies agree. It
+# shows the address and pairing code; the window draws no QR (#5486).
+_PAIRING_PHASE_ORDER = {"phone-code": 0, "qr": 1, "phone-sent": 1, "words": 2, "deciding": 3, "outcome": 4}
+# A QR row in the relay's block: half-block glyphs and spaces only.
+_PAIRING_QR_ROW = re.compile(r"[ ▀▄█]*[▀▄█][ ▀▄█]*")
+
+
+def _manual_pairing_block(block: str) -> str:
+    """The relay's block without its QR rows (#5486).
+
+    The window reads only the ``Address:`` and ``Pairing code:`` lines, and
+    only when the reply has no ``address``/``pairingCode`` fields.
+    """
+    lines = str(block or "").split("\n")
+    return "\n".join(line for line in lines if not _PAIRING_QR_ROW.fullmatch(line.rstrip("\r")))
 
 
 def _build_direct_http_opener():
@@ -620,7 +649,10 @@ def _public_pairing_state(session: Mapping[str, Any], body: Mapping[str, Any]) -
             "phoneLabel": str(prompt.get("phoneLabel") or "unknown device")[:240],
             "phrase": str(prompt.get("safetyPhraseText") or "")[:240],
         }
-    return {"active": True, "sessionId": session["id"], "phase": "qr"}
+    sent = session.get("delivery") == "sent"
+    message = desktop_pairing.PHONE_CODE_SENT.rstrip() if sent else session.get("manualMessage")
+    return {"active": True, "sessionId": session["id"], "phase": "phone-sent" if sent else "qr",
+            **({"message": message} if message else {})}
 
 
 def _remember_public_pairing_state(
@@ -630,7 +662,15 @@ def _remember_public_pairing_state(
 
     candidate = dict(public)
     if candidate.get("phase") == "qr":
-        candidate["bootstrapBlock"] = str(session.get("bootstrapBlock") or "")
+        candidate["bootstrapBlock"] = _manual_pairing_block(session.get("bootstrapBlock"))
+        # #5484: the relay's own address and pairing code, which the window
+        # reads before the block. An older relay sends neither.
+        for key in ("address", "pairingCode"):
+            if session.get(key):
+                candidate[key] = str(session[key])
+        # #5486: when the address and code stop working, for the window's clock.
+        if isinstance(session.get("expiresAtMs"), int):
+            candidate["expiresAtMs"] = session["expiresAtMs"]
     previous = session.get("public")
     if isinstance(previous, Mapping):
         previous_phase = str(previous.get("phase") or "")
@@ -711,6 +751,9 @@ def _deliver_terminal_callback(session: Dict[str, Any]) -> bool:
     return delivered
 
 
+_PHONE_CODE_WINDOW_EXPIRED = "Pairing took longer than this window allows. Nothing was approved."
+
+
 def _expire_pairing(session: Dict[str, Any]) -> Dict[str, Any]:
     credential = pairing._read_relay_credential()
     control_secret = str(session.get("controlSecret") or "")
@@ -734,7 +777,10 @@ def _expire_pairing(session: Dict[str, Any]) -> Dict[str, Any]:
             "phase": "outcome",
             "outcomeState": "failed",
             "reason": "expired",
-            "message": "Pairing took longer than the two-minute window. Nothing was approved.",
+            # With a phone code the window had a longer typing budget than the
+            # exchange's five minutes, so its expiry names this window.
+            "message": _PHONE_CODE_WINDOW_EXPIRED if session.get("phoneCode") else
+            "Pairing took longer than the five-minute window. Nothing was approved.",
         },
     )
     session["terminal"] = public
@@ -783,7 +829,12 @@ def _causal_legs(
     receipt_blocked = platform_gate.get("eligible") is not True
     blocked_by: Optional[str] = None
     result = []
-    for key, label in _LEG_ORDER:
+    order = (
+        _CUSTOM_LEG_ORDER
+        if isinstance(raw_legs, Mapping) and "customRoute" in raw_legs
+        else _LEG_ORDER
+    )
+    for key, label in order:
         raw = raw_legs.get(key) if isinstance(raw_legs, Mapping) else None
         raw = raw if isinstance(raw, Mapping) else {}
         source_state = raw.get("state") if raw.get("state") in _HEALTH_STATES else "unknown"
@@ -981,6 +1032,18 @@ def _verified_phone_address(snapshot: Mapping[str, Any], facts: Mapping[str, Any
     route = legs.get("tailnetRoute") if isinstance(legs, Mapping) else None
     if not isinstance(gateway, Mapping) or gateway.get("state") != "healthy":
         return None
+    custom = legs.get("customRoute") if isinstance(legs, Mapping) else None
+    if isinstance(custom, Mapping):
+        # #5209: a healthy custom route passed every check, so the configured
+        # address, canonicalized by the shared contract, is the phone address.
+        if custom.get("classification") != "ready" or not all(
+            custom.get(key) == "yes" for key in ("configured", "reachable", "applicationReady")
+        ):
+            return None
+        custom_route = importlib.import_module(
+            serve.__name__.rsplit(".", 1)[0] + ".custom_route"
+        )
+        return custom_route.canonical_address(facts.get("customPhoneAddress"))
     if not isinstance(route, Mapping):
         return None
     if not all(route.get(key) == "yes" for key in ("configured", "reachable", "applicationReady")):
@@ -1042,6 +1105,10 @@ def build_dashboard_payload(
 
     producer = canonical.get("producer") or {}
     profile = canonical.get("profile") or {}
+    # Warning rows change no state: an untested newer Hermes stays configured.
+    warnings = []
+    if setup.get("hermesVersionUntested") is True:
+        warnings.append(health.hermes_untested_message(producer.get("hermesPackageVersion")))
     if health_state == "healthy" and proof_state == "proven":
         next_checkpoint = "No recovery checkpoint is needed; the prior G2 proof remains durable."
     elif health_state == "healthy":
@@ -1060,6 +1127,7 @@ def build_dashboard_payload(
             "evidenceMode": canonical.get("observationMode"),
         },
         "outcome": outcome,
+        "warnings": warnings,
         "causalPath": legs,
         "primary": primary,
         "safeAction": action,
@@ -1071,7 +1139,8 @@ def build_dashboard_payload(
         "verifiedPhoneAddress": address,
         "pairing": {
             "command": "/ocuclaw-setup",
-            "qr": "QR pairing uses the private address and an approved encrypted exchange.",
+            # The key is the page's (dist/index.js); no pairing draws a QR (#5486).
+            "qr": "Phone-code pairing uses the code OcuClaw shows and an approved encrypted exchange.",
             "manual": "Manual pairing uses the private address plus a short-lived pairing code.",
         },
         "provenance": {
@@ -1391,7 +1460,7 @@ def get_setup_card() -> Dict[str, Any]:
     First-Run Proof on an established install that predates that receipt.
     It never uses renderer-side memory, so the
     card stays retired across Desktop reinstalls and fresh renderer storage.
-    Booleans only: no address, token, or capability crosses this boundary, so
+    Booleans and version strings only: no address, token, or capability crosses this boundary, so
     the route needs no presenter capability the way the ceremony routes do.
 
     It deliberately does NOT report whether the gateway loaded OcuClaw, even
@@ -1425,10 +1494,35 @@ def get_setup_card() -> Dict[str, Any]:
                 and snapshot_module.parse_timestamp(proof["provenAt"])
             )
 
+    # Additive within v1: the gateway's serving receipt against plugin.yaml,
+    # so the card can say when an update waits on a gateway restart. Version
+    # strings only, like ``paired`` a fact the backend reads from disk.
+    try:
+        restart_to_finish = health.restart_to_finish()
+    except Exception:  # noqa: BLE001 - a hint, never a reason to fail the card
+        restart_to_finish = None
+
     return {
         "contract": "ocuclaw.desktop-setup-card",
         "contractVersion": 1,
         "paired": paired,
+        "restartToFinish": restart_to_finish,
+    }
+
+
+@router.get("/setup-tools")
+def get_setup_tools() -> Dict[str, Any]:
+    """Is the setup skill switched off? The Desktop card asks before setup.
+
+    Desktop's own bridge answers for the setup tool's toolset but not for the
+    plugin skill (see ``setup_bootstrap.setup_skill_switches``). Booleans
+    only, like ``/setup-card``.
+    """
+
+    return {
+        "contract": "ocuclaw.setup-tools",
+        "contractVersion": 1,
+        **setup_bootstrap.setup_skill_switches(),
     }
 
 
@@ -1453,6 +1547,27 @@ def desktop_credentials_action(payload: Any = Body(...)) -> Dict[str, Any]:
     return desktop_credentials.submit(
         payload.get("requestId"), payload.get("values"), cancel=action == "cancel"
     )
+
+
+@router.post("/setup-invocation")
+def desktop_setup_invocation(payload: Any = Body(...)) -> Dict[str, Any]:
+    """The card's ``/ocuclaw-setup`` message when the host cannot resolve it.
+
+    The card asks only after Hermes's own ``slash.exec`` and
+    ``command.dispatch`` both failed: Hermes 0.22.1 resolves neither for a
+    skill bundle. The answer is Hermes's own bundle expansion for this
+    profile, in the ``send`` shape those routes answer, and the card submits
+    it with ``prompt.submit`` as before. Read-only. The presenter capability
+    keeps it to the local Desktop presenter, like the ceremony routes.
+    """
+    _require_presenter_capability(payload)
+    if not isinstance(payload, dict) or set(payload) != {"presenterCapability"}:
+        raise HTTPException(status_code=400, detail="Invalid setup invocation request")
+    return {
+        "contract": "ocuclaw.setup-invocation",
+        "contractVersion": 1,
+        **setup_bootstrap.build_setup_invocation(),
+    }
 
 
 @router.post("/pairing/claim")
@@ -1491,6 +1606,7 @@ def claim_desktop_pairing(payload: Any = Body(...)) -> Dict[str, Any]:
             "bootstrapBlock": "",
             "phraseShown": False,
             "public": None,
+            "triesLeft": 3,
             "terminal": None,
             "presenterCapability": presenter_capability,
         }
@@ -1499,39 +1615,108 @@ def claim_desktop_pairing(payload: Any = Body(...)) -> Dict[str, Any]:
             failure = {"state": "failed", "failure": {"reason": "relay_credential_missing"}}
             _PAIRING_SESSION = session
             return _finish_pairing(session, failure)
-        try:
-            status, created = pairing._post(
-                str(activation["controlUrl"]),
-                {
-                    "v": 1,
-                    "op": "create",
-                    "address": activation["address"],
-                    "lightTerminal": True,
-                },
-                credential=credential,
-                opener=_DIRECT_HTTP_OPENER,
-            )
-        except pairing.ControlError:
-            status, created = 503, {}
-        control_secret = str(created.get("controlSecret") or "")
-        bootstrap = str(created.get("bootstrapBlock") or "")
-        if status != 200 or not control_secret or not bootstrap:
-            failure = {
-                "state": "failed",
-                "failure": {
-                    "reason": str(created.get("reason") or "create_refused"),
-                    "message": str(created.get("message") or "The relay refused pairing."),
-                },
-            }
-            _PAIRING_SESSION = session
-            return _finish_pairing(session, failure)
-        session["controlSecret"] = control_secret
-        session["bootstrapBlock"] = bootstrap
         _PAIRING_SESSION = session
-        return _remember_public_pairing_state(
-            session,
-            {"active": True, "sessionId": session["id"], "phase": "qr"},
+        # #5224: ask before creating. The exchange and its clock start only
+        # when the person presses Pair or picks manual pairing. The activation
+        # already asked to pick its budget; reuse that answer so the budget,
+        # the wording and this window agree. Only an activation that recorded
+        # none (an explicit wait) asks the relay here.
+        decision = activation.get("phoneCode")
+        if decision in desktop_pairing.PHONE_CODE_DECISIONS:
+            status = ({"available": True} if decision == "available"
+                      else {"available": False, "reason": decision})
+        else:
+            status = desktop_pairing.phone_code_status(
+                str(activation["address"]), str(activation["controlUrl"]), credential, _DIRECT_HTTP_OPENER,
+            )
+        if status.get("available") is True:
+            session["phoneCode"] = True
+            return _remember_public_pairing_state(
+                session, {"active": True, "sessionId": session["id"], "phase": "phone-code"},
+            )
+        # Off and a custom route open today's window with no extra line, as
+        # the terminal does; only an outage says why.
+        if status.get("reason") == "unavailable":
+            session["manualMessage"] = desktop_pairing.PHONE_CODE_OUTAGE.rstrip()
+        return _create_desktop_pairing(session, credential)
+
+
+# A phone code is 6 digits; the relay normalises spaces and dashes. Anything
+# longer is not forwarded.
+_PHONE_CODE_MAX_CHARS = 64
+_RELAY_TIMEOUT_MESSAGE = (
+    "The OcuClaw relay did not answer in time. Nothing was approved. "
+    "You can retry this setup checkpoint."
+)
+
+
+def _timed_out(error: BaseException) -> bool:
+    """True when a control request gave up waiting, not when it was refused."""
+    cause = error.__cause__
+    return isinstance(cause, TimeoutError) or isinstance(getattr(cause, "reason", None), TimeoutError)
+
+
+def _create_desktop_pairing(session: Dict[str, Any], credential: str,
+                           phone_code: Optional[str] = None) -> Dict[str, Any]:
+    """Create the exchange, with the typed phone code or for manual pairing.
+
+    A wrong code leaves no exchange behind (the relay cancels it), so the
+    window asks again; the third wrong code opens the manual views.
+    """
+    try:
+        status, created = desktop_pairing.create_desktop_exchange(
+            session["activation"], credential, _DIRECT_HTTP_OPENER, phone_code,
         )
+    except pairing.ControlError as error:
+        if _timed_out(error):
+            return _finish_pairing(session, {
+                "state": "failed",
+                "failure": {"reason": "relay_timeout", "message": _RELAY_TIMEOUT_MESSAGE},
+            })
+        status, created = 503, {}
+    reason = created.get("reason")
+    if phone_code is not None and status == 200:
+        if reason == "pairing_code_typed":
+            # As the terminal: only the pairing-code line, and no try used.
+            return _remember_public_pairing_state(session, {
+                "active": True, "sessionId": session["id"], "phase": "phone-code",
+                "message": desktop_pairing.PHONE_CODE_PAIRING_TYPED.rstrip(),
+            })
+        if reason in {"no_code", "spent", "malformed"}:
+            session["triesLeft"] -= 1
+            message = desktop_pairing.PHONE_CODE_MISSING.rstrip()
+            if session["triesLeft"] > 0:
+                return _remember_public_pairing_state(session, {
+                    "active": True, "sessionId": session["id"], "phase": "phone-code",
+                    "message": message, "triesLeft": session["triesLeft"],
+                })
+            session["manualMessage"] = message
+            return _create_desktop_pairing(session, credential)
+    control_secret = str(created.get("controlSecret") or "")
+    bootstrap = str(created.get("bootstrapBlock") or "")
+    sent = created.get("delivery") == "sent"
+    if status != 200 or not control_secret or (not sent and not bootstrap):
+        return _finish_pairing(session, {
+            "state": "failed",
+            "failure": {"reason": str(created.get("reason") or "create_refused"),
+                        "message": str(created.get("message") or "The relay refused pairing.")},
+        })
+    session["controlSecret"] = control_secret
+    session["bootstrapBlock"] = bootstrap
+    for key in ("address", "pairingCode"):
+        value = created.get(key)
+        session[key] = value.strip() if isinstance(value, str) and value.isprintable() else ""
+    seconds = created.get("expiresInSeconds")
+    valid_seconds = isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and 0 < seconds <= 3600
+    session["expiresAtMs"] = _now_ms() + int(seconds * 1000) if valid_seconds else None
+    session["delivery"] = created.get("delivery")
+    if session["delivery"] == "unavailable":
+        session["manualMessage"] = desktop_pairing.PHONE_CODE_OUTAGE.rstrip()
+    return _remember_public_pairing_state(
+        session, {"active": True, "sessionId": session["id"], "phase": "phone-sent" if sent else "qr",
+                  **({"message": desktop_pairing.PHONE_CODE_SENT.rstrip()} if sent else
+                     {"message": session["manualMessage"]} if session.get("manualMessage") else {})},
+    )
 
 
 @router.post("/pairing/{session_id}")
@@ -1545,7 +1730,16 @@ def drive_desktop_pairing(
     if (
         op not in _PAIRING_OPS
         or not isinstance(payload, Mapping)
-        or set(payload) != {"op", "presenterCapability"}
+        or set(payload) != ({"op", "presenterCapability", "phoneCode"}
+                            if op == "create" and "phoneCode" in payload
+                            else {"op", "presenterCapability"})
+        or (
+            "phoneCode" in payload
+            and (
+                not isinstance(payload["phoneCode"], str)
+                or len(payload["phoneCode"]) > _PHONE_CODE_MAX_CHARS
+            )
+        )
     ):
         raise HTTPException(status_code=400, detail="invalid pairing command")
     global _PAIRING_SESSION
@@ -1573,6 +1767,14 @@ def drive_desktop_pairing(
         if op == "approve" and session.get("phraseShown") is not True:
             raise HTTPException(status_code=409, detail="safety phrase not presented")
         credential = pairing._read_relay_credential()
+        if op == "create":
+            if not credential or (session.get("public") or {}).get("phase") != "phone-code":
+                raise HTTPException(status_code=409, detail="pairing already started")
+            return _create_desktop_pairing(session, credential, payload.get("phoneCode"))
+        if op == "state" and not session.get("controlSecret"):
+            return dict(session["public"])
+        if op == "cancel" and not session.get("controlSecret"):
+            return _finish_pairing(session, {"state": "cancelled", "failure": {"reason": "cancelled"}})
         if not credential or not session.get("controlSecret"):
             raise HTTPException(status_code=409, detail="pairing ceremony unavailable")
         try:

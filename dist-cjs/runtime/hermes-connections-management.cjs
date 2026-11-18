@@ -90,7 +90,7 @@ function connectionReceipt(raw     , allowUrl = false)      {
   return result;
 }
 
-function connectionsManagementResult(identity     , raw     )      {
+function connectionsManagementResult(identity     , raw     , backend = "Hermes")      {
   const op = identity.operation;
   const snapshot = connectionsSnapshot(raw.connections?.snapshot);
   const receipt = connectionReceipt(raw.connections?.receipt, ["mcp.oauthStart", "mcp.oauthStatus"].includes(op));
@@ -99,8 +99,8 @@ function connectionsManagementResult(identity     , raw     )      {
   const readback = !receipt || receipt.outcome !== "committed" || !["mcp.enabled", "channels.enabled"].includes(op) || receipt.savedEnabled === identity.connections?.value;
   const envelope = Object.fromEntries(["requestId", "operation", "scope", "profileId"].map(k => [k, identity[k]]));
   if (raw.status === "ok" && valid && readback) return { ...envelope, status: "ok", capabilities: [], connections: op === "connections.read" ? { snapshot } : { receipt } };
-  const code = raw.status !== "ok" && Object.hasOwn(CONNECTION_ERRORS, raw.errorCode) ? raw.errorCode : CONNECTION_READS.has(op) ? "native_read_failed" : "outcome_unknown";
-  return { ...envelope, status: code === "unsupported" ? "unsupported" : "error", capabilities: [], errorCode: code, errorMessage: CONNECTION_ERRORS[code], ...(receipt && receipt.mutationId === identity.connections?.mutationId ? { connections: { receipt } } : {}) };
+  const code = raw.status === "unsupported" ? "unsupported" : raw.status !== "ok" && Object.hasOwn(CONNECTION_ERRORS, raw.errorCode) ? raw.errorCode : CONNECTION_READS.has(op) ? "native_read_failed" : "outcome_unknown";
+  return { ...envelope, status: code === "unsupported" ? "unsupported" : "error", capabilities: [], errorCode: code, errorMessage: CONNECTION_ERRORS[code].replace(/Hermes/g, backend), ...(receipt && receipt.mutationId === identity.connections?.mutationId ? { connections: { receipt } } : {}) };
 }
 
-module.exports = { CONNECTION_OPERATIONS, CONNECTION_READS, CONNECTION_ERRORS, connectionsRequest, connectionsSnapshot, connectionReceipt, connectionsManagementResult };
+module.exports = { CONNECTION_READS, CONNECTION_OPERATIONS, CONNECTION_ERRORS, connectionsRequest, connectionsSnapshot, connectionReceipt, connectionsManagementResult };

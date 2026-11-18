@@ -1,4 +1,4 @@
-function normalizeLogger(logger) {
+function normalizeLogger(logger     ) {
   if (!logger || typeof logger !== "object") {
 
     return {

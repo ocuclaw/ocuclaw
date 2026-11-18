@@ -6,15 +6,16 @@ const CLIENT_DIAGNOSTICS_FILES = [
   "client/prior-session/events.jsonl", "client/prior-session/connection-log.json", "client/prior-session/errors.json",
 ];
 
-const ENV_KEYS = new Set(["appVersion", "platform", "userAgent", "online", "language", "lastTerminalErrorClass", "diag.persistVerdict", "timerScheduler", "hiddenPump", "framePump"]);
+const ENV_KEYS = new Set(["appVersion", "platform", "userAgent", "online", "language", "lastTerminalErrorClass", "diag.persistVerdict", "timerScheduler", "hiddenPump", "framePump", "voice.onDevice"]);
 const object = (value         )                               => !!value && typeof value === "object" && !Array.isArray(value);
 const count = (value         ) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000 ? value : 0;
 const time = (value         ) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 const byteLength = (value        ) => new TextEncoder().encode(value).byteLength;
-const safeText = (value         , max = 120) => typeof value === "string"
-  ? redactDiagnosticData({ value: value.slice(0, max) }).value : "";
 
-function parseClientReportDiagnostics(raw         , { mode = "off" } = {}) {
+const safeText = (value         , max = 120) => typeof value === "string"
+  ? String(redactDiagnosticData({ value: value.slice(0, max + 256) }).value).slice(0, max) : "";
+
+function parseClientReportDiagnostics(raw         , { mode = "structural" } = {}) {
   const absent = (status        ) => ({ files: new Map                (), metadata: { status } });
   if (raw == null) return absent("missing");
   if (typeof raw !== "string" || byteLength(raw) > CLIENT_DIAGNOSTICS_MAX_BYTES) return absent("invalid");
@@ -35,8 +36,10 @@ function parseClientReportDiagnostics(raw         , { mode = "off" } = {}) {
         const parsed = JSON.parse(content);
         if (!object(parsed)) { invalidFiles++; continue; }
         const env = Object.fromEntries(Object.entries(parsed).filter(([key, value]) => ENV_KEYS.has(key) && typeof value === "string")
-          .map(([key, value]) => [key, String(value).slice(0, 512)]));
-        files.set(name, JSON.stringify(redactDiagnosticData(env, mode)));
+          .map(([key, value]) => [key, String(value).slice(0, 512 + 256)]));
+        const redactedEnv = Object.fromEntries(Object.entries(redactDiagnosticData(env, mode))
+          .map(([key, value]) => [key, typeof value === "string" ? value.slice(0, 512) : value]));
+        files.set(name, JSON.stringify(redactedEnv));
       } else if (name.endsWith(".jsonl")) {
         const rows = [];
         for (const line of content.split("\n").filter(line => line.trim())) {
@@ -78,4 +81,4 @@ function parseClientReportDiagnostics(raw         , { mode = "off" } = {}) {
   } };
 }
 
-module.exports = { parseClientReportDiagnostics, CLIENT_DIAGNOSTICS_MAX_BYTES, CLIENT_DIAGNOSTICS_FILES };
+module.exports = { CLIENT_DIAGNOSTICS_MAX_BYTES, CLIENT_DIAGNOSTICS_FILES, parseClientReportDiagnostics };

@@ -14,8 +14,13 @@ const GRAPHIC_SLOT_VALIDATORS = Object.freeze(Object.assign(Object.create(null),
   gauge: validateGraphicGaugeSlot,
   keyvalue: validateGraphicKeyvalueSlot,
   status: validateGraphicStatusSlot,
+  timeline: validateGraphicTimelineSlot,
+  comparison: validateGraphicComparisonSlot,
 }));
 const GRAPHIC_SLOT_TYPES = Object.freeze(Object.keys(GRAPHIC_SLOT_VALIDATORS));
+const GLASSES_UI_DURATION_PICKER_SCHEMA = {type:"object",required:["min","max","step","value","label"],additionalProperties:false,properties:{
+  min:{type:"integer",minimum:1},max:{type:"integer",maximum:999},step:{type:"integer",minimum:1},value:{type:"integer"},label:{type:"string",maxLength:18},
+},description:"duration_picker: inclusive min/max, aligned value and step, at most 20 choices; e.g. 10..60 step 5. No refresh, title or children."};
 
 const GLASSES_UI_GRAPHIC_SCHEMA = {
   type: "object",
@@ -100,8 +105,19 @@ const GLASSES_UI_GRAPHIC_SCHEMA = {
             type: "string",
             description:
               "metric, status: optional icon name, e.g. \"sun\", \"cloud-rain\", \"wind\", \"battery-low\", \"alert-triangle\", \"check-circle\". " +
-              "Only the names in the glasses-ui skill's references/graphic-icons.md draw; any other name is removed, never guessed.",
+              "Only glyph's closed set of icon names draws; any other name is removed, never guessed.",
           },
+          startMinute: { type: "integer", description: "timeline: range start, minute of day 0..1440." },
+          endMinute: { type: "integer", description: "timeline: range end, greater than startMinute, at most 1440." },
+          nowMinute: { type: "integer", description: "timeline: supplied current minute within the range; no client timer." },
+          events: { type: "array", items: { type: "object", required: ["startMinute","endMinute","label"], properties: {
+            startMinute: {type:"integer"}, endMinute: {type:"integer"}, label: {type:"string",description:"Nonblank, up to 18 chars; longer is rejected."},
+          }, additionalProperties:false }, description: "timeline: up to 6 bounded spans; at most 2 overlap. Use one full-width slot." },
+          series: { type:"array", minItems:2, items: {type:"object",required:["label","values"],properties:{
+            label:{type:"string",description:"Nonblank, up to 18 chars; longer is rejected."}, values:{type:"array",minItems:2,items:{description:"Finite in-range number or null for a gap."},description:"2..30 aligned samples; longer is rejected."},
+          },additionalProperties:false},description:"comparison: exactly two aligned series on the same explicit min/max scale (-9999..9999). One full-width slot." },
+          startLabel: {type:"string",description:"comparison: first sample axis label, nonblank <=18 chars."},
+          endLabel: {type:"string",description:"comparison: last sample axis label, nonblank <=18 chars."},
         },
       },
     },
@@ -178,14 +194,14 @@ const GLASSES_UI_CHILDREN_SCHEMA = {
     "Cannot be combined with refresh.",
 };
 
-function childPayloadChars(spec) {
+function childPayloadChars(spec     ) {
   let n = typeof spec.title === "string" ? spec.title.length : 0;
   if (typeof spec.body === "string") n += spec.body.length;
   if (Array.isArray(spec.pages)) for (const page of spec.pages) n += page.length;
   return n;
 }
 
-function validateChildren(obj, itemCount) {
+function validateChildren(obj     , itemCount     )      {
   const raw = obj.children;
   if (raw === undefined) return { ok: true, children: null };
   if (!Array.isArray(raw)) {
@@ -202,7 +218,7 @@ function validateChildren(obj, itemCount) {
       message: `children has ${raw.length} entries; items has ${itemCount} (children[i] belongs to items[i])`,
     };
   }
-  const children = [];
+  const children      = [];
   let total = 0;
   let hasChild = false;
   for (let i = 0; i < itemCount; i += 1) {
@@ -233,7 +249,13 @@ function validateChildren(obj, itemCount) {
     }
     const result = getKindDescriptor(child.kind).validateSpec(child);
     if (!result.ok) {
-      return { ok: false, code: `child_${result.code}`, message: `children[${i}]: ${result.message}` };
+      return {
+        ok: false,
+        code: `child_${result.code}`,
+
+        ...(typeof result.path === "string" ? { path: `children[${i}].${result.path}` } : {}),
+        message: `children[${i}]: ${result.message}`,
+      };
     }
     if (Array.isArray(result.spec.pages) && result.spec.pages.length > GLASSES_UI_LIMITS.maxChildPages) {
       return {
@@ -256,7 +278,7 @@ function validateChildren(obj, itemCount) {
   return { ok: true, children: hasChild ? children : null };
 }
 
-function defineKindItemGrammar(schema) {
+function defineKindItemGrammar(schema     ) {
   const properties = schema.properties || {};
   const required = new Set(schema.required || []);
   const allowedKeys = Object.freeze(Object.keys(properties));
@@ -319,6 +341,7 @@ function validateImageCaptionTemplate(obj = Object.create(null), body = "") {
     return {
       ok: false,
       code: "image_caption_too_long",
+      path: "body",
       message: `image_caption body must be 1-${GLASSES_UI_LIMITS.imageCaptionMax} chars`,
     };
   }
@@ -425,7 +448,7 @@ const GRAPHIC_ELLIPSIS = "…";
 
 const GRAPHIC_SLOT_TYPE_ECHO_MAX = 40;
 
-function isPlainRecord(value) {
+function isPlainRecord(value     ) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
@@ -434,19 +457,19 @@ function graphicSlotDataInvalid(path = "", detail = "") {
 }
 
 function createRepairCollector() {
-  const repairs = [];
+  const repairs      = [];
   return {
-    push(code, path, message) {
+    push(code     , path     , message     ) {
       repairs.push({ code, path, message });
     },
     list() {
-      return repairs.map((repair) => ({ ...repair }));
+      return repairs.map((repair     ) => ({ ...repair }));
     },
   };
 }
 
-function osaDistance(a, b) {
-  const rows = [];
+function osaDistance(a     , b     ) {
+  const rows      = [];
   for (let i = 0; i <= a.length; i += 1) rows.push([i]);
   for (let j = 1; j <= b.length; j += 1) rows[0][j] = j;
   for (let i = 1; i <= a.length; i += 1) {
@@ -462,15 +485,15 @@ function osaDistance(a, b) {
   return rows[a.length][b.length];
 }
 
-function nearestName(input, candidates) {
+function nearestName(input     , candidates     ) {
   const names = (Array.isArray(candidates) ? candidates : [])
-    .filter((name) => typeof name === "string")
+    .filter((name     ) => typeof name === "string")
     .sort();
   if (names.length === 0) return null;
-  const fold = (value) =>
+  const fold = (value     ) =>
     String(value).slice(0, GRAPHIC_SLOT_TYPE_ECHO_MAX).toLowerCase().replace(/[^a-z0-9]/g, "");
   const wanted = typeof input === "string" ? fold(input) : "";
-  const exact = names.find((name) => fold(name) === wanted);
+  const exact = names.find((name     ) => fold(name) === wanted);
   if (exact !== undefined) return exact;
   if (wanted.length >= 3) {
     let prefixMatch = null;
@@ -498,7 +521,7 @@ function nearestName(input, candidates) {
   return nearest;
 }
 
-function graphicSlotTypeUnknown(fieldPath, type) {
+function graphicSlotTypeUnknown(fieldPath     , type     ) {
   const got = typeof type === "string"
     ? JSON.stringify(type.slice(0, GRAPHIC_SLOT_TYPE_ECHO_MAX))
     : "a missing or non-string type";
@@ -511,7 +534,7 @@ function graphicSlotTypeUnknown(fieldPath, type) {
   };
 }
 
-function truncateGraphicText(text, max) {
+function truncateGraphicText(text     , max     ) {
   let kept = "";
   for (const ch of text) {
     if (kept.length + ch.length > max - GRAPHIC_ELLIPSIS.length) break;
@@ -520,11 +543,11 @@ function truncateGraphicText(text, max) {
   return kept.trimEnd() + GRAPHIC_ELLIPSIS;
 }
 
-function readGraphicText(slot, key, max, path, repairs, hint = "") {
+function readGraphicText(slot     , key     , max     , path     , repairs     , hint = "") {
   return readGraphicTextAt(slot[key], `${path}.${key}`, max, repairs, hint);
 }
 
-function readGraphicTextAt(value, fieldPath, max, repairs, hint = "") {
+function readGraphicTextAt(value     , fieldPath     , max     , repairs     , hint = "") {
   if (typeof value !== "string" || value.trim().length === 0) {
     return graphicSlotDataInvalid(fieldPath, `must be a non-blank string of 1-${max} chars${hint}`);
   }
@@ -538,7 +561,7 @@ function readGraphicTextAt(value, fieldPath, max, repairs, hint = "") {
   return { ok: true, value: cut };
 }
 
-function validateGraphicMetricSlot(slot, path, repairs) {
+function validateGraphicMetricSlot(slot     , path     , repairs     ) {
   const unknown = Object.keys(slot).find((key) => !GRAPHIC_METRIC_FIELDS.includes(key));
   if (unknown !== undefined) {
     return graphicSlotDataInvalid(
@@ -546,23 +569,23 @@ function validateGraphicMetricSlot(slot, path, repairs) {
       `is not a metric field; allowed: ${GRAPHIC_METRIC_FIELDS.join(", ")}`,
     );
   }
-  const value = readGraphicText(slot, "value", GLASSES_UI_LIMITS.graphicMetricValueMax, path, repairs, ', e.g. "12.5"');
+  const value      = readGraphicText(slot, "value", GLASSES_UI_LIMITS.graphicMetricValueMax, path, repairs, ', e.g. "12.5"');
   if (!value.ok) return value;
-  const unit = slot.unit === undefined
+  const unit      = slot.unit === undefined
     ? { ok: true, value: undefined }
     : readGraphicText(slot, "unit", GLASSES_UI_LIMITS.graphicMetricUnitMax, path, repairs);
   if (!unit.ok) return unit;
-  const label = slot.label === undefined
+  const label      = slot.label === undefined
     ? { ok: true, value: undefined }
     : readGraphicText(slot, "label", GLASSES_UI_LIMITS.graphicMetricLabelMax, path, repairs);
   if (!label.ok) return label;
   if (slot.delta !== undefined && (typeof slot.delta !== "number" || !Number.isFinite(slot.delta))) {
     return graphicSlotDataInvalid(`${path}.delta`, "must be a finite number, e.g. 1.5 or -2");
   }
-  const icon = readOptionalGraphicIcon(slot, path, repairs);
+  const icon      = readOptionalGraphicIcon(slot, path, repairs);
   if (!icon.ok) return icon;
 
-  const normalized = { type: "metric", value: value.value };
+  const normalized      = { type: "metric", value: value.value };
   if (unit.value !== undefined) normalized.unit = unit.value;
   if (label.value !== undefined) normalized.label = label.value;
   if (slot.delta !== undefined) normalized.delta = slot.delta;
@@ -572,14 +595,14 @@ function validateGraphicMetricSlot(slot, path, repairs) {
 
 const GRAPHIC_ICON_SET = Object.freeze(Object.assign(
   Object.create(null),
-  Object.fromEntries(GRAPHIC_ICON_NAMES.map((name) => [name, true])),
+  Object.fromEntries(GRAPHIC_ICON_NAMES.map((name     ) => [name, true])),
 ));
 
 const GRAPHIC_ICON_ECHO_MAX = 40;
 const GRAPHIC_KEYVALUE_FIELDS = Object.freeze(["type", "rows", "label"]);
 const GRAPHIC_STATUS_FIELDS = Object.freeze(["type", "text", "icon"]);
 
-function readOptionalGraphicIcon(slot, path, repairs) {
+function readOptionalGraphicIcon(slot     , path     , repairs     ) {
   const icon = slot.icon;
   if (icon === undefined) return { ok: true, value: undefined };
   const fieldPath = `${path}.icon`;
@@ -591,19 +614,19 @@ function readOptionalGraphicIcon(slot, path, repairs) {
     "icon_dropped",
     fieldPath,
     `${fieldPath} ${JSON.stringify(icon.slice(0, GRAPHIC_ICON_ECHO_MAX))} is not a Graphic icon name; removed ` +
-      "(icons are never guessed; the names are in the glasses-ui skill's references/graphic-icons.md)",
+      "(icons are never guessed; only glyph's closed set of names draws)",
   );
   return { ok: true, value: undefined };
 }
 
-function readGraphicKeyvalueCell(row, index, max, rowPath, repairs) {
+function readGraphicKeyvalueCell(row     , index     , max     , rowPath     , repairs     ) {
   const raw = row[index];
   const cell = typeof raw === "number" && Number.isFinite(raw) ? String(raw) : raw;
   const role = index === 0 ? "the key" : "the value";
   return readGraphicTextAt(cell, `${rowPath}[${index}]`, max, repairs, ` (${role})`);
 }
 
-function validateGraphicKeyvalueSlot(slot, path, repairs) {
+function validateGraphicKeyvalueSlot(slot     , path     , repairs     ) {
   const unknown = graphicUnknownSlotField(slot, GRAPHIC_KEYVALUE_FIELDS, "keyvalue", path);
   if (unknown) return unknown;
   const fieldPath = `${path}.rows`;
@@ -630,43 +653,43 @@ function validateGraphicKeyvalueSlot(slot, path, repairs) {
     if (!Array.isArray(row) || row.length !== 2) {
       return graphicSlotDataInvalid(rowPath, 'must be a [key, value] pair of two strings, e.g. ["Gust", "18 kt"]');
     }
-    const key = readGraphicKeyvalueCell(row, 0, GLASSES_UI_LIMITS.graphicKeyvalueKeyMax, rowPath, repairs);
+    const key      = readGraphicKeyvalueCell(row, 0, GLASSES_UI_LIMITS.graphicKeyvalueKeyMax, rowPath, repairs);
     if (!key.ok) return key;
-    const value = readGraphicKeyvalueCell(row, 1, GLASSES_UI_LIMITS.graphicKeyvalueValueMax, rowPath, repairs);
+    const value      = readGraphicKeyvalueCell(row, 1, GLASSES_UI_LIMITS.graphicKeyvalueValueMax, rowPath, repairs);
     if (!value.ok) return value;
     rows.push([key.value, value.value]);
   }
-  const label = readOptionalGraphicLabel(slot, path, repairs);
+  const label      = readOptionalGraphicLabel(slot, path, repairs);
   if (!label.ok) return label;
-  const normalized = { type: "keyvalue", rows };
+  const normalized      = { type: "keyvalue", rows };
   if (label.value !== undefined) normalized.label = label.value;
   return { ok: true, slot: normalized };
 }
 
-function validateGraphicStatusSlot(slot, path, repairs) {
+function validateGraphicStatusSlot(slot     , path     , repairs     ) {
   const unknown = graphicUnknownSlotField(slot, GRAPHIC_STATUS_FIELDS, "status", path);
   if (unknown) return unknown;
-  const text = readGraphicText(slot, "text", GLASSES_UI_LIMITS.graphicStatusTextMax, path, repairs, ', e.g. "Rain in 20 min"');
+  const text      = readGraphicText(slot, "text", GLASSES_UI_LIMITS.graphicStatusTextMax, path, repairs, ', e.g. "Rain in 20 min"');
   if (!text.ok) return text;
-  const icon = readOptionalGraphicIcon(slot, path, repairs);
+  const icon      = readOptionalGraphicIcon(slot, path, repairs);
   if (!icon.ok) return icon;
-  const normalized = { type: "status", text: text.value };
+  const normalized      = { type: "status", text: text.value };
   if (icon.value !== undefined) normalized.icon = icon.value;
   return { ok: true, slot: normalized };
 }
 
-function graphicUnknownSlotField(slot, fields, type, path) {
+function graphicUnknownSlotField(slot     , fields     , type     , path     ) {
   const unknown = Object.keys(slot).find((key) => !fields.includes(key));
   if (unknown === undefined) return null;
   return graphicSlotDataInvalid(`${path}.${unknown}`, `is not a ${type} field; allowed: ${fields.join(", ")}`);
 }
 
-function readOptionalGraphicLabel(slot, path, repairs) {
+function readOptionalGraphicLabel(slot     , path     , repairs     ) {
   if (slot.label === undefined) return { ok: true, value: undefined };
   return readGraphicText(slot, "label", GLASSES_UI_LIMITS.graphicMetricLabelMax, path, repairs);
 }
 
-function readGraphicSeries(slot, path) {
+function readGraphicSeries(slot     , path     ) {
   const values = slot.values;
   const fieldPath = `${path}.values`;
   const min = GLASSES_UI_LIMITS.graphicSeriesMin;
@@ -685,7 +708,7 @@ function readGraphicSeries(slot, path) {
   return { ok: true, values: values.slice() };
 }
 
-function downsampleGraphicSeries(values, target) {
+function downsampleGraphicSeries(values     , target     ) {
   const count = values.length;
   if (count <= target || target < 3) return values.slice();
   const every = (count - 2) / (target - 2);
@@ -724,16 +747,16 @@ function downsampleGraphicSeries(values, target) {
   return kept;
 }
 
-function clampGraphicValue(value, min, max, path, repairs) {
+function clampGraphicValue(value     , min     , max     , path     , repairs     ) {
   if (value >= min && value <= max) return value;
   const kept = value < min ? min : max;
   repairs.push("value_clamped", path, `${path} was ${value}; clamped to ${kept} (range ${min}..${max})`);
   return kept;
 }
 
-function clampGraphicSeries(values, min, max, path, repairs) {
-  const outside = [];
-  const kept = values.map((value, index) => {
+function clampGraphicSeries(values     , min     , max     , path     , repairs     ) {
+  const outside      = [];
+  const kept = values.map((value     , index     ) => {
     if (value >= min && value <= max) return value;
     outside.push(index);
     return value < min ? min : max;
@@ -748,14 +771,14 @@ function clampGraphicSeries(values, min, max, path, repairs) {
   return kept;
 }
 
-function trimGraphicSeriesToRecent(values, max) {
+function trimGraphicSeriesToRecent(values     , max     ) {
   return values.length > max ? values.slice(values.length - max) : values;
 }
 
-function validateGraphicSparklineSlot(slot, path, repairs) {
+function validateGraphicSparklineSlot(slot     , path     , repairs     ) {
   const unknown = graphicUnknownSlotField(slot, GRAPHIC_SPARKLINE_FIELDS, "sparkline", path);
   if (unknown) return unknown;
-  const series = readGraphicSeries(slot, path);
+  const series      = readGraphicSeries(slot, path);
   if (!series.ok) return series;
   const max = GLASSES_UI_LIMITS.graphicSparklineValuesMax;
   let values = series.values;
@@ -768,17 +791,17 @@ function validateGraphicSparklineSlot(slot, path, repairs) {
         "keeping the first and last points; every kept point is one you sent",
     );
   }
-  const label = readOptionalGraphicLabel(slot, path, repairs);
+  const label      = readOptionalGraphicLabel(slot, path, repairs);
   if (!label.ok) return label;
-  const normalized = { type: "sparkline", values };
+  const normalized      = { type: "sparkline", values };
   if (label.value !== undefined) normalized.label = label.value;
   return { ok: true, slot: normalized };
 }
 
-function validateGraphicBarsSlot(slot, path, repairs) {
+function validateGraphicBarsSlot(slot     , path     , repairs     ) {
   const unknown = graphicUnknownSlotField(slot, GRAPHIC_BARS_FIELDS, "bars", path);
   if (unknown) return unknown;
-  const series = readGraphicSeries(slot, path);
+  const series      = readGraphicSeries(slot, path);
   if (!series.ok) return series;
   const count = series.values.length;
   const highlight = slot.highlight;
@@ -804,18 +827,18 @@ function validateGraphicBarsSlot(slot, path, repairs) {
       `${path}.values held ${count} values; kept the most recent ${max} (max ${max})${note}`,
     );
   }
-  const label = readOptionalGraphicLabel(slot, path, repairs);
+  const label      = readOptionalGraphicLabel(slot, path, repairs);
   if (!label.ok) return label;
-  const normalized = { type: "bars", values };
+  const normalized      = { type: "bars", values };
   if (keptHighlight !== undefined) normalized.highlight = keptHighlight;
   if (label.value !== undefined) normalized.label = label.value;
   return { ok: true, slot: normalized };
 }
 
-function validateGraphicHeatstripSlot(slot, path, repairs) {
+function validateGraphicHeatstripSlot(slot     , path     , repairs     ) {
   const unknown = graphicUnknownSlotField(slot, GRAPHIC_HEATSTRIP_FIELDS, "heatstrip", path);
   if (unknown) return unknown;
-  const series = readGraphicSeries(slot, path);
+  const series      = readGraphicSeries(slot, path);
   if (!series.ok) return series;
   const max = GLASSES_UI_LIMITS.graphicHeatstripValuesMax;
   const recent = trimGraphicSeriesToRecent(series.values, max);
@@ -828,9 +851,9 @@ function validateGraphicHeatstripSlot(slot, path, repairs) {
   }
 
   const values = clampGraphicSeries(recent, GRAPHIC_HEATSTRIP_MIN, GRAPHIC_HEATSTRIP_MAX, `${path}.values`, repairs);
-  const label = readOptionalGraphicLabel(slot, path, repairs);
+  const label      = readOptionalGraphicLabel(slot, path, repairs);
   if (!label.ok) return label;
-  const normalized = { type: "heatstrip", values };
+  const normalized      = { type: "heatstrip", values };
   if (label.value !== undefined) normalized.label = label.value;
   return { ok: true, slot: normalized };
 }
@@ -841,7 +864,7 @@ const GRAPHIC_GAUGE_FIELDS = Object.freeze(["type", "value", "min", "max", "labe
 
 const GRAPHIC_PERCENT_READ_MAX = 100;
 
-function readGraphicNumber(slot, key, path, hint = "") {
+function readGraphicNumber(slot     , key     , path     , hint = "") {
   const value = slot[key];
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return graphicSlotDataInvalid(`${path}.${key}`, `must be a finite number${hint}, not text or null`);
@@ -849,15 +872,15 @@ function readGraphicNumber(slot, key, path, hint = "") {
   return { ok: true, value: value + 0 };
 }
 
-function readOptionalGraphicNumber(slot, key, path, hint = "") {
+function readOptionalGraphicNumber(slot     , key     , path     , hint = "") {
   if (slot[key] === undefined) return { ok: true, value: undefined };
   return readGraphicNumber(slot, key, path, hint);
 }
 
-function validateGraphicFractionSlot(type, slot, path, repairs) {
+function validateGraphicFractionSlot(type     , slot     , path     , repairs     ) {
   const unknown = graphicUnknownSlotField(slot, GRAPHIC_FRACTION_FIELDS, type, path);
   if (unknown) return unknown;
-  const read = readGraphicNumber(slot, "value", path, ", the fraction done 0..1 such as 0.68");
+  const read      = readGraphicNumber(slot, "value", path, ", the fraction done 0..1 such as 0.68");
   if (!read.ok) return read;
   const fieldPath = `${path}.value`;
   let value = read.value;
@@ -872,50 +895,50 @@ function validateGraphicFractionSlot(type, slot, path, repairs) {
   } else {
     value = clampGraphicValue(value, 0, 1, fieldPath, repairs);
   }
-  const label = readOptionalGraphicLabel(slot, path, repairs);
+  const label      = readOptionalGraphicLabel(slot, path, repairs);
   if (!label.ok) return label;
-  const normalized = { type, value };
+  const normalized      = { type, value };
   if (label.value !== undefined) normalized.label = label.value;
   return { ok: true, slot: normalized };
 }
 
-function validateGraphicProgressSlot(slot, path, repairs) {
+function validateGraphicProgressSlot(slot     , path     , repairs     ) {
   return validateGraphicFractionSlot("progress", slot, path, repairs);
 }
 
-function validateGraphicRingSlot(slot, path, repairs) {
+function validateGraphicRingSlot(slot     , path     , repairs     ) {
   return validateGraphicFractionSlot("ring", slot, path, repairs);
 }
 
-function validateGraphicBulletSlot(slot, path, repairs) {
+function validateGraphicBulletSlot(slot     , path     , repairs     ) {
   const unknown = graphicUnknownSlotField(slot, GRAPHIC_BULLET_FIELDS, "bullet", path);
   if (unknown) return unknown;
-  const value = readGraphicNumber(slot, "value", path);
+  const value      = readGraphicNumber(slot, "value", path);
   if (!value.ok) return value;
-  const target = readGraphicNumber(slot, "target", path, ", the goal on the same scale as value");
+  const target      = readGraphicNumber(slot, "target", path, ", the goal on the same scale as value");
   if (!target.ok) return target;
-  const max = readGraphicNumber(slot, "max", path, ", the top of the scale above 0");
+  const max      = readGraphicNumber(slot, "max", path, ", the top of the scale above 0");
   if (!max.ok) return max;
   if (max.value <= 0) {
     return graphicSlotDataInvalid(`${path}.max`, `must be above 0; got ${max.value}`);
   }
   const keptValue = clampGraphicValue(value.value, 0, max.value, `${path}.value`, repairs);
   const keptTarget = clampGraphicValue(target.value, 0, max.value, `${path}.target`, repairs);
-  const label = readOptionalGraphicLabel(slot, path, repairs);
+  const label      = readOptionalGraphicLabel(slot, path, repairs);
   if (!label.ok) return label;
-  const normalized = { type: "bullet", value: keptValue, target: keptTarget, max: max.value };
+  const normalized      = { type: "bullet", value: keptValue, target: keptTarget, max: max.value };
   if (label.value !== undefined) normalized.label = label.value;
   return { ok: true, slot: normalized };
 }
 
-function validateGraphicGaugeSlot(slot, path, repairs) {
+function validateGraphicGaugeSlot(slot     , path     , repairs     ) {
   const unknown = graphicUnknownSlotField(slot, GRAPHIC_GAUGE_FIELDS, "gauge", path);
   if (unknown) return unknown;
-  const value = readGraphicNumber(slot, "value", path);
+  const value      = readGraphicNumber(slot, "value", path);
   if (!value.ok) return value;
-  const min = readOptionalGraphicNumber(slot, "min", path);
+  const min      = readOptionalGraphicNumber(slot, "min", path);
   if (!min.ok) return min;
-  const max = readOptionalGraphicNumber(slot, "max", path);
+  const max      = readOptionalGraphicNumber(slot, "max", path);
   if (!max.ok) return max;
   const low = min.value === undefined ? GLASSES_UI_LIMITS.graphicGaugeMinDefault : min.value;
   const high = max.value === undefined ? GLASSES_UI_LIMITS.graphicGaugeMaxDefault : max.value;
@@ -925,13 +948,56 @@ function validateGraphicGaugeSlot(slot, path, repairs) {
     return graphicSlotDataInvalid(`${path}.max`, `must be above min; got max ${highText} and min ${lowText}`);
   }
   const kept = clampGraphicValue(value.value, low, high, `${path}.value`, repairs);
-  const label = readOptionalGraphicLabel(slot, path, repairs);
+  const label      = readOptionalGraphicLabel(slot, path, repairs);
   if (!label.ok) return label;
-  const normalized = { type: "gauge", value: kept };
+  const normalized      = { type: "gauge", value: kept };
   if (min.value !== undefined) normalized.min = min.value;
   if (max.value !== undefined) normalized.max = max.value;
   if (label.value !== undefined) normalized.label = label.value;
   return { ok: true, slot: normalized };
+}
+
+function validateGraphicTimelineSlot(slot     , path     , repairs     ) {
+  const allowed=["type","label","startMinute","endMinute","nowMinute","events"];
+  const minute=(n     )=>Number.isInteger(n) && n>=0 && n<=1440;
+  const text=(s     )=>typeof s==="string" && s.trim().length>0 && s.length<=18;
+  if(Object.keys(slot).some(k=>!allowed.includes(k)) || !minute(slot.startMinute) || !minute(slot.endMinute) ||
+      slot.startMinute>=slot.endMinute || !minute(slot.nowMinute) || slot.nowMinute<slot.startMinute || slot.nowMinute>slot.endMinute ||
+      (slot.label!==undefined && !text(slot.label)) || !Array.isArray(slot.events) || slot.events.length>6) {
+    return graphicSlotDataInvalid(path,"timeline requires a bounded minute-of-day range, nowMinute and up to 6 events");
+  }
+  for(const e of slot.events) {
+    if(!isPlainRecord(e) || Object.keys(e).some(k=>!["startMinute","endMinute","label"].includes(k)) ||
+        !minute(e.startMinute) || !minute(e.endMinute) || e.startMinute<slot.startMinute || e.endMinute>slot.endMinute ||
+        e.startMinute>=e.endMinute || !text(e.label)) return graphicSlotDataInvalid(path,"invalid timeline span");
+  }
+  const ends=[-1,-1];
+  for(const e of [...slot.events].sort((a,b)=>a.startMinute-b.startMinute)) {
+    const lane=ends.findIndex(end=>end<=e.startMinute);
+    if(lane<0)return graphicSlotDataInvalid(path,"timeline supports at most two overlapping events");
+    ends[lane]=e.endMinute;
+  }
+  return {ok:true,slot:{type:"timeline",startMinute:slot.startMinute,endMinute:slot.endMinute,nowMinute:slot.nowMinute,
+    events:slot.events.map((e     )=>({startMinute:e.startMinute,endMinute:e.endMinute,label:e.label})),...(slot.label!==undefined?{label:slot.label}:{})}};
+}
+
+function validateGraphicComparisonSlot(slot     , path     , repairs     ) {
+  const text=(s     )=>typeof s==="string" && s.trim().length>0 && s.length<=18;
+  if(Object.keys(slot).some(k=>!["type","min","max","series","startLabel","endLabel"].includes(k)) ||
+      !Number.isFinite(slot.min) || !Number.isFinite(slot.max) || slot.min< -9999 || slot.max>9999 || slot.min>=slot.max ||
+      !text(slot.startLabel) || !text(slot.endLabel) || !Array.isArray(slot.series) || slot.series.length!==2) {
+    return graphicSlotDataInvalid(path,"comparison requires two aligned series, shared min/max and axis labels");
+  }
+  let count;
+  for(const s of slot.series) {
+    if(!isPlainRecord(s) || Object.keys(s).some(k=>!["label","values"].includes(k)) || !text(s.label) ||
+        !Array.isArray(s.values) || s.values.length<2 || s.values.length>30 || !s.values.some((v     )=>v!==null) ||
+        s.values.some((v     )=>v!==null && (typeof v!=="number" || !Number.isFinite(v) || v<slot.min || v>slot.max)) ||
+        (count!==undefined && count!==s.values.length))return graphicSlotDataInvalid(path,"invalid or misaligned comparison series");
+    count=s.values.length;
+  }
+  return {ok:true,slot:{type:"comparison",min:slot.min,max:slot.max,startLabel:slot.startLabel,endLabel:slot.endLabel,
+    series:slot.series.map((s     )=>({label:s.label,values:[...s.values]}))}};
 }
 
 function validateGraphicTemplate(obj = Object.create(null), body = "") {
@@ -939,6 +1005,7 @@ function validateGraphicTemplate(obj = Object.create(null), body = "") {
     return {
       ok: false,
       code: "graphic_title_unsupported",
+      path: "title",
       message: "graphic has no title; put what the reading is in the caption body, numbers first",
     };
   }
@@ -953,6 +1020,7 @@ function validateGraphicTemplate(obj = Object.create(null), body = "") {
     return {
       ok: false,
       code: "graphic_body_required",
+      path: "body",
       message: `graphic requires body, a 1-${GLASSES_UI_LIMITS.graphicCaptionMax} char caption that is also the fallback text`,
     };
   }
@@ -1000,14 +1068,16 @@ function validateGraphicTemplate(obj = Object.create(null), body = "") {
     }
     const validate = typeof slot.type === "string" ? GRAPHIC_SLOT_VALIDATORS[slot.type] : undefined;
     if (typeof validate !== "function") return graphicSlotTypeUnknown(`${path}.type`, slot.type);
-    const result = validate(slot, path, repairs);
+    const result      = validate(slot, path, repairs);
     if (!result.ok) return result;
     slots.push(result.slot);
   }
   const repaired = repairs.list();
+  const extended = slots.some(slot=>["timeline","comparison"].includes(slot.type));
+  if(extended && slots.length!==1)return graphicSlotDataInvalid("graphic.slots","timeline and comparison require one full-width slot");
   return {
     ok: true,
-    spec: { kind: "text_surface", template: "graphic", body, graphic: { slots } },
+    spec: { kind: "text_surface", template: extended ? "graphic_v2" : "graphic", body, graphic: { slots } },
     ...(repaired.length > 0 ? { repairs: repaired } : {}),
   };
 }
@@ -1015,6 +1085,7 @@ function validateGraphicTemplate(obj = Object.create(null), body = "") {
 const TEXT_SURFACE_TEMPLATE_VALIDATORS = Object.assign(Object.create(null), {
   image_caption: validateImageCaptionTemplate,
   graphic: validateGraphicTemplate,
+  graphic_v2: validateGraphicTemplate,
 });
 
 function textSurfaceTemplateValues() {
@@ -1076,12 +1147,13 @@ const textSurfaceDescriptor = {
     if (titleErr) return titleErr;
     const body = obj.body;
     if (typeof body !== "string") {
-      return { ok: false, code: "missing_field", message: "text_surface requires body (string)" };
+      return { ok: false, code: "missing_field", path: "body", message: "text_surface requires body (string)" };
     }
     if (body.length > GLASSES_UI_LIMITS.bodyMax) {
       return {
         ok: false,
         code: "body_too_long",
+        path: "body",
         message: `body is ${body.length} chars; max ${GLASSES_UI_LIMITS.bodyMax}`,
       };
     }
@@ -1130,6 +1202,8 @@ const listSurfaceDescriptor = {
         items: GLASSES_UI_LIST_ITEM_SCHEMA,
       },
       children: GLASSES_UI_CHILDREN_SCHEMA,
+      template: {type:"string",enum:["duration_picker"],description:"Optional local minute picker: tap edit, swipe draft, tap save; double-tap back discards draft. items must match its minute lattice."},
+      durationPicker: GLASSES_UI_DURATION_PICKER_SCHEMA,
       refresh: undefined,
     },
   },
@@ -1137,6 +1211,23 @@ const listSurfaceDescriptor = {
     const titleErr = validateTitle(obj);
     if (titleErr) return titleErr;
     const items = obj.items;
+    let picker     ;
+    if(obj.template!==undefined || obj.durationPicker!==undefined) {
+      picker=obj.durationPicker;
+      if(obj.template!=="duration_picker" || !isPlainRecord(picker) ||
+          Object.keys(picker).some(k=>!["min","max","step","value","label"].includes(k)) ||
+          ![picker.min,picker.max,picker.step,picker.value].every(Number.isInteger) || picker.min<1 || picker.max>999 ||
+          picker.max<=picker.min || picker.step<1 || (picker.max-picker.min)%picker.step!==0 ||
+          (picker.max-picker.min)/picker.step+1>20 || picker.value<picker.min || picker.value>picker.max ||
+          (picker.value-picker.min)%picker.step!==0 || typeof picker.label!=="string" || !picker.label.trim() || picker.label.length>18 ||
+          obj.children!==undefined || obj.refresh!==undefined || obj.title!==undefined) {
+        return {ok:false,code:"duration_picker_invalid",message:"duration_picker requires a bounded, aligned minute lattice and label; no title, children or refresh"};
+      }
+      const expected=Array.from({length:(picker.max-picker.min)/picker.step+1},(_,i)=>`${picker.min+i*picker.step} minutes`);
+      if(!Array.isArray(items) || items.length!==expected.length || items.some((v,i)=>v!==expected[i])) {
+        return {ok:false,code:"duration_picker_invalid",message:"items must match the durationPicker lattice as '<value> minutes'"};
+      }
+    }
     if (!Array.isArray(items) || items.length === 0) {
       return { ok: false, code: "missing_field", message: "list_surface requires items (non-empty array)" };
     }
@@ -1162,7 +1253,8 @@ const listSurfaceDescriptor = {
     }
     const kids = validateChildren(obj, items.length);
     if (!kids.ok) return kids;
-    const spec = { kind: "list_surface", items };
+    const spec      = { kind: "list_surface", items };
+    if(picker){spec.template="duration_picker";spec.durationPicker={min:picker.min,max:picker.max,step:picker.step,value:picker.value,label:picker.label};}
     if (typeof obj.title === "string") spec.title = obj.title;
     if (kids.children) spec.children = kids.children;
     return { ok: true, spec };
@@ -1266,6 +1358,7 @@ const listWithDetailsSurfaceDescriptor = {
           return {
             ok: false,
             code: "detail_body_too_long",
+            path: `items[${i}].body`,
             message: `items[${i}].body is ${it.body.length} chars; max ${GLASSES_UI_LIMITS.detailBodyMax}`,
           };
         }
@@ -1283,7 +1376,7 @@ const listWithDetailsSurfaceDescriptor = {
     }
     const kids = validateChildren(obj, normalizedItems.length);
     if (!kids.ok) return kids;
-    const spec = { kind: "list_with_details_surface", items: normalizedItems };
+    const spec      = { kind: "list_with_details_surface", items: normalizedItems };
     if (typeof obj.title === "string") spec.title = obj.title;
     if (kids.children) spec.children = kids.children;
     return { ok: true, spec };
@@ -1311,7 +1404,7 @@ const checklistSurfaceDescriptor = {
       refresh: undefined,
     },
   },
-  validateSpec(obj) {
+  validateSpec(obj     ) {
     const titleErr = validateTitle(obj);
     if (titleErr) return titleErr;
     if (obj.queueMode !== "log") {
@@ -1357,11 +1450,11 @@ const checklistSurfaceDescriptor = {
       if (item.checked !== undefined && typeof item.checked !== "boolean") {
         return { ok: false, code: "invalid_checked", message: `items[${i}].checked must be a boolean` };
       }
-      const normalized = { label: item.label };
+      const normalized      = { label: item.label };
       if (item.checked !== undefined) normalized.checked = item.checked;
       normalizedItems.push(normalized);
     }
-    const spec = { kind: "checklist_surface", items: normalizedItems };
+    const spec      = { kind: "checklist_surface", items: normalizedItems };
     if (typeof obj.title === "string") spec.title = obj.title;
     return { ok: true, spec };
   },
@@ -1387,7 +1480,7 @@ const pagedTextSurfaceDescriptor = {
       refresh: undefined,
     },
   },
-  validateSpec(obj) {
+  validateSpec(obj     ) {
     const titleErr = validateTitle(obj);
     if (titleErr) return titleErr;
     const pages = obj.pages;
@@ -1409,11 +1502,12 @@ const pagedTextSurfaceDescriptor = {
         return {
           ok: false,
           code: "page_too_long",
+          path: `pages[${i}]`,
           message: `pages[${i}] is ${pages[i].length} chars; max ${GLASSES_UI_LIMITS.pageMax}`,
         };
       }
     }
-    const spec = { kind: "paged_text_surface", pages: [...pages] };
+    const spec      = { kind: "paged_text_surface", pages: [...pages] };
     if (typeof obj.title === "string") spec.title = obj.title;
     return { ok: true, spec };
   },
@@ -1431,7 +1525,7 @@ function getKindDescriptor(kind) {
   return GLASSES_UI_KIND_DESCRIPTORS.find((d) => d.kind === kind);
 }
 
-function getKindItemGrammar(kind) {
+function getKindItemGrammar(kind     ) {
   return getKindDescriptor(kind)?.itemGrammar || null;
 }
 
@@ -1441,7 +1535,7 @@ function listKindItemSchemas() {
     .filter(Boolean);
 }
 
-function matchesSchemaType(value, type) {
+function matchesSchemaType(value     , type     ) {
   if (type === "string") return typeof value === "string";
   if (type === "boolean") return typeof value === "boolean";
   if (type === "number") return typeof value === "number" && Number.isFinite(value);
@@ -1450,7 +1544,7 @@ function matchesSchemaType(value, type) {
   return false;
 }
 
-function validateKindItemAgainstGrammar(kind, item) {
+function validateKindItemAgainstGrammar(kind     , item     )      {
   const grammar = getKindItemGrammar(kind);
   if (!grammar) return { ok: false, code: "items_unsupported" };
   if (grammar.valueType !== "object") {
@@ -1484,4 +1578,4 @@ function buildOneOfBranches() {
   return GLASSES_UI_KIND_DESCRIPTORS.map((d) => d.schemaBranch);
 }
 
-module.exports = { GLASSES_UI_LIST_ITEM_SCHEMA, GLASSES_UI_DETAIL_ITEM_SCHEMA, GLASSES_UI_CHECKLIST_ITEM_SCHEMA, GLASSES_UI_CHILD_KINDS, GLASSES_UI_CHILD_SURFACE_SCHEMA, GLASSES_UI_CHILDREN_SCHEMA, GLASSES_UI_IMAGE_ASSETS, GLASSES_UI_GRAPHIC_SCHEMA, createRepairCollector, nearestName, downsampleGraphicSeries, GLASSES_UI_KIND_DESCRIPTORS, getKindDescriptor, getKindItemGrammar, listKindItemSchemas, validateKindItemAgainstGrammar, listKindStrings, buildOneOfBranches };
+module.exports = { GLASSES_UI_IMAGE_ASSETS, GLASSES_UI_DURATION_PICKER_SCHEMA, GLASSES_UI_GRAPHIC_SCHEMA, GLASSES_UI_LIST_ITEM_SCHEMA, GLASSES_UI_DETAIL_ITEM_SCHEMA, GLASSES_UI_CHECKLIST_ITEM_SCHEMA, GLASSES_UI_CHILD_KINDS, GLASSES_UI_CHILD_SURFACE_SCHEMA, GLASSES_UI_CHILDREN_SCHEMA, createRepairCollector, nearestName, downsampleGraphicSeries, GLASSES_UI_KIND_DESCRIPTORS, getKindDescriptor, getKindItemGrammar, listKindItemSchemas, validateKindItemAgainstGrammar, listKindStrings, buildOneOfBranches };

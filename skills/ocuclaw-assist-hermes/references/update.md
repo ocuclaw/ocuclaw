@@ -1,11 +1,11 @@
 # Updating OcuClaw on Hermes
 
-**Guide version:** 2026-09-29 (1.3.26-hermes)
+**Guide version:** 2026-10-28 (1.3.27-hermes)
 
 Use this for an installed, healthy OcuClaw on Hermes moving to a strictly
 higher published bundle version. It is version-neutral: it never names a
 source version and never removes or reinstalls the plugin. There is one
-access-controlled GitHub channel; there is no npm or ClawHub selector. Preserve
+public GitHub channel; there is no npm or ClawHub selector. Preserve
 unexplained local plugin source instead of replacing it without the user's
 decision.
 
@@ -22,8 +22,9 @@ This is the one wording every OcuClaw-on-Hermes surface uses. Quote it; do not
 paraphrase it, and do not reorder its steps.
 
 <!-- ocuclaw:install-block:start -->
-OcuClaw needs Hermes `>=0.21.1,<0.22.0`; the certified baseline is Hermes
-`0.21.5`. Install it once, in the default Hermes profile: that profile owns the
+OcuClaw needs Hermes 0.21.4 or newer. It is tested on `>=0.21.4,<0.24.0`, and
+the certified baseline is Hermes `0.23.2`; a newer Hermes runs with a warning.
+Install it once, in the default Hermes profile: that profile owns the
 relay the glasses pair to, and a second copy in another profile is never the
 answer.
 
@@ -31,11 +32,27 @@ answer.
 invitation or GitHub sign-in to clone. Git must still be installed and working
 on the installing machine (Desktop uses Git too). Verify with
 `git ls-remote https://github.com/ocuclaw/ocuclaw.git HEAD` before installing;
-never paste an access token into setup chat. Even Hub beta access is a separate
-invitation, and the software itself is still beta.
+no GitHub token is needed, so never paste one into setup chat. Even Hub beta
+access is a separate invitation.
 
-**Terminal first.** This is the supported path and the one every beta build is
-tested on:
+**Setup runs in your agent's chat.** Once OcuClaw is installed, the main way to
+finish setup on every host is to ask your agent in its own chat (on Cloudways,
+the web UI behind **Open Agent**): "Install OcuClaw and set it up for my Even G2
+glasses." The agent relays OcuClaw's own nine setup steps word for word. You
+approve the private route on a card in the chat, open the Tailscale link it
+gives you, type the phone code from OcuClaw's **Pair this phone** sheet into the
+chat, and allow the four-words card only if the words match your phone or
+glasses. The TUI pairs the same way. Hermes Desktop shows its own pairing
+panel for the code and the words instead. Hermes loads OcuClaw only when it
+restarts, so right after the agent installs it, the agent runs
+`hermes ocuclaw setup-start`: it turns on OcuClaw's settings and restarts Hermes
+once. On Cloudways that restarts the whole container: open the chat again and
+type `continue`. If the agent cannot install OcuClaw itself, run the install
+line below yourself, then `hermes ocuclaw setup-start`, then ask again.
+The terminal commands below are the fallback.
+
+**Terminal first.** Of the two ways to install, this is the supported one and
+the one every release is tested on:
 
 **Cloudways managed Hermes: install, then one command. Do not restart yet.**
 
@@ -72,7 +89,7 @@ ten minutes, having changed nothing, and running the same command again picks
 up right there. Leave Tailscale switched on afterwards: the phone needs it to
 reach this server.
 
-**The pairing code waits for you.** It lasts two minutes, so step 7 asks you to
+**The pairing code waits for you.** It lasts five minutes, so step 7 asks you to
 have the phone in your hand with the Even app open, and waits for you to press
 Enter before it makes the code. If a code does run out before anyone uses it,
 the command does not give up: press Enter for a new one, or type `stop` to
@@ -132,15 +149,18 @@ hermes://plugin/install?repo=ocuclaw/ocuclaw
 
 installs the same bundle through the Desktop install modal, enabled by default.
 OcuClaw ships **one** Desktop UI, and the enabled plugin generates it, so the
-order is: install, then restart the gateway, and the OcuClaw UI appears in the
-Hermes Desktop title bar on the next Desktop launch or reload.
+order is: install, restart the gateway, then pair. The window stays open the
+whole time.
 
 1. Restart the gateway — use the native **Restart gateway** button when the
    OcuClaw card is visible, otherwise `hermes gateway restart` in a terminal. Until it
    restarts, OcuClaw is installed but not loaded, and there is no OcuClaw
-   Desktop UI yet.
-2. The OcuClaw setup card then appears in the title bar reading
-   **Pair your glasses**. Run `/ocuclaw-setup` and finish pairing. The card
+   Desktop UI yet. On the card, that one click also restarts Desktop's backend
+   so the pairing panel loads. The card reads **Finishing setup…** meanwhile.
+2. The OcuClaw setup card then appears in the title bar. Wait until it turns
+   green, reads **OcuClaw ready** and offers **Pair your glasses**. If the card
+   instead reads **Quit and reopen Hermes Desktop to finish setup**, do that.
+   Run `/ocuclaw-setup` and finish pairing. The card
    retires on the durable pairing receipt and stays gone, including across a
    Desktop relaunch.
 
@@ -164,13 +184,17 @@ gateway start and not a moment sooner, so restart it yourself — then run
 `/ocuclaw-setup` and let it re-verify health.
 
 **Cloudways Managed AI Agents.** The same install block applies. That host has
-no root and no system Tailscale, so OcuClaw carries its own path for it, and
-`hermes ocuclaw cloudways setup` runs the whole of it: a user-owned userspace
-Tailscale under `~/bin` and `~/.tailscale`, a Hermes cron watchdog that starts
-it again after every `hermes gateway restart` (a container restart there), the
-private tailnet route, the pairing ceremony and the first message. Cloudways has
-approved those pieces. Your only manual steps are opening the Tailscale
-authorization link it prints and the phone.
+no root, so OcuClaw carries its own path for it. Setup in the agent's chat, or
+`hermes ocuclaw cloudways setup` in the terminal, runs the whole of it: a
+user-owned userspace Tailscale (the server's own `/usr/bin` copy; a server
+without it is told to restart from the Cloudways panel) with state in
+`~/.tailscale`, kept alive by OcuClaw, which starts it again after every
+`hermes gateway restart` (a container restart there). When Cloudways' own
+Tailscale is already running and signed in, OcuClaw uses that one instead. Then
+the private tailnet route, the pairing ceremony and the first message. Cloudways
+has approved those pieces. Sign your model in from the Cloudways panel
+(**LLM & Channels**, then **OAuth**); setup does not sign it in for you. Your
+only manual steps are opening the Tailscale authorization link and the phone.
 
 The same work is still available one verb at a time (`hermes ocuclaw cloudways
 detect`, `install`, `enroll`, `status`, `retry`, `enable`, `disable`,
@@ -185,7 +209,8 @@ hermes --version
 hermes plugins list
 ```
 
-Hermes must remain within `>=0.21.1,<0.22.0`, and `ocuclaw` must be installed.
+Hermes must be 0.21.4 or newer (tested `>=0.21.4,<0.24.0`), and `ocuclaw` must
+be installed.
 Call `{"operation":"status"}` first. If the state is not `configured` or
 `connected`, this is not an update — call `{"operation":"troubleshooting"}` or
 `{"operation":"fresh_install"}` instead.
@@ -259,16 +284,34 @@ the gate). Preserve any ids already listed and append `ocuclaw-wearer`.
 
 Then follow `Restarting the gateway` once more.
 
-An update never turns a key on by itself. Read
+Live reasoning follows the fresh-install rule (Step 4b) on an update too: it
+is on by default when the key is unset, and a saved value always stands. Read
 `status.hermesHooks.streamReasoningDeltasOffer` from the receipt you already
-have and follow the same four-way rule as fresh install Step 4b:
+have:
 `already_enabled` -> one line and move on; `inert` -> say the key would do
 nothing on this Hermes and do not offer it; `unknown` -> skip; `offer` ->
-CHECKPOINT the gateway-wide cost, wait for an explicit yes, then call
-`{"operation":"enable_stream_reasoning_deltas","confirm":true}` once and
-follow `Restarting the gateway` a final time. A no is a finished answer.
+apply the default below.
 
-Call `{"operation":"doctor"}` for the setup-bundle reconciliation receipt,
+Tell the user: "I'll enable live reasoning so your glasses can show reasoning
+steps as they arrive. This setting applies across this Hermes gateway."
+Continue without another yes/no question. If the user declines it in this
+conversation, skip the write and record their choice. Then call the setup tool
+once, preserving every value already saved:
+
+```json
+{"operation":"enable_stream_reasoning_deltas","confirm":true,"defaultsOnly":true}
+```
+
+`defaultsOnly: true` restricts the write to an unset key: an explicit
+`plugins.stream_reasoning_deltas: false` is never changed, and
+`existing_choice` means a saved value was kept; record it and move on.
+`written` must have `applied: true` and `restartRequired: true`. The key is
+saved but not live until Hermes rebuilds its plugin hook set, so follow
+`Restarting the gateway` a final time. `stream_hooks_unavailable` or
+`config_unwritable`: report the receipt and continue without retrying.
+
+Call `{"operation":"doctor"}` for the setup-bundle receipt (on this build it
+reports the old `/ocuclaw-setup` bundle's retirement),
 then run the bounded host command `hermes ocuclaw doctor`. Require a configured
 setup and healthy four-leg result. If its Setup section shows
 `multiple agents  off · agent mode not chosen yet` with the

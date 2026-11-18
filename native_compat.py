@@ -35,6 +35,18 @@ def _sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
 
 
+def _contract_dependencies(active, requested):
+    """A logical contract has one exact-byte active provider, including dependencies."""
+    def provider(name):
+        matches = [key for key, manifest in active.items() if key == name or name in manifest.get("provides", [])]
+        if len(matches) != 1:
+            raise ValueError("Required native contract is missing or ambiguous.")
+        return matches[0]
+    for name in requested:
+        provider(name)
+    return {key: {provider(name) for name in manifest.get("dependencies", [])} for key, manifest in active.items()}
+
+
 def _frontend_sources(root):
     paths = [root / "package-lock.json", root / "web/package.json", root / "web/vite.config.ts"]
     for directory in (root / "web/src", root / "apps/shared/src"):
@@ -68,13 +80,12 @@ def probe(engine_root, packages, *, require_frontend=True):
             if modules and all(_sha(_safe(root, item["target"])) == _sha(_safe(directory, item["source"]))
                                for item in modules):
                 active[candidate.name] = manifest
-        if not set(packages) <= set(active):
-            raise ValueError("Required native contract is unavailable.")
+        dependencies = _contract_dependencies(active, packages)
         checked = set()
         states = {}
         while set(active) - checked:
             ready = [p for p in active if p not in checked and
-                     set(active[p].get("dependencies", [])) <= checked]
+                     dependencies[p] <= checked]
             if not ready:
                 raise ValueError("Missing or cyclic native contract dependency.")
             for package in ready:

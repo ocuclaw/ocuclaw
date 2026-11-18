@@ -13,7 +13,7 @@ from .health import CERTIFIED_HERMES_TAG, hermes_version, ocuclaw_version
 from .optional_route_rpc import OptionalRouteRpc
 
 _ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
-_OPS = {"status", "credential.begin", "credential.save", "credential.cancel",
+_OPS = {"status", "credential.begin", "credential.save", "credential.cancel", "credential.remove",
         "activation.preview", "activation.apply", "activation.status", "diagnostics.preview", "diagnostics.apply",
         "route.preview", "route.apply", "route.status"}
 # Public capability name (what the phone sends) -> this lane's internal field name.
@@ -75,7 +75,8 @@ class OptionalSetupRpc:
     Desktop routes retain their native presenterCapability gate unchanged.
     """
 
-    def __init__(self, restart_rpc, *, clock=time.time, observe=None):
+    def __init__(self, restart_rpc, *, clock=time.time, observe=None, apply_card_switches=None,
+                 apply_liveui_jev=None):
         self.restart = restart_rpc
         self.clock = clock
         # Adapter-supplied `async observe(home) -> disk | None`: re-records the
@@ -83,6 +84,10 @@ class OptionalSetupRpc:
         # the adapter's serialized observation path (never on the event loop).
         # Optional; the presence pump also refreshes it every 30 s.
         self.observe = observe
+        self.apply_card_switches = apply_card_switches
+        # Adapter-supplied `async apply_liveui_jev(home) -> bool`: the Smart interfaces
+        # switch, applied to the running relay. False keeps the restart path.
+        self.apply_liveui_jev = apply_liveui_jev
         self.pending = {}
         self.previews = {}
         self.diagnostic_previews = {}
@@ -161,8 +166,11 @@ class OptionalSetupRpc:
         caps = {}
         for public, name in _FIELDS.items():
             state = observed.get("capabilities", {}).get(name, "unknown")
-            caps[public] = {"present": bool(values[name]),
-                            "state": "saved" if state == "saved_not_activated" else state}
+            # Internal restart states stay internal: a removed key still loaded by
+            # the relay is simply absent (`activation.required` offers the restart).
+            caps[public] = {"present": bool(values[name]) and state != "removed_not_activated",
+                            "state": {"saved_not_activated": "saved",
+                                      "removed_not_activated": "not_configured"}.get(state, state)}
             reason = (observed.get("reasons") or {}).get(name)
             if reason:
                 caps[public]["reason"] = reason
@@ -212,7 +220,7 @@ class OptionalSetupRpc:
         allowed = {"requestId", "operation"}
         allowed |= {"capability", "intent"} if operation == "credential.begin" else set()
         allowed |= {"transactionId", "credential"} if operation == "credential.save" else set()
-        allowed |= {"transactionId"} if operation == "credential.cancel" else set()
+        allowed |= {"transactionId"} if operation in {"credential.cancel", "credential.remove"} else set()
         allowed |= {"permission", "allowed"} if operation == "diagnostics.preview" else set()
         allowed |= {"operationId"} if operation in {"activation.apply", "activation.status", "route.apply", "route.status", "diagnostics.apply"} else set()
         try:
@@ -232,7 +240,7 @@ class OptionalSetupRpc:
             if operation.startswith("credential."):
                 return self._credential(result, request, owner, home)
             if operation.startswith("diagnostics."):
-                return self._diagnostics(result, request, owner, home)
+                return await self._diagnostics(result, request, owner, home)
             if operation.startswith("route."):
                 if operation != "route.preview" and (not isinstance(request.get("operationId"), str)
                         or not _ID.fullmatch(request["operationId"])):
@@ -248,11 +256,18 @@ class OptionalSetupRpc:
         operation = request["operation"]
         if operation == "credential.begin":
             capability, intent = request.get("capability"), request.get("intent")
-            if capability not in _FIELDS or intent not in {"create", "replace"}:
+            if capability not in _FIELDS or intent not in {"create", "replace", "remove"}:
                 return result
-            values, _ = setup._disk_values()
+            if intent == "remove" and _FIELDS[capability] not in setup.REMOVABLE:
+                return result
+            values, even_ai_enabled = setup._disk_values()
             present = bool(values[_FIELDS[capability]])
-            if (present and intent != "replace") or (not present and intent != "create"):
+            if intent == "remove":
+                # Nothing to remove: the phone's view is stale. Turning off Even AI
+                # also counts its enable flag, so a half-done turn-off can finish.
+                if not setup.has_removable(_FIELDS[capability], values, even_ai_enabled):
+                    return {**result, "code": "configuration_changed"}
+            elif (present and intent != "replace") or (not present and intent != "create"):
                 return {**result, "code": "replacement_required" if present else "configuration_changed"}
             if len(self.pending) >= 64:
                 return {**result, "code": "busy"}
@@ -272,6 +287,11 @@ class OptionalSetupRpc:
         del self.pending[transaction_id]  # Single-use even when validation/write fails.
         if operation == "credential.cancel":
             return {**result, "status": "cancelled", "code": "cancelled", "snapshot": self._snapshot(home)}
+        # A remove transaction only removes; a create/replace one only saves.
+        if (operation == "credential.remove") != (row["intent"] == "remove"):
+            return {**result, "code": "transaction_invalid"}
+        if operation == "credential.remove":
+            return self._remove(result, row, home)
         value = request.get("credential")
         if not isinstance(value, str) or len(value) > 4096 or any(ord(c) < 32 or ord(c) > 126 for c in value):
             return {**result, "code": "invalid_input"}
@@ -297,7 +317,28 @@ class OptionalSetupRpc:
                             "snapshot": self._snapshot(home)}
         return {**result, "status": "saved", "code": "saved", "snapshot": self._snapshot(home)}
 
-    def _diagnostics(self, result, request, owner, home):
+    def _remove(self, result, row, home):
+        """`credential.remove`: the consumed remove transaction, same lock and identity check as save."""
+        with receipts.receipt_state_lock(receipts.state_dir(home), credentials.LOCK_FILE) as locked:
+            if not locked:
+                return {**result, "code": "busy"}
+            if self._identity(home) != row["identity"]:
+                return {**result, "code": "configuration_changed"}
+            try:
+                removed = setup.remove_credential(home, _FIELDS[row["capability"]])
+            except Exception as error:
+                code = str(error) if isinstance(error, ValueError) else None
+                if code in setup.SAVE_REFUSALS | {"invalid_selection"}:  # Refused before any write.
+                    return {**result, "code": code}
+                return {**result, "status": "outcome_unknown", "code": "save_unconfirmed",
+                        "snapshot": self._snapshot(home)}
+            if not removed:
+                return {**result, "code": "configuration_changed"}
+        # The running relay keeps the key until a restart: the snapshot's
+        # `activation.required` offers it.
+        return {**result, "status": "removed", "code": "removed", "snapshot": self._snapshot(home)}
+
+    async def _diagnostics(self, result, request, owner, home):
         if request["operation"] == "diagnostics.preview":
             permission, allowed = request.get("permission"), request.get("allowed")
             if not isinstance(permission, str) or permission not in diagnostics.FIELDS or type(allowed) is not bool:
@@ -328,6 +369,22 @@ class OptionalSetupRpc:
             except Exception:
                 return {**result, "status": "outcome_unknown", "code": "save_unconfirmed",
                         "snapshot": self._snapshot(home)}
+        if row["permission"] in {"program_cards_jev", "program_cards_mcp", "program_cards_model"}:
+            try:
+                if self.apply_card_switches is None or not await self.apply_card_switches(home):
+                    raise ValueError("apply_unconfirmed")
+            except Exception:
+                return {**result, "status": "outcome_unknown", "code": "apply_unconfirmed",
+                        "snapshot": self._snapshot(home)}
+        if row["permission"] == "liveui_jev" and self.apply_liveui_jev is not None:
+            # The Smart interfaces switch applies live where the relay can (no restart). A
+            # relay that cannot (an older runtime, no usable key, no answer) leaves the save
+            # as it always was: saved, and the snapshot's `activation.required` offers the
+            # restart. Never replayed.
+            try:
+                await self.apply_liveui_jev(home)
+            except Exception:
+                pass
         return {**result, "status": "saved", "code": "saved", "snapshot": self._snapshot(home)}
 
     async def _activation(self, result, request, owner, home):
@@ -372,10 +429,11 @@ class OptionalSetupRpc:
             if not stored:
                 return {**result, "code": "operation_unknown"}
             state = setup.status(home)
+            states = setup.activation_states(state)
             complete = (state.get("revision") == stored["revision"]
                         and not state.get("activationRequested")
-                        and all(setup.activation_states(state).get(name) == "available_to_test"
-                                for name in stored["selected"]))
+                        and all(states.get(name) == "available_to_test" for name in stored["selected"])
+                        and all(states.get(name) == "not_configured" for name in stored.get("removed") or ()))
             return {**result, "status": "ok", "code": "observed", "snapshot": self._snapshot(home),
                     "activation": {"operationId": operation_id, "expiresAtMs": 0, "mode": "restart",
                                    "affectsAllProfiles": True, "state": "complete" if complete else "unknown"}}
@@ -403,8 +461,10 @@ class OptionalSetupRpc:
             pending["activationRequested"] = setup._admission(gateway)
             pending["activationAttempt"] = setup._attempt_marker(home, gateway)
             # Durable admission precedes native restart; a lost reply never causes a retry.
+            states = setup.activation_states(state)
             operations[operation_id] = {"revision": row["revision"], "selected": [
-                name for name, value in setup.activation_states(state).items() if value == "saved_not_activated"]}
+                name for name, value in states.items() if value == "saved_not_activated"], "removed": [
+                name for name, value in states.items() if value == "removed_not_activated"]}
             setup._write(home, _RECEIPTS, {"v": 1, "operations": operations})
             setup._write(home, setup.PENDING, pending)
             native = await self.restart.handle(self._native_params("restart.request", operation_id,

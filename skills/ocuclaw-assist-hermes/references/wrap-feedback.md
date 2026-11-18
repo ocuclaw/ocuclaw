@@ -1,6 +1,6 @@
 # OcuClaw Hermes wrap-up and feedback
 
-**Guide version:** 2026-09-29 (1.3.26-hermes)
+**Guide version:** 2026-10-28 (1.3.27-hermes)
 
 Use this `ocuclaw_setup` response only at a genuine finish: fresh install,
 update, or standalone fix completed. Never after an unresolved failure or
@@ -21,8 +21,8 @@ A genuine finish delivers, in order:
 
 If interrupted, answer the question and resume at the first undelivered item.
 The donation line is the last line of the wrap message; nothing follows it in
-that message. Do not ask the user to rate the setup assistant or send setup
-feedback; completion should not add another question.
+that message. Do not request a rating of the setup assistant or setup feedback
+from the user; completion should not add another question.
 
 Do not render an address template or ask the user to reconstruct one. If they
 need the current private address, return to `hermes ocuclaw doctor` and use

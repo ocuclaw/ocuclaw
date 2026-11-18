@@ -1,7 +1,6 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-
 const process = require("node:process");
 
 const CLOUDWAYS_HOSTNAME_SUFFIX = ".cloudwaysagents.com";
@@ -144,4 +143,4 @@ function gatewayRestartRisk(normal     , host      = undefined) {
   return mentionsGatewayRestart(normal) ? CLOUDWAYS_RESTART_RISK : normal;
 }
 
-module.exports = { CLOUDWAYS_HOSTNAME_SUFFIX, CLOUDWAYS_RESTART_NOTE, CLOUDWAYS_RESTART_RISK, DETECT_CLOUDWAYS, DETECT_LIKELY, DETECT_NO, detectionSignals, detectionVerdict, detectSync, gatewayRestartAdvice, gatewayRestartRisk, hostIsCloudways, hostSummary, isCloudwaysManagedHost, mentionsGatewayRestart, readProc1Cmdline, resetHostSummaryCache, resolveHostname };
+module.exports = { CLOUDWAYS_HOSTNAME_SUFFIX, DETECT_CLOUDWAYS, DETECT_LIKELY, DETECT_NO, CLOUDWAYS_SPECIFIC_SIGNALS, readProc1Cmdline, detectionSignals, detectionVerdict, resolveHostname, detectSync, hostSummary, resetHostSummaryCache, CLOUDWAYS_RESTART_NOTE, isCloudwaysManagedHost, hostIsCloudways, gatewayRestartAdvice, mentionsGatewayRestart, CLOUDWAYS_RESTART_RISK, gatewayRestartRisk };

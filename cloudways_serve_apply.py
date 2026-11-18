@@ -26,6 +26,16 @@ answered:
 Everywhere else the plugin stays print-only. ``hermes ocuclaw doctor`` prints
 the command; nothing in this bundle but this module runs it.
 
+The chat card (#6378, ADR-0026 amendment)
+-----------------------------------------
+
+Chat-first setup applies the route on every host after the host's own
+approval card (#6397). :func:`run_chat_route` is that second entry point, and
+:mod:`setup_chat_approvals` is its only caller. The card replaces the typed
+``yes`` and the Cloudways-only trigger; every other rule below stays. The
+argv is still built here, once, and the call refuses when it no longer joins
+to the exact text the card showed.
+
 The rules this seam keeps
 -------------------------
 
@@ -43,8 +53,9 @@ The rules this seam keeps
   consent says so out loud.
 * **The certificate precheck is a hard gate** (#2672). A tailnet that cannot
   issue the node's TLS certificate produces a route that classifies ``ready``
-  and fails every connection, so the consent is never even offered there.
-  The precheck only reads ``tailscale status --json`` (#3648). The one
+  and fails every connection, so the consent is never offered there: the
+  HTTPS gate shows where to turn HTTPS on and waits for it first. The
+  precheck and the gate only read ``tailscale status --json`` (#3648). The one
   ``tailscale cert`` call starts after the yes and the apply: an issued
   certificate publishes the node's tailnet name in public Certificate
   Transparency logs, so a "no" must never have started one.
@@ -75,13 +86,20 @@ The rules this seam keeps
 """
 from __future__ import annotations
 
+import http.client
+import json
 import os
+import re
 import shlex
 import shutil
+import socket
 import subprocess
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+import threading
+import time
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from . import doctor, receipts, serve
+from . import doctor, receipts, serve, tailnet_dial
 
 # -- bounds -------------------------------------------------------------------
 
@@ -129,6 +147,15 @@ CERT_GLANCE_POLL_S = 0.25
 #: the last one the wait goes on with the route probe alone.
 CERT_MAX_CALLS = 3
 
+#: How long the HTTPS gate waits for someone to turn HTTPS on before the
+#: consent. Matched by the OpenClaw ladder.
+HTTPS_WAIT_S = 600.0
+
+#: The enable-link query to this box's own tailscaled: one bounded local
+#: request, and the most of its answer that is read.
+ENABLE_LINK_TIMEOUT_S = 10.0
+ENABLE_LINK_MAX_BODY = 64 * 1024
+
 # -- journal vocabulary -------------------------------------------------------
 
 #: The closed set of words this step may put in ``StepRecord.detail``. Never a
@@ -145,6 +172,9 @@ DETAIL_WAIT_TIMEOUT = "route-wait-timeout"
 DETAIL_NOT_READY_AFTER_APPLY = "route-not-ready-after-apply"
 DETAIL_PUBLISHED = "route-published"
 DETAIL_PRESENT = "route-present"
+#: The chat card's own endings (#6378). The chat path keeps no journal.
+DETAIL_COMMAND_CHANGED = "route-command-changed"
+DETAIL_CERT_REFUSED = "route-tls-cert-refused"
 
 ROUTE_JOURNAL_DETAILS = frozenset(
     {
@@ -189,11 +219,24 @@ NO_TAILNET_NAME_MESSAGE = (
     'Check that Tailscale is running, then run setup again.'
 )
 
-CERT_UNAVAILABLE_MESSAGE = (
-    'Tailscale cannot issue the certificate needed for this route. Nothing changed.\n'
-    'In the Tailscale admin console, open DNS and enable MagicDNS and HTTPS '
-    'Certificates.\n'
-    'Then run setup again.'
+#: The HTTPS gate: HTTPS Certificates are off for this tailnet, so the route
+#: could never answer. Every line is shared with the OpenClaw ladder word for
+#: word. The link is Tailscale's own one-click enable link when tailscaled
+#: gives one, else the admin console's DNS page.
+HTTPS_OFF_LINE = (
+    "Your Tailscale account has HTTPS turned off. Your phone's private route needs it."
+)
+HTTPS_ENABLE_LINK_LINE = "Open this link, sign in to Tailscale and turn on HTTPS:"
+HTTPS_ADMIN_PAGE_LINE = (
+    "Open this page, sign in to Tailscale and turn on MagicDNS and HTTPS Certificates:"
+)
+HTTPS_ADMIN_PAGE_URL = "https://console.tailscale.com/admin/dns"
+HTTPS_CARRY_ON_LINE = "Setup carries on by itself once it is on."
+HTTPS_WAITING_LINE = "Waiting for HTTPS to be turned on."
+HTTPS_ON_LINE = "HTTPS is on."
+HTTPS_TIMEOUT_MESSAGE = (
+    "HTTPS is still off, so setup stopped here. Turn it on, then run the same "
+    "command again; setup picks up here."
 )
 
 CERT_UNKNOWN_MESSAGE = (
@@ -375,14 +418,19 @@ def consent_lines(
     operator wants next: that it is one route on one port, that `doctor`
     prints the command that removes it, and that the line stays theirs to run
     by hand. It never changes the command, the question or the answer.
+
+    Since Matt's WebUI onboarding ruling (2026-10-01) the short form says what
+    the route does in plain words and names ``--details`` for the literal
+    line, the way step 2 does for its settings: in the WebUI's 88-column panel
+    the command alone took three of its ten rows. The literal line is still
+    one flag away, and the question, the answer and the command are unchanged.
     """
     override = (OVERRIDE_CONSENT_LINE,) if override_in_force else ()
     if not details:
         return override + (
             "  Allow access from your tailnet only. Never public; never Tailscale Funnel.",
-            "  If you say yes, setup will run:",
-            *wrap_command_lines(command, columns),
-            "  Anything but yes leaves this route unchanged.",
+            "  Setup will add one private route so your phone can reach OcuClaw.",
+            "  Run setup with --details to see the exact command first.",
         )
     return override + (
         "  If you say yes, setup will run:",
@@ -444,6 +492,7 @@ def run_private_route(
     observe_fn: Optional[Callable[..., Any]] = None,
     issue_fn: Optional[Callable[..., Any]] = None,
     record_fn: Optional[Callable[..., str]] = None,
+    enable_link_fn: Optional[Callable[[Any], Optional[str]]] = None,
 ) -> Any:
     """Publish the private route on a decisive Cloudways host, after consent.
 
@@ -453,12 +502,15 @@ def run_private_route(
 
     ``issue_fn(ctx, dns_name, budget_s)`` starts one ``tailscale cert`` call
     and returns its handle (see :class:`_ProcessIssuance`).
+    ``enable_link_fn(ctx)`` answers Tailscale's link that turns HTTPS on, or
+    ``None`` (see :func:`query_serve_enable_link`).
     """
     setup = _setup()
     probe = probe_fn or _default_probe
     observe = observe_fn or _default_observe
     issue = issue_fn or _default_issue
     record = record_fn or doctor.record_route_ownership
+    enable_link = enable_link_fn or _default_enable_link
 
     def record_for(status: str, detail: str, exit_code: Optional[int] = None) -> Any:
         return setup.StepRecord("private-route", status, detail, exit_code=exit_code)
@@ -529,7 +581,7 @@ def run_private_route(
 
     # #2672's precheck, before the consent rather than after it: a route this
     # tailnet cannot certify would apply cleanly, classify `ready`, and fail
-    # every connection, so the question is never asked there.
+    # every connection, so the question waits for a tailnet that can.
     #
     # It only READS (#3648): `tailscale status --json`, whose CertDomains is
     # empty on a tailnet with HTTPS Certificates off. It never runs
@@ -539,11 +591,13 @@ def run_private_route(
     # starts only after the yes and the apply, in the certificate wait.
     verdict = _cert_precheck(ctx, dns_name)
     if verdict == doctor.OUTCOME_CERT_UNAVAILABLE:
-        _say_block(ctx, CERT_UNAVAILABLE_MESSAGE)
-        return record_for(
-            setup.STATUS_FAILED, DETAIL_CERT_UNAVAILABLE, setup.SETUP_EXIT_PROBLEM
-        )
-    if verdict == doctor.OUTCOME_CERT_UNKNOWN:
+        # The HTTPS gate: show where to turn HTTPS on, and wait for it. It
+        # reads the same way the precheck does, and nothing more.
+        if not _https_gate(ctx, dns_name, enable_link):
+            return record_for(
+                setup.STATUS_FAILED, DETAIL_CERT_UNAVAILABLE, setup.SETUP_EXIT_PROBLEM
+            )
+    elif verdict == doctor.OUTCOME_CERT_UNKNOWN:
         # The status could not be read, or does not say (an older Tailscale).
         # Unknown withholds nothing and claims nothing, exactly as it does in
         # doctor; the certificate wait after the apply is the real gate
@@ -677,19 +731,37 @@ def _finish(
     port: int,
     applied: bool,
     issue: Optional[Callable[..., Any]] = None,
+    stop_when_refused: bool = False,
 ) -> Any:
-    """Wait for the route to answer, then record what was observed."""
-    healthy, _last_outcome, waited_on_cert = _wait_for_route(
+    """Wait for the route to answer, then record what was observed.
+
+    ``stop_when_refused`` is the chat card's (#6378): a ``tailscale cert``
+    the tailnet refuses ends the wait at once with
+    :data:`DETAIL_CERT_REFUSED`. The ladder leaves it off and keeps waiting.
+    """
+    healthy, last_outcome, waited_on_cert = _wait_for_route(
         ctx,
         dns_name=dns_name,
         probe=probe,
         issue=issue,
         announced=applied,
+        stop_when_refused=stop_when_refused,
     )
     if healthy and waited_on_cert:
         # The handshake that ended the wait verified this node's certificate
         # against its own name, so this is observed, not assumed.
         ctx.say(f"  {CERTIFICATE_READY_MESSAGE}")
+    if (
+        not healthy
+        and stop_when_refused
+        and last_outcome == doctor.OUTCOME_CERT_UNAVAILABLE
+    ):
+        return setup.StepRecord(
+            "private-route",
+            setup.STATUS_FAILED,
+            DETAIL_CERT_REFUSED,
+            exit_code=setup.SETUP_EXIT_PROBLEM,
+        )
     if not healthy:
         # A bounded wait that ran out is a wait, not a broken route, and it
         # costs the user nothing: the next run picks up exactly here. No
@@ -731,6 +803,198 @@ def _finish(
     return setup.StepRecord("private-route", setup.STATUS_SKIPPED, DETAIL_PRESENT)
 
 
+# -- the chat card's entry point (#6378) ---------------------------------------
+
+
+class _ChatRouteContext:
+    """What the step's pieces read, for a call that has no terminal.
+
+    The card was the consent, so :meth:`ask` never says yes, and the lines the
+    pieces say are kept here rather than printed: the chat receipt carries a
+    status, never the command or a tailnet name.
+    """
+
+    def __init__(
+        self,
+        *,
+        hermes_home: Any,
+        runner: Optional[Callable[..., Any]],
+        clock: Callable[[], float],
+        sleep: Callable[[float], None],
+    ) -> None:
+        self.layout = SimpleNamespace(hermes_home=hermes_home)
+        self.runner = runner
+        self.clock = clock
+        self.sleep = sleep
+        self.options = SimpleNamespace(details=False)
+        self.state: Dict[str, Any] = {}
+        self.env: Dict[str, str] = {}
+        self.poll_s = ROUTE_POLL_S
+        self.lines: List[str] = []
+
+    def say(self, line: str, **_kwargs: Any) -> None:
+        self.lines.append(str(line))
+
+    def say_prompt(self, line: str) -> None:
+        self.lines.append(str(line))
+
+    def ask(self, *_args: Any, **_kwargs: Any) -> bool:
+        return False
+
+
+def _chat_ending(status: str, detail: str) -> Dict[str, str]:
+    return {"status": status, "detail": detail}
+
+
+def run_chat_route(
+    approved_command: str,
+    *,
+    hermes_home: Any,
+    runner: Optional[Callable[..., Any]] = None,
+    clock: Optional[Callable[[], float]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+    probe_fn: Optional[Callable[[str, int, float], str]] = None,
+    observe_fn: Optional[Callable[..., Any]] = None,
+    issue_fn: Optional[Callable[..., Any]] = None,
+    record_fn: Optional[Callable[..., str]] = None,
+) -> Dict[str, str]:
+    """Publish the private route after an approved chat card, on any host.
+
+    ``approved_command`` is the exact text the card showed (the plugin's own
+    record of it, never the agent's). Returns ``{"status", "detail"}``, with a
+    status from the ``apply_route`` receipt vocabulary and a fixed,
+    secret-free detail.
+
+    Against :func:`run_private_route`: no Cloudways trigger (the card is the
+    consent on every host, #6397), no typed yes, and HTTPS off returns
+    ``https_off`` at once instead of waiting at the gate. Everything else
+    stays: the argv is built here once and must join to the approved text;
+    the port is read after the approval and only an absent route is applied
+    (``ready`` is ``already``); a foreign, conflicting or unreadable route
+    stops with no change; the proposed receipt is the same atomic first
+    claim; then the one apply and the bounded certificate wait. Nothing is
+    restarted.
+    """
+    setup = _setup()
+    ctx = _ChatRouteContext(
+        hermes_home=hermes_home,
+        runner=runner,
+        clock=clock or time.monotonic,
+        sleep=sleep or time.sleep,
+    )
+    probe = probe_fn or _default_probe
+    observe = observe_fn or _default_observe
+    issue = issue_fn or _default_issue
+    record = record_fn or doctor.record_route_ownership
+
+    port = relay_port()
+    # Resolved once, here: this exact tuple is what runs, and it has to be
+    # the command the user approved, byte for byte.
+    argv = serve_apply_argv(relay_port=port)
+    if shlex.join(argv) != str(approved_command or ""):
+        return _chat_ending("stale_binding", DETAIL_COMMAND_CHANGED)
+
+    observation = observe(ctx, port)
+    classification = getattr(observation, "classification", serve.CLASSIFY_UNKNOWN)
+    if classification == serve.CLASSIFY_UNKNOWN:
+        return _chat_ending("unreadable", DETAIL_UNREADABLE)
+    if classification == serve.CLASSIFY_WRONG:
+        return _chat_ending("foreign", DETAIL_FOREIGN)
+
+    facts = _route_facts(ctx, observation, port)
+    if _claim_conflict(facts) is not None:
+        return _chat_ending("foreign", DETAIL_FOREIGN)
+
+    dns_name = getattr(observation, "dns_name", None)
+    if not dns_name:
+        return _chat_ending("failed", DETAIL_NO_TAILNET_NAME)
+    if classification == serve.CLASSIFY_READY:
+        return _chat_ending("already", DETAIL_PRESENT)
+    if classification != serve.CLASSIFY_ABSENT:
+        return _chat_ending("unreadable", DETAIL_UNREADABLE)
+
+    # #2672's precheck, read-only (#3648). Off returns at once: the step
+    # machine sends the user Tailscale's link and asks again afterwards.
+    if _cert_precheck(ctx, dns_name) == doctor.OUTCOME_CERT_UNAVAILABLE:
+        return _chat_ending("https_off", DETAIL_CERT_UNAVAILABLE)
+
+    proposal = record(facts)
+    if proposal != doctor.RECORD_PROPOSED:
+        return _chat_ending("foreign", DETAIL_FOREIGN)
+
+    returncode, _message = _apply(ctx, argv)
+    if returncode != 0:
+        return _chat_ending("failed", DETAIL_APPLY_FAILED)
+
+    finished = _finish(
+        ctx,
+        setup,
+        facts=facts,
+        dns_name=dns_name,
+        probe=probe,
+        observe=observe,
+        record=record,
+        port=port,
+        applied=True,
+        issue=issue,
+        stop_when_refused=True,
+    )
+    detail = str(getattr(finished, "detail", "") or "")
+    if detail == DETAIL_PUBLISHED:
+        return _chat_ending("applied", detail)
+    if detail == DETAIL_CERT_REFUSED:
+        return _chat_ending("certificate_refused", detail)
+    if detail == DETAIL_WAIT_TIMEOUT:
+        return _chat_ending("certificate_timeout", detail)
+    return _chat_ending("failed", detail or DETAIL_NOT_READY_AFTER_APPLY)
+
+
+def wait_chat_route_certificate(
+    *,
+    hermes_home: Any,
+    budget_s: float,
+    runner: Optional[Callable[..., Any]] = None,
+    clock: Optional[Callable[[], float]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+    probe_fn: Optional[Callable[[str, int, float], str]] = None,
+    observe_fn: Optional[Callable[..., Any]] = None,
+    issue_fn: Optional[Callable[..., Any]] = None,
+) -> Dict[str, str]:
+    """The step machine's certificate wait on a route that is already ours (#6377).
+
+    For a published route whose front door has not answered yet: the same
+    bounded certificate-first wait :func:`run_chat_route` runs after an apply,
+    cut to ``budget_s`` so one ``next`` call stays inside the tool window.
+    Read-only apart from ``tailscale cert``; never applies or changes a route.
+    Returns ``{"outcome": reachable | refused | waiting}``.
+    """
+    ctx = _ChatRouteContext(
+        hermes_home=hermes_home,
+        runner=runner,
+        clock=clock or time.monotonic,
+        sleep=sleep or time.sleep,
+    )
+    observe = observe_fn or _default_observe
+    observation = observe(ctx, relay_port())
+    dns_name = getattr(observation, "dns_name", None)
+    if getattr(observation, "classification", None) != serve.CLASSIFY_READY or not dns_name:
+        return {"outcome": "waiting"}
+    reachable, outcome, _announced = _wait_for_route(
+        ctx,
+        dns_name=dns_name,
+        probe=probe_fn or _default_probe,
+        issue=issue_fn or _default_issue,
+        announced=True,
+        stop_when_refused=True,
+        wait_s=budget_s,
+    )
+    if reachable:
+        return {"outcome": "reachable"}
+    if outcome == doctor.OUTCOME_CERT_UNAVAILABLE:
+        return {"outcome": "refused"}
+    return {"outcome": "waiting"}
+
+
 def _wait_for_route(
     ctx: Any,
     *,
@@ -738,6 +1002,8 @@ def _wait_for_route(
     probe: Callable[[str, int, float], str],
     issue: Optional[Callable[..., Any]] = None,
     announced: bool = False,
+    stop_when_refused: bool = False,
+    wait_s: float = ROUTE_WAIT_S,
 ) -> Tuple[bool, str, bool]:
     """Bounded wait on the front-door TLS handshake. Never the classifier.
 
@@ -768,7 +1034,7 @@ def _wait_for_route(
     """
     port = serve.serve_port()
     started = ctx.clock()
-    deadline = started + ROUTE_WAIT_S
+    deadline = started + max(0.0, min(float(wait_s), ROUTE_WAIT_S))
     next_notice = started + ROUTE_NOTICE_S
     issuance: Optional[Any] = None
     issued = False
@@ -788,6 +1054,8 @@ def _wait_for_route(
                     if finished == doctor.OUTCOME_CERT_AVAILABLE:
                         issued = True
                     elif finished == doctor.OUTCOME_CERT_UNAVAILABLE:
+                        if stop_when_refused:
+                            return False, finished, announced
                         issue = None
             if (
                 not issued
@@ -809,6 +1077,8 @@ def _wait_for_route(
                 finished, issuance = _begin_certificate(ctx, dns_name, issue, budget)
                 if finished == doctor.OUTCOME_CERT_AVAILABLE:
                     issued = True
+                elif finished == doctor.OUTCOME_CERT_UNAVAILABLE and stop_when_refused:
+                    return False, finished, announced
                 elif finished in (doctor.OUTCOME_CERT_UNAVAILABLE, doctor.OUTCOME_CERT_UNKNOWN):
                     # Refused, or could not run: the probe alone decides.
                     issue = None
@@ -935,6 +1205,48 @@ def _cert_precheck(ctx: Any, dns_name: str) -> str:
     return doctor.tailnet_cert_domains_check(
         dns_name, serve.READ_TIMEOUT_S, runner=ctx.runner
     )
+
+
+def _https_gate(
+    ctx: Any, dns_name: str, enable_link: Callable[[Any], Optional[str]]
+) -> bool:
+    """HTTPS Certificates are off: say where to turn them on, then wait.
+
+    Returns ``True`` once :func:`_cert_precheck` reads ``available``, or
+    ``False`` after :data:`HTTPS_WAIT_S`, having said so. Unavailable and
+    unknown both keep it waiting. Like the precheck it only reads, so it is
+    safe before the consent (#3648). No QR code: the page is Tailscale's
+    admin console, easiest on the computer this terminal is on.
+    """
+    try:
+        url = enable_link(ctx)
+    except Exception:  # noqa: BLE001 - no link; the admin page still works
+        url = None
+    ctx.say(f"  {HTTPS_OFF_LINE}")
+    if url:
+        ctx.say_prompt(f"  {HTTPS_ENABLE_LINK_LINE}")
+        ctx.say(f"    {url}")
+    else:
+        ctx.say_prompt(f"  {HTTPS_ADMIN_PAGE_LINE}")
+        ctx.say(f"    {HTTPS_ADMIN_PAGE_URL}")
+    ctx.say(f"  {HTTPS_CARRY_ON_LINE}")
+    started = ctx.clock()
+    deadline = started + HTTPS_WAIT_S
+    next_notice = started + ROUTE_NOTICE_S
+    while True:
+        now = ctx.clock()
+        if now >= deadline:
+            ctx.say(f"  {HTTPS_TIMEOUT_MESSAGE}")
+            return False
+        if now >= next_notice:
+            # One line a notice period, never one per poll.
+            ctx.say(f"  {HTTPS_WAITING_LINE}")
+            periods = int((now - started) // ROUTE_NOTICE_S)
+            next_notice = started + (periods + 1) * ROUTE_NOTICE_S
+        ctx.sleep(min(ctx.poll_s, max(0.0, deadline - ctx.clock())))
+        if _cert_precheck(ctx, dns_name) == doctor.OUTCOME_CERT_AVAILABLE:
+            ctx.say(f"  {HTTPS_ON_LINE}")
+            return True
 
 
 def _begin_certificate(
@@ -1132,7 +1444,7 @@ def _cert_runner(
 def _default_probe(dns_name: str, port: int, timeout_s: float) -> str:
     """Doctor's front-door TLS handshake, through this host's own proxy."""
     return doctor.tailnet_front_door_check(
-        dns_name, port, timeout_s, socks5=_socks5()
+        dns_name, port, timeout_s, socks5=_socks5(), **_nc_dial()
     )
 
 
@@ -1143,6 +1455,103 @@ def _socks5() -> Optional[Tuple[str, int]]:
     except Exception:  # noqa: BLE001 - a broken receipt means direct dial
         return None
     return None if receipt is None else receipt.socks5
+
+
+def _nc_dial() -> Dict[str, Any]:
+    """``{"nc_argv": …}`` when the receipt says to dial through `tailscale nc`
+    (an adopted daemon with no SOCKS listener, #6482), else nothing."""
+    try:
+        receipt = receipts.read_tailscale_cli()
+    except Exception:  # noqa: BLE001 - a broken receipt means direct dial
+        return {}
+    through = tailnet_dial.receipt_dial_kwargs(receipt)
+    return {"nc_argv": through["nc_argv"]} if "nc_argv" in through else {}
+
+
+#: What tailscaled's query-feature answer may put in front of the user. It is
+#: printed to a terminal, so no spaces and no control or escape characters.
+_ENABLE_LINK_URL = re.compile(r"^https://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$")
+_ENABLE_LINK_MAX_URL = 2048
+
+
+class _LocalAPIConnection(http.client.HTTPConnection):
+    """HTTP to tailscaled's LocalAPI over its unix socket."""
+
+    def __init__(self, socket_path: str, timeout_s: float) -> None:
+        super().__init__("local-tailscaled.sock", timeout=timeout_s)
+        self._socket_path = socket_path
+        self._raw: Optional[socket.socket] = None
+
+    def connect(self) -> None:
+        raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        raw.settimeout(self.timeout)
+        try:
+            raw.connect(self._socket_path)
+        except BaseException:
+            raw.close()
+            raise
+        self._raw = raw
+        self.sock = raw
+
+    def abort(self) -> None:
+        """Unblock whatever is waiting on the socket; the query then fails."""
+        raw = self._raw
+        if raw is not None:
+            try:
+                raw.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def query_serve_enable_link(
+    socket_path: Any, timeout_s: float = ENABLE_LINK_TIMEOUT_S
+) -> Optional[str]:
+    """Tailscale's one-click link that turns HTTPS on for this tailnet, or ``None``.
+
+    What ``tailscale serve --https`` asks for itself: ``POST
+    /localapi/v0/query-feature?feature=serve`` to this box's own tailscaled.
+    No Origin and no Referer header, because tailscaled refuses a request
+    carrying either. Only the answer's ``URL`` is used, and only when it
+    passes :data:`_ENABLE_LINK_URL`; Tailscale's ``Text`` is never shown.
+
+    Read-only and bounded: a timer ends the whole query after ``timeout_s``.
+    Never raises; any failure is ``None``, and the gate shows the admin page.
+    """
+    connection = _LocalAPIConnection(str(socket_path), timeout_s)
+    watchdog = threading.Timer(timeout_s, connection.abort)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        connection.request(
+            "POST",
+            "/localapi/v0/query-feature?feature=serve",
+            headers={"Host": "local-tailscaled.sock", "Content-Length": "0"},
+        )
+        response = connection.getresponse()
+        if response.status != 200:
+            return None
+        body = response.read(ENABLE_LINK_MAX_BODY + 1)
+        if len(body) > ENABLE_LINK_MAX_BODY:
+            return None
+        document = json.loads(body.decode("utf-8"))
+    except Exception:  # noqa: BLE001 - no link; the admin page still works
+        return None
+    finally:
+        watchdog.cancel()
+        connection.close()
+    url = document.get("URL") if isinstance(document, dict) else None
+    if (
+        isinstance(url, str)
+        and len(url) <= _ENABLE_LINK_MAX_URL
+        and _ENABLE_LINK_URL.fullmatch(url)
+    ):
+        return url
+    return None
+
+
+def _default_enable_link(ctx: Any) -> Optional[str]:
+    """The enable link from the tailscaled this ladder's layout runs."""
+    return query_serve_enable_link(ctx.layout.socket_path)
 
 
 def _apply(ctx: Any, argv: Sequence[str]) -> Tuple[Optional[int], str]:
@@ -1173,6 +1582,7 @@ def _apply(ctx: Any, argv: Sequence[str]) -> Tuple[Optional[int], str]:
 
 __all__ = [
     "APPLY_TIMEOUT_S",
+    "HTTPS_WAIT_S",
     "ROUTE_JOURNAL_DETAILS",
     "ROUTE_NOTICE_S",
     "ROUTE_POLL_S",
@@ -1180,7 +1590,10 @@ __all__ = [
     "ROUTE_WAIT_S",
     "certificate_progress_message",
     "consent_lines",
+    "query_serve_enable_link",
     "relay_port",
+    "run_chat_route",
     "run_private_route",
     "serve_apply_argv",
+    "wait_chat_route_certificate",
 ]

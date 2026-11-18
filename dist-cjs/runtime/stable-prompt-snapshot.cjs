@@ -13,6 +13,9 @@ function createStablePromptSnapshotStore(opts = {}) {
   const nowMs = typeof opts.nowMs === "function" ? opts.nowMs : () => Date.now();
   const ttlMs = Number.isFinite(opts.ttlMs) ? opts.ttlMs : DEFAULT_TTL_MS;
   const emitDebug = typeof opts.emitDebug === "function" ? opts.emitDebug : () => {};
+  const retiredOpt = (opts                           ).isRetired;
+  const isRetired                              =
+    typeof retiredOpt === "function" ? (retiredOpt                               ) : () => false;
   const statePath =
     typeof opts.stateDir === "string" && opts.stateDir.trim()
       ? path.join(opts.stateDir.trim(), STORE_FILENAME)
@@ -22,12 +25,17 @@ function createStablePromptSnapshotStore(opts = {}) {
 
   function load() {
     if (!statePath) return;
+    let retired = 0;
     try {
       const raw = fs.readFileSync(statePath, "utf8");
       const parsed = JSON.parse(raw);
       if (parsed && parsed.entries && typeof parsed.entries === "object") {
         for (const [k, v] of Object.entries(parsed.entries)) {
           if (v && typeof v.prompt === "string" && typeof v.sessionId === "string") {
+            if (isRetired((v                      ).prompt)) {
+              retired += 1;
+              continue;
+            }
             byKey.set(k, {
               sessionId: v.sessionId,
               prompt: v.prompt,
@@ -39,6 +47,10 @@ function createStablePromptSnapshotStore(opts = {}) {
       }
     } catch (_err) {
 
+    }
+    if (retired > 0) {
+      persist();
+      emitDebug("relay.session", "stable_prompt_retired", "info", {}, () => ({ count: retired }));
     }
   }
 
@@ -82,7 +94,7 @@ function createStablePromptSnapshotStore(opts = {}) {
       return prompt;
     },
 
-    peek(sessionKey, sessionId) {
+    peek(sessionKey     , sessionId     ) {
       const existing = byKey.get(sessionKey);
       if (!existing || existing.sessionId !== normSessionId(sessionId)) return "";
       existing.touchedMs = nowMs();

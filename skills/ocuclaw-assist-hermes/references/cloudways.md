@@ -1,11 +1,27 @@
-# Cloudways managed Hermes — userspace Tailscale kept alive by Hermes cron
+# Cloudways managed Hermes — userspace Tailscale kept alive by OcuClaw
 
-**Guide version:** 2026-09-29 (1.3.26-hermes)
+**Guide version:** 2026-10-28 (1.3.27-hermes)
 
 Use this branch in place of fresh-install Steps 6 and 7 when the host is a
 Cloudways **Managed AI Agents** container. Everything else in the fresh-install
 guide stays as written: rejoin it at Step 8 once C5 below is green. The
 setup receipt's `journey` keeps driving; this branch adds one sub-check.
+
+## Chat setup comes first
+
+When `ocuclaw_setup` offers `next`, setup on Cloudways is SKILL.md's **Chat
+setup**: call `next` and relay its lines. The user stays in the Cloudways
+Hermes web chat. `next` starts Tailscale, gets the approval link, opens the
+private route behind an approval card, pairs the phone from a code typed in
+chat, and announces the one container restart in its own words. Nobody opens
+a terminal or SSH on that path, nothing on this page is run by hand, and the
+SSH reconnect steps under **Before any restart** do not apply.
+
+Read the rest of this page only for:
+
+- a `stuck` result, to understand what `next` checked;
+- an older plugin with no `next`;
+- a user who asks to run setup in their own terminal instead.
 
 ## Already paired on this computer
 
@@ -29,7 +45,11 @@ read-only; pairing and private credential entry stay with their local owner.
 Switching Desktop back to the local connection restores its local actions.
 Check phone/glasses pairing separately before claiming they moved to Cloudways.
 
-## Fast path: one command
+Cloudways stays Tailscale-only: `hermes ocuclaw cloudways setup` refuses when
+`platforms.ocuclaw.extra.phoneAddress` is set. Tell the user to clear it with
+`hermes config set platforms.ocuclaw.extra.phoneAddress ''`.
+
+## Terminal fallback: one command
 
 ```bash
 hermes ocuclaw cloudways setup
@@ -43,6 +63,26 @@ Eight steps, `[1/8]` to `[8/8]`, one progress line each. It reads live state
 before every step and skips what is already done, so re-running after a dropped
 SSH session resumes instead of redoing. There is no `--retry` flag: running the
 same command again is how you resume.
+
+**A model comes first, from the Cloudways panel.** Right after the host check,
+setup reads whether a model is signed in and selected. It never signs in
+itself. With no model it says to sign in to OpenAI in the Cloudways panel
+(**LLM & Channels → OAuth → OpenAI → Connect**) and stops, with `--yes` too.
+That Connect restarts the container and can take several minutes, so never
+start it while setup runs and never tell the user to skip the model. Once the
+agent is back, run the same setup command again: it reads the model as signed
+in and carries on. Signed in with no model chosen, it names `hermes model` and
+stops the same way. A check setup cannot read never stops it.
+
+**ChatGPT needs device code sign-in turned on first.** That Connect signs in to
+ChatGPT with a link and a one-time code, and ChatGPT refuses it until the
+account's **Enable device code sign-in for Codex, Excel, PowerPoint, and Word**
+switch is on (ChatGPT **Settings → Security and login → App security**,
+https://chatgpt.com/settings/security). While it is off, the sign-in can loop
+through account picking and security checks before ChatGPT says why. If the
+user says the OpenAI sign-in is refused or keeps looping, tell them to turn that
+switch on and click Connect again. On a ChatGPT Business, Enterprise or Edu
+workspace, an admin may have to allow it.
 
 **It now looks for the phone itself.** Step 5 asks the user to install
 Tailscale on the phone and approve the enrollment link there, so the phone
@@ -63,9 +103,17 @@ not loaded at all, because then no Relay Credential exists. Any interruption,
 including a restart that closes SSH, Hermes and tmux, resumes by running the
 same command again.
 
-It asks twice on this host, each time printing exactly what changes and
-defaulting to no: the settings write, and the tailnet route. On a host that
-has a bounded restart plan, step 3 adds a third question before it restarts
+It asks at most twice on this host, each time defaulting to no. Step 2 applies
+the glasses settings (tool progress kept out of the chat, reply streaming, and
+live reasoning when unset) as part of the setup command the user ran, and asks one question only while
+"Continue here" is off:
+`Continue your Desktop and terminal chats on your glasses? Type yes or no: `.
+A yes turns it on; a no skips that one setting, says
+`Not turned on. To turn it on later, run the same setup command again.`, and
+setup carries on. Live reasoning is gateway-wide: setup announces the default,
+preserves saved values, and uses the same pending restart as the other settings.
+The other question is the tailnet route. On a host that
+has a bounded restart plan, step 3 adds a restart question before it restarts
 the gateway; a Cloudways container has no such plan, so it never appears here.
 `--yes` answers all of them (use it only
 for automation), `--no-pair` stops at step 7 with exit 0 and a line naming the
@@ -73,7 +121,7 @@ command that resumes, `--no-first-use` stops at step 8 the same way,
 `--wait <seconds>` sets how long it waits for the node to be approved
 (default 600), `--first-use-wait <seconds>` sets how long it waits for the
 first phone reply (default 600), `--hostname <name>` names a fresh tailnet
-node, `--light-terminal` renders the pairing QR for a light background,
+node, `--light-terminal` is kept so older commands still run and does nothing,
 `--details` spells out the exact settings keys and the full route explanation
 in the two questions, and `--json` prints the final summary. Exit 0 is done or
 cleanly handed off, 1 a problem, 2 refused or stopped by the user.
@@ -119,6 +167,17 @@ Six facts to state plainly when you offer it:
     from that terminal actually does here: it stops the gateway, stopping it
     restarts the whole container, and SSH drops for a few seconds and comes
     back. Exit 2, and a rerun picks up here with the settings intact.
+  - Loaded, but the gateway still runs older OcuClaw code than the files on
+    disk (an upgrade such as `hermes plugins install ocuclaw/ocuclaw --force`
+    or `hermes plugins update ocuclaw` with no restart since): `Your agent is
+    still running OcuClaw <old>. OcuClaw <new> is installed.`, or `Your agent
+    is still running an older OcuClaw than the one installed.` when the two
+    versions cannot both be named. It never says "loaded and ready" then. The
+    same restart follows as for "not loaded": typed by hand over SSH (exit 2),
+    asked and run by setup in the WebUI terminal, asked first on a host with a
+    bounded restart plan. The check compares the version the running gateway
+    reports with `plugin.yaml`, and when the installed files landed with when
+    the gateway started; when neither can be read it asks for no restart.
   - Loaded, with the step 2 settings waiting for a gateway start, on a host
     with no bounded restart plan (every real Cloudways container): nothing
     extra is said and the ladder carries on to step 4. The only setting that
@@ -136,13 +195,18 @@ Six facts to state plainly when you offer it:
   - A restart that ran but did not complete, or that came back without both
     the gateway and the relay healthy inside 180 seconds: exit 1, asking for a
     rerun once `hermes ocuclaw doctor` is clean.
-- **The two questions are short by default.** Step 2 names the two settings in
-  plain words and step 6 says what the route is and is not, then shows the
-  exact command it will run. `--details` prints the full technical block for
-  both. It changes what the questions say, never what is done or what is asked.
+- **The questions are short by default.** Step 2 lists no settings: it asks
+  only about Continue here, then says `Glasses settings applied.` Step 6 says
+  what the route is and is not, then shows the exact command it will run.
+  `--details` prints the full technical block for both. It changes what the
+  steps say, never what is done or what is asked.
 - **Continue here is a follow-up.** While its setting awaits a gateway start,
   the last line is `Continue here activates at the next agent restart.` No
-  immediate second restart is needed to finish Core Setup Completion.
+  immediate second restart is needed to finish Core Setup Completion. A run in
+  which the user said no to it never prints that line. To turn it on later,
+  run the same setup command again once the agent has restarted: it asks again
+  while Continue here is off. The run that carries on after the step 3 restart
+  does not ask again.
 
 Offer this when the user would rather type one command than have you drive the
 steps. C1-C5 below stay the agent-led path and the manual fallback, and they
@@ -190,13 +254,13 @@ A refused or cancelled approval is a decision, not a missing phone.
 Whenever no message arrives from the phone in step 8, it
 says `Tailscale on your phone has to stay switched on for the phone to reach this server.`
 
-## The pairing code and its two minutes
+## The pairing code and its five minutes
 
-The code lasts two minutes, and it used to appear before the user had the
+The code lasts five minutes, and it used to appear before the user had the
 phone in hand. On a real terminal, step 7 now waits before it mints the code:
 
 ```
-Open Even on your phone. The pairing code lasts 2 minutes.
+Open Even on your phone. The pairing code lasts 5 minutes.
 Press Enter when ready.
 ```
 
@@ -214,9 +278,10 @@ Press Enter for a new code, or type stop:
 Enter mints a fresh code in the same step; `stop` finishes there. Without an
 interactive terminal it still exits 1, as before.
 
-The scan state keeps Address and Pairing code above the QR. Small terminals
-use Manual pairing rather than clipping the QR. Four-word instructions appear
-only after the phone joins. Compare the boxed words in order, then type
+The pair prompt asks for the phone code OcuClaw shows. For manual pairing the
+user types `m` at the pair prompt, then in OcuClaw taps **Pair with your agent >
+Pair manually** and types the address and pairing code the terminal shows.
+Four-word instructions appear only after the phone joins. Compare the boxed words in order, then type
 `approve`, `refuse`, or `cancel`. Letter case is ignored; punctuation and typos
 never approve. Invalid answers re-prompt within the existing retry bound.
 Approval remains pending until the phone authenticates back.
@@ -230,20 +295,21 @@ Markdown link; the Hermes TUI hides a link's address).
 
 Hermes runs as a non-root user inside a container: no privilege elevation of
 any kind, no systemd, no cron binary, no TUN device, and the system
-`tailscale` command does not exist. `hermes gateway restart` restarts the **whole container**. Files under
+`tailscale` command exists only on current images. `hermes gateway restart` restarts the **whole container**. Files under
 the home directory survive that; background processes do not.
 
-Cloudways has approved exactly two things for OcuClaw here: a user-owned
-**userspace-networking tailscaled** (binaries in `~/bin`, state in
-`~/.tailscale`) and **Hermes cron** as the supervisor that starts it again
-after a restart. `hermes ocuclaw cloudways ...` implements that path as
+Cloudways has approved a user-owned **userspace-networking tailscaled** for
+OcuClaw here, with state in `~/.tailscale`. The server's own `/usr/bin`
+Tailscale runs it; OcuClaw downloads none of its own. OcuClaw
+keeps it alive: it starts the daemon on every gateway start and checks it
+every minute. `hermes ocuclaw cloudways ...` implements that path as
 idempotent verbs the agent runs from its Terminal tool. The only manual work
 is Tailscale authorization (a link the user opens) and the phone.
 
 Never, on this host: any elevation or root prefix, the `TS-NOT-INSTALLED`
 installers, Tailscale Funnel, ACL or tailnet policy edits,
-`tailscale serve reset`, starting `tailscaled` by hand, or editing the
-generated watchdog script.
+`tailscale serve reset`, starting `tailscaled` by hand, or a cron job that
+starts it (OcuClaw already does; two supervisors on one daemon is refused).
 
 ## Before any restart · reconnect and resume
 
@@ -253,7 +319,8 @@ Ask which computer they use: Windows Terminal/PowerShell on Windows, Terminal
 on macOS, or their terminal app on Linux. Use the SSH command from Cloudways'
 Access Details. Its SSH password is separate from the web-interface password.
 If SSH reports too many authentication failures, preserve the supplied user,
-host and port and add `-o PreferredAuthentications=password -o PubkeyAuthentication=no`.
+host and port and add `-o PreferredAuthentications=password -o PubkeyAuthentication=no`
+to that one command. It only stops SSH offering saved keys on that login, so the server asks for the password.
 Passwords belong in SSH's private prompt, never this conversation.
 
 Before handing over the restart (`quick_reference` → `Restarting the gateway`,
@@ -281,7 +348,7 @@ activation. A saved setting or an old healthy gateway is not activation proof.
 If SSH returns but the gateway/relay does not, mark `restart recovery required`,
 inspect gateway status and the existing restart receipt, and report the specific
 failure. Do not issue another restart just because the previous tool disconnected.
-The watchdog recovery window is described under Restart survival below.
+The Tailscale recovery window is described under Restart survival below.
 
 ## C1 · Detect
 
@@ -302,7 +369,7 @@ hermes ocuclaw cloudways detect
 Before running the command, use Hermes' `clarify` tool. Put the explanation
 and command in `clarify.question` as plain text:
 
-> This Cloudways host needs its approved user-owned Tailscale daemon and watchdog before the private route can be created. This installs verified Tailscale binaries in your home directory, creates protected local state, and registers a Hermes cron watchdog so it returns after gateway restarts. Re-running it is safe.
+> This Cloudways host needs its approved user-owned Tailscale daemon before the private route can be created. This uses the Tailscale the server ships, creates protected local state, starts the daemon, and lets OcuClaw start it again after gateway restarts. Re-running it is safe.
 >
 >     hermes ocuclaw cloudways install
 >
@@ -310,20 +377,27 @@ and command in `clarify.question` as plain text:
 
 Offer exactly **Install now** and **Not now**. Run only after **Install now**;
 on **Not now**, leave this checkpoint pending. Use a prose question only when
-`clarify` is unavailable; never ask the user to type approval after a selection.
+`clarify` is unavailable. The selection is the approval; do not also have the user type one.
 
 ```bash
 hermes ocuclaw cloudways install
 ```
 
-One run does all of: download the pinned Tailscale `1.102.4` tarball and verify
-its SHA-256 against both the pinned value and the publisher's `.sha256` file
-(existing binaries are adopted when they already print that version), create
-`~/.tailscale` (mode 700), write the host receipt that points `doctor` and
-`status` at `~/bin/tailscale --socket=...`, write the watchdog script to
-`~/.hermes/scripts/`, create the every-minute Hermes cron job
-`ocuclaw-tailscale-watchdog` (`--no-agent`, no LLM) or keep the existing one,
-and fire it once. Re-running reports `adopted` / `kept` and changes nothing.
+One run does all of: use the server's `/usr/bin/tailscale` and
+`/usr/bin/tailscaled` (`binaries platform`); create `~/.tailscale` (mode 700);
+write the host receipt that points `doctor` and `status` at
+`/usr/bin/tailscale --socket=...`; hand the daemon to OcuClaw
+(`~/.evenclaw/state/ocuclaw.cloudways.hermes.json`); and start `tailscaled`
+once. On a box an earlier OcuClaw version set up, it also removes the old
+`ocuclaw-tailscale-watchdog` cron job and, when the image now ships Tailscale,
+restarts the daemon from `/usr/bin` with the same `~/.tailscale` state (same
+node, no new approval) and removes the `~/bin` copy. Re-running changes
+nothing.
+
+`Tailscale is missing on this server.` means the image has no
+`/usr/bin/tailscaled`; nothing was written. Tell the user to restart their
+agent from the Cloudways panel (that brings the current server image), then
+run setup again. Never install Tailscale another way here.
 
 Exit 2 with `never run two supervisors` means another `tailscaled` or a legacy
 supervisor is already running. Do not kill it. Report the printed process
@@ -337,14 +411,14 @@ under `~/.hermes/disabled-hooks/` and the old supervisor under
 hermes ocuclaw cloudways status --wait 45
 ```
 
-The watchdog starts `tailscaled` on the next cron tick (up to about a minute).
-Read the first line:
+`install` already started `tailscaled`; this waits for it to settle. Read the
+first line:
 
 - `daemon running`: an existing identity was adopted. Skip to C5.
 - `daemon needs-authorization`: a fresh identity. Continue with C4.
-- `daemon stopped` after the wait: run the same command once more with
-  `--wait 90`. If still stopped, run `hermes cron list --all` and report the
-  job line and `~/.tailscale/log/tailscaled.log` tail to the user.
+- `daemon stopped` after the wait: run `hermes ocuclaw cloudways enable`, then
+  `status --wait 90`. If still stopped, report the
+  `~/.tailscale/log/tailscaled.log` tail to the user.
 
 ## C4 · Enroll (the one manual step)
 
@@ -359,8 +433,8 @@ Progress appears on stderr; `--json` stdout remains one result. A pending result
 is not a failed registration. `retry` observes the same enrollment, including a
 link that arrives after the original command's 25-second deadline. Cancellation
 stops observation and preserves enrollment for retry; it does not log out.
-If the daemon fails, diagnose `status` before retrying. Never loop indefinitely:
-after one bounded retry still has no link, explain the pending state and offer
+If the daemon fails, diagnose `status` before retrying. Retry at most once:
+if that one bounded retry still has no link, explain the pending state and offer
 to retry later or cancel setup. Do not print daemon logs or secrets to the wearer.
 
 Put the returned URL in one plain-text `clarify` question: ask the user to open it
@@ -381,7 +455,7 @@ authorization again when the key expires.
 
 Run fresh-install Step 7 exactly as written: `hermes ocuclaw doctor` prints the
 fully substituted apply command. On this host it begins with
-`/home/<user>/bin/tailscale --socket=/home/<user>/.tailscale/run/tailscaled.sock`
+`/usr/bin/tailscale --socket=/home/<user>/.tailscale/run/tailscaled.sock`
 because the receipt tells `doctor` which binary owns the route. Run that exact
 line only after Step 7's `clarify` approval, then `doctor` again. The bounded reachability and relay checks must
 report `reachable_yes` and `relay_credential_accepted`; on this host they dial
@@ -396,8 +470,8 @@ Certificates; only a repeat timeout points at the admin-console settings.
 
 Then continue at fresh-install **Step 8**. Wherever a later step runs a bare
 `tailscale` command (Step 8's `tailscale status --json`), run
-`~/bin/tailscale --socket="$HOME/.tailscale/run/tailscaled.sock"` followed by
-the same arguments.
+`/usr/bin/tailscale --socket="$HOME/.tailscale/run/tailscaled.sock"` (the
+binary `status` reports in its receipt line) followed by the same arguments.
 
 ## Journey and health surfaces
 
@@ -406,7 +480,7 @@ the same arguments.
   `starting`, `absent`) and `subCheck: "tailnet-daemon"` when it is not
   `running`. Fix the daemon (C3/C4) before the route.
 - `hermes ocuclaw status` and `doctor` print a `Tailscale daemon (userspace,
-  cron-kept)` section with the same state and the one command that fixes it.
+  kept alive by OcuClaw)` section with the same state and the one command that fixes it.
   The section is absent on hosts without the receipt.
 - The bare `hermes` TUI on Hermes 0.21 starts its own gateway child next to
   the managed gateway. OcuClaw's platform loads there too, but the managed
@@ -418,10 +492,9 @@ the same arguments.
 
 ## Restart survival
 
-`hermes gateway restart` restarts the container. The gateway's cron scheduler
-starts about 30 s later and its first tick about a minute after that; the
-watchdog then starts `tailscaled`. Measured on the test host: node `running`
-again 18–100 s after the container came back. After any restart, run
+`hermes gateway restart` restarts the container. OcuClaw starts with the
+gateway and starts `tailscaled` then, with the same `~/.tailscale` state, and
+checks it again every minute. After any restart, run
 `hermes ocuclaw cloudways status --wait 120` before probing the route.
 
 **Activating saved optional choices restarts the container too** (Matty,
@@ -436,22 +509,19 @@ reconnects in 1–5 minutes. Active replies are stopped, not finished.` It still
 `cloudways setup` ladder does not restart by itself; it still names the
 dashboard restart when OcuClaw is not loaded.
 
-One slower case, seen once: the container bounced a second time while the
-watchdog's first tick was running. Hermes cron then holds that tick's fire
-claim for 300 s, every tick in that window logs `Fire claim lost; execution
-was not started`, and the daemon returns on the first tick after the claim
-expires (5 min 16 s after the final boot on the test host). If `status
---wait 120` still says `stopped`, run it once more with `--wait 300` before
-reporting anything. `hermes cron list --all` shows the same job line and
-`Last run` throughout; nothing needs repair.
+A box an earlier OcuClaw version set up kept the daemon alive with a Hermes cron
+job, `ocuclaw-tailscale-watchdog`. After a plugin upgrade, the first gateway
+start removes that job and OcuClaw takes over; a paused job stays disabled.
+`status` reporting an old cron watchdog means run `install` once.
 
 ## Disable, enable, rollback
 
-- `hermes ocuclaw cloudways disable`: pause the cron job and stop the daemon.
+- `hermes ocuclaw cloudways disable`: stop keeping the daemon alive and stop it.
   The node goes offline; nothing is removed.
-- `hermes ocuclaw cloudways enable`: resume the job and fire it now.
-- `hermes ocuclaw cloudways rollback --yes`: remove the job, daemon, script,
-  OcuClaw's Serve route, and the binaries and receipt this plugin provisioned.
+- `hermes ocuclaw cloudways enable`: keep it alive again and start it now.
+- `hermes ocuclaw cloudways rollback --yes`: remove the supervision state, daemon,
+  OcuClaw's Serve route, and the binaries and receipt this plugin provisioned
+  (never `/usr/bin`).
   The Tailscale identity in `~/.tailscale` is kept unless `--purge-identity` is
   added, so a later `install` comes back `running` without a new authorization.
   Without `--yes` it refuses (exit 2). Rollback is a `clarify` checkpoint;

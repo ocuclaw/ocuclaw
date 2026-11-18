@@ -6,12 +6,13 @@ const FIRST_USE_SUCCESS = "OcuClaw setup is complete. Optional integrations can 
 
 const OPTIONAL_SETUP_HANDOFF_LINES = Object.freeze([
   "Optional: on your phone, the Optional setup card on Home offers voice and Even AI.",
-  "You can also reach them later under Settings > Voice and Settings > Defaults > Even AI.",
+  "It shows after the glasses basics and things to try.",
+  "You can also reach them later under Settings > Voice and Settings > Even AI.",
   "Choose what you want, or leave it for later.",
 ]);
 const OPTIONAL_SETUP_HANDOFF = OPTIONAL_SETUP_HANDOFF_LINES.join(" ");
 
-function firstUseSuccessLines(record) {
+function firstUseSuccessLines(record     ) {
   const evidence = record?.confirmation && record.confirmation.source !== "test-input"
     ? "You confirmed the reply appeared on your glasses."
     : record?.replyEvidence === "client_sdk_receipt"
@@ -20,7 +21,7 @@ function firstUseSuccessLines(record) {
   return [FIRST_USE_SUCCESS, evidence, ...OPTIONAL_SETUP_HANDOFF_LINES].filter(Boolean);
 }
 
-function firstUseSuccess(record) {
+function firstUseSuccess(record     ) {
   return firstUseSuccessLines(record).join(" ");
 }
 const FIRST_USE_RETRY = "Send a new message from the phone in this OpenClaw session, wait for its reply, then run openclaw ocuclaw first-use again.";
@@ -41,7 +42,7 @@ const FIRST_USE_PROVIDER_ERROR_CLASSES = Object.freeze([
   "overloaded",
   "model_error",
 ]);
-const PROVIDER_ERROR_CODE_CLASSES = Object.freeze({
+const PROVIDER_ERROR_CODE_CLASSES      = Object.freeze({
   provider_auth_invalid: "auth",
   provider_quota_exhausted: "quota",
   provider_rate_limited: "rate_limit",
@@ -52,7 +53,7 @@ const PROVIDER_ERROR_CODE_CLASSES = Object.freeze({
   reply_run_rate_limited: "rate_limit",
 });
 
-function firstUseProviderErrorClass(value) {
+function firstUseProviderErrorClass(value     ) {
   if (value && typeof value === "object") {
     if (FIRST_USE_PROVIDER_ERROR_CLASSES.includes(value.class)) return value.class;
     return firstUseProviderErrorClass(value.code);
@@ -60,12 +61,12 @@ function firstUseProviderErrorClass(value) {
   return typeof value === "string" && PROVIDER_ERROR_CODE_CLASSES[value] ? PROVIDER_ERROR_CODE_CLASSES[value] : "model_error";
 }
 
-function firstUseRunErrored(code) {
+function firstUseRunErrored(code     ) {
   const known = typeof code === "string" && code ? code : null;
   return { code: known, class: firstUseProviderErrorClass(known) };
 }
 
-function firstUseWithRunErrored(result, errored) {
+function firstUseWithRunErrored(result     , errored     ) {
   if (!result || !errored) return result;
   const open = result.status === "awaiting-reply" ||
     (result.status === "awaiting-confirmation" && result.replyWasProviderError === true);
@@ -76,7 +77,7 @@ function firstUseWithRunErrored(result, errored) {
 const TOOL_POLICY_ALSO_ALLOW_APPLY_COMMAND =
   `openclaw config set tools.alsoAllow '["ocuclaw"]' --strict-json`;
 
-function toolPolicyWarnings(toolPolicy) {
+function toolPolicyWarnings(toolPolicy     ) {
   if (toolPolicy?.exposure !== "hidden-by-profile") return [];
   return [{
     id: "tool-policy-hides-ocuclaw",
@@ -86,7 +87,7 @@ function toolPolicyWarnings(toolPolicy) {
   }];
 }
 
-function setupInstallation(stateDir) {
+function setupInstallation(stateDir     ) {
   return {
     backend: "openclaw",
     id: stateDir
@@ -98,7 +99,7 @@ function setupInstallation(stateDir) {
   };
 }
 
-function coldCertificateWindow(route, daemon) {
+function coldCertificateWindow(route     , daemon     ) {
   if (!route || typeof route !== "object") return false;
   if (route.route?.classification !== "ready") return false;
   if (route.ownership?.status !== "owned") return false;
@@ -111,22 +112,61 @@ function coldCertificateWindow(route, daemon) {
 const CLOUDWAYS_INSTALL_ACTION =
   "This is a Cloudways managed host. There is no system Tailscale here and there cannot be: no root, no TUN device, no working installer. Do not look for a `tailscale` binary and do not ask the user whether Cloudways supports Tailscale. Read references/cloudways.md, then in your own terminal run `openclaw ocuclaw cloudways install --json`, then `openclaw ocuclaw cloudways status --wait 45 --json`, then `openclaw ocuclaw cloudways enroll --json` if it reports needs-authorization, and give the user the authorization link it prints. Re-read journey after each step. Never run `openclaw gateway restart` on this host: it is a no-op.";
 
-function cloudwaysRouteBlocked(route, daemon, host) {
+function cloudwaysRouteBlocked(route     , daemon     , host     ) {
   if (!host || host.managed !== "cloudways") return false;
   if (daemon && daemon.state === "absent") return true;
 
   return route?.route?.readCode === "serve_cli_absent" || route?.evidence === "serve_cli_absent";
 }
 
-const SERVE_CLI_ABSENT_ACTION =
-  "The tailscale CLI is not on the gateway process's PATH (macOS App Store build: expose the CLI), or Tailscale runs in a different container/VM than the gateway; move one of them.";
+const PHONE_ADDRESS_SET_COMMAND =
+  "openclaw config set plugins.entries.ocuclaw.config.phoneAddress wss://<name>:<port>";
+const CUSTOM_ROUTE_OFFER =
+  `Already have your own private network? Set your phone address instead: ${PHONE_ADDRESS_SET_COMMAND}`;
 
-function serveCliAbsent(route) {
+const SERVE_CLI_ABSENT_ACTION =
+  "The tailscale CLI is not on the gateway process's PATH (macOS App Store build: expose the CLI), or Tailscale runs in a different container/VM than the gateway; move one of them. " +
+  CUSTOM_ROUTE_OFFER;
+
+const CUSTOM_REOBSERVE = "then re-read journey.";
+function customRouteAction(route     ) {
+  const check = route.customRoute?.check ?? null;
+  const reason = route.customRoute?.reason ?? route.evidence;
+  const relayTarget = `127.0.0.1:${route.relay?.port ?? "<relay port>"}`;
+  if (route.status === "healthy") {
+    return "Your phone address is verified: this host reached it over a private address, the certificate passed the same checks the phone applies, and the front door leads to this relay. Pair next.";
+  }
+  if (route.status === "unverified") {
+    return `This host could not check your phone address from here (${reason}). That is normal when your network does not route a host back to itself, or the name only resolves on the phone. Nothing is proven yet: pair next, and the phone connecting is the proof. The address is bound into the safety phrase, so a wrong one fails safely.`;
+  }
+  if (reason === "relay-port-unknown") return `The relay's loopback port is not known yet. Verify the relay first, ${CUSTOM_REOBSERVE}`;
+  switch (check) {
+    case "address":
+      return `The phone address is not a valid wss://name:port address (${reason}). Set it with an explicit port and no path: ${PHONE_ADDRESS_SET_COMMAND} — ${CUSTOM_REOBSERVE}`;
+    case "cloudways":
+      return "Cloudways hosts reach the phone only through their own Tailscale. Remove the phone address (openclaw config unset plugins.entries.ocuclaw.config.phoneAddress) and follow references/cloudways.md.";
+    case "loopback":
+      return `The relay is not answering on its loopback port. Verify the relay in the owning gateway, ${CUSTOM_REOBSERVE}`;
+    case "private":
+      return `Your phone address resolves to a public address on this host. OcuClaw pairs only over a private route (10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7). Point the name at this host's private address on your network, ${CUSTOM_REOBSERVE}`;
+    case "tls":
+      return `The front door at your phone address did not present a certificate the phone would trust for that name. Give your TLS front door (Caddy, nginx, Traefik or your router's proxy) a publicly trusted certificate for exactly this name, ${CUSTOM_REOBSERVE}`;
+    case "probe":
+      return reason === "other-relay"
+        ? `Your phone address leads to a different relay, not this one. Point your TLS front door at this host's relay on ${relayTarget}, ${CUSTOM_REOBSERVE}`
+        : `The front door at your phone address answered, but not as an OcuClaw relay. Point it at this host's relay on ${relayTarget}, ${CUSTOM_REOBSERVE}`;
+    default:
+      return `Your phone address could not be checked (${reason}). Inspect your TLS front door and network, ${CUSTOM_REOBSERVE}`;
+  }
+}
+
+function serveCliAbsent(route     ) {
   if (!route || typeof route !== "object") return false;
   return route.route?.readCode === "serve_cli_absent" || route.evidence === "serve_cli_absent";
 }
 
-function privateRouteAction(route, daemon = null, host = null) {
+function privateRouteAction(route     , daemon      = null, host      = null) {
+  if (route?.mode === "custom") return customRouteAction(route);
 
   if (cloudwaysRouteBlocked(route, daemon, host)) return CLOUDWAYS_INSTALL_ACTION;
 
@@ -177,17 +217,19 @@ function privateRouteAction(route, daemon = null, host = null) {
   }
 }
 
-function tailnetDaemonBlock(tailnetDaemon) {
+function tailnetDaemonBlock(tailnetDaemon     ) {
   if (!tailnetDaemon || typeof tailnetDaemon !== "object") return null;
   const daemonState = typeof tailnetDaemon.state === "string" ? tailnetDaemon.state : "unknown";
   return {
     state: daemonState,
     detail: typeof tailnetDaemon.detail === "string" ? tailnetDaemon.detail : "",
     blocking: daemonState !== "running",
+
+    ...(typeof tailnetDaemon.backend === "string" ? { backend: tailnetDaemon.backend } : {}),
   };
 }
 
-function tailnetDaemonAction(daemon) {
+function tailnetDaemonAction(daemon     ) {
   if (daemon.state === "absent") return CLOUDWAYS_INSTALL_ACTION;
   if (daemon.state === "needs-authorization") {
     return "The Cloudways Tailscale node is not authorized yet. Run `openclaw ocuclaw cloudways enroll --json`, give the user the https://login.tailscale.com link it returns and ask them to approve the node on a device signed in to their tailnet, then run `openclaw ocuclaw cloudways status --wait 45 --json` until it reports running. Never ask for their identity-provider password.";
@@ -201,7 +243,7 @@ function tailnetDaemonAction(daemon) {
   return "The Cloudways Tailscale daemon state could not be read. Run `openclaw ocuclaw cloudways status --json` and follow references/cloudways.md. Do not start tailscaled by hand.";
 }
 
-function setupJourney(state, installation, route = null, firstUse = null, tailnetDaemon = null, runErrored = null) {
+function setupJourney(state     , installation     , route      = null, firstUse      = null, tailnetDaemon      = null, runErrored      = null) {
   const daemon = tailnetDaemonBlock(tailnetDaemon);
 
   const host = state.host && typeof state.host === "object" ? state.host : null;
@@ -315,17 +357,21 @@ function setupJourney(state, installation, route = null, firstUse = null, tailne
         : "Verify the relay in the owning gateway; use the existing gateway recovery path if it is unavailable.",
     },
     {
-      id: "verify-private-route", status: route?.status === "healthy" ? "complete" : route?.status ?? "unknown", reason: route?.evidence ?? "private-route-evidence-unavailable",
+
+      id: "verify-private-route",
+      status: route?.status === "healthy" || (route?.mode === "custom" && route?.status === "unverified") ? "complete" : route?.status ?? "unknown",
+      reason: route?.evidence ?? "private-route-evidence-unavailable",
 
       action: daemon?.blocking ? tailnetDaemonAction(daemon) : privateRouteAction(route, daemon, host),
       ...(daemon ? { tailnetDaemon: daemon } : {}),
+      ...(route?.mode === "custom" ? { routeMode: "custom", routeAnswer: route.customRoute?.answer ?? "wrong" } : {}),
     },
     {
       id: "pair-phone", status: pairingAvailable ? (state.runtime.appClientConnected === true ? "complete" : "incomplete") : "unavailable",
       reason: pairingAvailable ? "direct-terminal-pairing" : "pairing-operation-unavailable",
       action: pairingAvailable
-        ? "In your own interactive terminal run openclaw ocuclaw pair. Scan QR or use its short-lived Manual code, compare all four words on the phone and terminal, then explicitly approve or refuse. The assistant must not run or capture this ceremony. Re-read journey afterwards to resume this installation; an already connected phone is current health, not durable pairing or first-use proof."
-        : "This host cannot offer the production terminal ceremony: it is outside the plugin's declared OpenClaw compatibility window (2026.7.1-2 or newer) or lacks the runtime APIs the ceremony uses. Move to a supported host (recommended OpenClaw 2026.9.4) and re-read journey; preserve existing credentials.",
+        ? "In your own interactive terminal run openclaw ocuclaw pair and type the phone code OcuClaw shows. For manual pairing, type m at the pair prompt, then in OcuClaw tap Pair with your agent > Pair manually and type the address and pairing code. Compare all four words on the phone and terminal, then explicitly approve or refuse. The assistant must not run or capture this ceremony. Re-read journey afterwards to resume this installation; an already connected phone is current health, not durable pairing or first-use proof."
+        : "This host cannot offer the production terminal ceremony: it is outside the plugin's declared OpenClaw compatibility window (2026.9.5 or newer) or lacks the runtime APIs the ceremony uses. Move to a supported host and re-read journey; preserve existing credentials.",
     },
     {
 
@@ -410,6 +456,12 @@ function setupJourney(state, installation, route = null, firstUse = null, tailne
 
       replyRunErrored,
       welcome: firstUse?.completionPolicy === "reply-and-welcome" ? firstUse?.welcome?.status ?? "not-started" : "not-required-legacy",
+
+      relayRun: firstUse?.relayRun ? {
+        status: firstUse.relayRun.ending ? "ended" : "running",
+        outcome: firstUse.relayRun.ending?.outcome ?? null,
+        stage: firstUse.relayRun.ending?.stage ?? null,
+      } : null,
       action: firstUseAction,
     },
     checkpoints,
@@ -425,4 +477,4 @@ function setupJourney(state, installation, route = null, firstUse = null, tailne
   };
 }
 
-module.exports = { setupInstallation, setupJourney, FIRST_USE_SUCCESS, FIRST_USE_RETRY, firstUseSuccess, firstUseSuccessLines, OPTIONAL_SETUP_HANDOFF, OPTIONAL_SETUP_HANDOFF_LINES, FIRST_USE_TERMINAL_ARMED, FIRST_USE_PROVIDER_ERROR_ACTION, FIRST_USE_ERRORED_RUN_REASONS, toolPolicyWarnings, FIRST_USE_PROVIDER_ERROR_CLASSES, firstUseProviderErrorClass, firstUseRunErrored, firstUseWithRunErrored };
+module.exports = { FIRST_USE_SUCCESS, OPTIONAL_SETUP_HANDOFF_LINES, OPTIONAL_SETUP_HANDOFF, firstUseSuccessLines, firstUseSuccess, FIRST_USE_RETRY, FIRST_USE_TERMINAL_ARMED, FIRST_USE_PROVIDER_ERROR_ACTION, FIRST_USE_ERRORED_RUN_REASONS, FIRST_USE_PROVIDER_ERROR_CLASSES, firstUseProviderErrorClass, firstUseRunErrored, firstUseWithRunErrored, TOOL_POLICY_ALSO_ALLOW_APPLY_COMMAND, toolPolicyWarnings, setupInstallation, PHONE_ADDRESS_SET_COMMAND, CUSTOM_ROUTE_OFFER, SERVE_CLI_ABSENT_ACTION, setupJourney };

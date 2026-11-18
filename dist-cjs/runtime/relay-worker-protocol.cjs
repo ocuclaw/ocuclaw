@@ -1,6 +1,7 @@
 const { activeBackendDisplayName } = require("../gateway/backend-contract.cjs");
 
 const APP_PROTOCOL = Object.freeze({
+  activity: "ocuclaw.activity.update",
   messageSend: "ocuclaw.message.send",
   messageSendAck: "ocuclaw.message.send.ack",
   operationReceived: "ocuclaw.operation.received",
@@ -23,6 +24,7 @@ const APP_PROTOCOL = Object.freeze({
   automationRegistry: "ocuclaw.automation.registry",
   approvalRequest: "ocuclaw.approval.request",
   approvalResolved: "ocuclaw.approval.resolved",
+  approvalExplanation: "ocuclaw.approval.explanation",
   sessionContextSnapshot: "ocuclaw.session.context.snapshot",
   sessionCompact: "ocuclaw.session.compact",
   sessionCompactAck: "ocuclaw.session.compact.ack",
@@ -115,7 +117,7 @@ function parseNonNegativeInteger(value) {
   return parseNonNegativeRevision(value);
 }
 
-function parseOptionalInteger(value) {
+function parseOptionalInteger(value     ) {
   if (value === null || value === undefined) return null;
   if (typeof value === "string" && value.trim() === "") return null;
   return Number.isFinite(Number(value)) ? Math.floor(Number(value)) : null;
@@ -256,8 +258,8 @@ function formatWorkerRestartUncertainAck(requestId) {
 }
 
 function formatProtocolHelloAck(payload = {}) {
-  const value = { ...payload };
-  const ack = {
+  const value      = { ...payload };
+  const ack      = {
     type: APP_PROTOCOL.protocolHelloAck,
     protocolVersion: value.protocolVersion || "v2",
     supportedProtocolVersions: Array.isArray(value.supportedProtocolVersions)
@@ -277,8 +279,8 @@ function formatProtocolHelloAck(payload = {}) {
 }
 
 function formatResumeAck(payload = {}) {
-  const value = { ...payload };
-  const msg = {
+  const value      = { ...payload };
+  const msg      = {
     type: APP_PROTOCOL.resumeAck,
     reason: value.reason || null,
     sentPages: !!value.sentPages,

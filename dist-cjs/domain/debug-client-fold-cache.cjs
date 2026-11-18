@@ -6,24 +6,24 @@ const CLIENT_FOLD_MAX_BYTES = 1024 * 1024;
 const CLIENT_FOLD_MAX_LINES = 5_000;
 const DEFAULT_MAX_ENTRIES = 16;
 
-function boundedId(value) {
+function boundedId(value     ) {
   return typeof value === "string" && value.trim().length > 0 && value.trim().length <= 128
     ? value.trim()
     : null;
 }
 
-function nonNegativeInt(value) {
+function nonNegativeInt(value     ) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
-function countLines(value) {
+function countLines(value     ) {
   if (!value) return 0;
   const lines = value.split("\n");
   if (lines[lines.length - 1] === "") lines.pop();
   return lines.length;
 }
 
-function samePart(left, right) {
+function samePart(left     , right     ) {
   return left.eventsJsonl === right.eventsJsonl &&
     left.clientNowMs === right.clientNowMs &&
     left.partCount === right.partCount &&
@@ -32,7 +32,7 @@ function samePart(left, right) {
     left.ringCapped === right.ringCapped;
 }
 
-function createClientEventFoldCache(options = {}) {
+function createClientEventFoldCache(options      = {}) {
   const now = typeof options.now === "function" ? options.now : () => Date.now();
   const ttlMs = options.ttlMs || CLIENT_FOLD_TTL_MS;
   const maxPartBytes = options.maxPartBytes || CLIENT_FOLD_MAX_PART_BYTES;
@@ -43,8 +43,8 @@ function createClientEventFoldCache(options = {}) {
   const entries = new Map();
   const staleKeys = new Map();
 
-  const keyFor = (installId, foldId) => `${installId.length}:${installId}${foldId}`;
-  const markStale = (key, atMs) => {
+  const keyFor = (installId     , foldId     ) => `${installId.length}:${installId}${foldId}`;
+  const markStale = (key     , atMs     ) => {
     entries.delete(key);
     if (!staleKeys.has(key) && staleKeys.size >= maxStaleEntries) {
       const oldest = staleKeys.keys().next().value;
@@ -60,9 +60,9 @@ function createClientEventFoldCache(options = {}) {
       if (expiresAtMs <= atMs) staleKeys.delete(key);
     }
   };
-  const reject = (reason) => ({ accepted: false, reason, bytes: 0, complete: false });
+  const reject = (reason     ) => ({ accepted: false, reason, bytes: 0, complete: false });
 
-  function accept(message = {}) {
+  function accept(message      = {}) {
     const atMs = now();
     prune(atMs);
     const foldId = boundedId(message.foldId);
@@ -145,7 +145,7 @@ function createClientEventFoldCache(options = {}) {
     return { accepted: true, duplicate: false, bytes: entry.bytes, complete: entry.parts.length === partCount };
   }
 
-  function get(message = {}) {
+  function get(message      = {}) {
     const atMs = now();
     prune(atMs);
     const foldId = boundedId(message.foldId);
@@ -163,4 +163,4 @@ function createClientEventFoldCache(options = {}) {
   return { accept, get, prune };
 }
 
-module.exports = { createClientEventFoldCache, CLIENT_FOLD_TTL_MS, CLIENT_FOLD_MAX_PART_BYTES, CLIENT_FOLD_MAX_BYTES, CLIENT_FOLD_MAX_LINES };
+module.exports = { CLIENT_FOLD_TTL_MS, CLIENT_FOLD_MAX_PART_BYTES, CLIENT_FOLD_MAX_BYTES, CLIENT_FOLD_MAX_LINES, createClientEventFoldCache };

@@ -53,16 +53,16 @@ from . import board_ops
 OPERATION = "board.action"
 #: The More menu's actions, in the order the phone shows them. Each is gated by
 #: its own capability key of the same name. #3707: ``make_ready`` leads.
-ACTIONS = ("make_ready", "reassign", "set_model", "retry", "archive")
+ACTIONS = ("make_ready", "edit", "reassign", "set_model", "retry", "archive")
 #: #3063: Settings › Board › Maintenance's per-card reclaim of a stale worker.
 #: It rides this flow but is never on the More menu: its gate is the
 #: ``maintenance`` capability plus its own maintenance gate (``board_maintenance``).
 MAINTENANCE_ACTIONS = ("reclaim",)
 ALL_ACTIONS = ACTIONS + MAINTENANCE_ACTIONS
-PAYLOAD_KEYS = {"slug", "anchor", "id", "key", "action", "state", "run", "assignee", "model", "provider", "claim"}
+PAYLOAD_KEYS = {"slug", "anchor", "id", "key", "action", "state", "run", "assignee", "model", "provider", "claim", "title", "body", "priority"}
 #: The value keys each action takes, beyond the binding. #3063: reclaim's
 #: ``claim`` is the digest of the claim the wearer viewed.
-VALUE_KEYS = {"make_ready": set(), "reassign": {"assignee"}, "set_model": {"model", "provider"},
+VALUE_KEYS = {"make_ready": set(), "edit": {"title", "body", "priority"}, "reassign": {"assignee"}, "set_model": {"model", "provider"},
               "retry": set(), "archive": set(), "reclaim": {"claim"}}
 _CLAIM = re.compile(r"^[0-9a-f]{16}$")
 
@@ -71,6 +71,7 @@ _CLAIM = re.compile(r"^[0-9a-f]{16}$")
 #: card takes it. Done and archived cards take neither. A status this engine
 #: does not know takes no action at all.
 REASSIGN_STATES = ("triage", "todo", "scheduled", "ready", "blocked", "review")
+EDIT_STATES = ("triage", "todo", "scheduled", "ready", "blocked")
 SET_MODEL_STATES = ("triage", "todo", "scheduled", "ready", "running", "blocked", "review")
 ARCHIVE_STATES = ("triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done")
 #: Run outcomes that are a failed run, as opposed to a state transition.
@@ -84,6 +85,19 @@ MODEL_MAX = 128
 _ASSIGNEE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
 _PROVIDER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def edit_supported() -> bool:
+    """Only stock title/brief/priority editing, available from Hermes 0.21.4."""
+    try:
+        from hermes_cli.kanban_db import edit_task
+        signature = inspect.signature(edit_task)
+        if not {"title", "body", "priority"} <= set(signature.parameters):
+            return False
+        signature.bind(None, "card", title="Title", body="", priority=0)
+        return True
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return False
 
 #: Named points, in order. ``receipted``: the pending receipt is durable,
 #: nothing checked. ``checked``: the pre-check passed and its fence is on the
@@ -132,12 +146,16 @@ def fits(action: str, facts: dict) -> bool:
     if action == "make_ready":
         # #3707: stock specify_triage_task moves a triage card only.
         return status == "triage"
+    if action == "edit":
+        return status in EDIT_STATES
     if action == "reassign":
         return status in REASSIGN_STATES
     if action == "set_model":
         return status in SET_MODEL_STATES
     if action == "retry":
-        return retry_via(facts) is not None
+        # Hermes 0.22.1 never retries a run whose outcome is unknown; Retry's
+        # reclaim would repeat its side effects. Only a running card is paused.
+        return retry_via(facts) is not None and not facts.get("paused")
     if action == "archive":
         return status in ARCHIVE_STATES and (status != "running" or archive_stops_worker())
     if action == "reclaim":
@@ -162,7 +180,8 @@ def card_actions(facts: dict, capabilities: list) -> list:
 def card_facts(conn: sqlite3.Connection, card_id: str) -> Optional[dict]:
     """What the guards and the stale check read, in the caller's transaction:
     status, block kind, the newest run (id and outcome), unfinished parents,
-    the card's newest event id (the fence), assignee and model override."""
+    the card's newest event id (the fence), assignee and model override, and
+    whether Hermes 0.22.1 holds the running card (``paused``: outcome unknown)."""
     columns = bm._columns(conn, "tasks")
     model = ", t.model_override AS model" if "model_override" in columns else ", NULL AS model"
     row = conn.execute(
@@ -178,7 +197,9 @@ def card_facts(conn: sqlite3.Connection, card_id: str) -> Optional[dict]:
     status = bm._decoded(row[0])
     block_kind = bm._decoded(row[1])
     outcome = bm._decoded(row[5])
+    from .board_maintenance import reclaim_paused
     return {"status": status if isinstance(status, str) and bm._STATUS.match(status) else "unknown",
+            "paused": status == "running" and reclaim_paused(conn, card_id),
             "blockKind": block_kind if isinstance(block_kind, str) else None,
             "assignee": bm._clean(row[2], 64) or None,
             "model": bm._clean(row[3], MODEL_MAX) or None,
@@ -200,18 +221,18 @@ def parse(payload) -> tuple:
         raise bm.BoardReadError("invalid_request")
     slug, anchor, key = payload.get("slug"), payload.get("anchor"), payload.get("key")
     card_id, action = payload.get("id"), payload.get("action")
-    if not isinstance(slug, str) or not bm._SLUG.match(slug):
+    if not isinstance(slug, str) or not bm._SLUG.fullmatch(slug):
         raise bm.BoardReadError("invalid_request")
-    if not isinstance(anchor, str) or not bm._ANCHOR.match(anchor):
+    if not isinstance(anchor, str) or not bm._ANCHOR.fullmatch(anchor):
         raise bm.BoardReadError("invalid_request")
-    if not isinstance(key, str) or not board_ops.KEY.match(key):
+    if not isinstance(key, str) or not board_ops.KEY.fullmatch(key):
         raise bm.BoardReadError("invalid_request")
-    if not isinstance(card_id, str) or not bm._CARD_ID.match(card_id):
+    if not isinstance(card_id, str) or not bm._CARD_ID.fullmatch(card_id):
         raise bm.BoardReadError("invalid_request")
     if action not in ALL_ACTIONS:
         raise bm.BoardReadError("invalid_request")
     state, run = payload.get("state"), payload.get("run")
-    if not isinstance(state, str) or not bm._STATUS.match(state):
+    if not isinstance(state, str) or not bm._STATUS.fullmatch(state):
         raise bm.BoardReadError("invalid_request")
     if isinstance(run, bool) or not isinstance(run, int) or run < 0:
         raise bm.BoardReadError("invalid_request")
@@ -219,23 +240,42 @@ def parse(payload) -> tuple:
     if extra - VALUE_KEYS[action]:
         raise bm.BoardReadError("invalid_request")
     intent = {"id": card_id, "action": action, "state": state, "run": run}
+    if action == "edit":
+        from .board_create import _text, _PROSE_REFUSED, TITLE_MAX, BODY_MAX, PRIORITY_MIN, PRIORITY_MAX
+        if not extra:
+            raise bm.BoardReadError("invalid_request")
+        if "title" in extra:
+            title = _text(payload["title"], TITLE_MAX)
+            if title is None:
+                raise bm.BoardReadError("invalid_request")
+            intent["title"] = title
+        if "body" in extra:
+            body = payload["body"]
+            if not isinstance(body, str) or len(body) > BODY_MAX or _PROSE_REFUSED.search(body):
+                raise bm.BoardReadError("invalid_request")
+            intent["body"] = body
+        if "priority" in extra:
+            priority = payload["priority"]
+            if isinstance(priority, bool) or not isinstance(priority, int) or not PRIORITY_MIN <= priority <= PRIORITY_MAX:
+                raise bm.BoardReadError("invalid_request")
+            intent["priority"] = priority
     if action == "reassign":
         assignee = payload.get("assignee")
-        if not isinstance(assignee, str) or (assignee and not _ASSIGNEE.match(assignee)):
+        if not isinstance(assignee, str) or (assignee and not _ASSIGNEE.fullmatch(assignee)):
             raise bm.BoardReadError("invalid_request")
         intent["assignee"] = assignee.lower() or None
     if action == "set_model":
         model, provider = payload.get("model"), payload.get("provider")
-        if not isinstance(model, str) or (model and not _MODEL.match(model)):
+        if not isinstance(model, str) or (model and not _MODEL.fullmatch(model)):
             raise bm.BoardReadError("invalid_request")
-        if provider is not None and (not isinstance(provider, str) or not _PROVIDER.match(provider) or not model):
+        if provider is not None and (not isinstance(provider, str) or not _PROVIDER.fullmatch(provider) or not model):
             raise bm.BoardReadError("invalid_request")
         intent["model"] = model or None
         intent["provider"] = provider
     if action == "reclaim":
         # #3063: the claim the wearer viewed; a reclaim only ever fits a running card.
         claim = payload.get("claim")
-        if not isinstance(claim, str) or not _CLAIM.match(claim) or state != "running":
+        if not isinstance(claim, str) or not _CLAIM.fullmatch(claim) or state != "running":
             raise bm.BoardReadError("invalid_request")
         intent["claim"] = claim
     return slug, anchor, key, intent
@@ -254,7 +294,7 @@ def op_tag(gateway: str, profile: str, slug: str, key: str, action: Optional[str
 # Native write
 # --------------------------------------------------------------------------
 
-def _native(db: Path, intent: dict, via: Optional[str], tag: str) -> bool:
+def _native(db: Path, intent: dict, via: Optional[str], tag: str, slug: str) -> bool:
     """The one stock call. True when it applied; False when stock refused it
     (its own row check found the card changed). Never ``force``."""
     from hermes_cli.kanban_db import (archive_task, promote_task, reassign_task, reclaim_task,
@@ -267,6 +307,9 @@ def _native(db: Path, intent: dict, via: Optional[str], tag: str) -> bool:
             # #3707: no title, body or assignee, so no audit comment; the
             # ``specified`` event's payload is None. Lands todo, then ready.
             return bool(specify_triage_task(conn, card_id, author=None))
+        if action == "edit":
+            from hermes_cli.kanban_db import edit_task
+            return bool(edit_task(conn, card_id, board=slug, **{k: intent[k] for k in VALUE_KEYS["edit"] if k in intent}))
         if action == "reassign":
             return bool(reassign_task(conn, card_id, intent["assignee"]))
         if action == "set_model":
@@ -339,7 +382,9 @@ def _capability(capabilities: list, action: str) -> None:
     key = "maintenance" if action in MAINTENANCE_ACTIONS else action
     row = next((r for r in capabilities if r["key"] == key), None)
     if row is None or not row.get("enabled"):
-        raise bm.BoardReadError((row or {}).get("code") or "unsupported")
+        code = (row or {}).get("code") or "unsupported"
+        # A missing optional Edit capability must not withdraw the whole Board.
+        raise bm.BoardReadError("edit_unsupported" if action == "edit" and code == "unsupported" else code)
     if action in MAINTENANCE_ACTIONS:
         from .board_maintenance import require
         require(capabilities, action)
@@ -421,6 +466,10 @@ def _execute(root: Path, slug: str, anchor: str, key: str, intent: dict, capabil
         # #3063: a reclaim is bound to the claim the wearer viewed, still stale now.
         if action == "reclaim" and (facts["claim"] != intent["claim"] or facts["stale"] is None):
             return _refuse(key, "stale_target")
+        # Hermes 0.22.1 paused the run since the wearer looked (its outcome is
+        # unknown): no reclaim, and no Retry through one.
+        if action in ("reclaim", "retry") and facts["paused"]:
+            return _refuse(key, "stale_target")
         if not fits(action, facts):
             return _refuse(key, "invalid_request")
         if action == "reassign" and intent["assignee"] and not _assignee_exists(intent["assignee"]):
@@ -435,6 +484,10 @@ def _execute(root: Path, slug: str, anchor: str, key: str, intent: dict, capabil
     via = retry_via(facts) if action == "retry" else None
     failed = facts["outcome"] if facts["outcome"] in FAILED_OUTCOMES and action == "retry" else None
     noted = {"fence": facts["fence"], "via": via, "failedRun": failed}
+    if action == "edit":
+        # Stock emits only reprioritized for a priority-only edit. Neither
+        # event carries our receipt tag, so a dead writer stays uncertain.
+        noted["eventKind"] = "edited" if {"title", "body"} & set(intent) else "reprioritized"
     try:
         owned = board_ops.note(key, noted, writer=board_ops.current_writer())
     except board_ops.OpStoreError:
@@ -444,7 +497,7 @@ def _execute(root: Path, slug: str, anchor: str, key: str, intent: dict, capabil
         return board_ops.get(key) or {"key": key, "state": "outcome_unknown"}
     barrier("checked")
     try:
-        applied = _native(db, intent, via, tag)
+        applied = _native(db, intent, via, tag, slug)
     except Exception as exc:  # noqa: BLE001 - the store decides, never the exception text
         return _after_failure(db, key, intent, noted, tag, exc)
     if not applied:
@@ -463,7 +516,7 @@ def _after_failure(db: Path, key: str, intent: dict, noted: dict, tag: str, exc:
     """A stock call that raised may have committed (an after-commit step can
     raise too). Read to know: nothing of its kind after the fence is a refusal;
     anything else cannot be told apart from another writer's."""
-    kind = EVENT_KINDS[noted["via"] or intent["action"]]
+    kind = noted.get("eventKind") or EVENT_KINDS[noted["via"] or intent["action"]]
     try:
         landed = _landed(db, intent["id"], noted["fence"], kind, tag)
     except Exception:  # noqa: BLE001
@@ -499,7 +552,7 @@ def settle(root: Path, receipt: dict, tag: str, *, writer: tuple) -> dict:
     db, _meta = bm.board_paths(root, receipt["board"])
     try:
         same = db.is_file() and bm.board_anchor(root, bm._file_identity(db)) == receipt["anchor"]
-        kind = EVENT_KINDS[pending.get("via") or action]
+        kind = pending.get("eventKind") or EVENT_KINDS[pending.get("via") or action]
         landed = _landed(db, card_id, int(pending["fence"]), kind, tag) if same else None
     except (bm.BoardReadError, OSError, KeyError):
         # Busy or unreadable now: still pending, ask again.

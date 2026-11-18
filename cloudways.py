@@ -1,82 +1,111 @@
-"""The Cloudways managed-Hermes path: userspace Tailscale kept alive by cron (#2981, #2982).
+"""The Cloudways managed-Hermes path: userspace Tailscale kept alive by the OcuClaw runtime (#2981, #6359).
 
 Cloudways "Managed AI Agents" runs Hermes as a non-root user in a container
 with no systemd, no cron binary, no TUN device, and a gateway that is PID 1's
 child — `hermes gateway restart` restarts the whole container. Cloudways has
-approved two things for OcuClaw there: a **userspace-networking tailscaled**
-owned by the user (`~/bin`, `~/.tailscale`), and **Hermes cron** as the
-supervisor that brings it back after a restart. This module is that path,
-as deterministic idempotent verbs the on-box Hermes agent runs from its
-terminal tool:
+approved a **userspace-networking tailscaled** owned by the user (state in
+`~/.tailscale`) for OcuClaw there. The server's own `/usr/bin/tailscaled` runs
+it (#6358); we download nothing, and a server without it is told to restart
+from the Cloudways panel for the current image. Boxes an earlier OcuClaw set up
+on its own `~/bin` copy are moved off it (#6360). The OcuClaw Node runtime,
+which the gateway starts on every gateway start, brings the daemon back after
+a restart (#6359). This module is that path, as deterministic idempotent verbs
+the on-box Hermes agent runs from its terminal tool:
 
     hermes ocuclaw cloudways detect     which environment signals fired
-    hermes ocuclaw cloudways install    binaries (pinned + checksummed), state dirs,
-                                        host receipt, watchdog script, cron job
+    hermes ocuclaw cloudways install    the server's binaries, state dirs, host
+                                        receipt, runtime state, daemon start
     hermes ocuclaw cloudways enroll     `tailscale up`, print the authorization URL
-    hermes ocuclaw cloudways status     daemon / route / job / legacy, optional --wait
+    hermes ocuclaw cloudways status     daemon / route / supervisor / legacy, optional --wait
     hermes ocuclaw cloudways retry      a fresh authorization URL
-    hermes ocuclaw cloudways enable     resume the job, fire it now
-    hermes ocuclaw cloudways disable    pause the job, stop the daemon
-    hermes ocuclaw cloudways rollback   remove job, daemon, script, and the binaries
+    hermes ocuclaw cloudways enable     turn supervision on, start the daemon
+    hermes ocuclaw cloudways disable    turn supervision off, stop the daemon
+    hermes ocuclaw cloudways rollback   remove supervision, daemon, and the binaries
                                         and host receipt this plugin provisioned
 
 Design rulings this file implements (RULED.md in the arc's evidence dir):
 
-* **Single launcher.** Only the cron watchdog ever starts tailscaled; `install`
-  and `enable` ask Hermes to fire the job (`hermes cron run`), they never spawn
-  the daemon themselves. One start path, one thing to get right.
-* **The watchdog is pure bash and never runs `up`.** A daemon that answers is
-  left alone; a missing one is started with `setsid -f` and every fd redirected
-  (Hermes's `--no-agent` runner reads the script's pipes to EOF, so an inherited
-  pipe hangs the run and then tree-kills the daemon). `NeedsLogin` is reported,
-  never fixed: a human must open the URL.
+* **Single supervisor.** The OcuClaw runtime keeps the daemon alive, and only
+  while `ocuclaw.cloudways.hermes.json` says `supervisor: runtime`. That file
+  is written only once the old `ocuclaw-tailscale-watchdog` cron job is gone,
+  so two supervisors never share one daemon. `install` and `enable` start the
+  daemon once directly, so setup need not wait for a gateway start.
+* **Started detached, never `up`.** A daemon that answers is left alone; a
+  missing one is spawned in its own session with every fd redirected, so it
+  outlives the command that started it. `NeedsLogin` is reported, never fixed:
+  a human must open the URL.
 * **Loopback SOCKS5.** In userspace mode the host has no route to its own
   tailnet name; the daemon exposes `127.0.0.1:1055` and the host receipt tells
   doctor's probes to dial through it (#2980).
-* **Reuse, never duplicate.** Existing identity is adopted; existing binaries
-  are adopted when they print the pinned version; the cron job is found by
-  name and replaced only on drift; the 2026-09-15 disabled startup hook and the
-  `~/.local/share/tailscale` supervisor are reported, never touched.
+* **Reuse, never duplicate.** Existing identity is adopted; the platform
+  binaries are used as they are. An old-ladder box moves onto the platform binary
+  with the same `~/.tailscale` state, so no new approval is needed (#6360). The
+  2026-09-15 disabled startup hook and the `~/.local/share/tailscale`
+  supervisor are reported, never touched. A foreign tailscaled is refused,
+  never killed, with one exception: a logged-out daemon on the platform's own
+  `/var/lib/tailscale` holds no identity, so `install` replaces it.
+* **Adopt Cloudways' own daemon (#6482).** When the only tailscaled is the
+  image's own userspace one with its state under `$HOME`, and we hold no
+  identity of our own, `install` adopts it instead of refusing: a host record
+  names its line, and every verb then talks to its socket. It is never killed,
+  restarted or deleted; it is relaunched from its recorded line only when no
+  tailscaled at all runs (Cloudways restarts nothing after a reboot).
 * **No exposure changes.** No Funnel, no ACL edits, no Tailscale SSH, no `up`
   flags beyond `--hostname` on a fresh identity.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
-import tarfile
-import tempfile
 import time
-import urllib.request
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from . import receipts, serve
 
-# -- pins ---------------------------------------------------------------------
+# -- binaries -----------------------------------------------------------------
 
-TAILSCALE_VERSION = "1.102.4"
-TAILSCALE_TGZ_URL = (
-    f"https://pkgs.tailscale.com/stable/tailscale_{TAILSCALE_VERSION}_amd64.tgz"
+#: What `install` says on an image without /usr/bin Tailscale. Every Cloudways
+#: image seen ships it, and a panel restart brings the current image, so we
+#: download nothing ourselves.
+TAILSCALE_MISSING_MESSAGE = (
+    "Tailscale is missing on this server. Restart your agent from the Cloudways "
+    "panel to get the current server image, then run setup again."
 )
-#: Verified against `pkgs.tailscale.com/...tgz.sha256` on 2026-09-16. The live
-#: `.sha256` is fetched again at install as a second witness; both must agree.
-TAILSCALE_TGZ_SHA256 = "50748df1045e60b5b695f19f4c56b0da36c019948b440fb456b6584a50f0d8b9"
-TAILSCALE_TGZ_MEMBER_DIR = f"tailscale_{TAILSCALE_VERSION}_amd64"
+
+#: Where a current Cloudways image puts Tailscale (1.104.4 on 2026-11-02), and
+#: the state directory Cloudways' own bootstrap line gives it. That state lives
+#: on the overlay root and is wiped by every container restart, so ours stays
+#: in `~/.tailscale` on the persistent volume.
+PLATFORM_BIN_DIR: Optional[Path] = Path("/usr/bin")
+PLATFORM_STATE_DIR = "/var/lib/tailscale"
+PLATFORM_SOCKET = "/var/run/tailscale/tailscaled.sock"
+BINARIES_PLATFORM = "platform"
+BINARIES_BUNDLED = "bundled"
 
 SOCKS5_LISTEN = "127.0.0.1:1055"
+#: The Hermes cron supervisor this bundle used before #6359. Only ever looked
+#: up to be retired: two supervisors on one daemon is forbidden.
 WATCHDOG_JOB_NAME = "ocuclaw-tailscale-watchdog"
 WATCHDOG_SCRIPT_NAME = "ocuclaw-tailscale-watchdog.sh"
-WATCHDOG_SCHEDULE = "* * * * *"
-WATCHDOG_LOG_MAX_BYTES = 1_048_576
+DAEMON_LOG_MAX_BYTES = 1_048_576
 RECEIPT_PROVISIONER = "hermes ocuclaw cloudways"
+
+#: The bundle's runtime state, beside the host receipt: the twin of OpenClaw's
+#: `ocuclaw.cloudways.openclaw.json`. The OcuClaw runtime supervises the daemon
+#: only while it says `supervisor: runtime` and is not disabled.
+HERMES_STATE_FILENAME = "ocuclaw.cloudways.hermes.json"
+HERMES_STATE_SCHEMA_VERSION = 1
+SUPERVISOR_RUNTIME = "runtime"
+SUPERVISOR_OWNER = "ocuclaw-runtime"
 
 CLOUDWAYS_HOSTNAME_SUFFIX = ".cloudwaysagents.com"
 CLOUDWAYS_VENV_BIN = "/opt/hermes/hermes-venv/bin"
@@ -105,25 +134,111 @@ _CMD_TIMEOUT_S = 20.0
 
 # -- layout -------------------------------------------------------------------
 
+_PLATFORM_DEFAULT: Any = object()
+#: `Layout.adoption` left at this reads the host adoption record on each use.
+_READ_RECORD: Any = object()
 
 @dataclass(frozen=True)
 class Layout:
-    """Every absolute path the verbs and the generated script agree on."""
+    """Every absolute path the verbs and the generated script agree on.
+
+    On a box where we adopted Cloudways' own daemon (#6482) the socket, CLI
+    argv, daemon argv, log and "which process is ours" all follow the host
+    adoption record. Our markers stay in `~/.tailscale` either way.
+    """
 
     home: Path
     hermes_home: Path
+    # Read at construction, not import, so a test host's own /usr/bin copy can
+    # be switched off module-wide. None turns the platform binaries off.
+    platform_bin_dir: Optional[Path] = field(default_factory=lambda: PLATFORM_BIN_DIR)
+    # Left at the default the record is read on each use, so every verb
+    # follows it the moment install writes it. A test, or `pinned()`, passes
+    # an `Adoption` (or None) to fix it for the rest of one verb.
+    adoption: Any = field(default=_READ_RECORD, compare=False, repr=False)
+
+    @property
+    def adopted(self) -> Optional["Adoption"]:
+        if self.adoption is _READ_RECORD:
+            return read_adoption(self)
+        return self.adoption
+
+    def pinned(self) -> "Layout":
+        """This layout with the adoption read once, so a verb that removes or
+        writes the record halfway through keeps acting on one daemon."""
+        return replace(self, adoption=self.adopted)
+
+    @property
+    def platform_tailscaled(self) -> Optional[Path]:
+        """The image's own tailscaled, the only binary an adopted daemon may run."""
+        return None if self.platform_bin_dir is None else Path(self.platform_bin_dir) / "tailscaled"
+
+    @property
+    def own_state_flag(self) -> str:
+        """The argv token that marks a tailscaled process as the one we keep."""
+        adopted = self.adopted
+        return adopted.state_flag if adopted is not None else f"--statedir={self.state_dir}"
+
+    @property
+    def socks5_listen(self) -> Optional[str]:
+        """The loopback SOCKS5 our daemon listens on; an adopted one's own, or None."""
+        adopted = self.adopted
+        return adopted.socks5 if adopted is not None else SOCKS5_LISTEN
+
+    @property
+    def own_log_path(self) -> Path:
+        return self.log_dir / "tailscaled.log"
 
     @property
     def bin_dir(self) -> Path:
         return self.home / "bin"
 
     @property
-    def tailscale(self) -> Path:
+    def bundled_tailscale(self) -> Path:
+        """Our `~/bin` download, named even when the platform pair is used."""
         return self.bin_dir / "tailscale"
 
     @property
-    def tailscaled(self) -> Path:
+    def bundled_tailscaled(self) -> Path:
         return self.bin_dir / "tailscaled"
+
+    @property
+    def platform_daemon(self) -> Optional[Path]:
+        """The installed tailscaled: beside the CLI on a Cloudways image, or in
+        the sibling sbin (/usr/sbin) where Tailscale's installer and the Debian
+        package put it."""
+        base = self.platform_bin_dir
+        if base is None:
+            return None
+        for candidate in (Path(base) / "tailscaled", Path(base).parent / "sbin" / "tailscaled"):
+            if candidate.is_file():
+                return candidate
+        return None
+
+    @property
+    def binary_source(self) -> str:
+        base = self.platform_bin_dir
+        if base is not None and (base / "tailscale").is_file() and self.platform_daemon is not None:
+            return BINARIES_PLATFORM
+        return BINARIES_BUNDLED
+
+    @property
+    def tailscale(self) -> Path:
+        # An adopted daemon is the image's, so is its CLI, even if the
+        # pair is missing for a moment: never our `~/bin` copy against it.
+        if self.binary_source == BINARIES_PLATFORM or (
+            self.platform_bin_dir is not None and self.adopted is not None
+        ):
+            return Path(self.platform_bin_dir) / "tailscale"
+        return self.bundled_tailscale
+
+    @property
+    def tailscaled(self) -> Path:
+        if self.binary_source == BINARIES_PLATFORM or (
+            self.platform_bin_dir is not None and self.adopted is not None
+        ):
+            return self.platform_daemon or Path(self.platform_bin_dir) / "tailscaled"
+        return self.bundled_tailscaled
 
     @property
     def state_dir(self) -> Path:
@@ -135,6 +250,9 @@ class Layout:
 
     @property
     def socket_path(self) -> Path:
+        adopted = self.adopted
+        if adopted is not None:
+            return Path(adopted.socket)
         return self.run_dir / "tailscaled.sock"
 
     @property
@@ -153,6 +271,24 @@ class Layout:
     @property
     def watchdog_state(self) -> Path:
         return self.state_dir / "watchdog.state"
+
+    @property
+    def watchdog_lock(self) -> Path:
+        return self.state_dir / "watchdog.lock"
+
+    @property
+    def log_path(self) -> Path:
+        adopted = self.adopted
+        if adopted is not None:
+            return Path(adopted.log_path)
+        return self.own_log_path
+
+    @property
+    def state_path(self) -> Optional[Path]:
+        """The runtime state file. Host-scoped like the receipt, so resolved
+        through the same `receipts.host_state_dir()` (and patched with it)."""
+        directory = receipts.host_state_dir()
+        return None if directory is None else directory / HERMES_STATE_FILENAME
 
     @property
     def tgz_receipt(self) -> Path:
@@ -182,6 +318,10 @@ class Layout:
         return (str(self.tailscale), f"--socket={self.socket_path}")
 
     def daemon_argv(self) -> Tuple[str, ...]:
+        adopted = self.adopted
+        if adopted is not None:
+            # Exactly the line Cloudways started it with, never our flags.
+            return tuple(adopted.daemon_argv)
         return (
             str(self.tailscaled),
             f"--statedir={self.state_dir}",
@@ -192,13 +332,258 @@ class Layout:
 
     @classmethod
     def resolve(
-        cls, *, home: Optional[Path] = None, hermes_home: Optional[Path] = None
+        cls,
+        *,
+        home: Optional[Path] = None,
+        hermes_home: Optional[Path] = None,
+        platform_bin_dir: Any = _PLATFORM_DEFAULT,
     ) -> "Layout":
         resolved_home = Path(home) if home is not None else Path.home()
         if hermes_home is None:
             env_home = os.environ.get("HERMES_HOME", "").strip()
             hermes_home = Path(env_home) if env_home else resolved_home / ".hermes"
-        return cls(home=resolved_home, hermes_home=Path(hermes_home))
+        if platform_bin_dir is _PLATFORM_DEFAULT:
+            platform_bin_dir = PLATFORM_BIN_DIR
+        return cls(
+            home=resolved_home,
+            hermes_home=Path(hermes_home),
+            platform_bin_dir=Path(platform_bin_dir) if platform_bin_dir is not None else None,
+        )
+
+
+# -- adopting Cloudways' own daemon (#6482) ------------------------------------
+#
+# A current Cloudways image may already run its own userspace tailscaled with
+# state under the user's home (`~/tailscale`), signed in by the user. Refusing
+# it left the user with no way forward but to kill a daemon they rely on.
+# Instead, when it is the only tailscaled and its line is one we can fully
+# reason about, we adopt it: talk to its socket, relaunch its exact line after
+# a reboot, and never kill, restart or delete it or its state. The rule and the
+# record are shared with the OpenClaw bundle through
+# `tests/fixtures/tailscale-adoption-contract.json`.
+
+ADOPTION_FILENAME = "ocuclaw.tailscale-adopted.json"
+ADOPTION_SCHEMA_VERSION = 1
+ADOPTION_KIND = "cloudways-platform"
+#: The image's own daemon. A test layout points it elsewhere.
+PLATFORM_TAILSCALED = "/usr/bin/tailscaled"
+#: Every flag an adoptable line may carry. Anything else changes what the
+#: daemon does in a way we have not reasoned about, so it is not adopted.
+ADOPTABLE_FLAGS = frozenset({"tun", "state", "statedir", "socket", "port", "socks5-server", "verbose"})
+_STATE_FLAGS = ("state", "statedir")
+_DIGITS_RE = re.compile(r"[0-9]+")
+
+REASON_NOT_PLATFORM_BINARY = "not-platform-binary"
+REASON_FLAG_NOT_ALLOWED = "flag-not-allowed"
+REASON_NOT_USERSPACE = "not-userspace"
+REASON_NO_STATE_FLAG = "no-state-flag"
+REASON_TWO_STATE_FLAGS = "two-state-flags"
+REASON_OWN_STATE_DIR = "own-state-dir"
+REASON_STATE_OUTSIDE_HOME = "state-outside-home"
+
+
+def _flag_value_ok(name: str, value: str) -> bool:
+    if not value:
+        return False
+    if name == "socket":
+        return os.path.isabs(value)
+    if name == "port":
+        return bool(_DIGITS_RE.fullmatch(value)) and 0 < int(value) < 65536
+    if name == "socks5-server":
+        # Loopback only: the proxy has no authentication.
+        return receipts.parse_socks5(value) is not None
+    if name == "verbose":
+        return bool(_DIGITS_RE.fullmatch(value))
+    return True  # tun, state, statedir: any non-empty value
+
+
+def adoptable_daemon(
+    argv: Sequence[str], home: Any, *, platform_tailscaled: Any = PLATFORM_TAILSCALED
+) -> Dict[str, Any]:
+    """May we adopt the tailscaled running ``argv``? Pure; no I/O.
+
+    ``{"adoptable": True, "stateFlag", "socket", "socks5"}`` or
+    ``{"adoptable": False, "reason"}``. The checks run in a fixed order so
+    both bundles give the same reason for the same line.
+    """
+    tokens = [str(token) for token in argv]
+    if platform_tailscaled is None or not tokens or tokens[0] != str(platform_tailscaled):
+        return {"adoptable": False, "reason": REASON_NOT_PLATFORM_BINARY}
+    values: Dict[str, str] = {}
+    state_flags: List[str] = []
+    for token in tokens[1:]:
+        # Only the one-token `--name=value` form: a two-token flag could hide
+        # its value from this check.
+        if not token.startswith("--") or "=" not in token:
+            return {"adoptable": False, "reason": REASON_FLAG_NOT_ALLOWED}
+        name, _, value = token[2:].partition("=")
+        if name not in ADOPTABLE_FLAGS or not _flag_value_ok(name, value):
+            return {"adoptable": False, "reason": REASON_FLAG_NOT_ALLOWED}
+        if name in _STATE_FLAGS:
+            state_flags.append(token)
+            continue
+        if name in values:
+            # tailscaled keeps the last one; we would have to guess which.
+            return {"adoptable": False, "reason": REASON_FLAG_NOT_ALLOWED}
+        values[name] = value
+    if values.get("tun") != "userspace-networking":
+        return {"adoptable": False, "reason": REASON_NOT_USERSPACE}
+    if not state_flags:
+        return {"adoptable": False, "reason": REASON_NO_STATE_FLAG}
+    if len(state_flags) > 1:
+        return {"adoptable": False, "reason": REASON_TWO_STATE_FLAGS}
+    state_flag = state_flags[0]
+    # Lexical only: a symlink is the user's to point, and resolving it would
+    # make the answer depend on the disk.
+    state_path = os.path.normpath(state_flag.partition("=")[2])
+    home_text = os.path.normpath(str(home))
+    ours = os.path.normpath(os.path.join(home_text, ".tailscale"))
+    if state_path == ours or state_path.startswith(ours + os.sep):
+        return {"adoptable": False, "reason": REASON_OWN_STATE_DIR}
+    # Strictly inside home: the root disk is wiped by every container
+    # restart, and home itself is not a state path.
+    if not state_path.startswith(home_text.rstrip(os.sep) + os.sep):
+        return {"adoptable": False, "reason": REASON_STATE_OUTSIDE_HOME}
+    return {
+        "adoptable": True,
+        "stateFlag": state_flag,
+        "socket": values.get("socket", PLATFORM_SOCKET),
+        "socks5": values.get("socks5-server"),
+    }
+
+
+@dataclass(frozen=True)
+class Adoption:
+    """The host adoption record, validated against the rule above."""
+
+    daemon_argv: Tuple[str, ...]
+    state_flag: str
+    socket: str
+    socks5: Optional[str]
+    log_path: str
+    adopted_by: str
+    adopted_at: str
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "socket": self.socket,
+            "stateFlag": self.state_flag,
+            "logPath": self.log_path,
+            "adoptedBy": self.adopted_by,
+        }
+
+
+def adoption_path() -> Optional[Path]:
+    """Host-scoped like the CLI receipt: one tailscaled per box."""
+    directory = receipts.host_state_dir()
+    return None if directory is None else directory / ADOPTION_FILENAME
+
+
+def _iso_now_ms() -> str:
+    """The OpenClaw bundle's `toISOString()` form, so both write the same shape."""
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+
+
+def adoption_log_path(layout: Layout) -> Path:
+    """Cloudways' own `~/logs` when the box has one, else our log."""
+    logs = layout.home / "logs"
+    return logs / "tailscale.log" if logs.is_dir() else layout.own_log_path
+
+
+def build_adoption_body(
+    argv: Sequence[str],
+    verdict: Mapping[str, Any],
+    *,
+    log_path: Any,
+    adopted_by: str = RECEIPT_PROVISIONER,
+    adopted_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not verdict.get("adoptable"):
+        raise ValueError(f"not adoptable: {verdict.get('reason')}")
+    return {
+        "schemaVersion": ADOPTION_SCHEMA_VERSION,
+        "kind": ADOPTION_KIND,
+        "daemonArgv": [str(token) for token in argv],
+        "stateFlag": verdict["stateFlag"],
+        "socket": verdict["socket"],
+        "logPath": str(log_path),
+        "adoptedBy": adopted_by,
+        "adoptedAt": adopted_at or _iso_now_ms(),
+    }
+
+
+def write_adoption(body: Mapping[str, Any]) -> Path:
+    path = adoption_path()
+    if path is None:
+        raise receipts.ReceiptUnavailableError("no host state directory")
+    return receipts.write_json_receipt(path, body, durable=True)
+
+
+def remove_adoption() -> bool:
+    path = adoption_path()
+    if path is None:
+        return False
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _raw_adoption() -> Optional[Dict[str, Any]]:
+    path = adoption_path()
+    if path is None:
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def read_adoption(layout: Layout) -> Optional[Adoption]:
+    """The record, re-validated with today's home; anything off reads as absent.
+
+    Absent means today's behaviour: our own daemon on `~/.tailscale`. A stale
+    or forged record can therefore never point a verb at a daemon the rule
+    would not adopt now.
+    """
+    record = _raw_adoption()
+    if record is None:
+        return None
+    if record.get("schemaVersion") != ADOPTION_SCHEMA_VERSION or record.get("kind") != ADOPTION_KIND:
+        return None
+    argv = record.get("daemonArgv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(token, str) for token in argv):
+        return None
+    verdict = adoptable_daemon(argv, layout.home, platform_tailscaled=layout.platform_tailscaled)
+    if not verdict["adoptable"]:
+        return None
+    if record.get("stateFlag") != verdict["stateFlag"] or record.get("socket") != verdict["socket"]:
+        return None
+    log_path = record.get("logPath")
+    home_text = os.path.normpath(str(layout.home))
+    if (
+        not isinstance(log_path, str)
+        or not os.path.isabs(log_path)
+        # We append the daemon's output to it: never outside the user's home.
+        or not os.path.normpath(log_path).startswith(home_text.rstrip(os.sep) + os.sep)
+    ):
+        return None
+    adopted_by = record.get("adoptedBy")
+    adopted_at = record.get("adoptedAt")
+    if not isinstance(adopted_by, str) or not adopted_by or not isinstance(adopted_at, str):
+        return None
+    return Adoption(
+        daemon_argv=tuple(argv),
+        state_flag=verdict["stateFlag"],
+        socket=verdict["socket"],
+        socks5=verdict["socks5"],
+        log_path=os.path.normpath(log_path),
+        adopted_by=adopted_by,
+        adopted_at=adopted_at,
+    )
 
 
 Runner = Callable[..., Any]
@@ -395,26 +780,109 @@ def legacy_inventory(layout: Layout, *, runner: Optional[Runner] = None) -> Dict
             for entry in layout.disabled_hooks_dir.iterdir()
             if entry.is_dir() and "tailscale" in entry.name.lower()
         )
-    rc, out, _ = _run(("pgrep", "-af", "tailscaled|supervisor.py"), runner=runner, timeout_s=5.0)
     foreign: List[str] = []
-    own_statedir = f"--statedir={layout.state_dir}"
-    if rc == 0:
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) < 2 or not parts[0].isdigit() or int(parts[0]) == os.getpid():
-                continue
-            argv = parts[1:]
-            executable = Path(argv[0]).name
-            if executable == "tailscaled" and own_statedir not in argv:
-                foreign.append(line.strip()[:200])
-            elif "supervisor.py" in line and str(supervisor_dir) in line:
-                foreign.append(line.strip()[:200])
+    for _pid, argv, line in _process_lines(runner):
+        if _is_foreign_tailscaled(layout, argv):
+            foreign.append(line[:200])
+        elif "supervisor.py" in line and str(supervisor_dir) in line:
+            foreign.append(line[:200])
     return {
         "legacySupervisorDir": str(supervisor_dir),
         "legacySupervisorPresent": (supervisor_dir / "supervisor.py").is_file(),
         "disabledTailscaleHooks": hooks,
         "foreignDaemonProcesses": foreign,
     }
+
+
+def _process_lines(runner: Optional[Runner]) -> List[Tuple[int, List[str], str]]:
+    """``(pid, argv, line)`` for every tailscaled or supervisor process but ours."""
+    rc, out, _ = _run(("pgrep", "-af", "tailscaled|supervisor.py"), runner=runner, timeout_s=5.0)
+    if rc != 0:
+        return []
+    found: List[Tuple[int, List[str], str]] = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or not parts[0].isdigit() or int(parts[0]) == os.getpid():
+            continue
+        found.append((int(parts[0]), parts[1:], line.strip()))
+    return found
+
+
+def _is_foreign_tailscaled(layout: Layout, argv: Sequence[str]) -> bool:
+    """A tailscaled that is not the one we keep: ours carries `own_state_flag`
+    (`--statedir=~/.tailscale`, or an adopted daemon's own state flag)."""
+    return Path(argv[0]).name == "tailscaled" and layout.own_state_flag not in argv
+
+
+def platform_daemon_socket(argv_text: str) -> Optional[str]:
+    """The socket of a daemon on the platform's own state directory, else None.
+
+    That is Cloudways' bootstrap line (#6358); any other foreign daemon is
+    somebody's install and stays refused.
+    """
+    tokens = str(argv_text or "").split()
+    on_platform_state = any(
+        token == f"--statedir={PLATFORM_STATE_DIR}"
+        or token.startswith(f"--state={PLATFORM_STATE_DIR}/")
+        for token in tokens
+    )
+    if not on_platform_state:
+        return None
+    for token in tokens:
+        if token.startswith("--socket="):
+            return token[len("--socket="):]
+    return PLATFORM_SOCKET
+
+
+def replace_logged_out_platform_daemons(
+    layout: Layout,
+    *,
+    runner: Optional[Runner] = None,
+    kill: Optional[Callable[[int, int], None]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+    attempts: int = 20,
+) -> Dict[str, Any]:
+    """Stop each platform-started daemon nobody logged in to.
+
+    Its state is on the overlay root, wiped by every container restart, so it
+    holds no identity to lose. A logged-in one, or one that does not answer, is
+    left alone, and the foreign-supervisor refusal still catches it.
+    """
+    kill = os.kill if kill is None else kill
+    sleep = time.sleep if sleep is None else sleep
+    replaced: List[int] = []
+    for pid, argv, _line in _process_lines(runner):
+        if not _is_foreign_tailscaled(layout, argv):
+            continue
+        socket_path = platform_daemon_socket(" ".join(argv))
+        if socket_path is None:
+            continue
+        # A logged-out daemon can exit non-zero and still print its document.
+        _rc, out, _err = _run(
+            (str(layout.tailscale), f"--socket={socket_path}", "status", "--json"),
+            runner=runner,
+            timeout_s=8.0,
+        )
+        try:
+            document = json.loads(out) if out.strip() else None
+        except ValueError:
+            document = None
+        backend = document.get("BackendState") if isinstance(document, dict) else None
+        if backend not in ("NeedsLogin", "NoState"):
+            continue
+        try:
+            kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+        replaced.append(pid)
+    if not replaced:
+        return {"replaced": []}
+    for _ in range(attempts):
+        alive = {pid for pid, _argv, _line in _process_lines(runner)}
+        if not alive.intersection(replaced):
+            return {"replaced": replaced}
+        sleep(0.25)
+    return {"replaced": replaced, "stillRunning": sorted(alive.intersection(replaced))}
 
 
 # -- cron job -----------------------------------------------------------------
@@ -424,8 +892,15 @@ def _hermes_bin() -> str:
     found = shutil.which("hermes")
     if found:
         return found
-    sibling = Path(sys.executable).parent / "hermes"
-    return str(sibling) if sibling.exists() else "hermes"
+    # A gateway started without the venv on PATH still has its own Python's
+    # folder; on Windows the console script there is hermes.exe (#6377: chat
+    # setup's step 2 failed on the Windows runner).
+    folder = Path(sys.executable).parent
+    for name in ("hermes", "hermes.exe"):
+        sibling = folder / name
+        if sibling.exists():
+            return str(sibling)
+    return "hermes"
 
 
 def hermes_bin() -> str:
@@ -460,203 +935,119 @@ def job_schedule_text(job: Mapping[str, Any]) -> str:
     return str(schedule or "").strip()
 
 
-def job_matches(job: Mapping[str, Any], layout: Layout) -> bool:
-    script = str(job.get("script") or "")
-    return (
-        Path(script).name == WATCHDOG_SCRIPT_NAME
-        and bool(job.get("no_agent"))
-        and job_schedule_text(job) in (WATCHDOG_SCHEDULE, "every 1m")
-    )
-
-
 def _cron(layout: Layout, *args: str, runner: Optional[Runner] = None) -> Tuple[Optional[int], str, str]:
     env = dict(os.environ)
     env["HERMES_HOME"] = str(layout.hermes_home)
     return _run((_hermes_bin(), "cron", *args), runner=runner, timeout_s=40.0, env=env)
 
 
-def ensure_watchdog_job(layout: Layout, *, runner: Optional[Runner] = None) -> Dict[str, Any]:
-    """Create the job once; replace it only when its spec drifted."""
-    existing = find_watchdog_job(layout)
-    if existing is not None and job_matches(existing, layout):
-        return {"action": "kept", "jobId": existing.get("id"), "enabled": existing.get("enabled", True)}
-    if existing is not None:
-        rc, out, err = _cron(layout, "remove", str(existing.get("id")), runner=runner)
+def retire_watchdog(layout: Layout, *, runner: Optional[Runner] = None) -> Dict[str, Any]:
+    """Remove the pre-#6359 cron supervisor: its job, script, lock and state.
+
+    Idempotent. The job goes first; when Hermes refuses to remove it, its
+    script stays too, so the job still works and the caller must not hand the
+    daemon to the runtime.
+    """
+    removed: List[str] = []
+    job = find_watchdog_job(layout)
+    if job is not None:
+        rc, out, err = _cron(layout, "remove", str(job.get("id")), runner=runner)
         if rc != 0:
-            return {"action": "failed", "step": "remove-drifted", "error": (err or out).strip()[:300]}
-    rc, out, err = _cron(
-        layout,
-        "create",
-        WATCHDOG_SCHEDULE,
-        "--name",
-        WATCHDOG_JOB_NAME,
-        # Hermes insists on a bare filename relative to ~/.hermes/scripts/;
-        # an absolute path is refused at create time (observed 0.21.1).
-        "--script",
-        WATCHDOG_SCRIPT_NAME,
-        "--no-agent",
-        "--deliver",
-        "local",
-        runner=runner,
+            return {"ok": False, "error": f"cron remove: {(err or out).strip()[:300]}", "removed": removed}
+        removed.append(f"cron:{job.get('id')}")
+    for path in (layout.script_path, layout.watchdog_lock, layout.watchdog_state):
+        try:
+            path.unlink()
+            removed.append(str(path))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            return {"ok": False, "error": f"{path}: {exc}", "removed": removed}
+    return {"ok": True, "removed": removed}
+
+
+# -- the runtime state ----------------------------------------------------------
+
+
+def read_hermes_state(layout: Layout) -> Optional[Dict[str, Any]]:
+    """The runtime state file, or None when missing or unreadable."""
+    path = layout.state_path
+    if path is None:
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def write_hermes_state(layout: Layout, *, enabled: bool) -> Path:
+    """Hand the daemon to the OcuClaw runtime. Only once the cron job is gone."""
+    path = layout.state_path
+    if path is None:
+        raise receipts.ReceiptUnavailableError("no host state directory")
+    return receipts.write_json_receipt(
+        path,
+        {
+            "schemaVersion": HERMES_STATE_SCHEMA_VERSION,
+            "enabled": bool(enabled),
+            "provisioner": RECEIPT_PROVISIONER,
+            "supervisor": SUPERVISOR_RUNTIME,
+            "stateDir": str(layout.state_dir),
+            "socket": str(layout.socket_path),
+            "socks5": layout.socks5_listen,
+            "updatedAt": receipts.now_iso(),
+        },
+        durable=True,
     )
-    if rc != 0:
-        return {"action": "failed", "step": "create", "error": (err or out).strip()[:300]}
-    created = find_watchdog_job(layout)
+
+
+def remove_hermes_state(layout: Layout) -> bool:
+    path = layout.state_path
+    if path is None:
+        return False
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def supervisor_summary(layout: Layout) -> Dict[str, Any]:
+    state = read_hermes_state(layout)
+    present = state is not None and state.get("supervisor") == SUPERVISOR_RUNTIME
     return {
-        "action": "replaced" if existing is not None else "created",
-        "jobId": created.get("id") if created else None,
-        "enabled": True,
+        "owner": SUPERVISOR_OWNER,
+        "present": present,
+        "enabled": (state.get("enabled") is not False) if present else None,
     }
 
 
-#: `hermes cron run` ends a manual run with one verdict line
-#: (hermes_cli/cron.py `_run_outcome`). It is the only place success is stated.
-_CRON_RAN_NOW_RE = re.compile(r"Ran now:\s*(succeeded|failed)\.", re.IGNORECASE)
+def _receipt_is_ours() -> bool:
+    receipt = receipts.read_tailscale_cli()
+    return receipt is not None and receipt.provisioner == RECEIPT_PROVISIONER
 
 
-def fire_watchdog_now(layout: Layout, *, runner: Optional[Runner] = None) -> Dict[str, Any]:
+def adopt_runtime_supervisor(layout: Layout, *, runner: Optional[Runner] = None) -> Dict[str, Any]:
+    """Plugin upgrade on an old-ladder box: cron watchdog → OcuClaw runtime.
+
+    Acts only on our own install that still has the watchdog job. A paused job
+    meant `disable`, so the state says disabled then.
+    """
+    if not _receipt_is_ours():
+        return {"adopted": False, "reason": "no-hermes-receipt"}
     job = find_watchdog_job(layout)
     if job is None:
-        return {"fired": False, "error": "no watchdog job"}
-    rc, out, err = _cron(layout, "run", str(job.get("id")), runner=runner)
-    # The exit code says the RUN HAPPENED, not that it worked: `hermes cron run`
-    # returns 0 for a job that executed and failed. Reading rc alone reported a
-    # watchdog that ran and failed as fired, so parse the verdict instead.
-    #
-    # Three of `_run_outcome`'s four answers report no verdict at all —
-    # "Running in background.", "Running in background (delegation …)." and
-    # "It will run on the next scheduler tick." — so `unreported` is NEUTRAL,
-    # never a failure. Only a reported failure is one; whether the daemon
-    # actually came up is what `status` observes.
-    match = _CRON_RAN_NOW_RE.search(f"{out}\n{err}")
-    verdict = match.group(1).lower() if match else "unreported"
-    return {
-        "fired": rc == 0 and verdict != "failed",
-        "verdict": verdict,
-        "jobId": job.get("id"),
-        "detail": (out or err).strip()[:200],
-    }
-
-
-# -- watchdog script ----------------------------------------------------------
-
-
-def render_watchdog_script(layout: Layout) -> str:
-    """The bash the cron job runs every minute. Generated; never hand-edited."""
-    return f"""#!/usr/bin/env bash
-# OcuClaw Tailscale watchdog — generated by `hermes ocuclaw cloudways install`.
-# Do not edit: re-run install to regenerate. Runs from Hermes cron with
-# --no-agent (no LLM). Keeps the user-owned userspace tailscaled alive and
-# reports, on state change only, to the job's local delivery.
-#
-# Rules: the daemon is started only if its socket does not answer; it is
-# detached with setsid and every fd redirected, because the cron runner reads
-# this script's pipes to EOF and would otherwise hang and then kill the
-# daemon; the lock fd (9) is closed for the daemon too, or the daemon would
-# hold the watchdog lock for its whole life and every later tick would exit
-# at flock without looking; `tailscale up` is never run here — authorization
-# needs a human.
-set -u
-umask 077
-
-TS_BIN={_sh(layout.tailscale)}
-TSD_BIN={_sh(layout.tailscaled)}
-STATE_DIR={_sh(layout.state_dir)}
-RUN_DIR={_sh(layout.run_dir)}
-SOCK={_sh(layout.socket_path)}
-LOG_DIR={_sh(layout.log_dir)}
-LOG="$LOG_DIR/tailscaled.log"
-LOCK="$STATE_DIR/watchdog.lock"
-STATE_FILE={_sh(layout.watchdog_state)}
-NEEDS_AUTH={_sh(layout.needs_auth_marker)}
-SOCKS5={_sh(SOCKS5_LISTEN)}
-LOG_MAX={WATCHDOG_LOG_MAX_BYTES}
-
-[ -x "$TS_BIN" ] && [ -x "$TSD_BIN" ] || {{ echo "ocuclaw tailscale watchdog: binaries missing under $(dirname "$TSD_BIN"); run: hermes ocuclaw cloudways install"; exit 0; }}
-mkdir -p "$STATE_DIR" "$RUN_DIR" "$LOG_DIR" || exit 0
-chmod 700 "$STATE_DIR" "$RUN_DIR" "$LOG_DIR" 2>/dev/null
-
-# Duplicate prevention: one watchdog at a time, lock released by the kernel.
-exec 9>"$LOCK" || exit 0
-flock -n 9 || exit 0
-
-backend_state() {{
-  timeout 5 "$TS_BIN" --socket="$SOCK" status --json 2>/dev/null \\
-    | grep -o '"BackendState": *"[A-Za-z]*"' | head -n1 | sed 's/.*"\\([A-Za-z]*\\)"$/\\1/'
-}}
-
-rotate_log() {{
-  if [ -f "$LOG" ]; then
-    size=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
-    if [ "$size" -gt "$LOG_MAX" ]; then mv -f "$LOG" "$LOG.1"; fi
-  fi
-}}
-
-prev=$(cat "$STATE_FILE" 2>/dev/null || true)
-started=0
-report() {{  # report <state> <message>: print only on transition or after a start
-  if [ "$1" != "$prev" ] || [ "$started" = 1 ]; then
-    printf '%s\\n' "$1" > "$STATE_FILE"
-    echo "ocuclaw tailscale watchdog: $2"
-  fi
-}}
-
-state=$(backend_state)
-if [ -z "$state" ]; then
-  if pgrep -f -- "--statedir=$STATE_DIR" >/dev/null 2>&1; then
-    report starting "tailscaled process exists but its socket is not answering yet"
-    exit 0
-  fi
-  rotate_log
-  setsid -f "$TSD_BIN" --statedir="$STATE_DIR" --socket="$SOCK" --tun=userspace-networking --socks5-server="$SOCKS5" </dev/null >>"$LOG" 2>&1 9>&-
-  started=1
-  # Wait for a settled state (up to 20s): a fresh daemon answers NoState for
-  # a few seconds before it reaches Running or NeedsLogin.
-  for _ in $(seq 1 40); do
-    sleep 0.5
-    state=$(backend_state)
-    case "$state" in Running|NeedsLogin|NeedsMachineAuth|Stopped) break ;; esac
-  done
-  if [ -z "$state" ]; then
-    report start-failed "tailscaled did not answer within 20s after start; see $LOG"
-    exit 0
-  fi
-  chmod 600 "$SOCK" 2>/dev/null
-fi
-
-case "$state" in
-  Running)
-    rm -f "$NEEDS_AUTH"
-    if [ "$started" = 1 ]; then report running "started tailscaled; node is running"; else report running "tailscaled running"; fi
-    ;;
-  NeedsLogin|NeedsMachineAuth|Stopped)
-    # Enrollment recovery owns any existing contents; never truncate them.
-    touch "$NEEDS_AUTH"
-    report needs-authorization "tailscaled is up but the node needs authorization ($state): run hermes ocuclaw cloudways retry"
-    ;;
-  *)
-    if [ "$started" = 1 ]; then report starting "started tailscaled; still starting ($state)"; else report starting "tailscaled still starting ($state)"; fi
-    ;;
-esac
-exit 0
-"""
-
-
-def _sh(value: Any) -> str:
-    import shlex
-
-    return shlex.quote(str(value))
+        return {"adopted": False, "reason": "no-watchdog-job"}
+    enabled = job.get("enabled", True) is not False
+    retired = retire_watchdog(layout, runner=runner)
+    if not retired["ok"]:
+        return {"adopted": False, "reason": "watchdog-not-retired", "error": retired.get("error")}
+    write_hermes_state(layout, enabled=enabled)
+    return {"adopted": True, "enabled": enabled, "removed": retired["removed"]}
 
 
 # -- install ------------------------------------------------------------------
-
-
-Fetcher = Callable[[str, float], bytes]
-
-
-def _default_fetch(url: str, timeout_s: float) -> bytes:
-    with urllib.request.urlopen(url, timeout=timeout_s) as response:  # nosec B310 - https pin
-        return response.read()
 
 
 def _installed_version(layout: Layout, *, runner: Optional[Runner]) -> Optional[str]:
@@ -669,101 +1060,36 @@ def _installed_version(layout: Layout, *, runner: Optional[Runner]) -> Optional[
     return first or None
 
 
-def _safe_extract_binaries(archive: Path, layout: Layout) -> None:
-    wanted = {
-        f"{TAILSCALE_TGZ_MEMBER_DIR}/tailscale": layout.tailscale,
-        f"{TAILSCALE_TGZ_MEMBER_DIR}/tailscaled": layout.tailscaled,
-    }
-    layout.bin_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(layout.bin_dir, 0o700)
-    with tarfile.open(archive, "r:gz") as tar:
-        found = 0
-        for member in tar.getmembers():
-            target = wanted.get(member.name)
-            if target is None or not member.isfile():
-                continue
-            source = tar.extractfile(member)
-            if source is None:
-                continue
-            tmp = target.with_suffix(".tmp")
-            with tmp.open("wb") as sink:
-                shutil.copyfileobj(source, sink)
-            os.chmod(tmp, 0o700)
-            os.replace(tmp, target)
-            found += 1
-    if found != 2:
-        raise RuntimeError("archive did not contain both tailscale and tailscaled")
+def install_binaries(layout: Layout, *, runner: Optional[Runner] = None) -> Dict[str, Any]:
+    """The server's own binaries, or a refusal: nothing is ever downloaded.
 
-
-def install_binaries(
-    layout: Layout,
-    *,
-    fetch: Optional[Fetcher] = None,
-    runner: Optional[Runner] = None,
-    force_download: bool = False,
-) -> Dict[str, Any]:
-    """Pinned, double-checksummed, idempotent."""
-    fetch = _default_fetch if fetch is None else fetch
+    Nothing is written, so `installed` stays empty and nothing can ever name a
+    root-owned /usr/bin file for removal.
+    """
+    if layout.binary_source != BINARIES_PLATFORM:
+        return {"binaries": "missing", "error": TAILSCALE_MISSING_MESSAGE}
     version = _installed_version(layout, runner=runner)
-    if version == TAILSCALE_VERSION and not force_download:
-        return {"binaries": "adopted", "version": version}
-    payload = fetch(TAILSCALE_TGZ_URL, 120.0)
-    digest = hashlib.sha256(payload).hexdigest()
-    if digest != TAILSCALE_TGZ_SHA256:
-        raise RuntimeError(
-            f"tailscale archive sha256 {digest} does not match the pinned {TAILSCALE_TGZ_SHA256}"
-        )
-    live = fetch(TAILSCALE_TGZ_URL + ".sha256", 30.0).decode("utf-8", "replace").split()
-    if not live or live[0].lower() != TAILSCALE_TGZ_SHA256:
-        raise RuntimeError("the published .sha256 for the pinned archive does not match the pin")
-    layout.state_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(layout.state_dir, 0o700)
-    with tempfile.NamedTemporaryFile(dir=layout.state_dir, suffix=".tgz", delete=False) as handle:
-        handle.write(payload)
-        archive = Path(handle.name)
-    try:
-        _safe_extract_binaries(archive, layout)
-    finally:
-        try:
-            archive.unlink()
-        except OSError:
-            pass
-    receipts.write_json_receipt(
-        layout.tgz_receipt,
-        {
-            "schemaVersion": 1,
-            "version": TAILSCALE_VERSION,
-            "url": TAILSCALE_TGZ_URL,
-            "sha256": TAILSCALE_TGZ_SHA256,
-            "installedAt": receipts.now_iso(),
-        },
+    return {"binaries": BINARIES_PLATFORM, "version": version, "installed": []}
+
+
+def receipt_body(layout: Layout, *, provisioner: str = RECEIPT_PROVISIONER) -> Dict[str, Any]:
+    """The host CLI receipt for this layout.
+
+    An adopted daemon is reached through its own loopback SOCKS5 when its line
+    has one; otherwise probes dial through `tailscale nc` on its socket, since
+    we never restart it to add a listener (#6482).
+    """
+    socks5 = layout.socks5_listen
+    return receipts.build_tailscale_cli_body(
+        argv=layout.cli_argv(),
+        socks5=socks5,
+        provisioner=provisioner,
+        dial=receipts.DIAL_TAILSCALE_NC if socks5 is None else None,
     )
-    return {
-        "binaries": "downloaded" if version is None else "replaced",
-        "previousVersion": version,
-        "version": TAILSCALE_VERSION,
-    }
 
 
 def write_receipt(layout: Layout) -> Path:
-    body = receipts.build_tailscale_cli_body(
-        argv=layout.cli_argv(), socks5=SOCKS5_LISTEN, provisioner=RECEIPT_PROVISIONER
-    )
-    return receipts.write_tailscale_cli(body)
-
-
-def write_watchdog_script(layout: Layout) -> Dict[str, Any]:
-    content = render_watchdog_script(layout)
-    layout.scripts_dir.mkdir(parents=True, exist_ok=True)
-    before = layout.script_path.read_text(encoding="utf-8") if layout.script_path.exists() else None
-    if before == content:
-        os.chmod(layout.script_path, 0o700)
-        return {"script": "kept", "path": str(layout.script_path)}
-    tmp = layout.script_path.with_suffix(".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.chmod(tmp, 0o700)
-    os.replace(tmp, layout.script_path)
-    return {"script": "written" if before is None else "updated", "path": str(layout.script_path)}
+    return receipts.write_tailscale_cli(receipt_body(layout))
 
 
 def prepare_state_dirs(layout: Layout) -> None:
@@ -782,35 +1108,429 @@ def refuse_if_foreign_supervisor(inventory: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+# -- start the daemon ------------------------------------------------------------
+
+Spawner = Callable[[Layout], Mapping[str, Any]]
+_SETTLED = (STATE_RUNNING, STATE_NEEDS_AUTH)
+
+
+def _rotate_daemon_log(layout: Layout) -> None:
+    if layout.log_path != layout.own_log_path:
+        return  # Cloudways' own `~/logs` file: appended to, never moved
+    try:
+        if layout.log_path.stat().st_size > DAEMON_LOG_MAX_BYTES:
+            os.replace(layout.log_path, layout.log_path.with_name(layout.log_path.name + ".1"))
+    except OSError:
+        pass
+
+
+def _default_spawn(layout: Layout) -> Dict[str, Any]:
+    """Detached in its own session, every fd redirected to the log.
+
+    The daemon must outlive the command that started it, and an inherited pipe
+    would tie it to that command's reader. An adopted daemon runs its recorded
+    line exactly and appends to its recorded log.
+    """
+    if layout.log_path == layout.own_log_path:
+        layout.log_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(layout.log_dir, 0o700)
+    _rotate_daemon_log(layout)
+    fd = os.open(layout.log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        child = subprocess.Popen(  # noqa: S603 - fixed argv, absolute binary
+            list(layout.daemon_argv()),
+            stdin=subprocess.DEVNULL,
+            stdout=fd,
+            stderr=fd,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        os.close(fd)
+    return {"pid": child.pid}
+
+
+def _our_daemon_processes(layout: Layout, runner: Optional[Runner]) -> List[Tuple[int, List[str]]]:
+    own = layout.own_state_flag
+    return [
+        (pid, argv)
+        for pid, argv, _line in _process_lines(runner)
+        if Path(argv[0]).name == "tailscaled" and own in argv
+    ]
+
+
+def start_daemon(
+    layout: Layout,
+    *,
+    runner: Optional[Runner] = None,
+    spawn: Optional[Spawner] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+    attempts: int = 40,
+) -> Dict[str, Any]:
+    """Start the daemon if nothing of ours answers, then wait for it to settle.
+
+    Never runs `up`: authorization needs a human.
+
+    An adopted daemon (#6482) is only ever relaunched, from its recorded line,
+    when no tailscaled at all is running: Cloudways restarts nothing after a
+    reboot, and a second daemon beside a live one would split the identity.
+    """
+    layout = layout.pinned()
+    adopted = layout.adopted is not None
+    if not _binaries_present(layout):
+        return {"action": "absent", "state": STATE_ABSENT, "detail": "tailscale binaries are not installed"}
+    before = daemon_state(layout, runner=runner)
+    if before.state not in (STATE_STOPPED, STATE_ABSENT):
+        if before.state == STATE_RUNNING:
+            layout.needs_auth_marker.unlink(missing_ok=True)
+        return {"action": "kept", "state": before.state, "detail": before.detail or ""}
+    refusal = refuse_if_foreign_supervisor(legacy_inventory(layout, runner=runner))
+    if refusal:
+        return {"action": "refused", "state": before.state, "detail": refusal}
+    if _our_daemon_processes(layout, runner):
+        return {
+            "action": "starting",
+            "state": STATE_STARTING,
+            "detail": "tailscaled process exists but its socket is not answering yet",
+        }
+    if adopted:
+        # The checks above see every tailscaled, ours or not; this one only
+        # makes "none at all" explicit before we start the user's own line.
+        if any(Path(argv[0]).name == "tailscaled" for _pid, argv, _line in _process_lines(runner)):
+            return {
+                "action": "refused",
+                "state": before.state,
+                "detail": "a tailscaled is already running; the adopted daemon is not started beside it",
+            }
+    else:
+        prepare_state_dirs(layout)
+    spawn = _default_spawn if spawn is None else spawn
+    sleep = time.sleep if sleep is None else sleep
+    try:
+        spawned = spawn(layout) or {}
+    except OSError as exc:
+        return {"action": "start-failed", "state": STATE_STOPPED, "detail": str(exc)[:200]}
+    # A fresh daemon answers NoState for a few seconds before it settles.
+    state = daemon_state(layout, runner=runner)
+    for _ in range(attempts):
+        if state.state in _SETTLED:
+            break
+        sleep(0.5)
+        state = daemon_state(layout, runner=runner)
+    if state.state in (STATE_STOPPED, STATE_ABSENT):
+        return {
+            "action": "start-failed",
+            "state": state.state,
+            "pid": spawned.get("pid"),
+            "detail": f"tailscaled did not answer after start; see {layout.log_path}",
+        }
+    if state.state == STATE_RUNNING:
+        layout.needs_auth_marker.unlink(missing_ok=True)
+    if not adopted:
+        # An adopted daemon's socket is Cloudways' to set; others may use it.
+        try:
+            os.chmod(layout.socket_path, 0o600)
+        except OSError:
+            pass  # the daemon owns it
+    return {"action": "started", "state": state.state, "pid": spawned.get("pid"), "detail": state.detail or ""}
+
+
+# -- move an old-ladder box onto the platform binary (#6360) ---------------------
+
+
+def _downloaded_by_ocuclaw(layout: Layout) -> bool:
+    """Our tgz receipt in `~/.tailscale` (the Hermes one names no provisioner):
+    proof the `~/bin` copy is our download."""
+    try:
+        record = json.loads(layout.tgz_receipt.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(record, dict)
+        and isinstance(record.get("url"), str)
+        and record["url"].startswith("https://pkgs.tailscale.com/")
+        and isinstance(record.get("sha256"), str)
+    )
+
+
+def bundled_binary_in_use(layout: Layout) -> bool:
+    """Is this box still on our `~/bin` download while the image ships its own?
+
+    Read-only and spawns nothing, so `status` can ask it. A `~/bin` copy that
+    no install receipt of ours names is the user's, and never a pending move.
+    """
+    if layout.binary_source != BINARIES_PLATFORM or layout.adopted is not None:
+        return False
+    receipt = receipts.read_tailscale_cli()
+    if receipt is not None and receipt.provisioner != RECEIPT_PROVISIONER:
+        return False
+    if receipt is not None and _same_file(receipt.argv[0], layout.bundled_tailscale):
+        return True
+    on_disk = layout.bundled_tailscale.is_file() or layout.bundled_tailscaled.is_file()
+    return on_disk and _downloaded_by_ocuclaw(layout)
+
+
+def move_to_platform_binary(
+    layout: Layout,
+    *,
+    runner: Optional[Runner] = None,
+    kill: Optional[Callable[[int, int], None]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+    spawn: Optional[Spawner] = None,
+) -> Dict[str, Any]:
+    """Restart our daemon from the platform binary with the same `~/.tailscale`.
+
+    The node name, its login and the serve route all carry over, so nothing
+    needs approving again. Then the host receipt names the platform CLI, and the
+    download goes, only when our own tgz receipt says we put it there.
+    """
+    if layout.binary_source != BINARIES_PLATFORM:
+        return {"moved": False, "reason": "no-platform-binary"}
+    if layout.adopted is not None:
+        # The adopted daemon already runs the image's binary, and it is never
+        # ours to restart.
+        return {"moved": False, "reason": "adopted"}
+    receipt = receipts.read_tailscale_cli()
+    if receipt is not None and receipt.provisioner != RECEIPT_PROVISIONER:
+        return {"moved": False, "reason": f"receipt-provisioned-by-{receipt.provisioner}"}
+    bundled = str(layout.bundled_tailscaled)
+    on_bundled = [pid for pid, argv in _our_daemon_processes(layout, runner) if argv[0] == bundled]
+    if not on_bundled and not bundled_binary_in_use(layout):
+        return {"moved": False, "reason": "already-on-platform"}
+    report: Dict[str, Any] = {"moved": True, "restarted": False}
+    if on_bundled:
+        stopped = stop_daemon(layout, runner=runner, kill=kill, sleep=sleep)
+        if stopped["daemon"] == "still-running":
+            return {"moved": False, "reason": "old-daemon-did-not-stop", "pids": stopped.get("pids", [])}
+        started = start_daemon(layout, runner=runner, spawn=spawn, sleep=sleep)
+        if started["action"] not in ("started", "kept"):
+            # Never leave the box offline: bring the old daemon back and keep it.
+            restored = start_daemon(
+                replace(layout, platform_bin_dir=None), runner=runner, spawn=spawn, sleep=sleep
+            )
+            return {
+                "moved": False,
+                "reason": "platform-daemon-did-not-start",
+                "daemon": started,
+                "restored": restored,
+            }
+        report["restarted"] = True
+        report["daemon"] = started
+    if receipt is not None:
+        report["receipt"] = str(write_receipt(layout))
+    removed: List[str] = []
+    if _downloaded_by_ocuclaw(layout):
+        for target in (layout.bundled_tailscale, layout.bundled_tailscaled, layout.tgz_receipt):
+            try:
+                target.unlink()
+                removed.append(str(target))
+            except OSError:
+                pass  # already gone
+        try:
+            layout.bin_dir.rmdir()
+            removed.append(str(layout.bin_dir))
+        except OSError:
+            pass  # holds other files
+    else:
+        report["bundledKept"] = "no install receipt names this download"
+    report["removed"] = removed
+    return report
+
+
 def install(
     layout: Layout,
     *,
-    fetch: Optional[Fetcher] = None,
     runner: Optional[Runner] = None,
-    force_download: bool = False,
-    fire: bool = True,
+    start: bool = True,
+    kill: Optional[Callable[[int, int], None]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+    spawn: Optional[Spawner] = None,
 ) -> Dict[str, Any]:
+    """Binaries, receipt, runtime state, then one daemon start.
+
+    A box where Cloudways already runs its own signed-in userspace daemon has
+    that daemon adopted instead (#6482): nothing is started, stopped or
+    killed, and from then on every verb follows the adoption record. A record
+    already on disk makes this the idempotent re-run of that adoption.
+    """
+    layout = layout.pinned()
     report: Dict[str, Any] = {"ok": False, "layout": layout_summary(layout)}
+    replaced = replace_logged_out_platform_daemons(layout, runner=runner, kill=kill, sleep=sleep)
+    if replaced["replaced"]:
+        report["replacedPlatformDaemons"] = replaced["replaced"]
+    if layout.adopted is None:
+        found = find_adoptable(layout, runner=runner)
+        for key in ("foreignNotAdoptable", "adoptable"):
+            if key in found:
+                report[key] = found[key]
+        if found.get("error"):
+            report["legacy"] = legacy_inventory(layout, runner=runner)
+            report["error"] = found["error"]
+            return report
+        if found.get("adopt"):
+            return _install_adopted(layout, found, report, runner=runner)
     inventory = legacy_inventory(layout, runner=runner)
     report["legacy"] = inventory
     refusal = refuse_if_foreign_supervisor(inventory)
     if refusal:
         report["error"] = refusal
         return report
-    try:
-        report.update(install_binaries(layout, fetch=fetch, runner=runner, force_download=force_download))
-    except Exception as exc:  # noqa: BLE001 - reported, never raised at the agent
-        report["error"] = f"binary install failed: {exc}"
+    report.update(install_binaries(layout, runner=runner))
+    if report.get("error"):
+        # Nothing written: no receipt, no state, no `~/bin`.
         return report
-    prepare_state_dirs(layout)
+    if layout.adopted is None:
+        prepare_state_dirs(layout)
     report["receipt"] = str(write_receipt(layout))
-    report.update(write_watchdog_script(layout))
-    report["job"] = ensure_watchdog_job(layout, runner=runner)
-    if report["job"].get("action") == "failed":
-        report["error"] = f"cron job: {report['job'].get('error')}"
+    # The cron job goes before the runtime state exists: never two supervisors.
+    retired = retire_watchdog(layout, runner=runner)
+    report["watchdogRetired"] = retired["removed"]
+    if not retired["ok"]:
+        report["error"] = f"old watchdog: {retired.get('error')}"
         return report
-    if fire:
-        report["fired"] = fire_watchdog_now(layout, runner=runner)
+    report["state"] = str(write_hermes_state(layout, enabled=True))
+    move = move_to_platform_binary(layout, runner=runner, kill=kill, sleep=sleep, spawn=spawn)
+    if move["moved"]:
+        report["moved"] = move
+    elif move["reason"] in ("old-daemon-did-not-stop", "platform-daemon-did-not-start"):
+        report["moved"] = move
+        report["error"] = f"could not move Tailscale onto {layout.tailscaled}: {move['reason']}"
+        return report
+    if start:
+        report["daemon"] = start_daemon(layout, runner=runner, spawn=spawn, sleep=sleep)
+        if report["daemon"]["action"] == "refused":
+            report["error"] = report["daemon"]["detail"]
+            return report
+    if layout.adopted is not None:
+        report["adopted"] = _adopted_report(layout)
+    report["ok"] = True
+    return report
+
+
+def _socket_backend(layout: Layout, socket_path: str, *, runner: Optional[Runner]) -> Optional[str]:
+    """The BackendState a daemon's socket reports, or None when it does not answer."""
+    # A logged-out daemon can exit non-zero and still print its document.
+    _rc, out, _err = _run(
+        (str(layout.tailscale), f"--socket={socket_path}", "status", "--json"),
+        runner=runner,
+        timeout_s=8.0,
+    )
+    try:
+        document = json.loads(out) if out.strip() else None
+    except ValueError:
+        return None
+    backend = document.get("BackendState") if isinstance(document, dict) else None
+    return backend if isinstance(backend, str) and backend else None
+
+
+def find_adoptable(layout: Layout, *, runner: Optional[Runner] = None) -> Dict[str, Any]:
+    """Look at every foreign tailscaled and say whether install may adopt one.
+
+    Read-only: one `pgrep`, at most one `status --json`. Returns
+    ``{"adopt": (argv, verdict), "adoptable": …}`` when install should adopt,
+    ``{"error": …}`` when there would be two tailnet identities, and otherwise
+    only what it saw (``foreignNotAdoptable`` reasons), so today's refusal
+    still runs with the reason attached.
+    """
+    foreign = [
+        (pid, argv)
+        for pid, argv, _line in _process_lines(runner)
+        if _is_foreign_tailscaled(layout, argv)
+    ]
+    if not foreign:
+        return {}
+    found: Dict[str, Any] = {}
+    candidates = []
+    rejected = []
+    for pid, argv in foreign:
+        verdict = adoptable_daemon(argv, layout.home, platform_tailscaled=layout.platform_tailscaled)
+        if verdict["adoptable"]:
+            candidates.append((pid, argv, verdict))
+        else:
+            rejected.append({"pid": pid, "reason": verdict["reason"]})
+    if rejected:
+        found["foreignNotAdoptable"] = rejected
+    if len(candidates) != 1 or len(foreign) != 1:
+        # Two daemons at once is never ours to sort out.
+        return found
+    pid, argv, verdict = candidates[0]
+    info: Dict[str, Any] = {
+        "pid": pid,
+        "stateFlag": verdict["stateFlag"],
+        "socket": verdict["socket"],
+        "socks5": verdict["socks5"],
+    }
+    found["adoptable"] = info
+    own_pids = [own_pid for own_pid, _argv in _our_daemon_processes(layout, runner)]
+    own_state = layout.state_dir / "tailscaled.state"
+    if own_pids or own_state.exists():
+        # Both are real nodes on someone's tailnet. Which one stays is the
+        # user's call; we change nothing.
+        info["ownIdentity"] = {"stateDir": str(layout.state_dir), "pids": own_pids}
+        found["error"] = (
+            "two tailnet identities on this server: Cloudways' own Tailscale "
+            f"({verdict['stateFlag']}, socket {verdict['socket']}) and OcuClaw's own in "
+            f"{layout.state_dir}. Nothing was changed. Decide which one to keep, "
+            "remove the other yourself, then run install again."
+        )
+        return found
+    if layout.binary_source != BINARIES_PLATFORM:
+        return found
+    backend = _socket_backend(layout, verdict["socket"], runner=runner)
+    info["answered"] = backend is not None
+    if backend is None:
+        # A daemon we cannot talk to is not one we can keep alive.
+        return found
+    info["backend"] = backend
+    found["adopt"] = (list(argv), verdict)
+    return found
+
+
+def _adopted_report(layout: Layout) -> Dict[str, Any]:
+    adopted = layout.adopted
+    socks5 = adopted.socks5 if adopted is not None else None
+    return {
+        **(adopted.summary() if adopted is not None else {}),
+        "socks5": socks5,
+        "dial": None if socks5 is not None else receipts.DIAL_TAILSCALE_NC,
+    }
+
+
+def _install_adopted(
+    layout: Layout, found: Mapping[str, Any], report: Dict[str, Any], *, runner: Optional[Runner]
+) -> Dict[str, Any]:
+    """Adopt the one signed-in Cloudways daemon. Starts, stops and kills nothing."""
+    argv, verdict = found["adopt"]
+    report["adoption"] = str(
+        write_adoption(build_adoption_body(argv, verdict, log_path=adoption_log_path(layout)))
+    )
+    # Every later step reads through the record, so check it reads back.
+    adopted_layout = replace(layout, adoption=_READ_RECORD).pinned()
+    if adopted_layout.adopted is None:
+        remove_adoption()
+        report["error"] = "the adoption record did not read back; nothing else was changed"
+        return report
+    report["layout"] = layout_summary(adopted_layout)
+    report.update(install_binaries(adopted_layout, runner=runner))
+    if report.get("error"):
+        remove_adoption()
+        return report
+    report["receipt"] = str(write_receipt(adopted_layout))
+    # Never two supervisors, the same as a fresh install.
+    retired = retire_watchdog(adopted_layout, runner=runner)
+    report["watchdogRetired"] = retired["removed"]
+    if not retired["ok"]:
+        report["error"] = f"old watchdog: {retired.get('error')}"
+        return report
+    report["state"] = str(write_hermes_state(adopted_layout, enabled=True))
+    report["legacy"] = legacy_inventory(adopted_layout, runner=runner)
+    report["adopted"] = {
+        "socket": verdict["socket"],
+        "stateFlag": verdict["stateFlag"],
+        "backend": found["adoptable"].get("backend"),
+        "socks5": verdict["socks5"],
+        "dial": None if verdict["socks5"] is not None else receipts.DIAL_TAILSCALE_NC,
+    }
     report["ok"] = True
     return report
 
@@ -896,7 +1616,6 @@ def enroll(
     *,
     runner: Optional[Runner] = None,
     hostname: Optional[str] = None,
-    qr: bool = False,
     timeout_s: float = 25.0,
     wait_s: float = 90.0,
     clock: Callable[[], float] = time.monotonic,
@@ -908,18 +1627,21 @@ def enroll(
 
     The total 90-second budget includes the command and daemon observations.
     The existing auth-needed marker also records an in-flight enrollment so
-    interrupted observations can resume without another login. The watchdog
-    clears that marker when authorized; nothing here waits for a human.
+    interrupted observations can resume without another login. The OcuClaw
+    runtime and `start_daemon` clear that marker once authorized; nothing here
+    waits for a human.
     A marker left by a daemon that has since restarted is stale: it is
     cleared and a fresh login starts (``staleEnrollmentCleared`` + ``notice``).
     """
+    # An adopted daemon enrolls through its own socket, like ours (#6482).
+    layout = layout.pinned()
     deadline = clock() + max(1.0, min(float(wait_s), 90.0))
     before = daemon_state(layout, runner=runner, timeout_s=min(8.0, max(0.1, deadline - clock())))
     if before.state in (STATE_ABSENT, STATE_STOPPED, STATE_UNKNOWN):
         return {
             "ok": False,
             "state": before.state,
-            "error": before.detail or "tailscaled is not running; run install (the cron watchdog starts it)",
+            "error": before.detail or "tailscaled is not running; run install (it starts the daemon)",
         }
     if before.state == STATE_RUNNING:
         return {"ok": True, "state": STATE_RUNNING, "nodeName": before.node_name, "dnsName": before.dns_name}
@@ -935,8 +1657,6 @@ def enroll(
         # test: tailscaled reports the machine hostname before any login, so
         # the first live run enrolled as the bare container hostname.)
         argv.append(f"--hostname={default_node_name()}")
-    if qr:
-        argv.append("--qr")
     out, err = "", ""
     command_failed = False
     try:
@@ -999,8 +1719,6 @@ def enroll(
         "nodeName": after.node_name,
         "dnsName": after.dns_name,
     }
-    if qr and match:
-        result["qr"] = out
     if stale_cleared:
         # Callers without a progress sink (the setup ladder) print this line.
         result["staleEnrollmentCleared"] = True
@@ -1046,11 +1764,13 @@ def _relay_port() -> int:
 def layout_summary(layout: Layout) -> Dict[str, str]:
     return {
         "binDir": str(layout.bin_dir),
+        "binarySource": layout.binary_source,
+        "tailscaled": str(layout.tailscaled),
         "stateDir": str(layout.state_dir),
         "socket": str(layout.socket_path),
-        "script": str(layout.script_path),
+        "state": str(layout.state_path or ""),
         "receipt": str(receipts.tailscale_cli_path() or ""),
-        "socks5": SOCKS5_LISTEN,
+        "socks5": layout.socks5_listen or "",
     }
 
 
@@ -1063,9 +1783,9 @@ def daemon_summary(*, runner: Optional[Runner] = None) -> Optional[Dict[str, Any
     """
     if receipts.read_tailscale_cli() is None:
         return None
-    layout = Layout.resolve()
+    layout = Layout.resolve().pinned()
     state = daemon_state(layout, runner=runner)
-    return {
+    summary = {
         "state": state.state,
         "detail": state.detail,
         "nodeName": state.node_name,
@@ -1075,8 +1795,14 @@ def daemon_summary(*, runner: Optional[Runner] = None) -> Optional[Dict[str, Any
         # Same distinction `status` draws: a marker on a RUNNING node is stale.
         "authorizationPending": layout.needs_auth_marker.exists()
         and state.state != STATE_RUNNING,
+        "supervisor": supervisor_summary(layout),
+        # Expected False since #6359: a leftover job is what install retires.
         "watchdogJobPresent": find_watchdog_job(layout) is not None,
     }
+    if layout.adopted is not None:
+        # Only when present, so readers of the old shape see the old shape.
+        summary["adopted"] = layout.adopted.summary()
+    return summary
 
 
 def status(
@@ -1087,12 +1813,13 @@ def status(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Dict[str, Any]:
-    """Daemon, route, job, receipt, legacy — with an optional bounded wait.
+    """Daemon, route, supervisor, receipt, legacy — with an optional bounded wait.
 
     ``--wait N`` returns as soon as the daemon is running or needs
     authorization, otherwise after N seconds. The agent calls it repeatedly;
     each call stays well inside its terminal tool's timeout.
     """
+    layout = layout.pinned()
     deadline = clock() + max(0.0, float(wait_s))
     while True:
         daemon = daemon_state(layout, runner=runner)
@@ -1113,19 +1840,32 @@ def status(
             }
         except Exception as exc:  # noqa: BLE001 - status never raises
             route = {"classification": serve.CLASSIFY_UNKNOWN, "error": str(exc)[:200]}
-    return {
+    report = {
         "detect": detect().as_dict(),
         "daemon": daemon.as_dict(),
         "needsAuthorizationMarker": layout.needs_auth_marker.exists(),
-        # A marker left on a RUNNING node is stale, not a problem: only the
-        # watchdog clears it, and status is read-only. Advice must key off this,
-        # never off the bare marker, or an authorized node is told to retry.
+        # A marker left on a RUNNING node is stale, not a problem: only a
+        # daemon start clears it, and status is read-only. Advice must key off
+        # this, never off the bare marker, or an authorized node is told to retry.
         "authorizationPending": layout.needs_auth_marker.exists()
         and daemon.state != STATE_RUNNING,
+        "binaries": {
+            "present": _binaries_present(layout),
+            "path": str(layout.tailscaled),
+            "source": layout.binary_source,
+            # An old-ladder box still on the `~/bin` download: `install` moves it.
+            "movePending": bundled_binary_in_use(layout),
+        },
         "receipt": None
         if receipt is None
-        else {"argv": list(receipt.argv), "socks5": receipt.socks5, "provisioner": receipt.provisioner},
-        "script": {"path": str(layout.script_path), "present": layout.script_path.is_file()},
+        else {
+            "argv": list(receipt.argv),
+            "socks5": receipt.socks5,
+            "provisioner": receipt.provisioner,
+            **({"dial": receipt.dial} if receipt.dial else {}),
+        },
+        "supervisor": supervisor_summary(layout),
+        # The pre-#6359 cron supervisor, reported only so `install` can retire it.
         "job": None
         if job is None
         else {
@@ -1133,65 +1873,109 @@ def status(
             "name": job.get("name"),
             "schedule": job_schedule_text(job),
             "enabled": job.get("enabled", True),
-            "noAgent": bool(job.get("no_agent")),
-            "matches": job_matches(job, layout),
-            "lastRunAt": job.get("last_run_at") or job.get("last_run"),
         },
         "route": route,
         "legacy": legacy_inventory(layout, runner=runner),
         "layout": layout_summary(layout),
     }
+    if layout.adopted is not None:
+        # Cloudways' own daemon, kept, never restarted by us (#6482).
+        report["adopted"] = layout.adopted.summary()
+    return report
 
 
 # -- enable / disable / rollback ---------------------------------------------
 
 
-def stop_daemon(layout: Layout, *, runner: Optional[Runner] = None) -> Dict[str, Any]:
-    """Ask the daemon behind OUR socket to exit; never signal by name."""
+def stop_daemon(
+    layout: Layout,
+    *,
+    runner: Optional[Runner] = None,
+    kill: Optional[Callable[[int, int], None]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+) -> Dict[str, Any]:
+    """Ask the daemon behind OUR socket to exit; never signal by name.
+
+    An adopted daemon (#6482) is Cloudways' and the user's: it is never
+    signalled, whatever verb asked.
+    """
+    if layout.adopted is not None:
+        return {"daemon": "left-running", "reason": "adopted"}
     if daemon_state(layout, runner=runner).state in (STATE_ABSENT, STATE_STOPPED):
         return {"daemon": "already-stopped"}
+    kill = os.kill if kill is None else kill
+    sleep = time.sleep if sleep is None else sleep
     rc, out, err = _run(("pgrep", "-f", "--", f"--statedir={layout.state_dir}"), runner=runner, timeout_s=5.0)
     pids = [int(p) for p in out.split() if p.strip().isdigit()] if rc == 0 else []
     for pid in pids:
         try:
-            os.kill(pid, 15)
+            kill(pid, signal.SIGTERM)
         except OSError:
             pass
     for _ in range(20):
         if daemon_state(layout, runner=runner).state in (STATE_STOPPED, STATE_ABSENT):
             return {"daemon": "stopped", "pids": pids}
-        time.sleep(0.25)
+        sleep(0.25)
     return {"daemon": "still-running", "pids": pids}
 
 
-def enable(layout: Layout, *, runner: Optional[Runner] = None) -> Dict[str, Any]:
+def enable(
+    layout: Layout,
+    *,
+    runner: Optional[Runner] = None,
+    kill: Optional[Callable[[int, int], None]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+    spawn: Optional[Spawner] = None,
+) -> Dict[str, Any]:
+    """Turn runtime supervision back on and start the daemon now."""
+    layout = layout.pinned()
+    replace_logged_out_platform_daemons(layout, runner=runner, kill=kill, sleep=sleep)
     inventory = legacy_inventory(layout, runner=runner)
     refusal = refuse_if_foreign_supervisor(inventory)
     if refusal:
         return {"ok": False, "error": refusal, "legacy": inventory}
-    job = find_watchdog_job(layout)
-    if job is None:
-        return {"ok": False, "error": "no watchdog job; run install"}
-    rc, out, err = _cron(layout, "resume", str(job.get("id")), runner=runner)
-    fired = fire_watchdog_now(layout, runner=runner)
-    # Resuming the job is what `enable` promises; the immediate fire is a nudge.
-    # A run that reported no verdict (background dispatch, next scheduler tick)
-    # must not fail the verb — only a reported failure does.
+    if not _receipt_is_ours():
+        return {"ok": False, "error": "this plugin has not installed Tailscale here; run install"}
+    retired = retire_watchdog(layout, runner=runner)
+    if not retired["ok"]:
+        return {"ok": False, "error": f"old watchdog: {retired.get('error')}"}
+    write_hermes_state(layout, enabled=True)
+    started = start_daemon(layout, runner=runner, spawn=spawn, sleep=sleep)
     return {
-        "ok": rc == 0 and fired.get("verdict") != "failed",
-        "resumed": rc == 0,
-        "fired": fired,
+        "ok": started["action"] in ("started", "kept", "starting"),
+        "enabled": True,
+        "daemon": started,
+        "watchdogRetired": retired["removed"],
     }
 
 
-def disable(layout: Layout, *, runner: Optional[Runner] = None) -> Dict[str, Any]:
-    job = find_watchdog_job(layout)
-    paused = None
-    if job is not None:
-        rc, out, err = _cron(layout, "pause", str(job.get("id")), runner=runner)
-        paused = rc == 0
-    stopped = stop_daemon(layout, runner=runner)
-    return {"ok": paused is not False and stopped.get("daemon") != "still-running", "paused": paused, **stopped}
+def disable(
+    layout: Layout,
+    *,
+    runner: Optional[Runner] = None,
+    kill: Optional[Callable[[int, int], None]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+) -> Dict[str, Any]:
+    """Turn runtime supervision off, then stop the daemon.
+
+    The state goes first, or the runtime's next check would start it again.
+    An adopted daemon only loses its keepalive; it keeps running.
+    """
+    layout = layout.pinned()
+    retired = retire_watchdog(layout, runner=runner)
+    if not retired["ok"]:
+        return {"ok": False, "error": f"old watchdog: {retired.get('error')}"}
+    enabled_written = False
+    if _receipt_is_ours() or read_hermes_state(layout) is not None:
+        write_hermes_state(layout, enabled=False)
+        enabled_written = True
+    stopped = stop_daemon(layout, runner=runner, kill=kill, sleep=sleep)
+    return {
+        "ok": stopped.get("daemon") != "still-running",
+        "enabled": False if enabled_written else None,
+        "watchdogRetired": retired["removed"],
+        **stopped,
+    }
 
 
 def _raw_receipt_provisioner(path: Optional[Path]) -> Optional[str]:
@@ -1223,7 +2007,12 @@ def _same_file(candidate: str, target: Path) -> bool:
 
 
 def rollback(
-    layout: Layout, *, runner: Optional[Runner] = None, purge_identity: bool = False
+    layout: Layout,
+    *,
+    runner: Optional[Runner] = None,
+    purge_identity: bool = False,
+    kill: Optional[Callable[[int, int], None]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Undo install. Identity (`~/.tailscale` state) survives unless asked.
 
@@ -1233,13 +2022,26 @@ def rollback(
     `extensions/ocuclaw/src/setup/cloudways.ts`). A receipt somebody else
     wrote still describes a live install, so it survives — and so do the
     binaries it names, which on this layout are the same `~/bin` pair we
-    would otherwise delete out from under that install.
+    would otherwise delete out from under that install. Only that `~/bin` pair
+    is ever a target: the platform's /usr/bin pair is the image's, not ours.
     """
+    # Read once: the record goes below, and the daemon it names must still be
+    # the one this rollback leaves alone (#6482).
+    layout = layout.pinned()
+    adopted = layout.adopted
     report: Dict[str, Any] = {"ok": False}
-    job = find_watchdog_job(layout)
-    if job is not None:
-        rc, out, err = _cron(layout, "remove", str(job.get("id")), runner=runner)
-        report["jobRemoved"] = rc == 0
+    removed: List[str] = []
+    # Supervision ends before the daemon stops, or it would be started again.
+    state_path = layout.state_path
+    if remove_hermes_state(layout):
+        removed.append(str(state_path))
+    had_job = find_watchdog_job(layout) is not None
+    retired = retire_watchdog(layout, runner=runner)
+    removed += [entry for entry in retired["removed"] if not entry.startswith("cron:")]
+    if had_job:
+        report["jobRemoved"] = retired["ok"]
+    if not retired["ok"]:
+        report.setdefault("errors", []).append(retired.get("error"))
     running = daemon_state(layout, runner=runner).state == STATE_RUNNING
     if running:
         # Port-scoped `off`, never `serve reset` (the codebase's one removal form).
@@ -1249,7 +2051,7 @@ def rollback(
             timeout_s=15.0,
         )
         report["serveRouteRemoved"] = rc == 0
-    report.update(stop_daemon(layout, runner=runner))
+    report.update(stop_daemon(layout, runner=runner, kill=kill, sleep=sleep))
     receipt_path = receipts.tailscale_cli_path()
     receipt = receipts.read_tailscale_cli()
     # `read_tailscale_cli` fails soft (None for missing OR unreadable). A file
@@ -1260,13 +2062,16 @@ def rollback(
         receipt.provisioner if receipt is not None else _raw_receipt_provisioner(receipt_path)
     )
     keep_receipt = receipt_on_disk and provisioner != RECEIPT_PROVISIONER
-    keep_binaries = keep_receipt and (receipt is None or _same_file(receipt.argv[0], layout.tailscale))
-    targets: List[Path] = [layout.script_path]
+    keep_binaries = keep_receipt and (
+        receipt is None
+        or _same_file(receipt.argv[0], layout.tailscale)
+        or _same_file(receipt.argv[0], layout.bundled_tailscale)
+    )
+    targets: List[Path] = []
     if not keep_binaries:
         # The install receipt records where these binaries came from; it stays
         # with them.
-        targets += [layout.tailscale, layout.tailscaled, layout.tgz_receipt]
-    removed: List[str] = []
+        targets += [layout.bundled_tailscale, layout.bundled_tailscaled, layout.tgz_receipt]
     # A successful port-scoped teardown ends the route ownership claim too.
     # Keep the claim when teardown failed or the daemon could not be reached.
     route_receipt = receipts.managed_serve_route_path()
@@ -1293,6 +2098,25 @@ def rollback(
     pending_marker = receipts.restart_pending_path(layout.hermes_home)
     if receipts.remove_restart_pending(home=layout.hermes_home):
         removed.append(str(pending_marker))
+    if adopted is not None:
+        # The daemon, its state and its log are Cloudways' and stay. What goes
+        # is ours: the record (when we wrote it) and our markers.
+        report["daemonKept"] = adopted.summary()
+        if adopted.adopted_by == RECEIPT_PROVISIONER:
+            record_path = adoption_path()
+            if remove_adoption():
+                removed.append(str(record_path))
+        else:
+            # The other bundle adopted it and still relies on the record.
+            report["adoptionKept"] = adopted.adopted_by
+        for marker in (layout.needs_auth_marker, layout.enrollment_daemon):
+            try:
+                marker.unlink()
+                removed.append(str(marker))
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                report.setdefault("errors", []).append(f"{marker}: {exc}")
     # `~/.tailscale` holds the node key, and it is as shared as the receipt:
     # purging it while somebody else's receipt stands would de-authorize their
     # node. The identity outlives the purge in that case, and the report says so.
@@ -1308,10 +2132,25 @@ def rollback(
 
 
 __all__ = [
+    "ADOPTION_FILENAME",
+    "Adoption",
+    "adoptable_daemon",
+    "adoption_path",
+    "build_adoption_body",
+    "find_adoptable",
+    "read_adoption",
+    "receipt_body",
+    "remove_adoption",
+    "write_adoption",
+    "BINARIES_BUNDLED",
+    "BINARIES_PLATFORM",
     "DETECT_CLOUDWAYS",
     "DETECT_LIKELY",
     "DETECT_NO",
     "Layout",
+    "PLATFORM_BIN_DIR",
+    "PLATFORM_SOCKET",
+    "PLATFORM_STATE_DIR",
     "SOCKS5_LISTEN",
     "STALE_ENROLLMENT_NOTICE",
     "STATE_ABSENT",
@@ -1320,26 +2159,32 @@ __all__ = [
     "STATE_STARTING",
     "STATE_STOPPED",
     "STATE_UNKNOWN",
-    "TAILSCALE_TGZ_SHA256",
-    "TAILSCALE_TGZ_URL",
-    "TAILSCALE_VERSION",
+    "TAILSCALE_MISSING_MESSAGE",
+    "HERMES_STATE_FILENAME",
+    "SUPERVISOR_RUNTIME",
     "WATCHDOG_JOB_NAME",
-    "WATCHDOG_SCHEDULE",
     "WATCHDOG_SCRIPT_NAME",
+    "adopt_runtime_supervisor",
+    "bundled_binary_in_use",
     "daemon_state",
     "detect",
     "disable",
     "enable",
     "enroll",
     "enrollment_up_running",
-    "ensure_watchdog_job",
     "install",
     "install_binaries",
     "legacy_inventory",
-    "render_watchdog_script",
+    "move_to_platform_binary",
+    "platform_daemon_socket",
+    "replace_logged_out_platform_daemons",
     "rollback",
     "daemon_summary",
+    "read_hermes_state",
+    "retire_watchdog",
+    "start_daemon",
     "status",
+    "stop_daemon",
+    "write_hermes_state",
     "write_receipt",
-    "write_watchdog_script",
 ]

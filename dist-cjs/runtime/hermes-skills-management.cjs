@@ -91,4 +91,4 @@ const SKILLS_ERRORS                         = {
   external_target: "This proposal targets a shared external skill directory. Review it in native Hermes.",
 };
 
-module.exports = { SKILLS_OPERATIONS, SKILLS_ERRORS, skillsRequest, skillsResult };
+module.exports = { SKILLS_OPERATIONS, skillsRequest, skillsResult, SKILLS_ERRORS };

@@ -38,6 +38,16 @@ function createApprovalReplayCache(options = {}) {
     }
   }
 
+  function amend(id     , transform     ) {
+    if (typeof id !== "string" || typeof transform !== "function") return false;
+    const entry = entries.get(id.trim());
+    if (!entry) return false;
+    const next = transform(entry.frame);
+    if (typeof next !== "string" || !next) return false;
+    entry.frame = next;
+    return true;
+  }
+
   function remove(id) {
     if (typeof id !== "string") return false;
     return entries.delete(id.trim());
@@ -64,7 +74,7 @@ function createApprovalReplayCache(options = {}) {
     entries.clear();
   }
 
-  return { set, remove, activeFrames, size, clear };
+  return { set, amend, remove, activeFrames, size, clear };
 }
 
 module.exports = { createApprovalReplayCache };

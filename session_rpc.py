@@ -37,6 +37,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from .conversation_resolver import carriers_for_key, compression_ancestors, compression_tip, resolve_conversation, ConversationUnavailable
+from .control_link import LINK_MAX_LINE_BYTES
 
 from .session_writer import SharedSessionWriter
 
@@ -48,6 +49,18 @@ DENY_SOURCES: Tuple[str, ...] = ("tool", "cron", "subagent")
 # (Continue here, #2509). Mirrors ADOPTABLE_FOREIGN_SOURCES in
 # hermes-session-keys.ts and ADOPTABLE_FOREIGN_HERMES_SOURCES in SessionRoute.kt.
 ADOPTABLE_SOURCES: Tuple[str, ...] = ("desktop", "cli", "tui")
+# Hermes 0.23 runs Desktop/CLI/TUI chats in the gateway on its LOCAL route
+# (`agent:<ns>:local:dm:<id>`, stored source `local` or the surface's own name).
+# That route is the app surfaces' own, not a messaging peer, so a shared chat
+# (health.shared_chats_enabled) may adopt it; copy-only hosts never do.
+LOCAL_ROUTE_PLATFORM = "local"
+LOCAL_ROUTE_SOURCES: Tuple[str, ...] = ADOPTABLE_SOURCES + ("local",)
+
+
+def is_local_route_key(session_key: Any) -> bool:
+    """`agent:<ns>:local:<chat_type>:<id>` — a gateway-owned Desktop/CLI/TUI chat."""
+    parts = str(session_key or "").split(":")
+    return len(parts) >= 5 and parts[0] == "agent" and parts[2] == LOCAL_ROUTE_PLATFORM and bool(parts[-1])
 
 
 class NotAdoptableError(ValueError):
@@ -75,6 +88,9 @@ SEARCH_SCAN_LIMIT = 5000
 # across an entire long-lived DB (and again across every served profile).
 SEARCH_PROJECTION_MIN = 100
 SEARCH_PROJECTION_MULTIPLIER = 5
+# Rows the approval explainer's last-user-message read looks back over (#4985):
+# one turn's tool calls and results sit between the ask and the approval.
+LAST_USER_MESSAGE_SCAN = 24
 DB_METHOD_SESSIONS_LIST = "db.sessions.list"
 DB_METHOD_SESSIONS_SEARCH = "db.sessions.search"
 DB_METHOD_RESOLVE_KEY = "db.sessions.resolveKey"
@@ -108,6 +124,12 @@ SESSION_READ_STATE_PRIMITIVES: Tuple[str, ...] = (
 )
 SESSION_READ_STATE_UNSUPPORTED = "session read state unsupported on this hermes"
 
+# A cron run's session (#6422 test cleanup): ``cron_<jobId>_<YYYYmmdd>_<HHMMSS>`` on older
+# Hermes, or a session admitted by the cron owner for request ``cron:<jobId>:<executionId>``.
+_CRON_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+_CRON_RUN_SESSION = re.compile(r"cron_(.+)_\d{8}_\d{6}")
+CRON_OWNER_PRINCIPAL = "cron-owner"
+
 # Cache for session_read_state_supported(): the probe parses SCHEMA_SQL, so
 # pay it once per process. `None` = not yet computed.
 _SESSION_READ_STATE_SUPPORTED: Optional[bool] = None
@@ -121,6 +143,95 @@ def _optional_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+# Byte budget for conversational rows that cross the control link (#7327).
+# A reply over LINK_MAX_LINE_BYTES is replaced by a truncation marker and the
+# Node side rejects it (link_frame_truncated), so a count-only tail of large
+# rows lost the WHOLE history. The 64 KiB headroom covers the envelope around
+# the rows: the rpc.response keys (v/type/id/ok/sessionId/total/
+# rowIdsUnavailable) and the agent_end backend.hook ctx + sessionIdentity.
+HISTORY_BYTE_BUDGET = LINK_MAX_LINE_BYTES - 64 * 1024
+
+
+def _wire_row_bytes(message: Any) -> int:
+    """Serialized size of one row inside a link frame, plus its separator.
+
+    Same json.dumps arguments as ``control_link.encode_link_frame`` so UTF-8
+    byte counts agree. ``default=str`` and the catch-all keep the estimator
+    from raising where the old count-only slice never did: a row that cannot
+    be sized counts as over budget instead.
+    """
+    try:
+        return len(
+            json.dumps(message, separators=(",", ":"), ensure_ascii=False, default=str).encode("utf-8")
+        ) + 1
+    except Exception:  # noqa: BLE001
+        return HISTORY_BYTE_BUDGET + 1
+
+
+def _tail_within_bytes(
+    messages: List[Dict[str, Any]], limit: int, budget: Optional[int]
+) -> List[Dict[str, Any]]:
+    """Newest contiguous tail of ``messages`` within ``limit`` rows and ``budget`` bytes.
+
+    ``limit <= 0`` means no count bound and ``budget is None`` no byte bound.
+    The walk runs newest to oldest and stops at the first row that does not
+    fit, so the kept rows never have a gap. A newest row that alone exceeds
+    the budget yields ``[]``: content is never clipped here.
+    """
+    if limit > 0 and len(messages) > limit:
+        messages = messages[-limit:]
+    if budget is None:
+        return messages
+    used = 0
+    start = len(messages)
+    for index in range(len(messages) - 1, -1, -1):
+        used += _wire_row_bytes(messages[index])
+        if used > budget:
+            break
+        start = index
+    return messages[start:]
+
+
+def _head_within_bytes(
+    messages: List[Dict[str, Any]], limit: int, budget: Optional[int]
+) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """Oldest contiguous head of id-ordered ``messages`` within both bounds.
+
+    The mirror's forward page (#7379), the mirror image of
+    ``_tail_within_bytes``: the walk runs oldest to newest and stops at the
+    first row that does not fit, so the kept rows never have a gap. Returns
+    ``(rows, next_after_id)``. ``next_after_id`` is ``None`` when every row
+    was kept; otherwise it is the ``afterId`` the caller sends for the next
+    page: the last kept row's id, or, when the oldest row alone exceeds the
+    budget, that row's id, so the caller steps past a row that can never
+    cross the link instead of asking for it forever. Content is never
+    clipped here.
+    """
+    window = messages[:limit] if limit > 0 else messages
+    kept: List[Dict[str, Any]] = []
+    used = 0
+    for message in window:
+        if budget is not None:
+            used += _wire_row_bytes(message)
+            if used > budget:
+                break
+        kept.append(message)
+    if len(kept) == len(messages):
+        return kept, None
+    if kept:
+        return kept, int(kept[-1]["id"])
+    return [], int(messages[0]["id"])
+
+
+def tail_within_link_budget(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Newest contiguous rows that fit ``HISTORY_BYTE_BUDGET``.
+
+    For callers outside this module whose rows cross the control link (the
+    adapter's agent_end hook and history push, #7327). Never raises.
+    """
+    return _tail_within_bytes(list(messages or []), 0, HISTORY_BYTE_BUDGET)
 
 
 def _is_stale_schema_error(exc: BaseException) -> bool:
@@ -181,6 +292,18 @@ def _read_probe_statements() -> Tuple[str, ...]:
         for table, cols in sorted(tables.items())
     )
     return _READ_PROBE_STATEMENTS
+
+
+def _accepts_keyword(fn: Callable[..., Any], name: str) -> bool:
+    """True when ``fn`` takes keyword ``name`` (an older host's reader may not)."""
+    try:
+        parameters = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == name or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 def session_read_state_supported() -> bool:
@@ -280,6 +403,8 @@ class SessionRpc:
         self._operation_identity = None
         self._identity_warning_keys: set[Tuple[int, str, str]] = set()
         self._fts_probe_warning_emitted = False
+        # (mtime_ns, size) -> parsed profile config.yaml; see _profile_config.
+        self._profile_config_cache: Optional[Tuple[Tuple[int, int], Dict[str, Any]]] = None
 
     def _warn_identity_degrade_once(
         self, reader: Any, session_id: str, reason: str, message: str, *args: Any
@@ -459,6 +584,35 @@ class SessionRpc:
         return dict(row) if row else None
 
     @_session_operation
+    def waiting_row(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """id → the raw row plus ``_lineage_root_id`` (#4981). The waiting
+        list names its chat with the same fields the session list derives its
+        public key from (Node ``deriveHermesPublicKey``)."""
+        row = self._get_reader().get_session(str(session_id))
+        if not row:
+            return None
+        out = dict(row)
+        try:
+            out["_lineage_root_id"] = self._lineage_root_id(out)
+        except Exception:  # noqa: BLE001 - a broken chain still names the row itself
+            out["_lineage_root_id"] = out.get("id")
+        return out
+
+    @_session_operation
+    def last_user_message(self, session_id: str) -> Any:
+        """Content of the newest active user message in one transcript id, or
+        None (#4985: the approval explainer's context for a Waiting on you
+        approval). One indexed read of the session's last few rows, newest
+        first; a user turn further back than that reads as none."""
+        rows = self._get_reader().get_messages(
+            str(session_id), limit=LAST_USER_MESSAGE_SCAN, latest=True
+        )
+        for row in reversed(rows or []):
+            if row.get("role") == "user" and row.get("content"):
+                return row.get("content")
+        return None
+
+    @_session_operation
     def newest_carrier_id(self, session_key: str) -> Optional[str]:
         """Newest row id carrying a session_key (started_at DESC — hermes's
         own recovery order). A /new reset mints a FRESH row on the same
@@ -475,7 +629,11 @@ class SessionRpc:
         """Conversational rows for a transcript id (same shaping as
         chat.history: user/assistant with content, server-side tail slice) —
         the agent_end hook payload + history push source (on_session_end
-        itself carries no messages)."""
+        itself carries no messages).
+
+        Count-bounded only. ``copy_to_ocuclaw`` reads the full transcript
+        here and must keep every row, so a caller whose rows cross the
+        control link applies ``tail_within_link_budget`` itself (#7327)."""
         rows = self._conversation_rows_with_identity(str(session_id))
         messages = [
             self._conversation_row_to_wire(row)
@@ -762,6 +920,12 @@ class SessionRpc:
             wire["unread"] = bool(row.get("unread"))
         if "hidden" in row:
             wire["hidden"] = bool(row.get("hidden"))
+        # #5110: `source` is live routing state. Hermes 0.22.1 rewrites a TUI or CLI
+        # chat's source to "local" once a turn ends; `created_source` keeps the surface
+        # the chat was made on. Same `in row` gate: older hosts have no such column.
+        if "created_source" in row:
+            created = row.get("created_source")
+            wire["createdSource"] = created.strip() if isinstance(created, str) and created.strip() else None
         return wire
 
     def _list_row_visible(self, row: Dict[str, Any]) -> bool:
@@ -826,19 +990,25 @@ class SessionRpc:
             # still hold it open, and the honest answer is the row with
             # `hidden: true`, not a silent disappearance. The kwarg does not
             # exist at 0.20.0, so pass it only when the lane is supported.
-            hidden_kwargs = (
+            visibility_kwargs = (
                 {"include_hidden": True} if session_read_state_supported() else {}
             )
+            reader = self._get_reader()
+            # Same rule for a chat archived on Desktop: it leaves the picker
+            # list, but the open chat keeps its row (`sessionsGone` relies on
+            # this to tell an archive from a delete).
+            if _accepts_keyword(reader.list_sessions_rich, "include_archived"):
+                visibility_kwargs["include_archived"] = True
             # id_query is only honored on the order_by_last_active path
             # (hermes_state.py:2790-2793 — other callers pass None).
-            rows = self._get_reader().list_sessions_rich(
+            rows = reader.list_sessions_rich(
                 exclude_sources=list(DENY_SOURCES),
                 id_query=tip,
                 limit=2,
                 include_children=True,
                 order_by_last_active=True,
                 project_compression_tips=True,
-                **hidden_kwargs,
+                **visibility_kwargs,
             )
             wire = [
                 self._row_to_wire(row)
@@ -1137,15 +1307,69 @@ class SessionRpc:
         return {"deleted": deleted}
 
     @_session_operation
+    def delete_cron_job_sessions(self, job_id: str) -> Dict[str, Any]:
+        """Delete the sessions one cron job's runs made (#6422: a "See it work" test keeps no chat).
+
+        Older Hermes names a run's session ``cron_<jobId>_<YYYYmmdd>_<HHMMSS>``; newer Hermes
+        admits a ``local-<hex>`` session with request ``cron:<jobId>:<executionId>``. Each
+        lineage goes whole (compression continuations with it), and only once every session in
+        it has ended: a run still going keeps its sessions and counts in ``running``.
+        """
+        job = str(job_id or "")
+        if not _CRON_JOB_ID.fullmatch(job):
+            raise ValueError("invalid cron job id")
+        reader = self._get_reader()
+        conn = getattr(reader, "_conn", None)
+        if conn is None:
+            raise RuntimeError("session_writer_unsupported")
+        like = job.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        roots = []
+        for (sid,) in conn.execute(
+                "SELECT id FROM sessions WHERE source = 'cron' AND id LIKE ? ESCAPE '\\' ORDER BY id",
+                (f"cron\\_{like}\\_%",)).fetchall():
+            named = _CRON_RUN_SESSION.fullmatch(str(sid))
+            if named is not None and named.group(1) == job:
+                roots.append(sid)
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_admissions'").fetchone():
+            roots += [row[0] for row in conn.execute(
+                "SELECT DISTINCT target_session_id FROM session_admissions"
+                " WHERE principal_id = ? AND request_id LIKE ? ESCAPE '\\' ORDER BY target_session_id",
+                (CRON_OWNER_PRINCIPAL, f"cron:{like}:%")).fetchall()
+                if row[0] not in roots]
+        deleted: List[str] = []
+        running = 0
+        for root in roots:
+            lineage = [root]
+            # Compression continues a run in a child session; take it with its parent.
+            while len(lineage) <= 100:
+                children = [row[0] for row in conn.execute(
+                    "SELECT c.id FROM sessions c JOIN sessions p ON p.id = c.parent_session_id"
+                    " WHERE c.parent_session_id = ? AND p.end_reason = 'compression'",
+                    (lineage[-1],)).fetchall()]
+                if len(children) != 1:
+                    break
+                lineage.append(children[0])
+            rows = [reader.get_session(sid) for sid in reversed(lineage)]
+            if any(row is None for row in rows) or len(rows) > 100:
+                continue
+            if any(not row.get("ended_at") for row in rows):
+                running += 1
+                continue
+            deleted += self._get_writer().delete_conversation(
+                [dict(row) for row in rows], expected_identity=self._reader_identity)
+        return {"deleted": deleted, "running": running}
+
+    @_session_operation
     def _sync_history(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
         tip = self._resolve_target(p.get("identity"), fail_closed=True, allow_ended=True, latest_ended=True)
         rows = self._conversation_rows_with_identity(tip)
         # Conversational shaping happens HERE, before serialization: only
         # user/assistant rows with content survive, and the tail slice
-        # applies server-side so a long transcript never has to fit the
-        # 1 MiB link frame cap when the caller asked for a bounded page
-        # (Codex review W05 finding). Content stays scalar-or-block-list;
+        # applies server-side by count (the caller's `limit`, Codex review
+        # W05 finding) AND by bytes (HISTORY_BYTE_BUDGET, #7327), so the
+        # reply always fits the 1 MiB link frame cap even when a bounded
+        # page holds large rows. Content stays scalar-or-block-list;
         # the Node bridge re-shapes defensively over the same pinned shape.
         messages = [
             self._conversation_row_to_wire(row)
@@ -1178,11 +1402,26 @@ class SessionRpc:
             limit = int(p.get("limit"))
         except (TypeError, ValueError):
             limit = 0
-        if limit > 0 and len(messages) > limit:
-            messages = messages[-limit:]
+        next_after_id: Optional[int] = None
+        if after_id is not None and not row_ids_unavailable and p.get("order") == "oldest":
+            # Mirror forward page (#7379), add-only: the OLDEST rows past
+            # `afterId`, plus `nextAfterId` while rows remain, so the mirror
+            # walks forward without the gap a newest-tail page leaves when
+            # more than `limit` rows landed between two reads. Only callers
+            # that send `order` see either; every other read is unchanged.
+            messages.sort(key=lambda message: int(message["id"]))
+            messages, next_after_id = _head_within_bytes(
+                messages, limit, HISTORY_BYTE_BUDGET
+            )
+        else:
+            # Newest contiguous rows within both bounds. `total` stays the
+            # pre-slice count, so a byte cut reads as the same cut head.
+            messages = _tail_within_bytes(messages, limit, HISTORY_BYTE_BUDGET)
         result: Dict[str, Any] = {"messages": messages, "sessionId": tip, "total": total}
         if row_ids_unavailable:
             result["rowIdsUnavailable"] = True
+        if next_after_id is not None:
+            result["nextAfterId"] = next_after_id
         return result
 
     # -- Desktop→glasses mirror (#2513) --------------------------------------
@@ -1260,6 +1499,14 @@ class SessionRpc:
                     "session_rpc: SessionStore prompt-token read failed",
                     exc_info=True,
                 )
+        # A manual /compress (and gateway hygiene) sets last_prompt_tokens to
+        # 0 until the next turn reports a real figure, so the phone read "0%".
+        # Until then, Hermes' own after-compaction estimate stands in, marked.
+        if described.get("lastMessageTokenCount") == 0 and described["messageCount"] > 0:
+            estimate = self._post_compaction_estimate(tip, described["messageCount"])
+            if estimate is not None:
+                described["lastMessageTokenCount"] = estimate
+                described["lastMessageTokenCountEstimated"] = True
         # Spend belongs on the single-session read, next to the token counters
         # it sits beside conceptually. COALESCE(actual, estimated) is upstream's
         # own rule twice over: `HermesSession.displayCostUSD` in Scarf is
@@ -1270,7 +1517,98 @@ class SessionRpc:
         cost = self._coalesced_cost_usd(row)
         if cost is not None:
             described["costUsd"] = cost
+        # The window Hermes itself enforces for this session's model, when the
+        # profile config pins one. Absent (not 0) when unresolved: the relay
+        # then falls back to the models.dev catalog and its own window cache.
+        window = self._configured_context_window(row.get("model"))
+        if window is not None:
+            described["contextWindow"] = window
         return described
+
+    def _profile_config(self) -> Dict[str, Any]:
+        """This profile's raw ``config.yaml`` (beside its ``state.db``), or {}.
+
+        Profiles are isolated homes, so the file next to this reader's DB is
+        the config of the profile that owns these sessions. Re-read only when
+        the file changes: describe runs after every turn.
+        """
+        path = self._db_path.parent / "config.yaml"
+        try:
+            stat = path.stat()
+        except OSError:
+            return {}
+        stamp = (stat.st_mtime_ns, stat.st_size)
+        cached = self._profile_config_cache
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        config: Dict[str, Any] = {}
+        try:
+            from .yaml_compat import yaml
+
+            with open(path, encoding="utf-8-sig") as handle:
+                loaded = yaml.safe_load(handle)
+            if isinstance(loaded, dict):
+                config = loaded
+        except Exception:  # noqa: BLE001 - an unreadable config has no window
+            logger.debug("session_rpc: profile config read failed", exc_info=True)
+        self._profile_config_cache = (stamp, config)
+        return config
+
+    def _configured_context_window(self, session_model: Any) -> Optional[int]:
+        """Hermes' configured context window for a session's model, or None.
+
+        Config only, never the network: describe runs after every turn, and
+        Hermes' full resolver probes endpoints. Two sources, in Hermes' own
+        precedence (``get_model_context_length`` steps 0 and 0c):
+
+        1. ``model.context_length`` in the profile config;
+        2. a ``custom_providers``/``providers`` per-model ``context_length``
+           for the configured ``base_url`` (via Hermes' helper when present).
+
+        Both describe the profile's MAIN model, so they apply only when the
+        session runs on it (or has no recorded model yet).
+        """
+        config = self._profile_config()
+        model_cfg = config.get("model")
+        if isinstance(model_cfg, str):
+            model_cfg = {"default": model_cfg}
+        if not isinstance(model_cfg, dict):
+            return None
+        configured = str(
+            model_cfg.get("default") or model_cfg.get("model") or ""
+        ).strip()
+        current = str(session_model or "").strip()
+        if not configured or (current and current != configured):
+            return None
+        explicit = model_cfg.get("context_length")
+        if isinstance(explicit, int) and not isinstance(explicit, bool) and explicit > 0:
+            return explicit
+        base_url = str(model_cfg.get("base_url") or "").strip()
+        if not base_url:
+            return None
+        try:
+            from hermes_cli.config import get_custom_provider_context_length
+        except Exception:  # noqa: BLE001 - older Hermes: no per-model helper
+            return None
+        try:
+            try:
+                from hermes_cli.config import get_compatible_custom_providers
+
+                custom_providers = get_compatible_custom_providers(config)
+            except Exception:  # noqa: BLE001 - legacy list only
+                raw = config.get("custom_providers")
+                custom_providers = raw if isinstance(raw, list) else []
+            length = get_custom_provider_context_length(
+                model=configured,
+                base_url=base_url,
+                custom_providers=custom_providers,
+            )
+        except Exception:  # noqa: BLE001 - window degrades to the catalog
+            logger.debug("session_rpc: custom provider window failed", exc_info=True)
+            return None
+        if isinstance(length, int) and not isinstance(length, bool) and length > 0:
+            return length
+        return None
 
     @staticmethod
     def _coalesced_cost_usd(row: Dict[str, Any]) -> Optional[float]:
@@ -1296,11 +1634,51 @@ class SessionRpc:
     def _sync_compaction_info(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
         tip = self._resolve_target(p.get("identity"), fail_closed=True, allow_ended=True, latest_ended=True)
-        # Compaction count = compression-chain hops (map compaction.list row;
-        # in-place archive_and_compact events are invisible to a hop count —
-        # documented undercount, synthesized/medium).
-        hops = len(self._walk_compression_chain(tip)) - 1
-        return {"hops": hops}
+        # Hops: compactions that rotated the id onto a new chain segment. An
+        # in-place compaction (Hermes' default) keeps the id, so only the
+        # post_compaction ledger sees it (compaction_ledger.py). Without the
+        # hook the reply stays `{hops}`, a documented undercount.
+        chain = self._walk_compression_chain(tip)
+        hops = len(chain) - 1
+        out: Dict[str, Any] = {"hops": hops}
+        info = self._ledger_chain_info(chain)
+        if info is not None:
+            out.update(
+                compactions=hops + info["counted"],
+                exact=info["exact"],
+                live=True,
+                last=info["last"],
+            )
+        return out
+
+    def _ledger_chain_info(self, chain: List[str]) -> Optional[Dict[str, Any]]:
+        """The compaction ledger's view of a chain (ids tip first), or None
+        when this process has no post_compaction hook."""
+        from . import compaction_ledger
+
+        if not compaction_ledger.hook_registered():
+            return None
+        reader = self._get_reader()
+        rows = []
+        for session_id in chain:
+            row = reader.get_session(session_id)
+            rows.append(dict(row) if row else {"id": session_id})
+        return compaction_ledger.chain_info(self._db_path.parent, rows)
+
+    def _post_compaction_estimate(self, tip: str, message_count: int) -> Optional[int]:
+        """The newest compaction's after-token estimate, while nothing has
+        changed since: the event noted this message count and the session
+        still has it. A turn since, or an /undo, moves the count."""
+        try:
+            info = self._ledger_chain_info(self._walk_compression_chain(tip))
+        except Exception:  # noqa: BLE001 - no estimate is the honest fallback
+            logger.debug("session_rpc: compaction estimate read failed", exc_info=True)
+            return None
+        last = info["last"] if info is not None else None
+        if not last or last.get("messageCount") != message_count:
+            return None
+        after = last.get("afterTokens")
+        return after if isinstance(after, int) and after > 0 else None
 
     @_session_operation
     def copy_to_ocuclaw(
@@ -1340,8 +1718,12 @@ class SessionRpc:
     # -- Continue here (adopt) — #2509 ---------------------------------------
 
     @_session_operation
-    def resolve_adopt_source(self, identity: Any) -> Dict[str, Any]:
+    def resolve_adopt_source(self, identity: Any, *, allow_local_route: bool = False) -> Dict[str, Any]:
         """identity → the live tip of an ADOPTABLE external row.
+
+        ``allow_local_route`` (shared chats only): also adopt a Hermes 0.23
+        gateway-owned Desktop/CLI/TUI chat, whose row carries the gateway's
+        LOCAL route key instead of no key at all (``is_local_route_key``).
 
         Adoptable = a row Hermes wrote with no gateway peer (``session_key``
         NULL — Desktop/CLI/TUI, ADR-0004's external-root form) whose source
@@ -1369,9 +1751,13 @@ class SessionRpc:
             raise ValueError(f"no such session: {tip}")
         row = dict(row)
         source = str(row.get("source") or "")
-        if row.get("session_key"):
-            raise NotAdoptableError("platform_row_not_adoptable")
-        if source not in ADOPTABLE_SOURCES:
+        session_key = row.get("session_key")
+        if session_key:
+            if not (allow_local_route and is_local_route_key(session_key)):
+                raise NotAdoptableError("platform_row_not_adoptable")
+            if source not in LOCAL_ROUTE_SOURCES:
+                raise NotAdoptableError("source_not_adoptable")
+        elif source not in ADOPTABLE_SOURCES:
             raise NotAdoptableError("source_not_adoptable")
         lineage = self._walk_compression_chain(tip)
         return {
@@ -1758,6 +2144,12 @@ class ProfileSessionRpc:
     def row_by_id(self, session_id: str) -> Optional[Dict[str, Any]]:
         return self._ambient_rpc().row_by_id(session_id)
 
+    def waiting_row(self, session_id: str) -> Optional[Dict[str, Any]]:
+        return self._ambient_rpc().waiting_row(session_id)
+
+    def last_user_message(self, session_id: str) -> Any:
+        return self._ambient_rpc().last_user_message(session_id)
+
     def newest_carrier_id(self, session_key: str) -> Optional[str]:
         return self._ambient_rpc().newest_carrier_id(session_key)
 
@@ -1784,10 +2176,10 @@ class ProfileSessionRpc:
 
     # -- Continue here (adopt) — #2509: default-lane only, by contract ------
 
-    def resolve_adopt_source(self, identity: Any) -> Dict[str, Any]:
+    def resolve_adopt_source(self, identity: Any, *, allow_local_route: bool = False) -> Dict[str, Any]:
         return self._rpc_for_namespace(
             self._namespace_from_params({"identity": identity})
-        ).resolve_adopt_source(identity)
+        ).resolve_adopt_source(identity, allow_local_route=allow_local_route)
 
     def ensure_adopt_writer_supported(self, identity: Any) -> None:
         self._rpc_for_namespace(

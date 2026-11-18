@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
-const { stripAllTaggedSpans } = require("../domain/tagged-span-strip.cjs");
+const { stripReplyMarkup } = require("../domain/ui-record-family.cjs");
+const { projectOpenClawConversationHistory } = require("../domain/openclaw-conversation-history.cjs");
 const { isEvenAiSessionKey: matchesEvenAiSessionKeyGrammar } = require("../domain/even-ai-session-keys.cjs");
 const { activeBackendDisplayName, getActiveBackendKind } = require("../gateway/backend-contract.cjs");
 const { createDisplayToggleTracker } = require("./display-toggle-states.cjs");
@@ -8,7 +9,7 @@ const { decideTitleWrite, isUserOrigin } = require("./session-title-record.cjs")
 const { createDistillerBudget } = require("./session-title-distiller-budget.cjs");
 const { DEFAULT_HERMES_NAMESPACE, isAdoptableHermesSessionKey, isAdoptedHermesSessionKey, isForeignHermesSessionKey, isHermesSessionKey, parseHermesPublicKey } = require("./hermes-session-keys.cjs");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
-const { gatewaySessionKeyFor } = require("./openclaw-session-key.cjs");
+const { gatewaySessionKeyFor, relaySessionKeyFor } = require("./openclaw-session-key.cjs");
 const { buildTerminalErrorActivity } = require("../gateway/openclaw-client.cjs");
 const { GREETING_SEND_HOLD_DEADLINE_MS, createGreetingSendGate } = require("./greeting-send-gate.cjs");
 const { fixtureKeySlug, normalizeSessionListFixture, resolveSessionListFixtureView } = require("./session-list-fixture.cjs");
@@ -29,9 +30,12 @@ const NEW_SESSION_GREETING_PROMPT =
 const HERMES_NEW_SESSION_GREETING_PROMPT =
   "A new session was started via /new or /reset. Greet the user in your configured persona, if one is provided. Keep it to 1-3 sentences and ask what they want to do. Do not mention internal steps, files, tools, or reasoning.";
 
+const SESSION_STARTER_OPENING = "a new session was started via /new or /reset";
+const SESSION_STARTER_TITLE_MIN_LENGTH = 25;
+
 const NEW_SESSION_DISPATCH_ERROR_LABEL = "New session failed";
 
-function pickFirstNonEmptyString(values) {
+function pickFirstNonEmptyString(values     ) {
   for (const value of values) {
     if (typeof value === "string" && value.trim()) return value.trim();
   }
@@ -54,8 +58,8 @@ function createUnsupportedSessionKeyError(sessionKey, currentSessionKey = null) 
   return err;
 }
 
-function createSupersededSessionSwitchError(sessionKey, currentSessionKey = null) {
-  const err = new Error("session switch superseded");
+function createSupersededSessionSwitchError(sessionKey     , currentSessionKey      = null) {
+  const err      = new Error("session switch superseded");
   err.name = "SupersededSessionSwitchError";
   err.code = "session_switch_superseded";
   err.reason = "session_switch_superseded";
@@ -64,7 +68,7 @@ function createSupersededSessionSwitchError(sessionKey, currentSessionKey = null
   return err;
 }
 
-function isSupersededSessionSwitchError(err) {
+function isSupersededSessionSwitchError(err     ) {
   if (!err) return false;
   return (
     err.reason === "session_switch_superseded" ||
@@ -72,10 +76,10 @@ function isSupersededSessionSwitchError(err) {
   );
 }
 
-function caughtMessage(err) {
+function caughtMessage(err     ) {
   return err && err.message ? err.message : String(err);
 }
-function caughtCode(err) {
+function caughtCode(err     ) {
   return err && err.code ? err.code : null;
 }
 
@@ -109,7 +113,7 @@ function resolveSessionAgentCachePath(stateDir) {
   return path.join(resolvedStateDir, SESSION_AGENT_CACHE_FILE);
 }
 
-function resolveSessionAdoptCachePath(stateDir) {
+function resolveSessionAdoptCachePath(stateDir     ) {
   const resolvedStateDir = normalizeStateDir(stateDir);
   if (!resolvedStateDir) return null;
   return path.join(resolvedStateDir, SESSION_ADOPT_CACHE_FILE);
@@ -121,7 +125,7 @@ function deriveAgentIdFromFullKey(fullKey) {
   return match ? match[1] : "";
 }
 
-function deriveHermesProfileIdFromPublicKey(sessionKey) {
+function deriveHermesProfileIdFromPublicKey(sessionKey     ) {
   const parsed = parseHermesPublicKey(sessionKey);
   if (!parsed) return "";
   return parsed.namespace === DEFAULT_HERMES_NAMESPACE
@@ -129,19 +133,19 @@ function deriveHermesProfileIdFromPublicKey(sessionKey) {
     : parsed.namespace;
 }
 
-function sanitizeAssistantContentBlocks(content) {
+function sanitizeAssistantContentBlocks(content, { uiRecords = false } = {}) {
   if (typeof content === "string") {
-    return stripAllTaggedSpans(content);
+    return stripReplyMarkup(content, { uiRecords });
   }
   if (!Array.isArray(content)) return content;
   return content.map((block) =>
     block && block.type === "text" && typeof block.text === "string"
-      ? { ...block, text: stripAllTaggedSpans(block.text) }
+      ? { ...block, text: stripReplyMarkup(block.text, { uiRecords }) }
       : block,
   );
 }
 
-function stableChatHistoryRowId(message) {
+function stableChatHistoryRowId(message     ) {
   if (!message || typeof message !== "object") return null;
   const messageId = stableIdentityScalar(message.messageId);
   if (messageId !== null) {
@@ -161,20 +165,20 @@ function stableChatHistoryRowId(message) {
   return null;
 }
 
-function stableIdentityScalar(value) {
+function stableIdentityScalar(value     ) {
   if (typeof value === "string" && value.trim()) return value;
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
   return null;
 }
 
-function summarizeChatHistoryIdentity(messages) {
+function summarizeChatHistoryIdentity(messages     ) {
   const rows = Array.isArray(messages) ? messages : [];
   const conversationalRows = rows.filter(
     (message) =>
       message &&
       (message.role === "user" || message.role === "assistant"),
   );
-  const fieldCounts = {};
+  const fieldCounts      = {};
   let rowsWithStableId = 0;
   for (const row of conversationalRows) {
     const identity = stableChatHistoryRowId(row);
@@ -226,7 +230,12 @@ function createSessionService(opts = {}) {
     deadlineMs: greetingHoldDeadlineMs,
     preempt: greetingPreemptEnabled ? preemptGreetingForEarlyAsk : null,
     isGreetingLive: isGreetingRunLive,
-    onRelease({ sessionKey, reason, heldMs, heldSends, preempted, deadlineExtensions }) {
+    onRetry({ sessionKey, attempt, delayMs, error }     ) {
+      logger.warn(
+        `[relay] New-session greeting send refused, retrying: sessionKey=${sessionKey} attempt=${attempt} delayMs=${delayMs} error=${error && error.message ? error.message : error}`,
+      );
+    },
+    onRelease({ sessionKey, reason, heldMs, heldSends, preempted, deadlineExtensions }     ) {
       const severity =
         reason === "greeting_end" || reason === "greeting_aborted"
           ? "info"
@@ -273,6 +282,15 @@ function createSessionService(opts = {}) {
     typeof opts.getDefaultAgentId === "function"
       ? opts.getDefaultAgentId
       : () => "";
+
+  const agentPrimaryModelOpt = (opts                                      )
+    .getAgentPrimaryModel;
+  const getAgentPrimaryModel =
+    typeof agentPrimaryModelOpt === "function"
+      ? agentPrimaryModelOpt
+      : () => null;
+
+  let gatewayDefaultModelRef                                                                = null;
   const isUpstreamConnected =
     typeof opts.isUpstreamConnected === "function"
       ? opts.isUpstreamConnected
@@ -302,13 +320,13 @@ function createSessionService(opts = {}) {
       ? opts.isPinnedFirstUserMessageKey
       : null;
 
-  let currentSessionKey = null;
+  let currentSessionKey      = null;
 
   let sessionSelectionGeneration = 0;
 
   let pendingSessionListKey = null;
 
-  let unmaterializedDraftSessionKey = null;
+  let unmaterializedDraftSessionKey      = null;
   const inFlightDraftSessionSendCounts = new Map();
   let lastGeneratedSessionTimestamp = 0;
   const DEFAULT_SESSION_KEY_PREFIX =
@@ -367,14 +385,21 @@ function createSessionService(opts = {}) {
   const fixtureFakeSessionKeys = new Set();
 
   const sessionModelConfigCache = new Map();
+
+  const hermesReasoningByNamespace = new Map();
+
+  const openclawReasoningBySession = new Map();
   const sessionModelConfigOperations = new Map();
 
-  function queueSessionModelConfig(sessionKey, operation) {
-    const previous = sessionModelConfigOperations.get(sessionKey) || Promise.resolve();
-    const pending = previous.catch(() => {}).then(operation);
-    sessionModelConfigOperations.set(sessionKey, pending);
+  function queueSessionModelConfig(sessionKey     , operation                                      ) {
+    const identity = gatewayBridge?.kind === "hermes" ? parseHermesPublicKey(sessionKey) : null;
+    const openclawOwner = gatewayBridge?.kind === "openclaw" ? openClawSessionIdentity(sessionKey) : null;
+    const queueKey = openclawOwner || (identity?.kind === "minted" ? `hermes-profile:${identity.namespace}` : sessionKey);
+    const previous = sessionModelConfigOperations.get(queueKey) || Promise.resolve();
+    const pending = previous.catch(() => {}).then(() => operation(openclawOwner));
+    sessionModelConfigOperations.set(queueKey, pending);
     const cleanup = () => {
-      if (sessionModelConfigOperations.get(sessionKey) === pending) sessionModelConfigOperations.delete(sessionKey);
+      if (sessionModelConfigOperations.get(queueKey) === pending) sessionModelConfigOperations.delete(queueKey);
     };
     pending.then(cleanup, cleanup);
     return pending;
@@ -400,7 +425,7 @@ function createSessionService(opts = {}) {
 
   const sessionTitleByKey = loadSessionTitleCache();
 
-  let openClawAutoLabelSupported = null;
+  let openClawAutoLabelSupported      = null;
 
   const autoTitleReconciledKeys = new Set();
 
@@ -532,6 +557,7 @@ function createSessionService(opts = {}) {
       normalized === "medium" ||
       normalized === "high" ||
       normalized === "xhigh" ||
+      normalized === "adaptive" ||
       normalized === "max" ||
       normalized === "ultra"
     ) {
@@ -543,10 +569,46 @@ function createSessionService(opts = {}) {
   function normalizeReasoningLevel(raw) {
     if (typeof raw !== "string") return "off";
     const normalized = raw.trim().toLowerCase();
-    if (normalized === "on.full" || normalized === "full") return "on.full";
-    if (normalized === "stream") return "on";
+    if (normalized === "on.full" || normalized === "full" || normalized === "stream") return "on.full";
     if (normalized === "on") return "on";
     return "off";
+  }
+
+  function observedOpenClawReasoningLevel(raw         )                {
+    if (typeof raw !== "string") return null;
+    const normalized = raw.trim().toLowerCase();
+    if (normalized === "stream" || normalized === "on.full") return "on.full";
+    return normalized === "off" || normalized === "on" ? normalized : null;
+  }
+
+  function observeOpenClawReasoning(sessionKey         , raw         ) {
+    const level = observedOpenClawReasoningLevel(raw);
+    const key = openClawSessionIdentity(sessionKey);
+    if (gatewayBridge?.kind === "openclaw" && key && level) {
+      openclawReasoningBySession.set(key, level);
+    }
+    return level;
+  }
+
+  function openClawSessionIdentity(rawKey         )         {
+    const key = typeof rawKey === "string" ? rawKey.trim() : "";
+    if (!key) return "";
+    const bareKey = relaySessionKeyFor(key);
+    const nativeDefaults = typeof gatewayBridge?.getSessionDefaults === "function"
+      ? gatewayBridge.getSessionDefaults() : null;
+    const nativeDefaultOwner = typeof nativeDefaults?.defaultAgentId === "string"
+      ? nativeDefaults.defaultAgentId.trim() : "";
+    const owner = deriveAgentIdFromFullKey(key) || getSessionAgentId(bareKey, key) || nativeDefaultOwner || "main";
+    return `agent:${owner}:${bareKey}`.toLowerCase();
+  }
+
+  function openClawReceiptMatchesOwner(rawKey         , ownerKey               )          {
+    const key = typeof rawKey === "string" ? rawKey.trim() : "";
+    if (!key || !ownerKey) return false;
+
+    return deriveAgentIdFromFullKey(key)
+      ? openClawSessionIdentity(key) === ownerKey
+      : key.toLowerCase() === relaySessionKeyFor(ownerKey);
   }
 
   function normalizeVerboseLevel(raw) {
@@ -574,7 +636,8 @@ function createSessionService(opts = {}) {
         : null;
     let model =
       typeof modelRaw === "string" && modelRaw.trim() ? modelRaw.trim() : null;
-    if (model && model.includes("/")) {
+
+    if (!modelProvider && model && model.includes("/")) {
       const slashIdx = model.indexOf("/");
       const splitProvider = model.slice(0, slashIdx).trim();
       const splitModel = model.slice(slashIdx + 1).trim();
@@ -587,11 +650,19 @@ function createSessionService(opts = {}) {
     };
   }
 
-  function buildSessionModelConfig(sessionKey, row) {
-    const normalized = normalizeSessionModelRef(
+  function buildSessionModelConfig(sessionKey, row, ownerKey = sessionKey) {
+    const reported = normalizeSessionModelRef(
       row && row.modelProvider,
       row && row.model,
     );
+
+    const normalized = reported.model
+      ? reported
+      : openClawFallbackModelRef(sessionKey) || reported;
+    const effectiveAgentId = sessionEffectiveAgentId(sessionKey);
+    const openclawReasoning = gatewayBridge?.kind === "openclaw"
+      ? observeOpenClawReasoning(ownerKey, row?.reasoningLevel) || peekSessionReasoningLevel(ownerKey)
+      : null;
     return {
       sessionKey,
       modelProvider: normalized.modelProvider,
@@ -603,7 +674,7 @@ function createSessionService(opts = {}) {
       effectiveThinkingLevel: normalizeThinkingLevel(
         row && (row.effectiveThinkingLevel || row.thinkingLevel || row.thinkingDefault),
       ),
-      reasoningLevel: normalizeReasoningLevel(row && row.reasoningLevel),
+      reasoningLevel: openclawReasoning || normalizeReasoningLevel(row && row.reasoningLevel),
       verboseLevel: normalizeVerboseLevel(row && row.verboseLevel),
       fastMode: !!(row && row.fastMode === true),
 
@@ -613,17 +684,19 @@ function createSessionService(opts = {}) {
       elevatedLevel: normalizeElevatedLevel(row && row.elevatedLevel),
 
       agentId: sessionAgentSelectorId(sessionKey),
+
+      ...(effectiveAgentId ? { effectiveAgentId } : {}),
     };
   }
 
-  function sessionThinkingOptions(row) {
+  function sessionThinkingOptions(row     ) {
     const levels = Array.isArray(row?.thinkingLevels)
-      ? row.thinkingLevels.map((level) => typeof level === "string" ? level : level?.id)
+      ? row.thinkingLevels.map((level     ) => typeof level === "string" ? level : level?.id)
       : Array.isArray(row?.thinkingOptions) ? row.thinkingOptions : null;
     if (levels === null) return {};
-    return { thinkingLevels: [...new Set(levels.filter((level) =>
-      typeof level === "string" && /^(off|minimal|low|medium|high|xhigh|max|ultra)$/.test(level.trim()),
-    ).map((level) => level.trim()))] };
+    return { thinkingLevels: [...new Set(levels.filter((level     ) =>
+      typeof level === "string" && /^(off|minimal|low|medium|high|xhigh|adaptive|max|ultra)$/.test(level.trim()),
+    ).map((level     ) => level.trim()))] };
   }
 
   function listSessionsBySearch(search) {
@@ -663,38 +736,44 @@ function createSessionService(opts = {}) {
     return hasSupportedSessionKeyPrefix(shortKey) ? shortKey : "";
   }
 
-  function findBestSessionRow(rows, targetKey, canonicalKey) {
+  function findBestSessionRow(rows, targetKey, canonicalKey, ownerKey                = null) {
     if (!Array.isArray(rows) || rows.length === 0) return null;
+    const isOpenClaw = gatewayBridge?.kind === "openclaw";
+    const wanted = isOpenClaw ? ownerKey || openClawSessionIdentity(canonicalKey || targetKey) : "";
+
+    const candidateRows = isOpenClaw
+      ? rows.filter(row => row && openClawSessionIdentity(row.key) === wanted) : rows;
     const targetShort = extractShortKey(targetKey || "");
     const canonicalShort = extractShortKey(canonicalKey || "");
 
-    const fullCanonicalMatch = rows.find((row) => {
+    const fullCanonicalMatch = candidateRows.find((row) => {
       return row && typeof row.key === "string" && canonicalKey && row.key === canonicalKey;
     });
     if (fullCanonicalMatch) return fullCanonicalMatch;
 
-    const shortCanonicalMatch = rows.find((row) => {
+    const shortCanonicalMatch = candidateRows.find((row) => {
       if (!row || typeof row.key !== "string") return false;
       return canonicalShort && extractShortKey(row.key) === canonicalShort;
     });
     if (shortCanonicalMatch) return shortCanonicalMatch;
 
     return (
-      rows.find((row) => {
+      candidateRows.find((row) => {
         if (!row || typeof row.key !== "string") return false;
         return targetShort && extractShortKey(row.key) === targetShort;
       }) || null
     );
   }
 
-  async function fetchCurrentSessionRow(sessionKey) {
+  async function fetchCurrentSessionRow(sessionKey, ownerKey                = null) {
     const canonicalKey = await resolveSessionCanonicalKey(sessionKey);
     const firstResult = await listSessionsBySearch(sessionKey);
+    observeGatewaySessionDefaults(firstResult);
     const firstRows =
       firstResult && Array.isArray(firstResult.sessions)
         ? firstResult.sessions
         : [];
-    const firstMatch = findBestSessionRow(firstRows, sessionKey, canonicalKey);
+    const firstMatch = findBestSessionRow(firstRows, sessionKey, canonicalKey, ownerKey);
     if (firstMatch) {
       return { row: firstMatch, canonicalKey };
     }
@@ -704,12 +783,47 @@ function createSessionService(opts = {}) {
       secondResult && Array.isArray(secondResult.sessions)
         ? secondResult.sessions
         : [];
-    const secondMatch = findBestSessionRow(secondRows, sessionKey, canonicalKey);
+    const secondMatch = findBestSessionRow(secondRows, sessionKey, canonicalKey, ownerKey);
     return { row: secondMatch, canonicalKey };
   }
 
   function cachedSessionModelConfig(sessionKey) {
-    return sessionModelConfigCache.get(sessionKey) || buildSessionModelConfig(sessionKey, null);
+    const cached = sessionModelConfigCache.get(sessionKey) || buildSessionModelConfig(sessionKey, null);
+    const observed = peekSessionReasoningLevel(sessionKey);
+    if (gatewayBridge?.kind === "openclaw") return { ...cached, reasoningLevel: observed || "off" };
+    return observed ? { ...cached, reasoningLevel: observed } : cached;
+  }
+
+  function peekSessionReasoningLevel(sessionKey     )                {
+    if (gatewayBridge?.kind === "hermes") {
+      const identity = parseHermesPublicKey(sessionKey);
+      return identity?.kind === "minted"
+        ? hermesReasoningByNamespace.get(identity.namespace) || null : null;
+    }
+    if (gatewayBridge?.kind === "openclaw") {
+      return openclawReasoningBySession.get(openClawSessionIdentity(sessionKey)) || null;
+    }
+    const wanted = normalizeSessionKeyForCompare(sessionKey);
+    if (!wanted) return null;
+    for (const [key, config] of sessionModelConfigCache                 ) {
+      if (normalizeSessionKeyForCompare(key) === wanted) return (config && config.reasoningLevel) || null;
+    }
+    return null;
+  }
+
+  function observeHermesReasoning(sessionKey        , level                    ) {
+    const identity = parseHermesPublicKey(sessionKey);
+    if (gatewayBridge?.kind !== "hermes" || identity?.kind !== "minted" ||
+      (level !== "off" && level !== "on")) return;
+    hermesReasoningByNamespace.set(identity.namespace, level);
+    for (const [key, config] of sessionModelConfigCache) {
+      const other = parseHermesPublicKey(key);
+      if (other?.kind === "minted" && other.namespace === identity.namespace) {
+        const next = { ...config, reasoningLevel: level };
+        sessionModelConfigCache.set(key, next);
+        notifySessionModelConfigIfCurrent(key, next);
+      }
+    }
   }
 
   function primeSessionModelConfig(sessionKey, patch) {
@@ -725,6 +839,7 @@ function createSessionService(opts = {}) {
     const modelChanged = normalizedModel.modelProvider !== base.modelProvider ||
       normalizedModel.model !== base.model;
     const hasThinking = Object.prototype.hasOwnProperty.call(patch || {}, "thinkingLevel");
+    const effectiveAgentId = sessionEffectiveAgentId(sessionKey);
     const config = {
       sessionKey,
       modelProvider: normalizedModel.modelProvider,
@@ -764,17 +879,19 @@ function createSessionService(opts = {}) {
           : base.elevatedLevel,
 
       agentId: sessionAgentSelectorId(sessionKey),
+      ...(effectiveAgentId ? { effectiveAgentId } : {}),
     };
     sessionModelConfigCache.set(sessionKey, config);
     return config;
   }
 
   function notifySessionModelConfigIfCurrent(sessionKey, config) {
-    if (
-      onSessionModelConfig &&
-      normalizeSessionKeyForCompare(sessionKey) ===
-        normalizeSessionKeyForCompare(ensureSessionKey())
-    ) {
+    if (!onSessionModelConfig) return;
+    const currentSession = ensureSessionKey();
+    const isCurrent = gatewayBridge?.kind === "openclaw"
+      ? openClawSessionIdentity(sessionKey) === openClawSessionIdentity(currentSession)
+      : normalizeSessionKeyForCompare(sessionKey) === normalizeSessionKeyForCompare(currentSession);
+    if (isCurrent) {
       onSessionModelConfig(config);
     }
   }
@@ -793,40 +910,71 @@ function createSessionService(opts = {}) {
   }
 
   function getSessionModelConfig(sessionKey = ensureSessionKey()) {
-    return queueSessionModelConfig(sessionKey, () => readSessionModelConfig(sessionKey));
+    return queueSessionModelConfig(sessionKey, (ownerKey) => readSessionModelConfig(sessionKey, ownerKey));
   }
 
-  async function readSessionModelConfig(sessionKey) {
+  async function readSessionModelConfig(sessionKey     , ownerKey                = null) {
+    const ownerChanged = () => ownerKey && ownerKey !== openClawSessionIdentity(sessionKey);
+    if (ownerChanged()) return cachedSessionModelConfig(sessionKey);
     if (!isUpstreamConnected()) {
       return cachedSessionModelConfig(sessionKey);
     }
     try {
-      const resolved = await fetchCurrentSessionRow(sessionKey);
+      const resolved = await fetchCurrentSessionRow(sessionKey, ownerKey);
+      if (ownerChanged()) return cachedSessionModelConfig(sessionKey);
       const row = resolved && resolved.row ? resolved.row : null;
+      const identity = parseHermesPublicKey(sessionKey);
+      let profile = null;
+      if (gatewayBridge.kind === "hermes" && identity?.kind === "minted" &&
+        typeof getOcuClawProfileOptions === "function") {
+        try {
+          const response = await getOcuClawProfileOptions({ sessionKey });
+          if (response && (!response.status || response.status === "accepted")) profile = response;
+        } catch {
+
+        }
+      }
       if (!row) {
 
-        const identity = parseHermesPublicKey(sessionKey);
-        if (
-          gatewayBridge.kind === "hermes" && identity?.kind === "minted" &&
-          typeof getOcuClawProfileOptions === "function"
-        ) {
-          const profile = await getOcuClawProfileOptions({ sessionKey });
-          if (
-            profile && (!profile.status || profile.status === "accepted") &&
-            (profile.reasoningLevel === "on" || profile.reasoningLevel === "off")
-          ) {
+        if (profile) {
+          if (profile && (!profile.status || profile.status === "accepted")) {
+            const cached = cachedSessionModelConfig(sessionKey);
+            const defaultModel = normalizeSessionModelRef(null, profile.defaultModel);
             const config = {
-              ...cachedSessionModelConfig(sessionKey),
-              reasoningLevel: profile.reasoningLevel,
+              ...cached,
+
+              ...(!cached.model && defaultModel.model ? defaultModel : {}),
+              ...(profile.reasoningLevel === "on" || profile.reasoningLevel === "off"
+                ? { reasoningLevel: profile.reasoningLevel } : {}),
             };
+            observeHermesReasoning(sessionKey, profile.reasoningLevel);
             sessionModelConfigCache.set(sessionKey, config);
             notifySessionModelConfigIfCurrent(sessionKey, config);
             return config;
           }
         }
-        return cachedSessionModelConfig(sessionKey);
+        const cached = cachedSessionModelConfig(sessionKey);
+
+        const fallback = cached.model ? null : openClawFallbackModelRef(sessionKey);
+        if (fallback) {
+          const config = { ...cached, ...fallback };
+          sessionModelConfigCache.set(sessionKey, config);
+          notifySessionModelConfigIfCurrent(sessionKey, config);
+          return config;
+        }
+        return cached;
       }
-      const config = buildSessionModelConfig(sessionKey, row);
+      const config = buildSessionModelConfig(sessionKey, row, ownerKey || sessionKey);
+      const resolvedReasoning = profile?.reasoningLevel === "on" || profile?.reasoningLevel === "off"
+        ? profile.reasoningLevel : row.reasoningLevel;
+      observeHermesReasoning(sessionKey, resolvedReasoning);
+      const observedReasoning = peekSessionReasoningLevel(sessionKey);
+      if (gatewayBridge.kind === "hermes" && observedReasoning) {
+        config.reasoningLevel = observedReasoning;
+      } else if (gatewayBridge.kind === "hermes" && config.reasoningLevel === "on.full") {
+
+        config.reasoningLevel = "on";
+      }
       sessionModelConfigCache.set(sessionKey, config);
       notifySessionModelConfigIfCurrent(sessionKey, config);
       return config;
@@ -848,9 +996,9 @@ function createSessionService(opts = {}) {
     return getSessionModelConfig(ensureSessionKey());
   }
 
-  function setSessionModelConfig(sessionKey = ensureSessionKey(), patch, options = {}) {
+  function setSessionModelConfig(sessionKey = ensureSessionKey(), patch     , options = {}) {
     const write = () =>
-      queueSessionModelConfig(sessionKey, () => writeSessionModelConfig(sessionKey, patch, options));
+      queueSessionModelConfig(sessionKey, (ownerKey) => writeSessionModelConfig(sessionKey, patch, options, ownerKey));
     if (!options || Reflect.get(options, "initial") !== true ||
       !pendingInitialConfigSessionKeys.has(sessionKey)) {
       return write();
@@ -858,7 +1006,7 @@ function createSessionService(opts = {}) {
 
     const inFlight = initialSeedInFlight.get(sessionKey);
     if (inFlight) {
-      return inFlight.then((result) =>
+      return inFlight.then((result     ) =>
         result && result.status === "accepted" ? result : write());
     }
     const pending = write();
@@ -870,13 +1018,14 @@ function createSessionService(opts = {}) {
     return pending;
   }
 
-  function readBackSessionModelConfigLater(sessionKey, writeGeneration, seededConfig) {
+  function readBackSessionModelConfigLater(sessionKey     , writeGeneration     , seededConfig     , ownerKey                = null) {
     Promise.resolve()
-      .then(() => fetchCurrentSessionRow(sessionKey))
-      .then((resolved) => {
+      .then(() => fetchCurrentSessionRow(sessionKey, ownerKey))
+      .then((resolved     ) => {
         if (!resolved || !resolved.row) return;
-        if (sessionModelConfigWriteGeneration.get(sessionKey) !== writeGeneration) return;
-        const next = buildSessionModelConfig(sessionKey, resolved.row);
+        if (ownerKey && ownerKey !== openClawSessionIdentity(sessionKey)) return;
+        if (sessionModelConfigWriteGeneration.get(ownerKey || sessionKey) !== writeGeneration) return;
+        const next = buildSessionModelConfig(sessionKey, resolved.row, ownerKey || sessionKey);
         const current = sessionModelConfigCache.get(sessionKey) || seededConfig;
         sessionModelConfigCache.set(sessionKey, next);
         if (JSON.stringify(next) !== JSON.stringify(current)) {
@@ -892,7 +1041,11 @@ function createSessionService(opts = {}) {
     sessionKey = ensureSessionKey(),
     patch,
     options = {},
+    ownerKey                = null,
   ) {
+    const ownerChanged = () => ownerKey && ownerKey !== openClawSessionIdentity(sessionKey);
+    const ownerChangedResult = () => ({ status: "rejected", error: "OpenClaw session owner changed during config write" });
+    if (ownerChanged()) return ownerChangedResult();
     const hasHostPatch = isHostSessionModelPatch(patch);
 
     if (!hasHostPatch) {
@@ -909,8 +1062,9 @@ function createSessionService(opts = {}) {
       };
     }
 
-    const writeGeneration = (sessionModelConfigWriteGeneration.get(sessionKey) || 0) + 1;
-    sessionModelConfigWriteGeneration.set(sessionKey, writeGeneration);
+    const generationKey = ownerKey || sessionKey;
+    const writeGeneration = (sessionModelConfigWriteGeneration.get(generationKey) || 0) + 1;
+    sessionModelConfigWriteGeneration.set(generationKey, writeGeneration);
 
     const freshInitialSeed =
       !!options &&
@@ -919,13 +1073,15 @@ function createSessionService(opts = {}) {
       gatewayBridge.kind === "openclaw" &&
       getActiveBackendKind() !== "hermes";
     let canonicalKey = await resolveSessionCanonicalKey(sessionKey);
+    if (ownerChanged()) return ownerChangedResult();
     if (hasSupportedSessionKeyPrefix(sessionKey) && !freshInitialSeed) {
-      const resolved = await fetchCurrentSessionRow(sessionKey);
+      const resolved = await fetchCurrentSessionRow(sessionKey, ownerKey);
+      if (ownerChanged()) return ownerChangedResult();
       const row = resolved && resolved.row ? resolved.row : null;
       if (row && typeof row.key === "string" && row.key.trim()) {
         canonicalKey = row.key.trim();
         if (gatewayBridge.kind === "openclaw") {
-          sessionModelConfigCache.set(sessionKey, buildSessionModelConfig(sessionKey, row));
+          sessionModelConfigCache.set(sessionKey, buildSessionModelConfig(sessionKey, row, ownerKey || sessionKey));
         }
       }
     }
@@ -981,12 +1137,19 @@ function createSessionService(opts = {}) {
       try {
         result = await gatewayBridge.request("sessions.patch", request);
       } catch (err) {
+        if (ownerChanged()) return ownerChangedResult();
         const rejection = /^thinkingLevel "minimal" is not supported for \S+ \(use ([a-z|]+)\)$/.exec(caughtMessage(err));
         const supported = rejection ? rejection[1].split("|") : [];
         if (gatewayBridge.kind !== "openclaw" || request.thinkingLevel !== "minimal" ||
           !supported.includes("low") || supported.includes("minimal")) throw err;
         request.thinkingLevel = "low";
         result = await gatewayBridge.request("sessions.patch", request);
+      }
+      if (ownerChanged()) {
+        if (result?.entry && openClawReceiptMatchesOwner(result.key, ownerKey)) {
+          observeOpenClawReasoning(ownerKey, result.entry.reasoningLevel);
+        }
+        return ownerChangedResult();
       }
 
       let primePatch = Object.prototype.hasOwnProperty.call(request, "thinkingLevel")
@@ -998,6 +1161,13 @@ function createSessionService(opts = {}) {
         typeof result.applied === "object"
           ? result.applied
           : null;
+      if (gatewayBridge.kind === "hermes" && Object.prototype.hasOwnProperty.call(request, "reasoningLevel")) {
+        if (!applied || (applied.reasoningLevel !== "on" && applied.reasoningLevel !== "off")) {
+          throw new Error("Hermes reasoning visibility was not confirmed");
+        }
+        primePatch = { ...primePatch, reasoningLevel: applied.reasoningLevel };
+        observeHermesReasoning(sessionKey, applied.reasoningLevel);
+      }
       if (applied && typeof applied.model === "string" && applied.model.trim()) {
         const appliedProvider =
           typeof applied.provider === "string" && applied.provider.trim()
@@ -1010,11 +1180,39 @@ function createSessionService(opts = {}) {
             : applied.model.trim(),
         };
       }
+      let openclawReadback      = null;
+      let reasoningConfirmationError                = null;
+      const matchingOpenclawReceipt = gatewayBridge.kind === "openclaw" && result?.entry &&
+        openClawReceiptMatchesOwner(result.key, ownerKey || openClawSessionIdentity(request.key));
+      if (gatewayBridge.kind === "openclaw" && Object.prototype.hasOwnProperty.call(request, "reasoningLevel")) {
+        let confirmed = matchingOpenclawReceipt
+          ? observedOpenClawReasoningLevel(result.entry.reasoningLevel) : null;
+        if (!confirmed) {
+          try {
+            openclawReadback = await fetchCurrentSessionRow(sessionKey, ownerKey);
+            if (ownerChanged()) return ownerChangedResult();
+            confirmed = observedOpenClawReasoningLevel(openclawReadback?.row?.reasoningLevel);
+          } catch {
+
+          }
+        }
+        if (ownerChanged()) return ownerChangedResult();
+
+        primePatch = { ...primePatch };
+        delete primePatch.reasoningLevel;
+        delete primePatch.reasoningEnabled;
+        if (confirmed) {
+          primePatch.reasoningLevel = confirmed;
+          observeOpenClawReasoning(ownerKey || sessionKey, confirmed);
+        }
+        if (!confirmed || confirmed !== request.reasoningLevel) {
+          reasoningConfirmationError = "OpenClaw reasoning visibility could not be confirmed";
+        }
+      }
       let config = primeSessionModelConfig(sessionKey, primePatch);
       if (gatewayBridge.kind === "openclaw") {
 
-        if (result?.entry && result?.resolved && typeof result.key === "string" &&
-          normalizeSessionKeyForCompare(result.key) === normalizeSessionKeyForCompare(canonicalKey)) {
+        if (matchingOpenclawReceipt && result?.resolved) {
           const resolvedModel = normalizeSessionModelRef(result.resolved.modelProvider, result.resolved.model);
           if (resolvedModel.model && resolvedModel.modelProvider) {
             const modelChanged = resolvedModel.model !== config.model || resolvedModel.modelProvider !== config.modelProvider;
@@ -1023,28 +1221,36 @@ function createSessionService(opts = {}) {
               ...resolvedModel,
               thinkingLevel: result.entry.thinkingLevel || "",
               effectiveThinkingLevel: result.entry.thinkingLevel || (!modelChanged ? config.thinkingDefault || "" : ""),
-              reasoningLevel: result.entry.reasoningLevel ?? config.reasoningLevel,
+              reasoningLevel: observedOpenClawReasoningLevel(result.entry.reasoningLevel),
               verboseLevel: result.entry.verboseLevel ?? config.verboseLevel,
               fastMode: result.entry.fastMode ?? config.fastMode,
               elevatedLevel: result.entry.elevatedLevel ?? config.elevatedLevel,
-            });
+            }, ownerKey || sessionKey);
           }
         }
 
-        if (freshInitialSeed) {
-          readBackSessionModelConfigLater(sessionKey, writeGeneration, config);
+        if (freshInitialSeed && !openclawReadback) {
+          readBackSessionModelConfigLater(sessionKey, writeGeneration, config, ownerKey);
         } else {
           try {
-            const resolved = await fetchCurrentSessionRow(sessionKey);
-            if (resolved?.row) config = buildSessionModelConfig(sessionKey, resolved.row);
+            const resolved = openclawReadback || await fetchCurrentSessionRow(sessionKey, ownerKey);
+            if (ownerChanged()) return ownerChangedResult();
+            if (resolved?.row) config = buildSessionModelConfig(sessionKey, resolved.row, ownerKey || sessionKey);
           } catch {
 
           }
         }
+        if (ownerChanged()) return ownerChangedResult();
         sessionModelConfigCache.set(sessionKey, config);
       }
       notifySessionModelConfigIfCurrent(sessionKey, config);
-      pendingInitialConfigSessionKeys.delete(sessionKey);
+      if (reasoningConfirmationError) {
+        return { status: "rejected", error: reasoningConfirmationError, config };
+      }
+
+      if (!options || Reflect.get(options, "keepPendingInitial") !== true) {
+        pendingInitialConfigSessionKeys.delete(sessionKey);
+      }
       return { status: "accepted", config };
     } catch (err) {
       emitDebug(
@@ -1122,6 +1328,7 @@ function createSessionService(opts = {}) {
             ...adoptedOriginFields(key),
             activityDescription: rowActivityDescription(row),
             ...rowViewStateFields(row),
+            ...foreignRowSourceFields(key, row),
           };
         }),
       );
@@ -1321,19 +1528,25 @@ function createSessionService(opts = {}) {
     return out;
   }
 
-  function rowActivityDescription(row) {
+  function rowActivityDescription(row     ) {
     const value = row && row.lastActivityDescription;
     return typeof value === "string" && value.trim() ? value.trim() : null;
   }
 
-  function rowViewStateFields(row) {
-    const fields = {};
+  function rowViewStateFields(row     ) {
+    const fields      = {};
     if (row && row.agentStatus && typeof row.agentStatus === "object") {
       fields.agentStatus = row.agentStatus;
     }
     if (row && typeof row.unread === "boolean") fields.unread = row.unread;
     if (row && typeof row.hidden === "boolean") fields.hidden = row.hidden;
     return fields;
+  }
+
+  function foreignRowSourceFields(key     , row     ) {
+    if (!isForeignHermesSessionKey(key)) return {};
+    const source = row && typeof row.source === "string" ? row.source.trim() : "";
+    return source ? { source } : {};
   }
 
   async function getSessionsByExactKeys(sessionKeys) {
@@ -1407,6 +1620,7 @@ function createSessionService(opts = {}) {
         ...adoptedOriginFields(key),
         activityDescription: rowActivityDescription(row),
         ...rowViewStateFields(row),
+        ...foreignRowSourceFields(key, row),
       });
     }
 
@@ -1439,7 +1653,7 @@ function createSessionService(opts = {}) {
     return { key };
   }
 
-  async function adoptForeignSession(sourceKey, options = {}) {
+  async function adoptForeignSession(sourceKey     , options      = {}) {
     if (typeof sourceKey !== "string" || !sourceKey.trim()) {
       throw new Error("adoptForeignSession requires a session key");
     }
@@ -1449,13 +1663,13 @@ function createSessionService(opts = {}) {
     if (!isUpstreamConnected()) {
       throw new Error("gateway not connected");
     }
-    const params = { key: sourceKey.trim() };
+    const params      = { key: sourceKey.trim() };
     if (options && options.takeOver === true) params.takeOver = true;
     const result = await gatewayBridge.request("sessions.adopt", params);
     const status =
       result && typeof result.status === "string" ? result.status : "accepted";
     if (status !== "accepted") {
-      const err = new Error(
+      const err      = new Error(
         (result && (result.verdict || result.error)) || `sessions.adopt ${status}`,
       );
 
@@ -1497,7 +1711,7 @@ function createSessionService(opts = {}) {
     return prefixIndex >= 0 ? fullKey.slice(prefixIndex) : fullKey;
   }
 
-  function supportedMutationShortKey(key) {
+  function supportedMutationShortKey(key     ) {
     if (typeof key !== "string") return "";
     const trimmed = key.trim();
     if (!trimmed) return "";
@@ -1512,7 +1726,7 @@ function createSessionService(opts = {}) {
     return shortKey;
   }
 
-  function isSessionMutationKeyForKind(kind, key) {
+  function isSessionMutationKeyForKind(kind     , key     ) {
     if (kind !== "ocuclaw" && kind !== "evenai") return false;
 
     if (isFixtureFakeSessionKey(key)) return false;
@@ -1523,7 +1737,7 @@ function createSessionService(opts = {}) {
       : !isEvenAiSessionKey(shortKey);
   }
 
-  async function resolveSessionMutationKey(kind, key) {
+  async function resolveSessionMutationKey(kind     , key     ) {
     if (!isSessionMutationKeyForKind(kind, key)) {
       throw new Error("unsupported_session_key");
     }
@@ -1574,7 +1788,8 @@ function createSessionService(opts = {}) {
     for (const candidate of candidates) {
       if (typeof candidate !== "string") continue;
       const trimmed = candidate.trim();
-      if (trimmed) return trimmed;
+      if (!trimmed || isSyntheticSessionStarterTitle(trimmed)) continue;
+      return trimmed;
     }
     return null;
   }
@@ -1726,12 +1941,12 @@ function createSessionService(opts = {}) {
         JSON.stringify(Object.fromEntries(sessionAdoptOriginByKey.entries())),
         "utf8",
       );
-    } catch (err) {
+    } catch (err     ) {
       logger.error(`[relay] Failed to persist session adopt-origin cache: ${err.message}`);
     }
   }
 
-  function rememberAdoptedOrigin(adoptKey, sourceKey) {
+  function rememberAdoptedOrigin(adoptKey     , sourceKey     ) {
     const key = typeof adoptKey === "string" ? adoptKey.trim() : "";
     const source = typeof sourceKey === "string" ? sourceKey.trim() : "";
     if (!key || !source || !isAdoptedHermesSessionKey(key) || !isAdoptableHermesSessionKey(source)) {
@@ -1743,12 +1958,12 @@ function createSessionService(opts = {}) {
     return true;
   }
 
-  function getAdoptedOrigin(sessionKey) {
+  function getAdoptedOrigin(sessionKey     ) {
     const key = typeof sessionKey === "string" ? sessionKey.trim() : "";
     return key ? sessionAdoptOriginByKey.get(key) || null : null;
   }
 
-  function adoptedOriginFields(sessionKey) {
+  function adoptedOriginFields(sessionKey     ) {
     if (!isAdoptedHermesSessionKey(sessionKey)) return {};
     const origin = getAdoptedOrigin(sessionKey);
     return { adopted: true, ...(origin ? { adoptedFrom: origin } : {}) };
@@ -1837,7 +2052,7 @@ function createSessionService(opts = {}) {
       : "";
   }
 
-  function sessionAgentSelectorId(sessionKey) {
+  function sessionAgentSelectorId(sessionKey     ) {
     if (getActiveBackendKind() === "hermes") {
       const profileId = deriveHermesProfileIdFromPublicKey(sessionKey);
       if (profileId) return profileId;
@@ -1845,7 +2060,35 @@ function createSessionService(opts = {}) {
     return sessionAgentOverrideId(sessionKey);
   }
 
-  function getSessionProfileId(sessionKey, fullKey) {
+  function sessionEffectiveAgentId(sessionKey     ) {
+    if (getActiveBackendKind() === "hermes") return sessionAgentSelectorId(sessionKey);
+    const resolved = getSessionAgentId(sessionKey, sessionKey);
+    if (resolved) return resolved;
+    const nativeDefaults = typeof gatewayBridge?.getSessionDefaults === "function"
+      ? gatewayBridge.getSessionDefaults() : null;
+    return typeof nativeDefaults?.defaultAgentId === "string"
+      ? nativeDefaults.defaultAgentId.trim() : "";
+  }
+
+  function openClawFallbackModelRef(sessionKey     ) {
+    if (gatewayBridge?.kind !== "openclaw") return null;
+    const agentId = sessionEffectiveAgentId(sessionKey);
+    const agentPrimary = agentId ? getAgentPrimaryModel(agentId) : null;
+    if (typeof agentPrimary === "string" && agentPrimary.trim()) {
+      const ref = normalizeSessionModelRef(null, agentPrimary);
+      if (ref.model) return ref;
+    }
+    return gatewayDefaultModelRef && gatewayDefaultModelRef.model ? gatewayDefaultModelRef : null;
+  }
+
+  function observeGatewaySessionDefaults(result     ) {
+    const defaults = result && typeof result === "object" ? result.defaults : null;
+    if (!defaults || typeof defaults !== "object") return;
+    const ref = normalizeSessionModelRef(defaults.modelProvider, defaults.model);
+    if (ref.model) gatewayDefaultModelRef = ref;
+  }
+
+  function getSessionProfileId(sessionKey     , fullKey     ) {
     if (getActiveBackendKind() !== "hermes") return "";
     if (typeof fullKey === "string" && fullKey) {
       const fromFull = sessionAgentSelectorId(fullKey);
@@ -1865,7 +2108,7 @@ function createSessionService(opts = {}) {
       : "";
   }
 
-  function gatewaySessionPatchRequest(sessionKey, request) {
+  function gatewaySessionPatchRequest(sessionKey     , request     ) {
     if (
       getActiveBackendKind() === "hermes" ||
       !request ||
@@ -1934,7 +2177,7 @@ function createSessionService(opts = {}) {
   const READ_STAMP_SKIP_MS = 1000;
   const READ_STAMP_KEY_CAP = 200;
 
-  function canWriteSessionReadState(sessionKey) {
+  function canWriteSessionReadState(sessionKey     ) {
     if (typeof sessionKey !== "string" || !sessionKey.trim()) return false;
     if (!isHermesSessionKey(sessionKey)) return false;
     if (isFixtureFakeSessionKey(sessionKey)) return false;
@@ -1962,7 +2205,7 @@ function createSessionService(opts = {}) {
         "sessions.patch",
         gatewaySessionPatchRequest(key, { key, read: true }),
       );
-    } catch (err) {
+    } catch (err     ) {
 
       lastReadStampAtMsByKey.delete(key);
       emitDebug(
@@ -1976,6 +2219,30 @@ function createSessionService(opts = {}) {
     }
     invalidateSessionsCache();
     return { ok: true };
+  }
+
+  async function markAllSessionsRead() {
+    if (!sessionReadStateSupported()) {
+      return { ok: false, code: "session_read_state_unsupported" };
+    }
+    if (!isUpstreamConnected()) {
+      return { ok: false, code: "backend_disconnected" };
+    }
+    invalidateSessionsCache();
+    const rows = await getRealSessions();
+    const keys = (Array.isArray(rows) ? rows : [])
+      .filter((row     ) => row && row.unread === true && typeof row.key === "string")
+      .map((row     ) => row.key);
+    let marked = 0;
+    let failed = 0;
+    for (const key of keys) {
+
+      const result = await markSessionRead(key);
+      if (result && result.ok) marked += 1;
+      else failed += 1;
+    }
+    invalidateSessionsCache();
+    return { ok: true, marked, failed };
   }
 
   async function setSessionHidden(sessionKey, hidden) {
@@ -1999,7 +2266,7 @@ function createSessionService(opts = {}) {
           hidden: hidden === true,
         }),
       );
-    } catch (err) {
+    } catch (err     ) {
       emitDebug(
         "relay.session",
         "session_hidden_update_failed",
@@ -2032,12 +2299,7 @@ function createSessionService(opts = {}) {
       }
       try {
         await deleteSingleSession(kind, key);
-        greetingSendGate.evict(key);
-        sessionPinByKey.delete(key);
-        sessionTitleByKey.delete(key);
-        firstSentUserMessageBySession.delete(key);
-        distillerBudget.clear(key);
-        transcriptSearchCache.delete(key);
+        forgetDeletedSessionState(key);
         deleted.push(key);
       } catch (err) {
         failed.push({ key, reason: err?.message ?? "unknown" });
@@ -2047,6 +2309,34 @@ function createSessionService(opts = {}) {
     persistSessionTitleCache();
     invalidateSessionsCache();
     return { deleted, failed };
+  }
+
+  function forgetDeletedSessionState(key        ) {
+    greetingSendGate.evict(key);
+    sessionPinByKey.delete(key);
+    sessionTitleByKey.delete(key);
+    firstSentUserMessageBySession.delete(key);
+    distillerBudget.clear(key);
+    transcriptSearchCache.delete(key);
+  }
+
+  function forgetSessionsDeletedElsewhere(sessionKeys          ) {
+    for (const key of sessionKeys) {
+      if (typeof key === "string" && key.trim()) forgetDeletedSessionState(key);
+    }
+    persistSessionPinCache();
+    persistSessionTitleCache();
+    invalidateSessionsCache();
+  }
+
+  async function sessionStillExists(sessionKey        ) {
+    if (!isUpstreamConnected()) return null;
+    try {
+      const resolved = await fetchCurrentSessionRow(sessionKey);
+      return !!(resolved && resolved.row);
+    } catch {
+      return null;
+    }
   }
 
   async function searchTranscripts(kind, query, searchOpts = {}) {
@@ -2063,7 +2353,7 @@ function createSessionService(opts = {}) {
         limit: maxSnippets,
       });
       const snippets = (result && Array.isArray(result.snippets))
-        ? result.snippets.filter((snippet) => (
+        ? result.snippets.filter((snippet     ) => (
           snippet &&
           typeof snippet.sessionKey === "string" &&
           hasSupportedSessionKeyPrefix(snippet.sessionKey) &&
@@ -2084,7 +2374,7 @@ function createSessionService(opts = {}) {
     const sessions = await getTranscriptSearchSessions(kind).catch(() => []);
     const snippets = [];
     let truncated = false;
-    const searchable = sessions.map((session) => !(
+    const searchable = sessions.map((session     ) => !(
       (
         kind === "ocuclaw" &&
         (
@@ -2098,7 +2388,7 @@ function createSessionService(opts = {}) {
 
     const loads = new Array(sessions.length);
     let nextLoad = 0;
-    function fillWindow(scanIndex) {
+    function fillWindow(scanIndex     ) {
       while (nextLoad < sessions.length && nextLoad < scanIndex + TRANSCRIPT_SEARCH_CONCURRENCY) {
         if (searchable[nextLoad]) loads[nextLoad] = loadSearchTranscript(sessions[nextLoad]);
         nextLoad += 1;
@@ -2142,7 +2432,7 @@ function createSessionService(opts = {}) {
     return { snippets, truncated, unavailable: false };
   }
 
-  function loadSearchTranscript(session) {
+  function loadSearchTranscript(session     ) {
     const updatedAt = Number.isFinite(session && session.updatedAt) ? session.updatedAt : 0;
     const cached = updatedAt > 0 ? transcriptSearchCache.get(session.key) : null;
     if (cached && cached.updatedAt === updatedAt) {
@@ -2156,7 +2446,7 @@ function createSessionService(opts = {}) {
         sessionKey: session.key,
         limit: 200,
       }))
-      .then((history) => {
+      .then((history     ) => {
         const raw = (history && Array.isArray(history.messages)) ? history.messages : [];
         const messages = [];
         for (const msg of raw) {
@@ -2411,7 +2701,7 @@ function createSessionService(opts = {}) {
     pruneFirstUserMessageCache();
   }
 
-  function recordHistoryFirstUserMessage(sessionKey, messages, options = {}) {
+  function recordHistoryFirstUserMessage(sessionKey     , messages     , options      = {}) {
     const key = extractShortKey(sessionKey);
     if (!key || !isAdoptedHermesSessionKey(key)) return false;
     if (options && options.truncatedHead === true) return false;
@@ -2472,16 +2762,16 @@ function createSessionService(opts = {}) {
 
   const OPENCLAW_LABEL_SUFFIX_MAX = 9;
 
-  function sessionPatchErrorMessage(err) {
+  function sessionPatchErrorMessage(err     ) {
     if (err && typeof err.message === "string") return err.message;
     return String(err || "");
   }
 
-  function isLabelInUseError(err) {
+  function isLabelInUseError(err     ) {
     return /label already in use/i.test(sessionPatchErrorMessage(err));
   }
 
-  function isAutoLabelRejectedError(err) {
+  function isAutoLabelRejectedError(err     ) {
     return /unexpected property '?autoLabel/i.test(sessionPatchErrorMessage(err));
   }
 
@@ -2489,7 +2779,7 @@ function createSessionService(opts = {}) {
     return getActiveBackendKind() !== "hermes";
   }
 
-  async function requestSessionTitlePatch(sessionKey, canonicalKey, fields) {
+  async function requestSessionTitlePatch(sessionKey     , canonicalKey     , fields     ) {
     const result = await gatewayBridge.request(
       "sessions.patch",
       gatewaySessionPatchRequest(sessionKey, { key: canonicalKey, ...fields }),
@@ -2509,7 +2799,7 @@ function createSessionService(opts = {}) {
     return result;
   }
 
-  function warnSessionTitlePatchFailed(sessionKey, event, details, err) {
+  function warnSessionTitlePatchFailed(sessionKey     , event     , details     , err     ) {
     const message = sessionPatchErrorMessage(err);
     logger.warn(
       `[relay] Session title upstream write failed: sessionKey=${sessionKey} event=${event} error=${message}`,
@@ -2523,7 +2813,7 @@ function createSessionService(opts = {}) {
     );
   }
 
-  async function writeOpenClawAutoTitle(sessionKey, canonicalKey, title) {
+  async function writeOpenClawAutoTitle(sessionKey     , canonicalKey     , title     ) {
     if (openClawAutoLabelSupported !== false) {
       try {
         await requestSessionTitlePatch(sessionKey, canonicalKey, { autoLabel: title });
@@ -2555,13 +2845,13 @@ function createSessionService(opts = {}) {
     throw new Error("label suffixes exhausted");
   }
 
-  function isGeneratedTitleLabel(label, title) {
+  function isGeneratedTitleLabel(label     , title     ) {
     if (label === title) return true;
     if (!label.startsWith(`${title} (`)) return false;
     return /^ \(\d+\)$/.test(label.slice(title.length));
   }
 
-  async function reconcileOpenClawAutoTitles(rows) {
+  async function reconcileOpenClawAutoTitles(rows     ) {
     if (!isOpenClawTitleBackend() || !isUpstreamConnected()) return;
     for (const row of rows) {
       const key = extractShortKey(row && row.key);
@@ -2830,6 +3120,10 @@ function createSessionService(opts = {}) {
     displayToggleTracker.clear(sessionKey);
   }
 
+  function isLiveUiV2Session(sessionKey         ) {
+    return Boolean(relaySessionKeyFor(sessionKey));
+  }
+
   function getDistillerBudget() {
     return distillerBudget;
   }
@@ -2915,6 +3209,19 @@ function createSessionService(opts = {}) {
     if (/\bdo not mention\b/.test(normalized)) signalCount += 1;
     if (/\binternal\b.*\b(?:steps|files|tools|reasoning)\b/.test(normalized)) signalCount += 1;
     return signalCount >= 2;
+  }
+
+  function isSyntheticSessionStarterTitle(text     ) {
+    if (!text) return false;
+    if (isSyntheticSessionStarter(text)) return true;
+    const head = normalizeSessionText(text)
+      .replace(/\s*(?:…|\.{3})$/, "")
+      .toLowerCase();
+    if (head.length < SESSION_STARTER_TITLE_MIN_LENGTH) return false;
+    return (
+      head.startsWith(SESSION_STARTER_OPENING) ||
+      SESSION_STARTER_OPENING.startsWith(head)
+    );
   }
 
   function pruneFirstUserMessageCache() {
@@ -3112,12 +3419,15 @@ function createSessionService(opts = {}) {
           sessionKey,
           limit: 200,
         });
-        const messages =
+        const rawMessages =
           result && Array.isArray(result.messages) ? result.messages : [];
+        const messages = gatewayBridge?.kind === "openclaw"
+          ? projectOpenClawConversationHistory(rawMessages) : rawMessages;
+        const uiRecords = isLiveUiV2Session(sessionKey);
         const sanitized = Array.isArray(messages)
           ? messages.map((msg) =>
               msg && msg.role === "assistant"
-                ? { ...msg, content: sanitizeAssistantContentBlocks(msg.content) }
+                ? { ...msg, content: sanitizeAssistantContentBlocks(msg.content, { uiRecords }) }
                 : msg,
             )
           : messages;
@@ -3264,14 +3574,14 @@ function createSessionService(opts = {}) {
         : sessionKey;
 
       greetingSendGate.arm(sessionKey);
-      gatewayBridge
-        .sendMessage(
+      const sendGreeting = () => gatewayBridge.sendMessage(
           `/new ${activeNewSessionGreetingPrompt()}`,
           sessionKey,
           null,
           resetGatewayKey !== sessionKey ? { agentId: resetAgentId } : undefined,
-        )
-        .then((ack) => {
+        );
+
+      const noteGreetingAck = (ack     ) => {
           const status =
             ack && typeof ack.status === "string" ? ack.status.trim().toLowerCase() : "";
 
@@ -3280,7 +3590,11 @@ function createSessionService(opts = {}) {
             return;
           }
           greetingSendGate.noteGreetingRun(sessionKey, ack && ack.runId, "accepted");
-        })
+        };
+      const greeting = gatewayBridge.kind === "hermes"
+        ? getSessionModelConfig(sessionKey).then(sendGreeting).then(noteGreetingAck)
+        : greetingSendGate.sendGreeting(sessionKey, sendGreeting, noteGreetingAck);
+      greeting
         .catch((err) => {
           logger.error(`[relay] Failed to send /new for new session: ${err.message}`);
           greetingSendGate.evict(sessionKey);
@@ -3291,7 +3605,7 @@ function createSessionService(opts = {}) {
     return { sessionKey, pages };
   }
 
-  function materializeDraftSession(sessionKey) {
+  function materializeDraftSession(sessionKey     ) {
     if (
       !sessionKey ||
       (unmaterializedDraftSessionKey !== sessionKey &&
@@ -3313,11 +3627,11 @@ function createSessionService(opts = {}) {
     return true;
   }
 
-  function isDraftSession(sessionKey) {
+  function isDraftSession(sessionKey     ) {
     return !!sessionKey && unmaterializedDraftSessionKey === sessionKey;
   }
 
-  function markDraftSessionInFlight(sessionKey) {
+  function markDraftSessionInFlight(sessionKey     ) {
     if (!isDraftSession(sessionKey)) return false;
     inFlightDraftSessionSendCounts.set(
       sessionKey,
@@ -3326,7 +3640,7 @@ function createSessionService(opts = {}) {
     return true;
   }
 
-  function releaseDraftSessionSend(sessionKey) {
+  function releaseDraftSessionSend(sessionKey     ) {
     const count = inFlightDraftSessionSendCounts.get(sessionKey) || 0;
     if (count <= 1) return inFlightDraftSessionSendCounts.delete(sessionKey);
     inFlightDraftSessionSendCounts.set(sessionKey, count - 1);
@@ -3372,20 +3686,26 @@ function createSessionService(opts = {}) {
     pendingInitialConfigSessionKeys.delete(sessionKey);
   }
 
-  function dispatchUserSend(sessionKey, send) {
-    return greetingSendGate.dispatch(sessionKey, send);
+  function dispatchUserSend(sessionKey     , send     ) {
+    return greetingSendGate.dispatch(sessionKey, gatewayBridge?.kind === "hermes"
+      ? async () => {
+
+          await getSessionModelConfig(sessionKey);
+          return send();
+        }
+      : send);
   }
 
-  function observeGreetingActivity(sessionKey, phase, runId, origin) {
+  function observeGreetingActivity(sessionKey     , phase     , runId     , origin     ) {
     return greetingSendGate.onActivity(sessionKey, phase, runId, origin);
   }
 
-  function greetingGatewayKey(sessionKey) {
+  function greetingGatewayKey(sessionKey     ) {
     const agentId = getSessionAgentId(sessionKey, undefined);
     return agentId ? gatewaySessionKeyFor(sessionKey, agentId) : sessionKey;
   }
 
-  function isGreetingRunLive({ sessionKey, runId }) {
+  function isGreetingRunLive({ sessionKey, runId }     ) {
     if (getActiveBackendKind() === "hermes" || !gatewayBridge ||
       typeof gatewayBridge.request !== "function" || !runId) return false;
     return Promise.resolve()
@@ -3393,7 +3713,7 @@ function createSessionService(opts = {}) {
         sessionKey: greetingGatewayKey(sessionKey),
         limit: 1,
       }))
-      .then((history) => {
+      .then((history     ) => {
         const ids = history && history.sessionInfo && Array.isArray(history.sessionInfo.activeRunIds)
           ? history.sessionInfo.activeRunIds
           : [];
@@ -3412,12 +3732,12 @@ function createSessionService(opts = {}) {
 
   function preemptGreetingForEarlyAsk({
     sessionKey, runId, heldSends, release, stillEligible, noteAbortSent, abortFailed,
-  }) {
+  }     ) {
     if (getActiveBackendKind() === "hermes" || !gatewayBridge ||
       typeof gatewayBridge.request !== "function") return;
     const key = greetingGatewayKey(sessionKey);
     const eligible = () => typeof stillEligible !== "function" || stillEligible() === true;
-    const skip = (status, extra = {}) => {
+    const skip = (status     , extra      = {}) => {
       emitDebug(
         "relay.protocol",
         "greeting_preempt_result",
@@ -3443,7 +3763,7 @@ function createSessionService(opts = {}) {
 
         return gatewayBridge.request("chat.abort", { sessionKey: key, runId });
       })
-      .then((result) => {
+      .then((result     ) => {
         if (result === null) return;
         const runIds = result && Array.isArray(result.runIds) ? result.runIds : [];
         const aborted = !!(result && result.aborted === true) && (!runIds.length || runIds.includes(runId));
@@ -3457,7 +3777,7 @@ function createSessionService(opts = {}) {
         if (aborted) release("greeting_aborted");
         else if (typeof abortFailed === "function") abortFailed();
       })
-      .catch((err) => {
+      .catch((err     ) => {
 
         if (typeof abortFailed === "function") abortFailed();
         logger.warn(
@@ -3467,14 +3787,14 @@ function createSessionService(opts = {}) {
   }
 
   if (greetingPreemptEnabled && gatewayBridge && typeof gatewayBridge.on === "function") {
-    gatewayBridge.on("streaming", (frame) => {
+    gatewayBridge.on("streaming", (frame     ) => {
       if (frame && typeof frame.text === "string" && frame.text) {
         greetingSendGate.noteGreetingText(frame.sessionKey, frame.runId);
       }
     });
   }
 
-  function buildNewSessionDispatchErrorActivity(sessionKey, err) {
+  function buildNewSessionDispatchErrorActivity(sessionKey     , err     ) {
     const raw = err && typeof err === "object" ? err : {};
     const data = raw.data && typeof raw.data === "object" ? raw.data : {};
     const message =
@@ -3502,9 +3822,9 @@ function createSessionService(opts = {}) {
     );
   }
 
-  function broadcastNewSessionDispatchError(sessionKey, err) {
+  function broadcastNewSessionDispatchError(sessionKey     , err     ) {
     if (!broadcastActivity) return null;
-    const activity = buildNewSessionDispatchErrorActivity(sessionKey, err);
+    const activity      = buildNewSessionDispatchErrorActivity(sessionKey, err);
     emitDebug(
       "relay.session",
       "new_session_dispatch_failed",
@@ -3519,7 +3839,7 @@ function createSessionService(opts = {}) {
     );
     try {
       broadcastActivity(activity, "synthetic_new_session_error");
-    } catch (broadcastErr) {
+    } catch (broadcastErr     ) {
       logger.warn(
         `[relay] New-session error broadcast failed: ${broadcastErr?.message ?? broadcastErr}`,
       );
@@ -3541,6 +3861,7 @@ function createSessionService(opts = {}) {
     observeGreetingActivity,
     getSessionModelConfig,
     getCurrentSessionModelConfig,
+    peekSessionReasoningLevel,
     setSessionModelConfig,
     setCurrentSessionModelConfig,
     primeSessionModelConfig,
@@ -3572,6 +3893,7 @@ function createSessionService(opts = {}) {
     getDisplayStartStates,
     getDisplayCurrentStates,
     clearDisplayToggleStates,
+    isLiveUiV2Session,
     getDistillerBudget,
     clearDistillerBudget,
     clearSessionTitle,
@@ -3584,6 +3906,7 @@ function createSessionService(opts = {}) {
     setSessionPinned,
     setSessionHidden,
     markSessionRead,
+    markAllSessionsRead,
     getSessionPin,
     getSessionAgentId,
 
@@ -3593,10 +3916,12 @@ function createSessionService(opts = {}) {
     setSessionAgentId,
     hasExplicitSessionAgent,
     deleteSessions,
+    forgetSessionsDeletedElsewhere,
+    sessionStillExists,
     switchAndDeleteSessions,
     broadcastSessionsForKind,
     searchTranscripts,
   };
 }
 
-module.exports = { activeNewSessionGreetingPrompt, createSessionService, createSupersededSessionSwitchError, isSupersededSessionSwitchError, HERMES_NEW_SESSION_GREETING_PROMPT, NEW_SESSION_GREETING_PROMPT, summarizeChatHistoryIdentity };
+module.exports = { NEW_SESSION_GREETING_PROMPT, HERMES_NEW_SESSION_GREETING_PROMPT, NEW_SESSION_DISPATCH_ERROR_LABEL, activeNewSessionGreetingPrompt, createUnsupportedSessionKeyError, createSupersededSessionSwitchError, isSupersededSessionSwitchError, summarizeChatHistoryIdentity, createSessionService };

@@ -8,7 +8,7 @@ const CANDIDATE_ID_PATTERN = /^[0-9a-f]{64}$/;
 const PERMANENT_REFUSALS = ["candidate_unknown", "invalid_params"];
 const OBSERVE_KEYS =["candidateId", "sessionKey", "runId"];
 
-const HERMES_REASONS = {
+const HERMES_REASONS      = {
   deadline_expired: "observation_expired",
   recipient_disconnected: "client_disconnected",
   no_app_recipient: "client_disconnected",
@@ -22,7 +22,7 @@ const HERMES_REASONS = {
   reply_run_errored: "reply_run_errored",
   reply_run_rate_limited: "reply_run_rate_limited",
 };
-const hermesReason = (reason) =>
+const hermesReason = (reason     ) =>
   reason === null || reason === undefined ? null : HERMES_REASONS[reason] || "unspecified";
 
 function createHermesReplyDeliveryLink({
@@ -33,14 +33,14 @@ function createHermesReplyDeliveryLink({
   maxAttempts = DEFAULT_MAX_ATTEMPTS,
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
-}) {
+}     ) {
   let disposed = false;
   let inFlight = false;
-  let retryTimer = null;
+  let retryTimer      = null;
 
   const queue = new Map();
 
-  function warn(message) {
+  function warn(message     ) {
     if (logger && typeof logger.warn === "function") {
       logger.warn(`[hermes-reply-delivery] ${message}`);
     }
@@ -55,7 +55,7 @@ function createHermesReplyDeliveryLink({
     if (retryTimer && typeof retryTimer.unref === "function") retryTimer.unref();
   }
 
-  function failed(candidateId, entry, reason) {
+  function failed(candidateId     , entry     , reason     ) {
     entry.attempts += 1;
     if (queue.get(candidateId) === entry && entry.attempts >= maxAttempts) {
       queue.delete(candidateId);
@@ -69,18 +69,18 @@ function createHermesReplyDeliveryLink({
 
   function drain() {
     if (disposed || inFlight || retryTimer !== null || queue.size === 0) return;
-    const [candidateId, entry] = queue.entries().next().value;
+    const [candidateId, entry]      = queue.entries().next().value;
     inFlight = true;
-    let pending;
+    let pending     ;
     try {
       pending = link.request(LINK_REPLY_DELIVERY_REPORT_METHOD, entry.params);
-    } catch (err) {
+    } catch (err     ) {
       inFlight = false;
       failed(candidateId, entry, err && err.message ? err.message : String(err));
       return;
     }
     Promise.resolve(pending).then(
-      (result) => {
+      (result     ) => {
         if (disposed) return;
         inFlight = false;
         if (!result || result.ok !== true) {
@@ -97,7 +97,7 @@ function createHermesReplyDeliveryLink({
         if (queue.get(candidateId) === entry) queue.delete(candidateId);
         drain();
       },
-      (err) => {
+      (err     ) => {
         if (disposed) return;
         inFlight = false;
         failed(candidateId, entry, err && err.message ? err.message : String(err));
@@ -105,7 +105,7 @@ function createHermesReplyDeliveryLink({
     );
   }
 
-  function report(candidateId, status) {
+  function report(candidateId     , status     ) {
     if (disposed || !CANDIDATE_ID_PATTERN.test(String(candidateId))) return;
     if (!status || status.status === "pending") return;
     const evidence = status.status === "sdk_accepted" && status.evidence
@@ -128,8 +128,8 @@ function createHermesReplyDeliveryLink({
     drain();
   }
 
-  const methods = {};
-  methods[LINK_REPLY_DELIVERY_OBSERVE_METHOD] = (params) => {
+  const methods      = {};
+  methods[LINK_REPLY_DELIVERY_OBSERVE_METHOD] = (params     ) => {
     const keys = params && typeof params === "object" && !Array.isArray(params) ? Object.keys(params) : [];
     if (
       keys.length !== OBSERVE_KEYS.length ||

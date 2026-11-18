@@ -13,51 +13,14 @@ const ACTIVATION_CONTROL_HEADER = 'x-ocuclaw-tui-control-capability'
 const ACTIVATION_CHALLENGE_HEADER = 'x-ocuclaw-tui-activation-challenge'
 const ACTIVATION_SERVER_CHALLENGE_HEADER = 'x-ocuclaw-tui-server-challenge'
 const ACTIVATION_CLAIM_PROOF_HEADER = 'x-ocuclaw-tui-claim-proof'
+// The activation contract this file speaks (tui_pairing.WIDGET_PROTOCOL).
+// The setup tool refuses a claim on any other and asks for a relaunch, so a
+// copy loaded before an update fails loudly, not in silence.
+const ACTIVATION_WIDGET_PROTOCOL_HEADER = 'x-ocuclaw-tui-widget-protocol'
+const WIDGET_PROTOCOL = '2'
 const PRESENTER_CAPABILITY_URL = new URL('../state/ocuclaw.tui-pairing-capability.json', import.meta.url)
 const AUTO_ACTIVATION = '__ocuclaw_auto_activation__'
-const QR_QUIET_ZONE_MODULES = 4
-const QR_WATERMARK_BOTTOM_GUARD_ROWS = 1
-const QR_WATERMARK_FALLBACK = '#d9dde1'
-const QR_WATERMARK_OPACITY = 0.30
 const TERMINAL_PAIRING_STATES = new Set(['completed', 'failed', 'cancelled', 'refused'])
-
-// Normalized from the visible alpha bounds of the supplied 1024px OcuClaw
-// mark (the artwork itself sits off-centre in that source canvas). Each bit is
-// one square logo pixel. The terminal expands it to two columns by one row,
-// which is a square 2x2 QR-module cell on a typical 2:1 terminal cell grid.
-const OCUCLAW_PIXEL_LOGO = Object.freeze([
-  '00000000111100000000',
-  '00000001111100000000',
-  '00011111101100000000',
-  '00011110001100000000',
-  '01100000011100000000',
-  '01100000011100000000',
-  '01100000111001111000',
-  '01100000111001111000',
-  '11100000111001111100',
-  '11000000011111000110',
-  '11000000111111000110',
-  '11000000111011000110',
-  '11000000011111000111',
-  '11000000111111000011',
-  '11000000111111000011',
-  '11000000111111000111',
-  '11000000001100000110',
-  '11000000001100000110',
-  '11000000000000000110',
-  '11000000000000111100',
-  '11000000000000111100',
-  '11100000000000111100',
-  '01110000000001111100',
-  '01110000000001111100',
-  '00111111000011111000',
-  '00111111100011000000',
-  '00000001100011000000',
-])
-// The terminal needs one additional white row below the mark because one
-// glyph spans two QR-module rows. Collapse a duplicated interior logo row
-// here while preserving the shared canonical pixel source used by Desktop.
-const TUI_PIXEL_LOGO = Object.freeze(OCUCLAW_PIXEL_LOGO.filter((_, index) => index !== 23))
 
 let config = null
 let controlSecret = ''
@@ -68,9 +31,12 @@ let resultNotified = false
 let cancelRequested = false
 let activationProbeRunning = false
 let pairingActive = false
-// The reducer gets no window size. The last render records whether the QR
-// view fits, so `m` can refuse to switch to a QR that would not fit.
-let qrFitsWindow = false
+// #5483. A typed phone code is with the relay; keys wait for its answer.
+let codeSubmitting = false
+let phoneCodeTriesLeft = 3
+// The outcome is on screen: a status answer still on its way must not replace
+// it (a cancelled exchange answers a late poll with 401).
+let outcomeShown = false
 
 // #3521. A result code the setup tool maps to "make the Hermes window bigger".
 const WINDOW_TOO_SMALL = 'tui_window_too_small'
@@ -99,28 +65,77 @@ const largerSize = (...sizes) => ({
   rows: Math.max(...sizes.map(size => size.rows)),
 })
 const PAIRING_TITLE = 'Pair OcuClaw phone'
-const QR_HINT = 'm shows Manual · Esc/q cancels'
-const MANUAL_HINT = 'm shows QR · Esc/q cancels'
-const MANUAL_ONLY_HINT = 'Esc/q cancels · a bigger window shows the QR'
+const MANUAL_HINT = 'Esc/q cancels'
 const WORDS_HINT = '↑/↓ choose · Enter confirms · Esc/q refuses'
-const qrLines = state => [
-  state.qrBlock,
-  '',
-  // F17 (#3348). "Take a photo of the QR code" is the phone control.
-  'In Even Hub open OcuClaw, tap the Pair button,',
-  'then Take a photo of the QR code.',
-  'The screen advances automatically when the phone connects.',
-]
+const PHONE_CODE_HINT = 'Enter pairs · m manual pairing · Esc/q cancels'
+const SENT_HINT = 'Esc/q cancels'
+// #5483. The phone-code lines. The prompt is Hermes Desktop's
+// (desktop-template/plugin.js); the rest are Hermes pair's own copies
+// (pairing.py PHONE_CODE_*), and test_tui_pairing.py keeps them equal.
+const PHONE_CODE_PROMPT_LINES = Object.freeze([
+  'In Even Hub open OcuClaw and tap the Pair button.',
+  'Type the phone code it shows:',
+])
+const PHONE_CODE_MANUAL = "For manual pairing, type m."
+const PHONE_CODE_SENT = "Sent to your phone.\nCheck the four words on your glasses\nor in OcuClaw. They should match the\nwords that appear here."
+const PHONE_CODE_OUTAGE = "Phone codes aren't working right now, so here's manual pairing."
+const PHONE_CODE_MISSING = "No phone is waiting with that code. Check the code in OcuClaw. If it ran out, tap Get a new code there."
+const PHONE_CODE_PAIRING_TYPED = "That's the pairing code, which goes into the phone. Here, type the 6-digit phone code that OcuClaw shows."
+const PHONE_CODE_TRIES = 3
+const WRONG_PHONE_CODE_REASONS = new Set(['malformed', 'no_code', 'spent'])
+const PHONE_CODE_DECISIONS = new Set(['available', 'off', 'custom_route', 'unavailable'])
+// Wrap a sentence to the manual view's own line width, so the dialog never
+// soft-wraps a row its size check did not count.
+const WRAP_COLUMNS = 58
+const wrapLines = text => String(text ?? '').split('\n').flatMap(paragraph => {
+  const out = []
+  let line = ''
+  for (const word of paragraph.split(' ').filter(Boolean)) {
+    if (line && line.length + 1 + word.length > WRAP_COLUMNS) {
+      out.push(line)
+      line = word
+    } else {
+      line = line ? `${line} ${word}` : word
+    }
+  }
+  out.push(line)
+  return out
+})
+// One line saying why the panel opened manual pairing (#5483).
+const reasonLines = state => state.manualMessage ? [...wrapLines(state.manualMessage), ''] : []
+const phoneCodeLines = state => {
+  const digits = String(state.digits ?? '').padEnd(6, '_')
+  return [
+    ...PHONE_CODE_PROMPT_LINES,
+    '',
+    `  > ${digits.slice(0, 3)} ${digits.slice(3, 6)}`,
+    ...(state.codeMessage ? ['', ...wrapLines(state.codeMessage)] : []),
+    ...(state.triesLine ? [state.triesLine] : []),
+    '',
+    PHONE_CODE_MANUAL,
+  ]
+}
+const sentLines = () => [...PHONE_CODE_SENT.split('\n'), '', 'Waiting for the phone.']
+// #5486. Manual pairing is text only, in the words of every terminal's
+// manual block (spec, QR removal): the address and pairing code to type on
+// the phone, and how long they last.
+const MANUAL_PROMPT = 'In OcuClaw tap Pair with your agent > Pair manually, then type:'
+const manualDetail = (line, label) => {
+  const text = String(line ?? '')
+  return text.startsWith(label) ? `  ${label.padEnd(14)}${text.slice(label.length).trim()}` : `  ${text}`
+}
+const expiryLine = (expiresAtMs, now = Date.now()) => {
+  const left = Math.max(0, Math.ceil((expiresAtMs - now) / 1000))
+  return `Expires in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}.`
+}
 const manualLines = state => [
-  // F17 (#3348). Only the controls the phone app actually shows:
-  // the Pair button ("Pair with your agent"), "Enter the pairing code instead".
-  'In Even Hub open OcuClaw, tap the Pair button,',
-  'then Enter the pairing code instead:',
+  ...reasonLines(state),
+  MANUAL_PROMPT,
+  manualDetail(state.addressLine, 'Address:'),
+  manualDetail(state.codeLine, 'Pairing code:'),
+  // The clock line keeps its width as it counts down (`10:00.` at most).
+  ...(Number.isFinite(state.expiresAtMs) ? [expiryLine(state.expiresAtMs)] : []),
   '',
-  String(state.addressLine ?? ''),
-  String(state.codeLine ?? ''),
-  '',
-  'This is the same one-time encrypted exchange.',
   'The screen advances automatically when the phone connects.',
 ]
 const wordsLines = state => [
@@ -129,107 +144,53 @@ const wordsLines = state => [
   `    ${state.phrase ?? ''}`,
   '',
   'Approve only if all four words match in order on the phone.',
+  'Approving also lets these glasses talk to your agent.',
   '',
   `${state.selection === 'yes' ? '›' : ' '} Yes — all four words match`,
   `${state.selection === 'no' ? '›' : ' '} No — refuse this phone`,
 ]
-// The smallest window the whole ceremony fits in without the QR: the manual
-// view now, then the four-word check (its phrase is not known yet, so this
-// counts the fixed lines; the four short words fit well inside them).
+// The smallest window the rest of the ceremony fits in: the manual view now,
+// then the four-word check (its phrase is not known yet, so this counts the
+// fixed lines; the four short words fit well inside them).
 const manualMinimumSize = state => largerSize(
-  viewSize({ title: PAIRING_TITLE, hint: MANUAL_ONLY_HINT, lines: manualLines(state) }),
+  viewSize({ title: PAIRING_TITLE, hint: MANUAL_HINT, lines: manualLines(state) }),
   viewSize({ title: PAIRING_TITLE, hint: WORDS_HINT, lines: wordsLines({}) }),
 )
-const qrViewSize = state => viewSize({ title: PAIRING_TITLE, hint: QR_HINT, lines: qrLines(state) })
-const blendWithWhite = (value, opacity = QR_WATERMARK_OPACITY) => {
-  const source = String(value ?? '').trim()
-  const short = /^#([0-9a-f]{3})$/i.exec(source)
-  const full = /^#([0-9a-f]{6})$/i.exec(source)
-  const hex = full?.[1] || (short ? [...short[1]].map(digit => digit + digit).join('') : '')
-  if (!hex) return QR_WATERMARK_FALLBACK
-  const channels = [0, 2, 4].map(offset => Number.parseInt(hex.slice(offset, offset + 2), 16))
-  const blended = channels.map(channel => Math.round(255 + (channel - 255) * opacity))
-  if (blended.every(channel => channel === 255)) return QR_WATERMARK_FALLBACK
-  return `#${blended.map(channel => channel.toString(16).padStart(2, '0')).join('')}`
-}
-const pixelLogoCell = (x, y, cols, rows) => {
-  const logoWidth = TUI_PIXEL_LOGO[0].length * 2
-  const logoHeight = TUI_PIXEL_LOGO.length
-  const logoLeft = Math.floor((cols - logoWidth) / 2)
-  const logoTop = Math.floor((rows - logoHeight) / 2)
-  const rightQuietModules = cols - logoLeft - logoWidth
-  const bottomQuietModules = (rows - logoTop - logoHeight) * 2
-  if (
-    logoLeft < QR_QUIET_ZONE_MODULES ||
-    logoTop * 2 < QR_QUIET_ZONE_MODULES ||
-    rightQuietModules < QR_QUIET_ZONE_MODULES ||
-    bottomQuietModules < QR_QUIET_ZONE_MODULES + QR_WATERMARK_BOTTOM_GUARD_ROWS * 2
-  ) return false
-  const logoX = Math.floor((x - logoLeft) / 2)
-  const logoY = y - logoTop
-  return logoY >= 0 && logoY < logoHeight && logoX >= 0 && logoX < TUI_PIXEL_LOGO[logoY].length
-    ? TUI_PIXEL_LOGO[logoY][logoX] === '1'
-    : false
-}
-const qrWatermarkRuns = (block, watermarkColor) => {
-  const lines = String(block).split('\n')
-  const cols = requiredColumns(block)
-  return lines.map((line, y) => {
-    const runs = []
-    ;[...line].forEach((cell, x) => {
-      // A terminal glyph carries two QR rows. Only an all-white pair can show
-      // the pale mark; black and half-black QR glyphs remain canonical.
-      const backgroundColor = cell === ' ' && pixelLogoCell(x, y, cols, lines.length)
-        ? watermarkColor
-        : '#ffffff'
-      const previous = runs[runs.length - 1]
-      if (previous?.backgroundColor === backgroundColor) previous.text += cell
-      else runs.push({ text: cell, backgroundColor })
-    })
-    return runs
-  })
-}
+const phoneCodeMinimumSize = state => largerSize(
+  viewSize({ title: PAIRING_TITLE, hint: PHONE_CODE_HINT, lines: phoneCodeLines(state) }),
+  viewSize({ title: PAIRING_TITLE, hint: SENT_HINT, lines: sentLines() }),
+  viewSize({ title: PAIRING_TITLE, hint: WORDS_HINT, lines: wordsLines({}) }),
+)
 // BEGIN pairing-bootstrap-parser
 // Keep this block byte-identical in tui-widgets/ocuclaw-pair.mjs and
 // desktop-template/plugin.js. tests/hermes-pairing-bootstrap-contract.test.js
 // feeds both copies the text the relay presenter really prints.
-// The parts are found by shape, not by the words around them: the QR is the
-// longest run of equal-width half-block rows, and the manual details are the
-// "Address:" and "Pairing code:" lines at any indent. The 2.0.9 rewording broke
-// a wording-based parser; a shape-based one survives the next rewording.
-const PAIRING_QR_ROW = /^[ ▀▄█]+$/
-const parsePairingBootstrap = block => {
+// The manual details come first from the create reply's own `address` and
+// `pairingCode` fields (#5484). A reply from an older relay has neither, so
+// the block is still read, by shape, not by the words around it: the details
+// are the "Address:" and "Pairing code:" lines at any indent. The 2.0.9
+// rewording broke a wording-based parser; a shape-based one survives the next
+// rewording. Any QR rows in the block are ignored: no window draws a QR
+// (#5486). Only missing manual details make the block unusable.
+const pairingReplyValue = value =>
+  typeof value === 'string' && !/[\u0000-\u001f\u007f-\u009f]/.test(value) ? value.trim() : ''
+const parsePairingBootstrap = (block, reply) => {
   const lines = String(block ?? '').split('\n').map(line => line.replace(/\r$/, ''))
-  const labelled = label => {
+  const labelled = (label, field) => {
+    const given = pairingReplyValue(field)
+    if (given) return `${label} ${given}`
     const line = lines.find(candidate => candidate.trimStart().startsWith(label))
     const value = line ? line.trim().slice(label.length).trim() : ''
     return value ? `${label} ${value}` : ''
   }
-  let qrLines = []
-  let run = []
-  for (const line of [...lines, '']) {
-    const isRow = PAIRING_QR_ROW.test(line)
-    if (isRow && (run.length === 0 || [...run[0]].length === [...line].length)) {
-      run.push(line)
-      continue
-    }
-    if (run.length > qrLines.length) qrLines = run
-    run = isRow ? [line] : []
-  }
-  const width = qrLines.length ? [...qrLines[0]].length : 0
-  const address = labelled('Address:')
-  const code = labelled('Pairing code:')
-  if (qrLines.length < 10 || width < 10 || !qrLines.some(line => line.trim()) || !address || !code) return null
-  return { qrLines, address, code }
+  const address = labelled('Address:', reply?.address)
+  const code = labelled('Pairing code:', reply?.pairingCode)
+  return address && code ? { address, code } : null
 }
 // END pairing-bootstrap-parser
-const splitBootstrap = block => {
-  const parsed = parsePairingBootstrap(block)
-  return parsed && {
-    qrBlock: parsed.qrLines.join('\n'),
-    addressLine: clean(parsed.address),
-    codeLine: clean(parsed.code),
-  }
+const splitBootstrap = (block, reply) => {
+  const parsed = parsePairingBootstrap(block, reply)
+  return parsed && { addressLine: clean(parsed.address), codeLine: clean(parsed.code) }
 }
 const terminalCode = body => {
   const raw = clean(body?.failure?.reason).toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '')
@@ -241,6 +202,8 @@ const validActivation = value => {
   for (const key of ['address', 'controlUrl', 'controlToken', 'callbackUrl', 'callbackToken', 'runId']) {
     if (typeof value[key] !== 'string' || value[key].length < 1 || value[key].length > 2048) return false
   }
+  // #5483. The setup tool's answer to "does the relay offer a phone code?".
+  if ('phoneCode' in value && !PHONE_CODE_DECISIONS.has(value.phoneCode)) return false
   return value.controlUrl.startsWith('http://127.0.0.1:') && value.callbackUrl.startsWith(`${ACTIVATION_URL}/result/`)
 }
 const activationProof = (value, challenge, credential) => createHmac('sha256', credential).update(JSON.stringify([
@@ -254,6 +217,9 @@ const activationProof = (value, challenge, credential) => createHmac('sha256', c
   value.callbackToken,
   value.runId,
   value.expiresAtMs,
+  // Signed only when the activation carries it, so an activation without a
+  // phone-code decision keeps today's proof.
+  ...('phoneCode' in value ? [value.phoneCode] : []),
 ])).digest()
 const authenticActivation = (value, challenge, credential) => {
   if (!credential || typeof value?.activationMac !== 'string' || !/^[0-9a-f]{64}$/i.test(value.activationMac)) return false
@@ -281,7 +247,7 @@ export default function register(sdk) {
 
   const setState = patch => sdk.updateWidget(app, state => ({ ...state, ...patch }))
 
-  const control = async op => {
+  const control = async (op, phoneCode) => {
     const current = config
     if (!current || Date.now() >= current.expiresAtMs) throw new Error('pairing_activation_expired')
     const headers = {
@@ -290,10 +256,9 @@ export default function register(sdk) {
     }
     if (controlSecret) headers['x-ocuclaw-pair-control-secret'] = controlSecret
     const body = op === 'create'
-      // The widget paints the QR as black on white below, independently of
-      // the surrounding TUI theme. Ask the canonical renderer for the matching
-      // light-terminal polarity so spaces stay white and block glyphs stay black.
-      ? { v: 1, op, address: current.address, lightTerminal: true }
+      // No window draws a QR (#5486), so the request asks for no QR colours;
+      // a phone code is the only extra field (#5483).
+      ? { v: 1, op, address: current.address, ...(phoneCode === undefined ? {} : { phoneCode }) }
       : { v: 1, op }
     const response = await fetch(current.controlUrl, { method: 'POST', headers, body: JSON.stringify(body) })
     let parsed = {}
@@ -305,11 +270,15 @@ export default function register(sdk) {
     // A window-size cancel already owns the panel and the result (#3521).
     if (sizeCancellationStarted) return
     clearTimeout(pollTimer)
+    outcomeShown = true
     controlSecret = ''
+    setState(outcomePatch(body))
+  }
+  const outcomePatch = body => {
     const state = clean(body?.state) || 'failed'
     const code = terminalCode(body)
     const ok = state === 'completed'
-    setState({
+    return {
       phase: 'outcome',
       outcomeState: ok ? 'completed' : (state === 'failed' ? 'failed' : 'cancelled'),
       code,
@@ -317,20 +286,23 @@ export default function register(sdk) {
       message: ok
         ? 'The phone connected back and the managed gateway confirmed it.'
         : clean(body?.failure?.message) || 'Nothing was approved. You can retry this setup checkpoint.',
-    })
+    }
   }
+  // #5483. Stopped before any exchange existed: nothing to cancel at the relay.
+  const CANCELLED_BEFORE_EXCHANGE = { state: 'cancelled', failure: { reason: 'cancelled' } }
 
   const fail = (code, message) => outcome({ state: 'failed', failure: { reason: code, message } })
 
   const schedulePoll = () => {
     clearTimeout(pollTimer)
+    if (outcomeShown) return
     pollTimer = setTimeout(() => void poll(), 650)
   }
 
   const poll = async () => {
     try {
       const { status, body } = await control('state')
-      if (sizeCancellationStarted) return
+      if (sizeCancellationStarted || outcomeShown) return
       if (status !== 200) return fail('state_refused', `The relay refused the pairing status check (${status}).`)
       if (TERMINAL_PAIRING_STATES.has(body.state)) return outcome(body)
       if (body.prompt?.safetyPhraseText) {
@@ -348,10 +320,17 @@ export default function register(sdk) {
             ? state.selection
             : 'no',
         }))
+      } else {
+        // The manual view's clock: a new state redraws it once its text moves.
+        sdk.updateWidget(app, state => {
+          if (state.phase !== 'manual' || !Number.isFinite(state.expiresAtMs)) return state
+          const shown = expiryLine(state.expiresAtMs)
+          return shown === state.expiryShown ? state : { ...state, expiryShown: shown }
+        })
       }
       schedulePoll()
     } catch {
-      fail('relay_unreachable', 'The local OcuClaw relay could not be reached.')
+      if (!outcomeShown) fail('relay_unreachable', 'The local OcuClaw relay could not be reached.')
     }
   }
 
@@ -369,28 +348,91 @@ export default function register(sdk) {
     }
   }
 
-  const start = async () => {
+  const createRefused = (status, body) =>
+    fail(clean(body?.reason) || 'create_refused', clean(body?.message) || `The relay refused pairing (${status}).`)
+
+  // Show an exchange the relay opened for manual pairing. `manualMessage` is
+  // the one line saying why a phone code was not used (#5483).
+  const present = (body, manualMessage = '') => {
+    const bootstrap = splitBootstrap(body.bootstrapBlock, body)
+    if (!body.controlSecret || !bootstrap) return fail('invalid_create_response', 'The relay returned an unusable pairing request.')
+    controlSecret = String(body.controlSecret)
+    if (cancelRequested) return void decide('cancel')
+    // #5486: the address and pairing code, text only. The clock is the
+    // relay's own `expiresInSeconds`, counted from this reply.
+    const seconds = Number(body.expiresInSeconds)
+    setState({
+      phase: 'manual',
+      addressLine: bootstrap.addressLine,
+      codeLine: bootstrap.codeLine,
+      expiresAtMs: Number.isFinite(seconds) && seconds > 0 ? Date.now() + seconds * 1000 : undefined,
+      manualMessage,
+    })
+    schedulePoll()
+  }
+
+  const start = async (manualMessage = '') => {
     try {
       const { status, body } = await control('create')
-      if (status !== 200) return fail(clean(body?.reason) || 'create_refused', clean(body?.message) || `The relay refused pairing (${status}).`)
-      const bootstrap = splitBootstrap(body.bootstrapBlock)
-      if (!body.controlSecret || !bootstrap) return fail('invalid_create_response', 'The relay returned an unusable pairing request.')
-      controlSecret = String(body.controlSecret)
-      if (cancelRequested) return void decide('cancel')
-      // The QR is the preferred view. PairingView opens the manual view
-      // instead whenever the QR does not fit this window (#3521).
-      setState({
-        phase: 'qr',
-        view: 'qr',
-        qrBlock: bootstrap.qrBlock,
-        addressLine: bootstrap.addressLine,
-        codeLine: bootstrap.codeLine,
-        blockColumns: requiredColumns(bootstrap.qrBlock),
-      })
-      schedulePoll()
+      if (status !== 200) return createRefused(status, body)
+      present(body, manualMessage)
     } catch {
       fail('relay_unreachable', 'The local OcuClaw relay could not be reached.')
     }
+  }
+
+  // #5483. Send the typed phone code. The relay opens the exchange only for a
+  // code a phone is waiting with; a wrong code leaves nothing behind, so the
+  // panel asks again, and the third wrong code opens manual pairing.
+  const submitCode = async code => {
+    let reply
+    try {
+      reply = await control('create', code)
+    } catch {
+      codeSubmitting = false
+      if (sizeCancellationStarted) return
+      if (cancelRequested) return outcome(CANCELLED_BEFORE_EXCHANGE)
+      return fail('relay_unreachable', 'The local OcuClaw relay could not be reached.')
+    }
+    codeSubmitting = false
+    const { status, body } = reply
+    const secret = status === 200 && typeof body?.controlSecret === 'string' ? body.controlSecret : ''
+    if (sizeCancellationStarted || cancelRequested) {
+      // Stopped while the relay was answering: cancel what it made, if anything.
+      if (!secret) return sizeCancellationStarted ? undefined : outcome(CANCELLED_BEFORE_EXCHANGE)
+      controlSecret = secret
+      if (!sizeCancellationStarted) return void decide('cancel')
+      try { await control('cancel') } catch {}
+      controlSecret = ''
+      return
+    }
+    if (status === 200 && body?.reason === 'pairing_code_typed') {
+      // As Hermes pair: only this line, and no try used.
+      return setState({ phase: 'phone-code', digits: '', codeMessage: PHONE_CODE_PAIRING_TYPED, triesLine: '' })
+    }
+    if (status === 200 && WRONG_PHONE_CODE_REASONS.has(body?.reason)) {
+      phoneCodeTriesLeft -= 1
+      if (phoneCodeTriesLeft > 0) {
+        return setState({
+          phase: 'phone-code',
+          digits: '',
+          codeMessage: PHONE_CODE_MISSING,
+          triesLine: `${phoneCodeTriesLeft} ${phoneCodeTriesLeft === 1 ? 'try' : 'tries'} left.`,
+        })
+      }
+      setState({ phase: 'loading' })
+      return start(PHONE_CODE_MISSING)
+    }
+    if (status !== 200) return createRefused(status, body)
+    if (body?.delivery === 'sent') {
+      if (!secret) return fail('invalid_create_response', 'The relay returned an unusable pairing request.')
+      controlSecret = secret
+      setState({ phase: 'sent' })
+      return schedulePoll()
+    }
+    // The mailbox could not be reached: the relay already opened a fresh
+    // manual exchange for this answer.
+    return present(body, body?.delivery === 'unavailable' ? PHONE_CODE_OUTAGE : '')
   }
 
   // #3521. Below the manual/four-word minimum the ceremony cannot be shown at
@@ -466,8 +508,10 @@ export default function register(sdk) {
     decisionStarted = false
     sizeCancellationStarted = false
     resultNotified = false
-    qrFitsWindow = false
     cancelRequested = false
+    codeSubmitting = false
+    phoneCodeTriesLeft = PHONE_CODE_TRIES
+    outcomeShown = false
   }
 
   const closeOutcome = state => {
@@ -479,26 +523,18 @@ export default function register(sdk) {
   }
 
   const PairingView = ({ cols, rows, state, t }) => {
-    // #3521. The QR (about 43 rows) is the preferred view, but only when it
-    // fits. Otherwise the manual view (address + code for the same exchange)
-    // opens instead. Cancel only when even the manual and four-word views do
-    // not fit. Every size is measured from the lines this view renders.
-    const inQr = state.phase === 'qr'
-    const qrSize = inQr ? qrViewSize(state) : null
-    const minimum = inQr ? manualMinimumSize(state) : null
-    const qrFits = inQr && fitsWindow(qrSize, cols, rows)
-    const tooSmall = inQr && !fitsWindow(minimum, cols, rows)
-    const showQr = inQr && qrFits && state.view !== 'manual'
-    if (inQr) qrFitsWindow = qrFits
+    // #3521. Cancel only when the rest of the ceremony does not fit: the
+    // manual view (address + code) and then the four-word check. Every size
+    // is measured from the lines this view renders.
+    const inManual = state.phase === 'manual'
+    // #5483. The phone-code views lead to the four-word check with no manual
+    // view between, so they carry that minimum themselves.
+    const inCode = state.phase === 'phone-code' || state.phase === 'sent'
+    const minimum = inManual ? manualMinimumSize(state) : inCode ? phoneCodeMinimumSize(state) : null
+    const tooSmall = Boolean(minimum) && !fitsWindow(minimum, cols, rows)
     sdk.React.useEffect(() => {
-      if (tooSmall) {
-        cancelForSize({ cols, rows, minCols: minimum.cols, minRows: minimum.rows })
-      } else if (inQr && !qrFits && state.view !== 'manual') {
-        // Stay on the manual view: growing the window later must not swap
-        // the view under someone typing the code; `m` offers the QR then.
-        setState({ view: 'manual' })
-      }
-    }, [tooSmall, qrFits, inQr, state.view])
+      if (tooSmall) cancelForSize({ cols, rows, minCols: minimum.cols, minRows: minimum.rows })
+    }, [tooSmall])
 
     let title = state.title || PAIRING_TITLE
     let hint = 'Esc/q cancels'
@@ -518,19 +554,14 @@ export default function register(sdk) {
       ]
     } else if (state.phase === 'loading') {
       lines = ['Opening a one-time encrypted pairing exchange…']
-    } else if (inQr) {
-      // Give every canonical QR row its exact space so Ink never soft-wraps
-      // it; the manual view keeps the same width when the QR fits.
-      width = Math.min(
-        cols - WINDOW_MARGIN_COLUMNS,
-        Math.max(68, (qrFits ? qrSize : minimum).cols - WINDOW_MARGIN_COLUMNS),
-      )
-      if (showQr) {
-        hint = QR_HINT
-        lines = qrLines(state)
-      } else {
-        hint = qrFits ? MANUAL_HINT : MANUAL_ONLY_HINT
+    } else if (inCode || inManual) {
+      width = Math.min(cols - WINDOW_MARGIN_COLUMNS, Math.max(68, minimum.cols - WINDOW_MARGIN_COLUMNS))
+      if (inManual) {
+        hint = MANUAL_HINT
         lines = manualLines(state)
+      } else {
+        hint = state.phase === 'sent' ? SENT_HINT : PHONE_CODE_HINT
+        lines = state.phase === 'sent' ? sentLines() : phoneCodeLines(state)
       }
     } else if (state.phase === 'words') {
       hint = WORDS_HINT
@@ -543,30 +574,10 @@ export default function register(sdk) {
     }
 
     return h(Overlay, { backdrop: true, zone: 'center' },
-      h(Dialog, { title, hint, width }, ...lines.map((line, index) => {
-        const isQrBlock = showQr && index === 0
-        if (isQrBlock) {
-          const children = []
-          const rows = qrWatermarkRuns(line, blendWithWhite(t.color.accent))
-          rows.forEach((runs, rowIndex) => {
-            runs.forEach((run, runIndex) => children.push(h(Text, {
-              key: `${rowIndex}:${runIndex}`,
-              color: '#000000',
-              backgroundColor: run.backgroundColor,
-            }, run.text)))
-            if (rowIndex < rows.length - 1) children.push('\n')
-          })
-          return h(Text, {
-            key: index,
-            color: '#000000',
-            backgroundColor: '#ffffff',
-          }, ...children)
-        }
-        return h(Text, {
-          key: index,
-          color: state.phase === 'outcome' ? (state.outcomeState === 'completed' ? t.color.ok : t.color.error) : undefined,
-        }, line || ' ')
-      })))
+      h(Dialog, { title, hint, width }, ...lines.map((line, index) => h(Text, {
+        key: index,
+        color: state.phase === 'outcome' ? (state.outcomeState === 'completed' ? t.color.ok : t.color.error) : undefined,
+      }, line || ' '))))
   }
 
   // Keep the presenter out of Hermes' public slash-command catalog while it
@@ -579,7 +590,9 @@ export default function register(sdk) {
     id: 'ocuclaw-pair',
     help: 'internal OcuClaw setup pairing presenter',
     mode: 'modal',
-    init: rawArgs => rawArgs === AUTO_ACTIVATION ? { phase: 'loading', selection: 'no' } : null,
+    init: rawArgs => rawArgs !== AUTO_ACTIVATION ? null
+      : config?.phoneCode === 'available' ? { phase: 'phone-code', digits: '', selection: 'no' }
+        : { phase: 'loading', selection: 'no' },
     reduce(state, { ch, key }) {
       const cancelKey = key.escape || ch === 'q' || sdk.isCtrl(key, ch, 'c')
       if (state.phase === 'idle') return key.return || cancelKey ? null : state
@@ -599,12 +612,39 @@ export default function register(sdk) {
         }
         return state
       }
-      if (state.phase === 'qr' && ch === 'm') {
-        // #3521: `m` offers the QR only when the QR fits this window.
-        if (state.view === 'manual') return qrFitsWindow ? { ...state, view: 'qr' } : state
-        return { ...state, view: 'manual' }
+      if (state.phase === 'phone-code') {
+        // #5483. No exchange exists yet, unless a typed code is with the relay.
+        if (cancelKey) {
+          if (!codeSubmitting) return { ...state, ...outcomePatch(CANCELLED_BEFORE_EXCHANGE) }
+          cancelRequested = true
+          return { ...state, phase: 'deciding', message: 'Cancelling pairing…' }
+        }
+        if (codeSubmitting) return state
+        if (ch === 'm' || ch === 'M') {
+          void start()
+          return { ...state, phase: 'loading' }
+        }
+        const digits = String(state.digits ?? '')
+        if (key.return) {
+          if (digits.length !== 6) return state
+          codeSubmitting = true
+          void submitCode(digits)
+          return state
+        }
+        if (key.backspace || key.delete || ch === '\u007f' || ch === '\b') return { ...state, digits: digits.slice(0, -1) }
+        // A paste arrives as one string, maybe inside bracketed-paste marks.
+        const typed = String(ch ?? '').replace(/\u001b\[20[01]~/g, '')
+        if (/^[0-9]$/.test(typed)) return digits.length < 6 ? { ...state, digits: digits + typed } : state
+        const compact = typed.replace(/[\s-]/g, '')
+        if (typed.length > 1 && /^[0-9]+$/.test(compact)) return { ...state, digits: compact.slice(0, 6) }
+        if (typed.length > 1 && /^[A-Za-z0-9]+$/.test(compact)) {
+          // A pasted pairing code: the relay names it and no try is used.
+          codeSubmitting = true
+          void submitCode(typed.trim().slice(0, 64))
+        }
+        return state
       }
-      if (cancelKey && (state.phase === 'loading' || state.phase === 'qr')) {
+      if (cancelKey && (state.phase === 'loading' || state.phase === 'manual' || state.phase === 'sent')) {
         requestCancel()
         return { ...state, phase: 'deciding', message: 'Cancelling pairing…' }
       }
@@ -651,6 +691,7 @@ export default function register(sdk) {
           [ACTIVATION_CHALLENGE_HEADER]: challenge,
           [ACTIVATION_SERVER_CHALLENGE_HEADER]: serverChallenge,
           [ACTIVATION_CLAIM_PROOF_HEADER]: claimProof(serverChallenge, challenge, ownerPid, credential),
+          [ACTIVATION_WIDGET_PROTOCOL_HEADER]: WIDGET_PROTOCOL,
         },
       })
       if (response.status !== 200) return
@@ -661,12 +702,17 @@ export default function register(sdk) {
       decisionStarted = false
       sizeCancellationStarted = false
       resultNotified = false
-      qrFitsWindow = false
       cancelRequested = false
+      codeSubmitting = false
+      phoneCodeTriesLeft = PHONE_CODE_TRIES
+      outcomeShown = false
       pairingActive = true
       defineWidgetApp(app)
       sdk.openWidget(app, app.init(AUTO_ACTIVATION))
-      void start()
+      // #5483. With phone codes on, nothing is created until a code is typed
+      // or manual pairing is picked. Off and a custom route open today's
+      // panel with no extra line; only an outage says why.
+      if (config.phoneCode !== 'available') void start(config.phoneCode === 'unavailable' ? PHONE_CODE_OUTAGE : '')
     } catch {
       // Inert is the normal state. The activation endpoint exists only while
       // the setup tool is blocked waiting for this direct-human ceremony.

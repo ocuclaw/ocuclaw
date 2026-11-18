@@ -199,6 +199,9 @@
         )
       ),
       e(Section, { title: "Outcome", className: "oc-outcome" }, e("p", null, data.outcome)),
+      (data.warnings || []).map(function (line, index) {
+        return e("div", { key: "warning-" + index, className: "oc-warning", role: "status" }, e("strong", null, "Warning"), e("p", null, text(line)));
+      }),
       e(Section, { title: "Where the path stands", kicker: "CAUSAL, NOT INFERRED" }, e(CausalPath, { legs: data.causalPath || [] })),
       e(
         Section,

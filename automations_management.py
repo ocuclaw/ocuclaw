@@ -5,8 +5,12 @@ import re
 import time
 
 from .native_compat import probe
+from . import starter_gallery
 
-READS = {"automations.options", "automations.read", "automations.preview", "automations.receipt"}
+# ``automations.starters`` (#5034) is the Start from gallery: stock Hermes 0.22's
+# blueprint listing, so it needs no native-compat package.
+STARTERS = "automations.starters"
+READS = {"automations.options", "automations.read", "automations.preview", "automations.receipt", STARTERS}
 OPERATIONS = READS | {"automations.create", "automations.update", "automations.delete", "automations.cancel"}
 
 
@@ -27,7 +31,8 @@ def automations_capabilities(profile):
         supported = True
     except Exception:
         supported = False
-    return [{"operation": op, "scope": "profile", "supported": supported,
+    starters = starter_gallery.supported()
+    return [{"operation": op, "scope": "profile", "supported": starters if op == STARTERS else supported,
              "applyTiming": "read_only" if op in READS else "active_now"} for op in sorted(OPERATIONS)]
 
 
@@ -35,7 +40,7 @@ def _validate(operation, payload):
     p = payload or {}
     if not isinstance(p, dict):
         raise ValueError()
-    allowed = {"automations.options": set(), "automations.read": {"jobId"},
+    allowed = {"automations.options": set(), STARTERS: set(), "automations.read": {"jobId"},
                "automations.receipt": {"operationId"},
                "automations.preview": {"jobId", "revision", "fields", "template", "templateValues"}}
     keys = allowed.get(operation, {"operationId", "producedAt", "expiresAt"} |
@@ -87,6 +92,14 @@ def handle_automations(identity, payload):
         p = _validate(operation, payload)
     except ValueError:
         return fail("invalid_request")
+    if operation == STARTERS:
+        try:
+            starters = starter_gallery.list_starters()
+        except NotImplementedError:
+            return fail("unsupported", "unsupported")
+        except Exception:
+            return fail("native_read_failed")
+        return {**identity, "status": "ok", "capabilities": [], "automations": {"starters": starters}}
     try:
         native = _native(identity["profileId"])
     except Exception:

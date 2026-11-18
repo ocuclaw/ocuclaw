@@ -1,13 +1,13 @@
 # Agent choice — fresh installs AND existing ones
 
-**Guide version:** 2026-09-29 (1.3.26-hermes)
+**Guide version:** 2026-10-28 (1.3.27-hermes)
 
 Read during fresh setup before the gateway restart, and on ANY existing
 install whose `ocuclaw_setup` status reports
 `mandatoryConfiguration.agentModeChosen: false` (an install that predates this
 question, or an interrupted write). Multiple agents is the recommended OcuClaw
-beta experience. Keep this a product choice; do not ask the user to understand
-multiplexing or environment flags.
+experience. Keep this a product choice and explain it in product terms;
+the user does not need to know about multiplexing or environment flags.
 
 **Every command in this file runs in the DEFAULT Hermes profile.** The default
 profile owns the wearer's pairing and the one relay credential; secondary
@@ -66,7 +66,7 @@ adds `→ run /ocuclaw-setup in a Hermes chat to choose`.
 
    | `migration.gate` | what to do |
    |---|---|
-   | `migration_already_multiplex` | record the choice only (step 3d) |
+   | `migration_already_multiplex` | run the plan's `commands` (it saves an unset switch as `true`), then step 3d |
    | `migration_not_needed` | this host has one profile — step 3b |
    | `migration_via_flag_flip` | other profiles exist, none owns a gateway — step 3b |
    | `migration_via_gateway_migrate` | step 3c, the guided migration |
@@ -184,6 +184,14 @@ adds `→ run /ocuclaw-setup in a Hermes chat to choose`.
    ```bash
    hermes config set --force platforms.ocuclaw.extra.agent_mode multiple
    ```
+
+   The choice counts as recorded only when `gateway.multiplex_profiles` is
+   saved as `true`. An unset switch is not enough: Hermes 0.23 decides an
+   unset switch at every start, and a host with one profile starts with
+   multiple agents off. So when the preflight says the switch is unset
+   (`migration_already_multiplex` lists the write first), save it with
+   `hermes config set --force gateway.multiplex_profiles true` before this
+   line.
 
    **Restarts.** Step 5 below adds the restart this choice needs. Step 3c is
    the exception: `hermes gateway migrate` restarts the gateway itself, so do

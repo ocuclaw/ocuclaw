@@ -4,10 +4,19 @@ const fs = require("node:fs");
 const path = require("node:path");
 const WebSocket = require("ws");
 const { createGatewayTimingLedger } = require("./gateway-timing-ledger.cjs");
+const { stripDisplayMarkup } = require("../domain/tagged-span-strip.cjs");
+const { speckFeelings } = require("../domain/speck-marker.cjs");
 const { sanitizeConnectReason } = require("./sanitize-connect-reason.cjs");
 const { sanitizeProtocolFrame } = require("../runtime/downstream-handler.cjs");
 const { isAgentSelectionRequiredError, scopeOpenClawRequestSessionParams } = require("../runtime/openclaw-session-key.cjs");
 const { isTitleDistillerRun } = require("../runtime/session-title-distiller-helpers.cjs");
+const { createDeclinedToolRunTracker } = require("../runtime/declined-tool-reply.cjs");
+const { createApprovalContextRecorder } = require("./approval-context.cjs");
+const { createOpenclawAgentRunSignals } = require("./openclaw-run-signals.cjs");
+const { createOpenclawModelCallTracker, positiveModelCallSeq } = require("./openclaw-model-calls.cjs");
+const { stripLiveuiContextFenceFromHistoryResult } = require("../tools/glasses-ui-context-fence.cjs");
+const { projectOpenClawConversationHistory } = require("../domain/openclaw-conversation-history.cjs");
+const { pickPatchPath } = require("../domain/activity-status-labels.cjs");
 
 const DEVICE_KEY_FILE = "ocuclaw-device-key.json";
 const DEVICE_TOKEN_FILE = "ocuclaw-device-token.json";
@@ -27,7 +36,34 @@ const MIN_PROTOCOL_VERSION = 3;
 const MAX_PROTOCOL_VERSION = 4;
 const HISTORY_ACTIVITY_POLL_INTERVAL_MS = 500;
 const HISTORY_ACTIVITY_POLL_LIMIT = 40;
+
+const LATE_SUMMARY_HOLD_MS = 600;
+
+const RELEASES_HELD_SUMMARY_ITEM_KINDS = new Set(["preamble", "tool", "command", "patch", "search"]);
+
+const REASONING_CUE_LABEL = "Reasoning...";
+
+const TOOL_CALL_WRAPPER_NAME = "tool_call";
+const TOOL_CALL_WRAPPER_LIMIT = 256;
+const WRAPPED_TOOL_NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+
+function wrappedToolName(args     )                {
+  if (!args || typeof args !== "object" || typeof args.id !== "string") return null;
+  const id = args.id.trim();
+  const name = id.slice(id.lastIndexOf(":") + 1).trim();
+  return WRAPPED_TOOL_NAME_RE.test(name) && name !== TOOL_CALL_WRAPPER_NAME ? name : null;
+}
+
+const PLAN_MAX_ITEMS = 30;
+const PLAN_ITEM_MAX_CHARS = 120;
+const PLAN_STATUSES = ["pending", "in_progress", "completed", "cancelled"];
 const RUN_SESSION_KEY_LIMIT = 64;
+
+const PROGRESS_RECORDS_READ_BUDGET_MS = 3000;
+const PROGRESS_RECORDS_READ_RETRY_MS = 250;
+const PROGRESS_RECORDS_HISTORY_LIMIT = 20;
+
+const COMPOSE_TOOL_NAME = "compose_glasses_ui";
 const THINKING_FRAME_MAX_CHARS = 8000;
 const THINKING_FRAME_TRUNCATION_PREFIX = "[truncated]...";
 
@@ -299,6 +335,19 @@ function isObject(value) {
   return value && typeof value === "object" && !Array.isArray(value);
 }
 
+function helloFeaturesFrom(helloOk     ) {
+  const features = isObject(helloOk && helloOk.features) ? helloOk.features : {};
+  const server = isObject(helloOk && helloOk.server) ? helloOk.server : {};
+  const names = (list     ) =>
+    Array.isArray(list) ? list.filter((name) => typeof name === "string" && name.length > 0) : [];
+  return Object.freeze({
+    methods: Object.freeze(names(features.methods)),
+    events: Object.freeze(names(features.events)),
+    bootId: typeof server.bootId === "string" ? server.bootId : null,
+    version: typeof server.version === "string" ? server.version : null,
+  });
+}
+
 function isNullishToken(value) {
   if (typeof value !== "string") return false;
   const normalized = value.trim().toLowerCase();
@@ -309,6 +358,31 @@ function isNullishToken(value) {
     normalized === "(undefined)" ||
     normalized === "none"
   );
+}
+
+function stripPatchBodies(args     ) {
+  const looksLikePatch = (value     ) =>
+    typeof value === "string" && /^\s*\*\*\* Begin Patch/.test(value);
+  const hasBody =
+    "diff" in args ||
+    typeof args.patch === "string" ||
+    looksLikePatch(args.input) ||
+    Array.isArray(args.changes);
+  if (!hasBody) return args;
+  const out      = { ...args };
+  delete out.diff;
+  if (typeof out.patch === "string") delete out.patch;
+  if (looksLikePatch(out.input)) delete out.input;
+  if (Array.isArray(out.changes)) {
+    out.changes = out.changes.map((change     ) => {
+      if (!isObject(change)) return change;
+      const kept      = {};
+      if (typeof change.path === "string") kept.path = change.path;
+      if (change.kind !== undefined) kept.kind = change.kind;
+      return kept;
+    });
+  }
+  return out;
 }
 
 function pickStringPathFromArgs(args) {
@@ -463,6 +537,8 @@ function inferFailureHintFromText(rawText) {
     text.includes("rate limited") ||
     text.includes("too many requests") ||
     text.includes("usage limit") ||
+
+    text.includes("usage-limit") ||
     text.includes("organization usage limit")
   ) {
     return "rate_limit";
@@ -558,6 +634,10 @@ function resolveTerminalErrorCode(source, fallbackCode) {
     ),
   );
   return inferredHintCode || fallbackCode || "agent_error";
+}
+
+function isGatewaySeqGapNotice(data         )          {
+  return !!data && typeof data === "object" && (data                           ).reason === "seq gap";
 }
 
 function buildTerminalErrorActivity(data, fallbackRunId, fallbackSessionKey, fallbackCode) {
@@ -761,7 +841,90 @@ function normalizeRunId(rawRunId) {
   return trimmed || null;
 }
 
-function unscopeEcho(result, params, scoped) {
+function cumulativeAssistantText(data, previousText, previousItemId, startsMessage = false) {
+  if (typeof data.text === "string") return data.text;
+  if (typeof data.delta !== "string" || !data.delta) return null;
+
+  if (data.phase === "commentary") return null;
+  const itemId =
+    typeof data.itemId === "string" && data.itemId.trim() ? data.itemId.trim() : null;
+  const sameMessage =
+    !startsMessage &&
+    data.replace !== true &&
+    !(itemId && previousItemId && itemId !== previousItemId);
+  return `${sameMessage ? previousText : ""}${data.delta}`;
+}
+
+function noteMediaUrls(target          , data     ) {
+  if (!data || !Array.isArray(data.mediaUrls)) return;
+  for (const url of data.mediaUrls) {
+    const value = typeof url === "string" ? url.trim() : "";
+    if (value && !value.includes("\n") && !target.includes(value)) target.push(value);
+  }
+}
+
+function withMediaLines(text     , urls          ) {
+  const base = typeof text === "string" ? text : "";
+  const missing = (urls || []).filter((url) => !base.includes(`MEDIA:${url}`));
+  if (missing.length === 0) return base;
+  const lines = missing.map((url) => `MEDIA:${url}`).join("\n");
+  return base.trim() ? `${base.trimEnd()}\n\n${lines}` : lines;
+}
+
+function assistantMessagePhase(data     ) {
+  return typeof data.phase === "string" && data.phase.trim()
+    ? data.phase.trim().toLowerCase()
+    : null;
+}
+
+function collapseWhitespace(text     ) {
+  return typeof text === "string" ? text.replace(/\s+/g, " ").trim() : "";
+}
+
+function findProgressTexts(messages     , preambles          , found                   ) {
+  if (!Array.isArray(messages)) return found;
+  const next = found.slice();
+  for (let i = messages.length - 1; i >= 0 && next.some((text) => !text); i -= 1) {
+    const msg = messages[i];
+    if (!isObject(msg) || msg.role !== "assistant") continue;
+    const blocks = typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : msg.content;
+    if (!Array.isArray(blocks)) continue;
+    for (const block of blocks) {
+      if (!isObject(block) || block.type !== "text" || typeof block.text !== "string") continue;
+      const collapsed = collapseWhitespace(block.text);
+      preambles.forEach((preamble, index) => {
+        if (!next[index] && collapsed.startsWith(preamble)) next[index] = block.text;
+      });
+    }
+  }
+  return next;
+}
+
+function newRunProgress() {
+  return {
+
+    keepsLines: false,
+
+    streamedAsReply: false,
+
+    messages: new Map(),
+
+    holdsIndex: null       ,
+
+    read: null       ,
+  };
+}
+
+function beforeDeadline(promise              , deadline        ) {
+  let timer      = null;
+  const expiry = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error("deadline passed")), Math.max(0, deadline - Date.now()));
+    if (timer.unref) timer.unref();
+  });
+  return Promise.race([promise, expiry]).finally(() => clearTimeout(timer));
+}
+
+function unscopeEcho(result     , params     , scoped     ) {
   if (!result || typeof result !== "object" || Array.isArray(result)) return result;
   let next = result;
   for (const field of ["key", "sessionKey"]) {
@@ -816,7 +979,7 @@ function thinkingFrameDedupeKey(runId, extracted) {
   return `${normalizedRunId}:detail:${hashThinkingKey(detail)}`;
 }
 
-function clampThinkingFrameText(rawText) {
+function clampThinkingFrameText(rawText     ) {
   const text = typeof rawText === "string" ? rawText : "";
   if (text.length <= THINKING_FRAME_MAX_CHARS) return text;
   const keep = Math.max(
@@ -838,7 +1001,7 @@ function appendThinkingFrameText(previousText, nextText) {
   return clampThinkingFrameText(text);
 }
 
-function joinThinkingSegments(baseText, nextText) {
+function joinThinkingSegments(baseText     , nextText     ) {
   const base = typeof baseText === "string" ? baseText.trim() : "";
   const next = typeof nextText === "string" ? nextText.trim() : "";
   if (!base) return next;
@@ -846,13 +1009,109 @@ function joinThinkingSegments(baseText, nextText) {
   return `${base}\n${next}`;
 }
 
+function clampPlanText(raw     ) {
+  const text = typeof raw === "string" ? raw.replace(/\s+/g, " ").trim() : "";
+  if (text.length <= PLAN_ITEM_MAX_CHARS) return text;
+  return `${text.slice(0, PLAN_ITEM_MAX_CHARS - 1).trimEnd()}…`;
+}
+
+function normalizePlanStatus(raw     ) {
+  const status = typeof raw === "string" ? raw.trim().toLowerCase().replace(/-/g, "_") : "";
+  return PLAN_STATUSES.includes(status) ? status : "pending";
+}
+
+function planStepGlance(items       ) {
+  const counted = items.filter((item) => item.status !== "cancelled");
+  const total = counted.length;
+  if (!total) return null;
+  const completed = counted.filter((item) => item.status === "completed").length;
+  if (completed === total) return { index: total, total, done: true };
+  let index = counted.findIndex((item) => item.status === "in_progress");
+  let current = index >= 0 ? counted[index] : null;
+  if (!current) {
+    index = Math.min(completed, total - 1);
+    current = counted.find((item) => item.status === "pending") || counted[index];
+  }
+  const step      = { index: index + 1, total, done: false };
+  if (current && current.content) step.content = current.content;
+  return step;
+}
+
+function buildActivityPlan(data     , revision        ) {
+  if (!isObject(data) || !Array.isArray(data.steps)) return null;
+  const items        = [];
+  for (const raw of data.steps) {
+    if (!isObject(raw)) continue;
+    const content = clampPlanText(raw.step ?? raw.content ?? raw.text);
+    if (!content) continue;
+    items.push({ content, status: normalizePlanStatus(raw.status) });
+  }
+  if (!items.length) return null;
+  const summary      = { total: items.length };
+  for (const status of PLAN_STATUSES) {
+    summary[status] = items.filter((item) => item.status === status).length;
+  }
+  const plan      = { revision, items: items.slice(0, PLAN_MAX_ITEMS), summary };
+  if (items.length > PLAN_MAX_ITEMS) plan.truncated = true;
+  const step = planStepGlance(items);
+  if (step) plan.step = step;
+  const explanation = clampPlanText(data.explanation);
+  if (explanation) plan.explanation = explanation;
+  return plan;
+}
+
+function newThinkingStreamSegment() {
+  return { raw: "", base: "", events: 0, itemId: null, ordinal: 0, boundary: false };
+}
+
+const SUMMARY_TITLE_MAX_CHARS = 100;
+function asSummaryTitle(segment     , events        ) {
+  if (typeof segment !== "string" || events !== 1) return segment;
+  const title = segment.trim();
+  if (!title || title.length > SUMMARY_TITLE_MAX_CHARS) return segment;
+  if (title.includes("*") || /[\r\n]/.test(title)) return segment;
+  return `**${title}**`;
+}
+
+function finishedSentences(text     ) {
+  if (typeof text !== "string") return null;
+  const match = /^[\s\S]*[.!?](?=\s|$)/.exec(text.trim());
+  return match ? match[0].trim() : null;
+}
+
 class OpenClawClient extends EventEmitter {
 
-  _thinkingStreamSegments;
+  _thinkingStreamSegments     ;
+  _commentaryByRun     ;
+  _preToolProseKey     ;
+  _reasoningCueItemIds     ;
+  _planRevisionByRun     ;
+  _modelCalls     ;
+  _toolCallWrappers     ;
+  _liveThinkingRunIds     ;
+  _heldThinking     ;
+  _lateSummaryHoldMs     ;
+  _activeRunId     ;
+  _activeRunStartedAtMs     ;
+  _activeRunSessionKey     ;
+  _runMessagePhase     ;
+  _runRecordsPreambles     ;
+  _runStreamedRecordTexts     ;
+  _runProgress     ;
+  _runMessageIndex     ;
+  _activeRunGeneration     ;
+  _commitHold     ;
+  _runTextBuffer     ;
+  _runMediaUrls          ;
+  _historyResolved     ;
+  _eventQueue     ;
+  _logger     ;
+  _approvalContext     ;
 
-  _ws;
-  _socketGeneration;
-  _stopped;
+  _ws     ;
+  _socketGeneration     ;
+  _stopped     ;
+  _helloFeatures     ;
 
   constructor(opts = {}) {
     super();
@@ -881,6 +1140,8 @@ class OpenClawClient extends EventEmitter {
     this._deviceToken = null;
 
     this._sessionDefaults = null;
+
+    this._helloFeatures = null;
     this._agentSelectionRequiredLatched = false;
     this._sessionAgentResolver = null;
 
@@ -896,14 +1157,31 @@ class OpenClawClient extends EventEmitter {
     this._activeRunGeneration = 0;
     this._runTextBuffer = "";
 
-    const runRouting = this;
+    this._runMediaUrls = [];
+
+    const declinedToolRunsOwner      = this;
+    declinedToolRunsOwner._declinedToolRuns = createDeclinedToolRunTracker();
+
+    const runRouting      = this;
     runRouting._runSessionKeys = new Map();
 
     runRouting._backgroundRunText = new Map();
 
+    runRouting._runSignals = createOpenclawAgentRunSignals();
+
     this._runMessageIndex = 0;
 
     this._runItemId = null;
+
+    this._runMessagePhase = null;
+
+    this._runRecordsPreambles = new Map();
+
+    this._runStreamedRecordTexts = [];
+
+    this._runProgress = newRunProgress();
+
+    this._commitHold = false;
 
     this._chatCommandRuns = new Map();
 
@@ -922,7 +1200,26 @@ class OpenClawClient extends EventEmitter {
 
     this._thinkingStreamSegments = new Map();
 
+    this._commentaryByRun = new Map();
+
+    this._reasoningCueItemIds = new Set();
+
+    this._planRevisionByRun = new Map();
+
+    this._modelCalls = createOpenclawModelCallTracker();
+
+    this._toolCallWrappers = new Map();
+
+    this._approvalContext = createApprovalContextRecorder();
+
     this._liveThinkingRunIds = new Set();
+
+    this._heldThinking = new Map();
+    const holdMs = (opts       ).lateSummaryHoldMs;
+    this._lateSummaryHoldMs =
+      typeof holdMs === "number" && Number.isFinite(holdMs)
+        ? Math.max(0, holdMs)
+        : LATE_SUMMARY_HOLD_MS;
   }
 
   setLogger(logger) {
@@ -975,11 +1272,21 @@ class OpenClawClient extends EventEmitter {
   }
 
   request(method, params, opts) {
+
+    if (method === "chat.history" || method === "sessions.list") {
+      return this._requestScoped(method, params, opts).then((result) =>
+        stripLiveuiContextFenceFromHistoryResult(method, result),
+      );
+    }
+    return this._requestScoped(method, params, opts);
+  }
+
+  _requestScoped(method     , params     , opts     ) {
     if (method === "connect") return this._requestFrame(method, params, opts);
 
     const scoped = this._agentSelectionRequired()
       ? this._scopeSessionParams(method, params)
-      : params;
+      : this._scopeSessionParams(method, params, true);
     const sent = this._requestFrame(method, scoped, opts);
     if (scoped !== params) return sent.then((result) => unscopeEcho(result, params, scoped));
     return sent.catch((err) => {
@@ -996,8 +1303,12 @@ class OpenClawClient extends EventEmitter {
     });
   }
 
-  setSessionAgentResolver(resolver) {
+  setSessionAgentResolver(resolver     ) {
     this._sessionAgentResolver = typeof resolver === "function" ? resolver : null;
+  }
+
+  getHelloFeatures() {
+    return this._helloFeatures;
   }
 
   getSessionDefaults() {
@@ -1011,14 +1322,15 @@ class OpenClawClient extends EventEmitter {
     );
   }
 
-  _scopeSessionParams(method, params) {
+  _scopeSessionParams(method     , params     , nonDefaultOnly = false) {
     return scopeOpenClawRequestSessionParams(method, params, {
       resolveAgentId: this._sessionAgentResolver,
       defaultAgentId: this._sessionDefaults ? this._sessionDefaults.defaultAgentId : "",
+      nonDefaultOnly,
     });
   }
 
-  _requestFrame(method, params, opts) {
+  _requestFrame(method     , params     , opts     ) {
 
     const ws = this._ws;
     const gen = this._socketGeneration;
@@ -1069,6 +1381,9 @@ class OpenClawClient extends EventEmitter {
       expectFinal,
       diagnostic,
     });
+    if ((method === "agent" || method === "chat.send") && params) {
+      this._approvalContext.noteUserMessage(params.sessionKey, params.message);
+    }
     this.emit("protocol", {
       direction: "out",
       frame: sanitizeProtocolFrame(frame),
@@ -1154,22 +1469,34 @@ class OpenClawClient extends EventEmitter {
     this._activeRunSessionKey = normalizeSessionKey(sessionKey);
     this._activeRunStartedAtMs = Date.now();
     this._runTextBuffer = "";
+    this._runMediaUrls = [];
     this._runMessageIndex = 0;
     this._runItemId = null;
+    this._runMessagePhase = null;
     this._gapDuringRun = false;
     this._seenThinkingSummaryIds.clear();
     this._seenThinkingFrameIds.clear();
     this._thinkingFrameBuffers.clear();
     this._thinkingStreamSegments.clear();
+    this._commentaryByRun.clear();
+    this._reasoningCueItemIds.clear();
+    this._planRevisionByRun.clear();
+    this._runRecordsPreambles.clear();
+    this._runStreamedRecordTexts = [];
+    this._runProgress = newRunProgress();
     this._liveThinkingRunIds.clear();
+    this._clearHeldThinking();
+    this._toolCallWrappers.clear();
+    this._modelCalls.clear();
+    this._modelCalls.beginRun(this._activeRunId);
     return this._activeRunGeneration;
   }
 
-  _rememberRunSessionKey(runId, sessionKey) {
+  _rememberRunSessionKey(runId     , sessionKey     ) {
     const id = normalizeRunId(runId);
     const key = normalizeSessionKey(sessionKey);
     if (!id || !key) return;
-    const client = this;
+    const client      = this;
     const runSessionKeys = client._runSessionKeys;
     runSessionKeys.delete(id);
     runSessionKeys.set(id, key);
@@ -1178,16 +1505,16 @@ class OpenClawClient extends EventEmitter {
     }
   }
 
-  _sessionKeyForRun(runId, eventSessionKey) {
+  _sessionKeyForRun(runId     , eventSessionKey     ) {
     const direct = normalizeSessionKey(eventSessionKey);
     if (direct) return direct;
-    const client = this;
+    const client      = this;
     const id = normalizeRunId(runId);
     const known = id ? client._runSessionKeys.get(id) : null;
     return known || client._activeRunSessionKey;
   }
 
-  _isBackgroundRun(runId, sessionKey) {
+  _isBackgroundRun(runId     , sessionKey     ) {
     return isTitleDistillerRun(runId, sessionKey);
   }
 
@@ -1198,14 +1525,25 @@ class OpenClawClient extends EventEmitter {
     this._activeRunSessionKey = null;
     this._activeRunStartedAtMs = null;
     this._runTextBuffer = "";
+    this._runMediaUrls = [];
     this._runMessageIndex = 0;
     this._runItemId = null;
+    this._runMessagePhase = null;
     this._gapDuringRun = false;
     this._seenThinkingSummaryIds.clear();
     this._seenThinkingFrameIds.clear();
     this._thinkingFrameBuffers.clear();
     this._thinkingStreamSegments.clear();
+    this._commentaryByRun.clear();
+    this._reasoningCueItemIds.clear();
+    this._planRevisionByRun.clear();
+    this._runRecordsPreambles.clear();
+    this._runStreamedRecordTexts = [];
+    this._runProgress = newRunProgress();
     this._liveThinkingRunIds.clear();
+    this._clearHeldThinking();
+    this._toolCallWrappers.clear();
+    this._modelCalls.clear();
     return this._activeRunGeneration;
   }
 
@@ -1278,7 +1616,7 @@ class OpenClawClient extends EventEmitter {
       text,
     };
 
-    if (!this._historyResolved) {
+    if (!this._historyResolved || this._commitHold) {
       this._eventQueue.push({ chatCommit: commit });
       return;
     }
@@ -1334,8 +1672,10 @@ class OpenClawClient extends EventEmitter {
     this._historyResolved = false;
     this._eventQueue = [];
 
+    this._commitHold = false;
+
     this._chatCommandRuns.clear();
-    const runRouting = this;
+    const runRouting      = this;
     runRouting._backgroundRunText.clear();
     this._invalidateActiveRun();
 
@@ -1499,6 +1839,10 @@ class OpenClawClient extends EventEmitter {
           err.data = parsed.error.data;
         }
 
+        if (parsed.error && parsed.error.details !== undefined) {
+          Object.assign(err, { details: parsed.error.details });
+        }
+
         if (parsed.error && parsed.error.retryable && parsed.error.retryAfterMs) {
           err.retryAfterMs = parsed.error.retryAfterMs;
         }
@@ -1545,6 +1889,15 @@ class OpenClawClient extends EventEmitter {
       return;
     }
 
+    if (typeof evt.event === "string") {
+      this.emit("gatewayEvent", { event: evt.event });
+    }
+
+    if (evt.event === "talk.event") {
+      this.emit("talkEvent", evt.payload || null);
+      return;
+    }
+
     if (evt.event === "shutdown") {
       const payload = evt.payload || {};
       const restartMs = typeof payload.restartExpectedMs === "number" ? payload.restartExpectedMs : 5000;
@@ -1561,7 +1914,7 @@ class OpenClawClient extends EventEmitter {
     }
 
     if (evt.event === "exec.approval.requested") {
-      this.emit("approval", evt.payload);
+      this.emit("approval", this._withApprovalContext(evt.payload));
       return;
     }
 
@@ -1571,7 +1924,10 @@ class OpenClawClient extends EventEmitter {
     }
 
     if (evt.event === "plugin.approval.requested") {
-      this.emit("approval", { ...(evt.payload || {}), approvalKind: "plugin" });
+      this.emit(
+        "approval",
+        this._withApprovalContext({ ...(evt.payload || {}), approvalKind: "plugin" }),
+      );
       return;
     }
 
@@ -1581,13 +1937,11 @@ class OpenClawClient extends EventEmitter {
     }
 
     if (evt.event === "question.requested") {
-
       this.emit("question", evt.payload);
       return;
     }
 
     if (evt.event === "question.resolved") {
-
       this.emit("questionResolved", evt.payload);
       return;
     }
@@ -1611,22 +1965,35 @@ class OpenClawClient extends EventEmitter {
       });
 
       const isCommitEvent = data.phase === "end" && payload.stream === "lifecycle";
-      if (isCommitEvent && !this._historyResolved) {
 
-        this._eventQueue.push({
-          payload: evt.payload,
-          capturedCommit: {
-            fullText: this._runTextBuffer,
-            activeRunId: this._activeRunId,
-            activeRunSessionKey: this._activeRunSessionKey,
-            gapDuringRun: this._gapDuringRun,
-          },
-        });
+      const recordsPreambles = isCommitEvent ? this._recordsPreamblesToRead(payload.runId) : [];
+
+      if (isCommitEvent && recordsPreambles.length) this._runProgress.read = null;
+      if (isCommitEvent && (!this._historyResolved || this._commitHold || recordsPreambles.length)) {
+
+        const capturedCommit = {
+          fullText: withMediaLines(this._runTextBuffer, this._runMediaUrls),
+          activeRunId: this._activeRunId,
+          activeRunSessionKey: this._activeRunSessionKey,
+          gapDuringRun: this._gapDuringRun,
+          runProgress: this._runProgress,
+          ...(recordsPreambles.length ? { recordsPreambles } : {}),
+        };
+        if (!this._historyResolved || this._commitHold) {
+          this._eventQueue.push({ payload: evt.payload, capturedCommit });
+          return;
+        }
+        this._commitAgentEvent(evt.payload, capturedCommit);
         return;
       }
       this._handleAgentEvent(evt.payload);
       return;
     }
+  }
+
+  _withApprovalContext(payload     ) {
+    if (!payload || typeof payload !== "object") return payload;
+    return { ...payload, ocuclawApprovalContext: this._approvalContext.contextFor(payload) };
   }
 
   _handleAgentEvent(payload, capturedCommit) {
@@ -1638,6 +2005,8 @@ class OpenClawClient extends EventEmitter {
     if (chatCommandEntry) chatCommandEntry.agentOwned = true;
     if (!stream || !data) return;
 
+    this._approvalContext.noteAgentEvent(runId, stream, data);
+
     if (stream === "lifecycle" && data.phase === "start") {
       this._rememberRunSessionKey(runId, payload.sessionKey);
     }
@@ -1647,20 +2016,51 @@ class OpenClawClient extends EventEmitter {
       return;
     }
 
+    this._modelCalls.observe(normalizeRunId(runId) || normalizeRunId(this._activeRunId), stream, data);
+
     switch (stream) {
       case "lifecycle":
+        if (data.phase === "end" || data.phase === "error") {
+          this._releaseHeldThinking(runId, false, "run_ended");
+        }
         this._handleLifecycleEvent(runId, data, payload.sessionKey, capturedCommit);
         break;
       case "assistant":
         this._handleAssistantEvent(runId, data, runSessionKey);
         break;
       case "tool":
+        this._noteThinkingBoundary(runId);
         this._handleToolEvent(runId, data, runSessionKey);
         break;
       case "thinking":
         this._handleThinkingStreamEvent(runId, data, runSessionKey);
         break;
+      case "item":
+        this._noteThinkingBoundary(runId);
+
+        if (isObject(data) && RELEASES_HELD_SUMMARY_ITEM_KINDS.has(data.kind)) {
+          this._releaseHeldThinking(runId, true, `item_${data.kind}`);
+        }
+        this._noteRecordsPreamble(runId, data, runSessionKey);
+        this._handleCommentaryItemEvent(runId, data, runSessionKey);
+        this._handleAnalysisItemEvent(runId, data, runSessionKey);
+        break;
+      case "plan":
+        this._handlePlanStreamEvent(runId, data, runSessionKey);
+        break;
+      case "compaction":
+      case "run_status": {
+        const client      = this;
+        const signal = client._runSignals.fromAgentEvent(runId, stream, data, runSessionKey);
+        if (signal) client.emit("runSignal", signal);
+        break;
+      }
       case "error":
+        if (isGatewaySeqGapNotice(data)) {
+
+          this._logger.warn(`[openclaw] Gateway seq gap on run ${runId || "?"}: ${JSON.stringify(data)}`);
+          break;
+        }
         this._logger.error(`[openclaw] Agent error: ${JSON.stringify(data)}`);
         {
           const terminalActivity = buildTerminalErrorActivity(
@@ -1711,8 +2111,31 @@ class OpenClawClient extends EventEmitter {
           ? capturedCommit.activeRunSessionKey
           : this._activeRunSessionKey;
 
-        const fullText = capturedCommit ? capturedCommit.fullText : this._runTextBuffer;
+        const bufferedText = capturedCommit ? capturedCommit.fullText : withMediaLines(this._runTextBuffer, this._runMediaUrls);
         const completedRunId = normalizeRunId(committedActiveRunId) || normalizeRunId(runId);
+
+        const declinedToolRunsOwner      = this;
+        const declinedFallback = declinedToolRunsOwner._declinedToolRuns.takeFallback(completedRunId, bufferedText);
+        const replyText = declinedFallback || bufferedText;
+
+        const progressRecords =
+          capturedCommit && Array.isArray(capturedCommit.progressRecords)
+            ? capturedCommit.progressRecords
+            : [];
+
+        const runProgress = capturedCommit ? capturedCommit.runProgress || null : this._runProgress;
+        const paintedProgress = runProgress
+          ? [...runProgress.messages.values()].map((message     ) => message.text).filter(Boolean)
+          : [];
+        const liveUiText = progressRecords.length
+          ? [...progressRecords, replyText].filter(Boolean).join("\n\n")
+          : replyText;
+        const fullText = paintedProgress.length
+          ? [...progressRecords, ...paintedProgress, replyText].filter(Boolean).join("\n\n")
+          : liveUiText;
+        const openProgress = runProgress && runProgress.holdsIndex && !runProgress.holdsIndex.ended
+          ? runProgress.holdsIndex
+          : null;
         const completedSessionKey =
           normalizeSessionKey(sessionKey) ||
           normalizeSessionKey(committedActiveRunSessionKey) ||
@@ -1729,10 +2152,24 @@ class OpenClawClient extends EventEmitter {
           this._invalidateActiveRun();
         }
 
+        if (openProgress) {
+          openProgress.ended = true;
+          this.emit("streaming", {
+            text: openProgress.text,
+            messageIndex: openProgress.index,
+            messageId: openProgress.messageId,
+            sessionKey: completedSessionKey,
+            runId: completedRunId,
+            liveUiRecordsOnly: true,
+            end: true,
+            gatewayReceivedAtMs: Date.now(),
+          });
+        }
         this.emit("message", {
           runId: completedRunId,
           role: "assistant",
           content: [{ type: "text", text: fullText }],
+          ...(paintedProgress.length ? { liveUiText } : {}),
           sessionKey: completedSessionKey,
 
           finalReplyCommitted: commitIsLiveActiveRun && !!completedRunId &&
@@ -1753,17 +2190,33 @@ class OpenClawClient extends EventEmitter {
         if (gapDuringRun) {
           this._logger.info("[openclaw] Gap detected during run, re-fetching history");
         }
-        const historyGuardOwner = this;
-        this._fetchHistory(completedSessionKey || "main", {
-          idleRunGeneration: historyGuardOwner._activeRunGeneration,
+        const historyGuardOwner      = this;
+        const idleRunGeneration = historyGuardOwner._activeRunGeneration;
+        const rehydrate = () => this._fetchHistory(completedSessionKey || "main", {
+          idleRunGeneration,
 
           commitRunId: completedRunId,
           commitText: fullText,
-        }).catch((err) => {
-          this._logger.error(
+        });
+        function onRehydrateError(err     ) {
+          historyGuardOwner._logger.error(
             `[openclaw] Post-commit history fetch failed: ${err.message}`
           );
-        });
+        }
+        if (declinedFallback && completedSessionKey) {
+
+          historyGuardOwner.request("chat.inject", { sessionKey: completedSessionKey, message: declinedFallback })
+            .then(
+              () => historyGuardOwner._logger.info(`[openclaw] Declined-command fallback reply sent: ${completedRunId}`),
+              (err) => historyGuardOwner._logger.warn(
+                `[openclaw] Declined-command fallback inject failed: ${err && err.message}`,
+              ),
+            )
+            .then(rehydrate)
+            .catch(onRehydrateError);
+        } else {
+          rehydrate().catch(onRehydrateError);
+        }
         break;
       }
 
@@ -1799,19 +2252,24 @@ class OpenClawClient extends EventEmitter {
     }
   }
 
-  _handleBackgroundRunEvent(runId, stream, data, sessionKey) {
-    const client = this;
+  _handleBackgroundRunEvent(runId     , stream     , data     , sessionKey     ) {
+    const client      = this;
     const id = normalizeRunId(runId);
     if (!id) return;
     if (stream === "assistant") {
-      if (typeof data.text !== "string") return;
-      client._backgroundRunText.set(id, data.text);
+      const text = cumulativeAssistantText(
+        data,
+        client._backgroundRunText.get(id) || "",
+        null,
+      );
+      if (text === null) return;
+      client._backgroundRunText.set(id, text);
       client.emit("streaming", {
-        text: data.text,
+        text,
         sessionKey,
         runId: id,
         gatewayReceivedAtMs: Date.now(),
-        rawAssistantChars: data.text.length,
+        rawAssistantChars: text.length,
       });
       return;
     }
@@ -1869,15 +2327,33 @@ class OpenClawClient extends EventEmitter {
       sessionKey,
       data,
       "assistant_event",
+      { modelCallSeq: this._modelCalls.current(normalizeRunId(runId) || normalizeRunId(this._activeRunId)) },
     );
 
-    if (typeof data.text === "string") {
+    const phase = assistantMessagePhase(data);
+    const afterCommentary = this._runMessagePhase === "commentary" && phase !== "commentary";
 
-      if (data.text === "" && data.replace !== true) return;
+    const afterProgress = this._runProgress.holdsIndex !== null;
+
+    if (phase === "commentary") this._runProgress.streamedAsReply = true;
+
+    const text = cumulativeAssistantText(
+      data,
+      this._runTextBuffer,
+      this._runItemId,
+      (afterCommentary && phase !== null) || afterProgress,
+    );
+    if ((text === null || (text === "" && data.replace !== true)) && phase !== "commentary") {
+      noteMediaUrls(this._runMediaUrls, data);
+    }
+    if (text !== null) {
+
+      if (text === "" && data.replace !== true) return;
+      if (phase !== "commentary") this._releaseHeldThinking(runId, false, "reply_started");
       const previousText = this._runTextBuffer;
       const previousTextLength = previousText.length;
       const gatewayReceivedAtMs = Date.now();
-      const rawAssistantChars = data.text.length;
+      const rawAssistantChars = text.length;
       const assistantDeltaChars = Math.max(0, rawAssistantChars - previousTextLength);
       const firstGatewayChunk = previousTextLength <= 0;
 
@@ -1885,18 +2361,28 @@ class OpenClawClient extends EventEmitter {
         typeof data.itemId === "string" && data.itemId.trim()
           ? data.itemId.trim()
           : null;
-      const newMessage = itemId && this._runItemId
+      const leavesCommentary =
+        afterCommentary &&
+        (phase !== null || data.replace === true || !text.startsWith(previousText));
+      const newMessage = afterProgress || leavesCommentary || (itemId && this._runItemId
         ? itemId !== this._runItemId
         : previousTextLength > 0 &&
           data.replace !== true &&
-          !data.text.startsWith(previousText);
+          !text.startsWith(previousText));
       if (newMessage) {
+        if (previousText.includes("<ui")) this._runStreamedRecordTexts.push(collapseWhitespace(previousText));
+        this._runMediaUrls = [];
         this._runMessageIndex += 1;
+        this._runMessagePhase = null;
+        this._runProgress.holdsIndex = null;
       }
-      if (itemId) this._runItemId = itemId;
-      this._runTextBuffer = data.text;
+
+      if (itemId || leavesCommentary || afterProgress) this._runItemId = itemId;
+      if (phase === "commentary") this._runMessagePhase = "commentary";
+      if (phase !== "commentary") noteMediaUrls(this._runMediaUrls, data);
+      this._runTextBuffer = text;
       this.emit("streaming", {
-        text: data.text,
+        text,
         messageIndex: this._runMessageIndex,
         sessionKey,
         runId: runId || this._activeRunId || null,
@@ -1908,20 +2394,82 @@ class OpenClawClient extends EventEmitter {
     }
   }
 
-  _handleToolEvent(runId, data, sessionKey = this._activeRunSessionKey) {
-    if (!data || !data.name) return;
-    const rawPhase = typeof data.phase === "string" ? data.phase.trim().toLowerCase() : "";
+  _unwrapToolCallEvent(runId     , data     , isToolStart         , isToolEnd         )      {
+    const runKey = normalizeRunId(runId) || normalizeRunId(this._activeRunId) || "__global__";
+    const toolCallId =
+      typeof data.toolCallId === "string" && data.toolCallId.trim() ? data.toolCallId.trim() : null;
+    if (data.name !== TOOL_CALL_WRAPPER_NAME) {
+      const parentId =
+        typeof data.parentToolCallId === "string" && data.parentToolCallId.trim()
+          ? data.parentToolCallId.trim()
+          : null;
+      const silent = !!parentId && !!this._toolCallWrappers.get(`${runKey}:${parentId}`);
+      return { data, silent };
+    }
+    const wrapperKey = toolCallId ? `${runKey}:${toolCallId}` : null;
+    let inner               ;
+    if (isToolStart) {
+      inner = wrappedToolName(data.args);
+      if (wrapperKey) {
+        this._toolCallWrappers.set(wrapperKey, inner);
+        while (this._toolCallWrappers.size > TOOL_CALL_WRAPPER_LIMIT) {
+          this._toolCallWrappers.delete(this._toolCallWrappers.keys().next().value);
+        }
+      }
+    } else {
+      inner = wrapperKey ? this._toolCallWrappers.get(wrapperKey) || null : null;
+      if (isToolEnd && wrapperKey) this._toolCallWrappers.delete(wrapperKey);
+    }
+    if (!inner) return { data, silent: true };
+    const unwrapped      = { ...data, name: inner };
+    if (isToolStart) {
+      const innerArgs = isObject(data.args) && isObject(data.args.args) ? data.args.args : null;
+      if (innerArgs) unwrapped.args = innerArgs;
+      else delete unwrapped.args;
+    }
+    return { data: unwrapped, silent: false };
+  }
+
+  _handleToolEvent(runId     , rawData     , sessionKey      = this._activeRunSessionKey) {
+    if (!rawData || !rawData.name) return;
+    const rawPhase = typeof rawData.phase === "string" ? rawData.phase.trim().toLowerCase() : "";
     if (rawPhase !== "start" && rawPhase !== "update" && rawPhase !== "result") return;
     const isToolStart = rawPhase === "start";
     const isToolEnd = rawPhase === "result";
+    this._releaseHeldThinking(runId, true, "tool");
+    const unwrapped = this._unwrapToolCallEvent(runId, rawData, isToolStart, isToolEnd);
+    const data = unwrapped.data;
+    if (isToolStart) this._settleProgressRecordsAtTool(runId, data, sessionKey);
+    if (unwrapped.silent) {
+      if (isToolEnd) {
+        const declinedToolRunsOwner      = this;
+        declinedToolRunsOwner._declinedToolRuns.noteToolEnd(normalizeRunId(runId || this._activeRunId), {
+          tool: data.name,
+          isError: data.isError === true,
+          status: data.status,
+        });
+      }
+      return;
+    }
 
-    const args = isObject(data.args) ? data.args : null;
+    if (isToolStart && this._runMessagePhase !== "commentary" && this._runTextBuffer) {
+      const proseRunId = normalizeRunId(runId) || normalizeRunId(this._activeRunId);
+      const proseKey = `${proseRunId || "run"}:${this._runMessageIndex}:${this._runTextBuffer.length}`;
+      if (this._preToolProseKey !== proseKey) {
+        this._preToolProseKey = proseKey;
+        const visible = stripDisplayMarkup(this._runTextBuffer).replace(/`/g, "").replace(/\s+/g, " ").trim();
+        this._emitPreToolProse(proseRunId, sessionKey, visible.slice(-600), "last");
+      }
+    }
+
+    const rawArgs = isObject(data.args) ? data.args : null;
     const pathFromData =
       typeof data.path === "string" && data.path.trim() && !isNullishToken(data.path)
         ? data.path.trim()
         : null;
-    const pathFromArgs = pickStringPathFromArgs(args);
+    const pathFromArgs = pickStringPathFromArgs(rawArgs) || pickPatchPath(rawArgs);
     const path = pathFromData || pathFromArgs || null;
+    const args = rawArgs ? stripPatchBodies(rawArgs) : null;
 
     const activity = {
       state: "thinking",
@@ -1935,6 +2483,10 @@ class OpenClawClient extends EventEmitter {
 
     if (args) activity.args = args;
     if (path) activity.path = path;
+
+    if (isToolStart && typeof data.meta === "string" && data.meta.trim()) {
+      (activity       ).meta = data.meta.trim();
+    }
     if (typeof data.toolCallId === "string" && data.toolCallId.trim()) {
       const trimmedToolCallId = data.toolCallId.trim();
       activity.activityId = trimmedToolCallId;
@@ -1945,6 +2497,22 @@ class OpenClawClient extends EventEmitter {
     }
     if (isToolEnd && data.isError === true) {
       activity.isError = true;
+    }
+
+    const modelCallSeq = positiveModelCallSeq(this._modelCalls.forTool(
+      normalizeRunId(activity.runId),
+      (activity       ).toolCallId,
+      isToolStart ? "start" : isToolEnd ? "end" : "update",
+    ));
+    if (modelCallSeq !== null) (activity       ).modelCallSeq = modelCallSeq;
+    if (isToolEnd) {
+
+      const declinedToolRunsOwner      = this;
+      declinedToolRunsOwner._declinedToolRuns.noteToolEnd(normalizeRunId(activity.runId), {
+        tool: data.name,
+        isError: data.isError === true,
+        status: data.status,
+      });
     }
 
     this.emit("activity", activity);
@@ -2093,48 +2661,409 @@ class OpenClawClient extends EventEmitter {
     const gatewayText =
       typeof data.text === "string" && data.text.trim() ? data.text : null;
     const gatewayDelta = typeof data.delta === "string" && data.delta ? data.delta : null;
+    if (!gatewayText && !gatewayDelta) return;
+    const itemId = typeof data.itemId === "string" && data.itemId.trim() ? data.itemId.trim() : null;
 
-    const state = this._thinkingStreamSegments.get(segmentKey) || { raw: "", base: "" };
+    const state = this._thinkingStreamSegments.get(segmentKey) || newThinkingStreamSegment();
+    if (state.raw) {
+      let retire = false;
+      if (itemId) {
+        retire = itemId !== state.itemId;
+      } else if (state.boundary) {
+
+        retire = !(gatewayText && gatewayText.length > state.raw.length && gatewayText.startsWith(state.raw));
+      }
+      if (retire) {
+        state.base = joinThinkingSegments(state.base, asSummaryTitle(state.raw, state.events));
+        state.raw = "";
+        state.events = 0;
+        state.ordinal += 1;
+      }
+    }
+    state.boundary = false;
+    if (itemId) state.itemId = itemId;
+
     if (gatewayText) {
       if (!state.raw || gatewayText.startsWith(state.raw)) {
 
+        if (gatewayText !== state.raw) state.events += 1;
         state.raw = gatewayText;
       } else if (state.raw.startsWith(gatewayText)) {
 
+      } else if (state.itemId) {
+
+        state.raw = gatewayText;
+        state.events += 1;
       } else {
 
-        state.base = joinThinkingSegments(state.base, state.raw);
+        state.base = joinThinkingSegments(state.base, asSummaryTitle(state.raw, state.events));
         state.raw = gatewayText;
+        state.events = 1;
+        state.ordinal += 1;
       }
-    } else if (gatewayDelta) {
+    } else {
 
       state.raw = `${state.raw}${gatewayDelta}`;
-    } else {
-      return;
+      state.events += 1;
     }
     this._thinkingStreamSegments.set(segmentKey, state);
 
-    const cumulativeRaw = joinThinkingSegments(state.base, state.raw);
-    if (!cumulativeRaw.trim()) return;
+    const segmentText = asSummaryTitle(state.raw, state.events);
+    const cumulativeRaw = joinThinkingSegments(state.base, segmentText);
+    if (!cumulativeRaw.trim() || !String(segmentText || "").trim()) return;
 
     if (normalizedRunId) {
       this._liveThinkingRunIds.add(normalizedRunId);
     }
 
-    const payload = {
-      thinking: sliceFromLastClosedBoldSegment(cumulativeRaw) || cumulativeRaw,
+    const payload      = {
+      thinking: sliceFromLastClosedBoldSegment(segmentText) || segmentText,
     };
     if (data.thinkingSignature) payload.thinkingSignature = data.thinkingSignature;
-    this._emitThinkingActivityFromPayload(
-      normalizedRunId,
-      sessionKey,
-      payload,
-      "thinking_stream",
-      { frameText: cumulativeRaw },
+    const segment = `seg${state.ordinal}`;
+
+    const modelCallSeq = this._modelCalls.current(normalizedRunId);
+    this._holdThinkingSummary(normalizedRunId, () =>
+      this._emitThinkingActivityFromPayload(
+        normalizedRunId,
+        sessionKey,
+        payload,
+        "thinking_stream",
+        { frameText: cumulativeRaw, segment, modelCallSeq },
+      ),
     );
   }
 
-  _emitThinkingActivityFromPayload(runId, sessionKey, rawPayload, source = "unknown", options = {}) {
+  _noteThinkingBoundary(runId     ) {
+    const key = normalizeRunId(runId) || normalizeRunId(this._activeRunId) || "__global__";
+    const state = this._thinkingStreamSegments.get(key);
+    if (state && state.raw) state.boundary = true;
+  }
+
+  _holdThinkingSummary(runId     , emit            ) {
+    if (!(this._lateSummaryHoldMs > 0)) {
+      emit();
+      return;
+    }
+    const key = normalizeRunId(runId) || "__global__";
+    const held = this._heldThinking.get(key);
+    if (held) {
+      held.emit = emit;
+      return;
+    }
+    const entry      = { emit, heldAtMs: Date.now(), timer: null };
+    entry.timer = setTimeout(
+      () => this._releaseHeldThinking(key, true, "hold_elapsed"),
+      this._lateSummaryHoldMs,
+    );
+    this._heldThinking.set(key, entry);
+  }
+
+  _releaseHeldThinking(runId     , show         , reason        ) {
+    const key = normalizeRunId(runId) || normalizeRunId(this._activeRunId) || "__global__";
+    const held = this._heldThinking.get(key);
+    if (!held) return;
+    this._heldThinking.delete(key);
+    clearTimeout(held.timer);
+    this._logger.info(
+      `[openclaw] reasoning summary ${show ? "shown" : "dropped"} (${reason}, held ${
+        Date.now() - held.heldAtMs
+      } ms)`,
+    );
+    if (show) held.emit();
+  }
+
+  _clearHeldThinking() {
+    for (const held of this._heldThinking.values()) clearTimeout(held.timer);
+    this._heldThinking.clear();
+  }
+
+  _noteRecordsPreamble(runId     , data     , sessionKey      = this._activeRunSessionKey) {
+    if (!isObject(data) || data.kind !== "preamble" || typeof data.progressText !== "string") return;
+    const activeRunId = normalizeRunId(this._activeRunId);
+    const id = normalizeRunId(runId);
+    if (!activeRunId || (id && id !== activeRunId)) return;
+    const progress = this._runProgress;
+    if (data.progressText.includes("\n")) progress.keepsLines = true;
+    const itemId = typeof data.itemId === "string" ? data.itemId.trim() : "";
+    if (progress.messages.has(itemId)) {
+      this._paintProgressRecords(activeRunId, itemId, data.progressText, sessionKey, data.phase === "end");
+      return;
+    }
+    if (!data.progressText.includes("<ui")) return;
+    if (progress.keepsLines && !progress.streamedAsReply) {
+      this._runRecordsPreambles.delete(itemId);
+      this._paintProgressRecords(activeRunId, itemId, data.progressText, sessionKey, data.phase === "end");
+      return;
+    }
+    this._runRecordsPreambles.set(itemId, data.progressText);
+  }
+
+  _paintProgressRecords(runId     , itemId        , text        , sessionKey     , end = false) {
+    const progress = this._runProgress;
+    let message = progress.messages.get(itemId);
+    if (!message) {
+      this._runMessageIndex += 1;
+      message = {
+        index: this._runMessageIndex,
+        messageId: `progress:${itemId || this._runMessageIndex}`,
+        text: "",
+        ended: false,
+      };
+      progress.messages.set(itemId, message);
+      progress.holdsIndex = message;
+    }
+    if (message.ended || (!end && message.text === text)) return;
+    message.text = text;
+    message.ended = end;
+    this.emit("streaming", {
+      text,
+      messageIndex: message.index,
+      messageId: message.messageId,
+      sessionKey,
+      runId,
+      liveUiRecordsOnly: true,
+      ...(end ? { end: true } : {}),
+      gatewayReceivedAtMs: Date.now(),
+    });
+  }
+
+  _owedRecordsPreambles()                     {
+    if (!this._runRecordsPreambles.size) return [];
+    const streamed = [...this._runStreamedRecordTexts, collapseWhitespace(this._runTextBuffer)];
+    return [...this._runRecordsPreambles.entries()].filter(
+      ([, text]) => !streamed.some((messageText) => messageText.includes(collapseWhitespace(text))),
+    );
+  }
+
+  _recordsPreamblesToRead(runId     ) {
+    if (!this._runRecordsPreambles.size) return [];
+    const activeRunId = normalizeRunId(this._activeRunId);
+    const id = normalizeRunId(runId);
+    if (!activeRunId || (id && id !== activeRunId)) return [];
+    return this._owedRecordsPreambles().map(([, text]) => text);
+  }
+
+  _settleProgressRecordsAtTool(runId     , data     , sessionKey     ) {
+    const activeRunId = normalizeRunId(this._activeRunId);
+    const id = normalizeRunId(runId);
+    if (!activeRunId || (id && id !== activeRunId)) return;
+    const owed = this._owedRecordsPreambles();
+    if (!owed.length) return;
+    const args = isObject(data.args) ? data.args : null;
+    if (data.name === COMPOSE_TOOL_NAME && args && typeof args.records === "string" && args.records.trim()) {
+      for (const [itemId] of owed) this._runRecordsPreambles.delete(itemId);
+      this._logger.info(`[openclaw] ${owed.length} LiveUI progress text(s) left to the compose call's records`);
+      return;
+    }
+    const progress = this._runProgress;
+    if (progress.read) return;
+    const read = {};
+    progress.read = read;
+    const generation = this._activeRunGeneration;
+    const index = this._runMessageIndex;
+    const buffer = this._runTextBuffer;
+    this._readProgressTexts(sessionKey, owed.map(([, text]) => text))
+      .then((found) => {
+        if (progress.read !== read || this._activeRunGeneration !== generation) return;
+        progress.read = null;
+
+        if (this._runMessageIndex !== index || this._runTextBuffer !== buffer) return;
+        owed.forEach(([itemId], i) => {
+          const text = found[i];
+          if (!text || !this._runRecordsPreambles.has(itemId)) return;
+          this._runRecordsPreambles.delete(itemId);
+          this._paintProgressRecords(activeRunId, itemId, text, sessionKey, true);
+        });
+      })
+      .catch((err     ) => {
+        this._logger.debug(
+          `[openclaw] Progress text read at tool start failed: ${err && err.message ? err.message : String(err)}`
+        );
+      });
+  }
+
+  _commitAgentEvent(payload     , capturedCommit     ) {
+    const preambles = capturedCommit && capturedCommit.recordsPreambles;
+    if (!Array.isArray(preambles) || !preambles.length || Array.isArray(capturedCommit.progressRecords)) {
+      this._handleAgentEvent(payload, capturedCommit);
+      return true;
+    }
+    const ws = this._ws;
+    const generation = this._socketGeneration;
+    const sessionKey =
+      normalizeSessionKey(payload.sessionKey) ||
+      normalizeSessionKey(capturedCommit.activeRunSessionKey);
+    this._commitHold = true;
+    this._readProgressRecords(sessionKey, preambles)
+      .then((progressRecords) => {
+        if (!this._isCurrentSocket(ws, generation)) return;
+        this._commitHold = false;
+        try {
+          this._handleAgentEvent(payload, { ...capturedCommit, progressRecords });
+        } finally {
+          if (this._historyResolved) this._drainEventQueue();
+        }
+      })
+      .catch((err     ) => {
+        this._logger.error(
+          `[openclaw] Commit after progress read failed: ${err && err.message ? err.message : String(err)}`
+        );
+      });
+    return false;
+  }
+
+  async _readProgressRecords(sessionKey     , preambles          ) {
+    const found = await this._readProgressTexts(sessionKey, preambles);
+    const texts = found.filter((text)                 => typeof text === "string");
+    if (texts.length < preambles.length) {
+      this._logger.warn(
+        `[openclaw] ${preambles.length - texts.length} of ${preambles.length} LiveUI progress texts ` +
+          `not in history for session ${sessionKey}; committing without them`
+      );
+    } else {
+      this._logger.info(`[openclaw] Read ${texts.length} LiveUI progress text(s) back from history`);
+    }
+    return texts;
+  }
+
+  async _readProgressTexts(sessionKey     , preambles          )                             {
+    if (!sessionKey) return preambles.map(() => null);
+    const ws = this._ws;
+    const generation = this._socketGeneration;
+    const deadline = Date.now() + PROGRESS_RECORDS_READ_BUDGET_MS;
+    let found                    = preambles.map(() => null);
+    for (;;) {
+      try {
+        const result      = await beforeDeadline(
+          this.request("chat.history", { sessionKey, limit: PROGRESS_RECORDS_HISTORY_LIMIT }, undefined),
+          deadline,
+        );
+        found = findProgressTexts(result && result.messages, preambles, found);
+      } catch (err     ) {
+        this._logger.debug(
+          `[openclaw] Progress text read failed: ${err && err.message ? err.message : String(err)}`
+        );
+      }
+      if (!this._isCurrentSocket(ws, generation)) return preambles.map(() => null);
+      if (found.every(Boolean)) break;
+      if (Date.now() + PROGRESS_RECORDS_READ_RETRY_MS >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, PROGRESS_RECORDS_READ_RETRY_MS));
+    }
+    return found;
+  }
+
+  _handleCommentaryItemEvent(runId     , data     , sessionKey      = this._activeRunSessionKey) {
+    if (!isObject(data) || data.kind !== "preamble") return;
+
+    const feelings =
+      typeof data.progressText === "string" ? speckFeelings(data.progressText) : [];
+    const text =
+      typeof data.progressText === "string"
+        ? stripDisplayMarkup(data.progressText).replace(/`/g, "").replace(/\s+/g, " ").trim()
+        : "";
+
+    const note = data.phase === "end" ? text : finishedSentences(text);
+    if (!note) return;
+
+    const normalizedRunId =
+      normalizeRunId(runId) || normalizeRunId(this._activeRunId);
+    const runKey = normalizedRunId || "__global__";
+    const noteId =
+      typeof data.itemId === "string" && data.itemId.trim()
+        ? data.itemId.trim()
+        : `${runKey}:commentary`;
+    const previous = this._commentaryByRun.get(runKey);
+    const feelingKey = feelings.join(",");
+    if (
+      previous &&
+      previous.noteId === noteId &&
+      previous.note === note &&
+      previous.feelingKey === feelingKey
+    ) {
+      return;
+    }
+    this._commentaryByRun.set(runKey, { noteId, note, feelingKey });
+
+    this.emit("thinking", {
+      phase: "update",
+      sessionKey:
+        normalizeSessionKey(sessionKey) || normalizeSessionKey(this._activeRunSessionKey),
+      runId: normalizedRunId,
+      text: note,
+      delta: note,
+      presentation: "progress_note",
+      progressNoteId: noteId,
+      ...(feelings.length ? { speckFeelings: feelings } : {}),
+      source: "commentary",
+    });
+    this._emitPreToolProse(normalizedRunId, sessionKey, note);
+  }
+
+  _emitPreToolProse(runId     , sessionKey     , text     , pick      = "first") {
+    if (typeof text !== "string" || !text.trim()) return;
+    const client      = this;
+    const modelCallSeq = positiveModelCallSeq(this._modelCalls.current(runId));
+    client.emit("activity", {
+      state: "thinking",
+      sessionKey:
+        normalizeSessionKey(sessionKey) || normalizeSessionKey(this._activeRunSessionKey),
+      runId: runId || null,
+      origin: "narration",
+      phase: "update",
+      summary: text.length > 600 ? text.slice(0, 600) : text,
+
+      prosePick: pick === "last" ? "last" : "first",
+      ...(modelCallSeq === null ? {} : { modelCallSeq }),
+    });
+  }
+
+  _handleAnalysisItemEvent(runId     , data     , sessionKey      = this._activeRunSessionKey) {
+    if (!isObject(data) || data.kind !== "analysis" || data.phase !== "start") return;
+    const normalizedRunId = normalizeRunId(runId) || normalizeRunId(this._activeRunId);
+    const itemId = typeof data.itemId === "string" && data.itemId.trim() ? data.itemId.trim() : null;
+    if (itemId) {
+      const cueKey = `${normalizedRunId || "run"}:${itemId}`;
+      if (this._reasoningCueItemIds.has(cueKey)) return;
+      this._reasoningCueItemIds.add(cueKey);
+    }
+    const client      = this;
+    const modelCallSeq = positiveModelCallSeq(this._modelCalls.current(normalizedRunId));
+    client.emit("activity", {
+      state: "thinking",
+      sessionKey:
+        normalizeSessionKey(sessionKey) || normalizeSessionKey(this._activeRunSessionKey),
+      runId: normalizedRunId || null,
+      origin: "thinking",
+      phase: "update",
+      summary: REASONING_CUE_LABEL,
+      thinkingSummarySource: "generic",
+      ...(modelCallSeq === null ? {} : { modelCallSeq }),
+    });
+  }
+
+  _handlePlanStreamEvent(runId     , data     , sessionKey      = this._activeRunSessionKey) {
+    const normalizedRunId = normalizeRunId(runId) || normalizeRunId(this._activeRunId);
+    const runKey = normalizedRunId || "__global__";
+    const revision = (this._planRevisionByRun.get(runKey) || 0) + 1;
+    const plan = buildActivityPlan(data, revision);
+    if (!plan) return;
+    this._planRevisionByRun.set(runKey, revision);
+    const client      = this;
+    const modelCallSeq = positiveModelCallSeq(this._modelCalls.current(normalizedRunId));
+    client.emit("activity", {
+      state: "thinking",
+      sessionKey:
+        normalizeSessionKey(sessionKey) || normalizeSessionKey(this._activeRunSessionKey),
+      runId: normalizedRunId || null,
+      origin: "plan",
+      phase: "update",
+      plan,
+      ...(modelCallSeq === null ? {} : { modelCallSeq }),
+    });
+  }
+
+  _emitThinkingActivityFromPayload(runId     , sessionKey     , rawPayload     , source = "unknown", options      = {}) {
     const extracted = extractThinkingPayload(rawPayload);
     if (!extracted) return;
 
@@ -2153,7 +3082,7 @@ class OpenClawClient extends EventEmitter {
         normalizedSessionKey,
         extracted,
         source,
-        authoritativeFrameText,
+        authoritativeFrameText ? options.frameText : null,
       );
       if (emittedFrame && frameDedupeKey) {
         this._seenThinkingFrameIds.add(frameDedupeKey);
@@ -2161,7 +3090,10 @@ class OpenClawClient extends EventEmitter {
     }
 
     const dedupeSeed = extracted.signatureId || hashThinkingKey(extracted.label);
-    const dedupeKey = `${normalizedRunId || "run"}:${dedupeSeed}`;
+    const segment = options && typeof options.segment === "string" ? options.segment : null;
+    const dedupeKey = segment
+      ? `${normalizedRunId || "run"}:${segment}:${dedupeSeed}`
+      : `${normalizedRunId || "run"}:${dedupeSeed}`;
     if (this._seenThinkingSummaryIds.has(dedupeKey)) return;
     this._seenThinkingSummaryIds.add(dedupeKey);
 
@@ -2188,6 +3120,7 @@ class OpenClawClient extends EventEmitter {
         : null,
     });
 
+    const modelCallSeq = positiveModelCallSeq(options && options.modelCallSeq);
     this.emit("activity", {
       state: "thinking",
       sessionKey: normalizedSessionKey,
@@ -2198,14 +3131,19 @@ class OpenClawClient extends EventEmitter {
       thinking: extracted.detail,
       thinkingSummarySource: extracted.thinkingSummarySource,
       thinkingSignatureId: extracted.signatureId || null,
+      ...(modelCallSeq === null ? {} : { modelCallSeq }),
     });
   }
 
-  _emitThinkingFrameUpdate(runId, sessionKey, extracted, source, authoritativeText = null) {
+  _emitThinkingFrameUpdate(runId, sessionKey, extracted, source, authoritativeText      = null) {
     const normalizedRunId = normalizeRunId(runId);
     const normalizedSessionKey = normalizeSessionKey(sessionKey);
     const detail = normalizeThinkingText(extracted && extracted.detail);
-    const authoritative = normalizeThinkingText(authoritativeText);
+
+    const authoritative =
+      typeof authoritativeText === "string" && authoritativeText.trim()
+        ? authoritativeText.trim()
+        : null;
     if (!authoritative && !detail) return false;
     const bufferKey = normalizedRunId || "__global__";
     const previous = this._thinkingFrameBuffers.get(bufferKey) || "";
@@ -2308,6 +3246,7 @@ class OpenClawClient extends EventEmitter {
 
         this._applyConnectPolicy(helloOk.policy);
         this._applySessionDefaults(helloOk.snapshot && helloOk.snapshot.sessionDefaults);
+        this._helloFeatures = helloFeaturesFrom(helloOk);
 
         this._lastTick = Date.now();
         this._startTickWatch();
@@ -2344,7 +3283,9 @@ class OpenClawClient extends EventEmitter {
       })
       .catch((err) => {
         if (!isCurrent()) return;
-        this._logger.error(`[openclaw] Connect failed: ${err.message}`);
+
+        const reason = sanitizeConnectReason(err && err.message);
+        this._logger.error(`[openclaw] Connect failed: ${reason}`);
 
         if (canFallback) {
           this._logger.info(
@@ -2355,11 +3296,14 @@ class OpenClawClient extends EventEmitter {
         }
 
         this.emit("connectFailed", {
-          reason: sanitizeConnectReason(err && err.message),
+          reason,
           minProtocol: MIN_PROTOCOL_VERSION,
           maxProtocol: MAX_PROTOCOL_VERSION,
         });
-        this.emit("error", err);
+
+        const safeErr      = new Error(reason);
+        if (err && err.code != null) safeErr.code = err.code;
+        this.emit("error", safeErr);
         if (isCurrent()) {
           ws.close(1008, "connect failed");
         }
@@ -2388,7 +3332,7 @@ class OpenClawClient extends EventEmitter {
     this._drainEventQueue();
   }
 
-  async _fetchHistory(sessionKey, options = {}) {
+  async _fetchHistory(sessionKey, options      = {}) {
     const ws = this._ws;
     const generation = this._socketGeneration;
     const result = await this.request("chat.history", {
@@ -2398,8 +3342,8 @@ class OpenClawClient extends EventEmitter {
     if (!this._isCurrentSocket(ws, generation)) return result;
 
     if (Number.isFinite(options.idleRunGeneration)) {
-      const historyResult = result;
-      const historyGuardOwner = this;
+      const historyResult      = result;
+      const historyGuardOwner      = this;
       const responseSessionKey =
         normalizeSessionKey(historyResult && historyResult.sessionKey) || normalizeSessionKey(sessionKey);
       const stalePostCommitHydrate =
@@ -2414,7 +3358,9 @@ class OpenClawClient extends EventEmitter {
       }
     }
 
-    const messages = result && Array.isArray(result.messages) ? result.messages : [];
+    const messages = projectOpenClawConversationHistory(
+      result && Array.isArray(result.messages) ? result.messages : [],
+    );
 
     const echoedSessionKey = (result && result.sessionKey) || sessionKey;
     this._logger.info(
@@ -2436,18 +3382,25 @@ class OpenClawClient extends EventEmitter {
   }
 
   _drainEventQueue() {
+
+    if (this._commitHold) return;
     const ws = this._ws;
     const generation = this._socketGeneration;
     const queue = this._eventQueue;
     this._eventQueue = [];
-    for (const evt of queue) {
+    for (let index = 0; index < queue.length; index += 1) {
+      const evt = queue[index];
       if (!this._isCurrentSocket(ws, generation)) return;
 
       if (evt && evt.chatCommit) {
         this._commitChatCommandRun(evt.chatCommit);
         continue;
       }
-      this._handleAgentEvent(evt.payload, evt.capturedCommit);
+      if (!this._commitAgentEvent(evt.payload, evt.capturedCommit)) {
+
+        this._eventQueue = queue.slice(index + 1).concat(this._eventQueue);
+        return;
+      }
     }
   }
 
@@ -2485,7 +3438,7 @@ class OpenClawClient extends EventEmitter {
     }
   }
 
-  _applySessionDefaults(sessionDefaults) {
+  _applySessionDefaults(sessionDefaults     ) {
 
     this._agentSelectionRequiredLatched = false;
     if (!sessionDefaults || typeof sessionDefaults !== "object") {
@@ -2563,4 +3516,4 @@ function createPluginOpenclawClient(opts = {}) {
   return new OpenClawClient(opts);
 }
 
-module.exports = { createPluginOpenclawClient, buildTerminalErrorActivity, resolveTerminalErrorCode, mapFailureHintToActivityCode, inferFailureHintFromText };
+module.exports = { mapFailureHintToActivityCode, inferFailureHintFromText, resolveTerminalErrorCode, isGatewaySeqGapNotice, buildTerminalErrorActivity, createPluginOpenclawClient };

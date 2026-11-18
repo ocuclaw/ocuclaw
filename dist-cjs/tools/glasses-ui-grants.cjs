@@ -5,7 +5,7 @@ const GRANTS_SCHEMA_VERSION = 1;
 const GRANTS_FILENAME = "network-grants-v1.json";
 const DOCUMENT_KEYS = new Set(["version", "granted", "denied", "pending", "digest"]);
 
-function normalizeGrantHost(input) {
+function normalizeGrantHost(input         ) {
   if (typeof input !== "string") return { ok: false, code: "grant_invalid_host" };
   const host = input.trim().toLowerCase();
   if (
@@ -44,7 +44,7 @@ function emptyDocumentInput() {
   };
 }
 
-function validatesDocumentShape(record) {
+function validatesDocumentShape(record     ) {
   return !!record &&
     typeof record === "object" &&
     !Array.isArray(record) &&
@@ -57,14 +57,14 @@ function validatesDocumentShape(record) {
     !!record.digest;
 }
 
-function normalizeTimedHostRow(row, timestampKey) {
+function normalizeTimedHostRow(row     , timestampKey     ) {
   if (!row || typeof row !== "object" || Array.isArray(row)) return null;
   const normalized = normalizeGrantHost(row.host);
   if (!normalized.ok || typeof row[timestampKey] !== "string" || !row[timestampKey]) return null;
   return { host: normalized.host, [timestampKey]: row[timestampKey] };
 }
 
-function normalizePendingRow(row) {
+function normalizePendingRow(row     ) {
   if (!row || typeof row !== "object" || Array.isArray(row)) return null;
   const normalized = normalizeGrantHost(row.host);
   if (
@@ -87,9 +87,9 @@ function normalizePendingRow(row) {
   };
 }
 
-function uniqueRows(rows, normalize) {
+function uniqueRows(rows     , normalize     ) {
   const seen = new Set();
-  const output = [];
+  const output      = [];
   for (const row of rows) {
     const normalized = normalize(row);
     if (!normalized || seen.has(normalized.host)) continue;
@@ -99,17 +99,17 @@ function uniqueRows(rows, normalize) {
   return output;
 }
 
-function copyState(state) {
+function copyState(state     ) {
   return {
-    granted: state.granted.map((row) => ({ ...row })),
-    denied: state.denied.map((row) => ({ ...row })),
-    pending: state.pending.map((row) => ({ ...row })),
+    granted: state.granted.map((row     ) => ({ ...row })),
+    denied: state.denied.map((row     ) => ({ ...row })),
+    pending: state.pending.map((row     ) => ({ ...row })),
     digest: state.digest,
     grantsInvalid: state.grantsInvalid,
   };
 }
 
-function createLiveuiGrantsStore(opts) {
+function createLiveuiGrantsStore(opts     ) {
   const now = typeof opts.now === "function" ? opts.now : Date.now;
   const maxPending = Number.isSafeInteger(opts.maxPending) && opts.maxPending >= 0
     ? opts.maxPending
@@ -124,10 +124,10 @@ function createLiveuiGrantsStore(opts) {
     validateDocument: validatesDocumentShape,
   };
 
-  let cached = null;
+  let cached      = null;
   let cachedAtMs = 0;
 
-  function invalidState(reason) {
+  function invalidState(reason     ) {
     return {
       granted: [],
       denied: [],
@@ -139,23 +139,23 @@ function createLiveuiGrantsStore(opts) {
     };
   }
 
-  function projectRecord(record, virtual) {
+  function projectRecord(record     , virtual     ) {
     const denied = uniqueRows(
       record.denied,
-      (row) => normalizeTimedHostRow(row, "deniedAt"),
+      (row     ) => normalizeTimedHostRow(row, "deniedAt"),
     );
-    const deniedHosts = new Set(denied.map((row) => row.host));
+    const deniedHosts = new Set(denied.map((row     ) => row.host));
 
     const granted = uniqueRows(
       record.granted,
-      (row) => normalizeTimedHostRow(row, "grantedAt"),
-    ).filter((row) => !deniedHosts.has(row.host));
+      (row     ) => normalizeTimedHostRow(row, "grantedAt"),
+    ).filter((row     ) => !deniedHosts.has(row.host));
     const effectiveHosts = new Set([
-      ...granted.map((row) => row.host),
+      ...granted.map((row     ) => row.host),
       ...deniedHosts,
     ]);
     const pending = uniqueRows(record.pending, normalizePendingRow)
-      .filter((row) => !effectiveHosts.has(row.host));
+      .filter((row     ) => !effectiveHosts.has(row.host));
     return {
       state: {
         granted,
@@ -172,7 +172,7 @@ function createLiveuiGrantsStore(opts) {
   function loadInternal(force = false) {
     const nowMs = now();
     if (!force && cached && nowMs - cachedAtMs < cacheMs) return cached;
-    const loaded = library.loadDocument(GRANTS_FILENAME, documentOptions);
+    const loaded      = library.loadDocument(GRANTS_FILENAME, documentOptions);
     cached = loaded.status === "accepted"
       ? projectRecord(loaded.record, loaded.virtual === true)
       : { state: invalidState(loaded.reason), casDigest: null };
@@ -180,13 +180,13 @@ function createLiveuiGrantsStore(opts) {
     return cached;
   }
 
-  function cacheSavedRecord(record) {
+  function cacheSavedRecord(record     ) {
     cached = projectRecord(record, false);
     cachedAtMs = now();
     return cached;
   }
 
-  function saveState(state, expectedDigest) {
+  function saveState(state     , expectedDigest     ) {
     const digestInput = {
       version: GRANTS_SCHEMA_VERSION,
       granted: state.granted,
@@ -194,7 +194,7 @@ function createLiveuiGrantsStore(opts) {
       pending: state.pending,
     };
     try {
-      const saved = library.saveDocument(GRANTS_FILENAME, digestInput, {
+      const saved      = library.saveDocument(GRANTS_FILENAME, digestInput, {
         ...documentOptions,
         expectedDigest,
       });
@@ -215,23 +215,23 @@ function createLiveuiGrantsStore(opts) {
     return copyState(loadInternal().state);
   }
 
-  function isGranted(host) {
+  function isGranted(host         ) {
     const normalized = normalizeGrantHost(host);
     if (!normalized.ok) return false;
     const state = loadInternal().state;
     return state.grantsInvalid === null &&
-      state.granted.some((row) => row.host === normalized.host);
+      state.granted.some((row     ) => row.host === normalized.host);
   }
 
-  function isDenied(host) {
+  function isDenied(host         ) {
     const normalized = normalizeGrantHost(host);
     if (!normalized.ok) return false;
     const state = loadInternal().state;
     return state.grantsInvalid === null &&
-      state.denied.some((row) => row.host === normalized.host);
+      state.denied.some((row     ) => row.host === normalized.host);
   }
 
-  function filePending(req) {
+  function filePending(req     ) {
     const normalized = normalizeGrantHost(req && req.host);
     if (!normalized.ok) return normalized;
 
@@ -239,22 +239,22 @@ function createLiveuiGrantsStore(opts) {
       const current = loadInternal(attempt > 0);
       const state = current.state;
       if (state.grantsInvalid) return { ok: false, code: "grants_invalid" };
-      if (state.pending.some((row) => row.host === normalized.host)) {
+      if (state.pending.some((row     ) => row.host === normalized.host)) {
         return { ok: true, filed: false };
       }
       if (
-        state.granted.some((row) => row.host === normalized.host) ||
-        state.denied.some((row) => row.host === normalized.host)
+        state.granted.some((row     ) => row.host === normalized.host) ||
+        state.denied.some((row     ) => row.host === normalized.host)
       ) {
         return { ok: false, code: "grant_not_pending" };
       }
       if (state.pending.length >= maxPending) {
         return { ok: false, code: "grant_limit" };
       }
-      const next = {
+      const next      = {
         ...copyState(state),
         pending: [
-          ...state.pending.map((row) => ({ ...row })),
+          ...state.pending.map((row     ) => ({ ...row })),
           {
             host: normalized.host,
             method: req.method,
@@ -273,7 +273,32 @@ function createLiveuiGrantsStore(opts) {
     return { ok: false, code: "grants_write_failed" };
   }
 
-  function apply(intent) {
+  function grant(host         ) {
+    const normalized = normalizeGrantHost(host);
+    if (!normalized.ok) return normalized;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const current = loadInternal(attempt > 0);
+      const state = current.state;
+      if (state.grantsInvalid) return { ok: false, code: "grants_invalid" };
+      if (state.denied.some((row     ) => row.host === normalized.host)) {
+        return { ok: false, code: "grant_denied" };
+      }
+      const wasGranted = state.granted.some((row     ) => row.host === normalized.host);
+      const wasPending = state.pending.some((row     ) => row.host === normalized.host);
+      if (wasGranted && !wasPending) return { ok: true, granted: false };
+      const next = copyState(state);
+      next.pending = next.pending.filter((row     ) => row.host !== normalized.host);
+      if (!wasGranted) {
+        next.granted.push({ host: normalized.host, grantedAt: new Date(now()).toISOString() });
+      }
+      const saved = saveState(next, current.casDigest);
+      if (saved.ok) return { ok: true, granted: !wasGranted };
+      if (!saved.conflict) return { ok: false, code: "grants_write_failed" };
+    }
+    return { ok: false, code: "grants_write_failed" };
+  }
+
+  function apply(intent     ) {
     const current = loadInternal();
     const state = current.state;
     if (state.grantsInvalid) return { ok: false, code: "grants_invalid" };
@@ -290,24 +315,24 @@ function createLiveuiGrantsStore(opts) {
     const next = copyState(state);
     let removedHost;
     if (intent.action === "allow" || intent.action === "deny") {
-      const pendingIndex = next.pending.findIndex((row) => row.host === normalized.host);
+      const pendingIndex = next.pending.findIndex((row     ) => row.host === normalized.host);
       if (pendingIndex < 0) return { ok: false, code: "grant_not_pending" };
       next.pending.splice(pendingIndex, 1);
-      next.granted = next.granted.filter((row) => row.host !== normalized.host);
-      next.denied = next.denied.filter((row) => row.host !== normalized.host);
+      next.granted = next.granted.filter((row     ) => row.host !== normalized.host);
+      next.denied = next.denied.filter((row     ) => row.host !== normalized.host);
       if (intent.action === "allow") {
         next.granted.push({ host: normalized.host, grantedAt: timestamp });
       } else {
         next.denied.push({ host: normalized.host, deniedAt: timestamp });
       }
     } else if (intent.action === "remove") {
-      const wasGranted = next.granted.some((row) => row.host === normalized.host);
-      const wasDenied = next.denied.some((row) => row.host === normalized.host);
+      const wasGranted = next.granted.some((row     ) => row.host === normalized.host);
+      const wasDenied = next.denied.some((row     ) => row.host === normalized.host);
       if (!wasGranted && !wasDenied) {
         return { ok: false, code: "grant_not_found" };
       }
-      next.granted = next.granted.filter((row) => row.host !== normalized.host);
-      next.denied = next.denied.filter((row) => row.host !== normalized.host);
+      next.granted = next.granted.filter((row     ) => row.host !== normalized.host);
+      next.denied = next.denied.filter((row     ) => row.host !== normalized.host);
       removedHost = normalized.host;
     } else {
       return { ok: false, code: "grant_not_found" };
@@ -327,7 +352,7 @@ function createLiveuiGrantsStore(opts) {
     };
   }
 
-  return { load, isGranted, isDenied, filePending, apply };
+  return { load, isGranted, isDenied, filePending, grant, apply };
 }
 
 module.exports = { normalizeGrantHost, createLiveuiGrantsStore };

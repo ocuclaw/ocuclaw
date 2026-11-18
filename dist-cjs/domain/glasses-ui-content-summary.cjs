@@ -18,7 +18,7 @@ function summarizeGlassesUiContent(specOrPatch) {
 
   const hasDetail =
     !!rawItems &&
-    rawItems.some((i) => i && typeof i === "object" && typeof i.body === "string");
+    rawItems.some((i     ) => i && typeof i === "object" && typeof i.body === "string");
   if (rawPages && Reflect.get(o, "kind") === "paged_text_surface") Object.assign(out, { kind: "paged_text" });
   else if (rawItems && o.kind === "checklist_surface") out.kind = "checklist";
   else if (rawItems) out.kind = hasDetail ? "list_with_details" : "list";
@@ -37,7 +37,7 @@ function summarizeGlassesUiContent(specOrPatch) {
     if (Number.isInteger(imageHeight)) Object.assign(out, { imageHeight });
   }
 
-  if (Reflect.get(o, "template") === "graphic") {
+  if (["graphic", "graphic_v2"].includes(Reflect.get(o, "template"))) {
     const graphic = Reflect.get(o, "graphic");
     const slots = graphic && typeof graphic === "object" ? Reflect.get(graphic, "slots") : null;
     const slotTypes = Array.isArray(slots)
@@ -47,7 +47,7 @@ function summarizeGlassesUiContent(specOrPatch) {
         .slice(0, ITEMS_SHOWN)
         .map((type) => truncate(type, LABEL_MAX))
       : [];
-    Object.assign(out, { template: "graphic", slotTypes });
+    Object.assign(out, { template: Reflect.get(o, "template"), slotTypes });
   }
 
   if (rawItems) {

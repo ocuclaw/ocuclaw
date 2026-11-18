@@ -1,4 +1,7 @@
-const SAVED_OPERATIONS = ["saved.list", "saved.read", "saved.preview", "saved.mutate", "saved.receipt", "saved.recover"];
+const SAVED_OPERATIONS = ["saved.list", "saved.read", "saved.preview", "saved.mutate", "saved.receipt", "saved.recover", "saved.search"];
+const SAVED_SEARCH_QUERY_MAX = 200;
+const SAVED_SEARCH_RESULTS_MAX = 20;
+const SAVED_SEARCH_SNIPPET_MAX = 1000;
 const id = (value     ) => typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
 const revision = (value     ) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const string = (value     ) => typeof value === "string" && !value.includes("\u0000");
@@ -10,6 +13,7 @@ function savedRequest(operation        , value     )      {
     "saved.list": [], "saved.read": ["entryId"], "saved.preview": ["entryId", "action", "content"],
     "saved.mutate": ["operationId", "entryId", "action", "content", "previewRevision", "producedAtMs", "expiresAtMs"],
     "saved.receipt": ["operationId"], "saved.recover": ["operationId", "producedAtMs", "expiresAtMs"],
+    "saved.search": ["query"],
   };
   const keys = fields[operation];
   const row = value ?? {};
@@ -18,6 +22,9 @@ function savedRequest(operation        , value     )      {
   for (const key of keys) {
     if (key === "producedAtMs" || key === "expiresAtMs") {
       if (!Number.isSafeInteger(row[key]) || row[key] < 0) return null;
+    } else if (key === "query") {
+      if (typeof row[key] !== "string" || /[\u0000-\u001f\u007f]/.test(row[key]) ||
+        row[key].trim() !== row[key] || row[key].length < 1 || row[key].length > SAVED_SEARCH_QUERY_MAX) return null;
     } else if (key === "content") {
       if (!string(row[key]) || new TextEncoder().encode(row[key]).length > 262144) return null;
     } else if (key === "action") {
@@ -56,6 +63,17 @@ function entry(value     , summary = false)      {
 
 function savedResult(operation        , value     , request      )      {
   assert(value && new TextEncoder().encode(JSON.stringify(value)).length <= 524288);
+  if (operation === "saved.search") {
+
+    assert(Array.isArray(value.results) && value.results.length <= SAVED_SEARCH_RESULTS_MAX);
+    return { results: value.results.map((row     ) => {
+      assert(row && string(row.path) && row.path.length > 0 && row.path.length <= 512 &&
+        Number.isSafeInteger(row.startLine) && row.startLine >= 1 &&
+        Number.isSafeInteger(row.endLine) && row.endLine >= row.startLine &&
+        string(row.snippet) && row.snippet.length <= SAVED_SEARCH_SNIPPET_MAX);
+      return { path: row.path, startLine: row.startLine, endLine: row.endLine, snippet: row.snippet };
+    }) };
+  }
   if (operation === "saved.list") {
     assert(Array.isArray(value.records) && Array.isArray(value.targets) && value.applyTiming === "future_chat" &&
       typeof value.externalProviderUnsupported === "boolean");
@@ -124,4 +142,4 @@ const SAVED_ERRORS                         = {
   unsafe_path: "This saved target cannot be safely reviewed. Inspect it in native Hermes.",
 };
 
-module.exports = { SAVED_OPERATIONS, SAVED_ERRORS, savedRequest, savedResult };
+module.exports = { SAVED_OPERATIONS, SAVED_SEARCH_QUERY_MAX, SAVED_SEARCH_RESULTS_MAX, SAVED_SEARCH_SNIPPET_MAX, savedRequest, savedResult, SAVED_ERRORS };

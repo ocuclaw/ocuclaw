@@ -6,8 +6,51 @@ only the reference borrowed for one call, including exceptional completion.
 """
 from pathlib import Path
 from contextlib import contextmanager
+import contextvars
+import logging
 import sqlite3
 import json
+
+logger = logging.getLogger(__name__)
+
+# Set while OcuClaw's own delete tells plugins, so the on_session_delete call
+# that comes back into this plugin can tag its frame `origin: "ocuclaw"`: the
+# relay already did that chat's cleanup on its own delete path. A contextvar,
+# not a flag, so a concurrent Desktop delete on another thread stays untagged.
+_OWN_DELETE = contextvars.ContextVar("ocuclaw_own_session_delete", default=False)
+
+
+def own_delete_in_progress():
+    """True inside the hook dispatch of OcuClaw's own native delete."""
+    return _OWN_DELETE.get()
+
+
+def _after_native_delete(writer, removed, primary):
+    """What Hermes's own delete does once the delete has committed.
+
+    0.22.3 tells plugins (memory providers) through ``on_session_delete``
+    (hermes_state_common ``emit_session_deleted``, itself fail-open), and
+    every native delete then releases retired media. The delete already
+    landed, so nothing here may fail it.
+    """
+    try:
+        from hermes_state_common import emit_session_deleted
+    except ImportError:  # before Hermes 0.22.3: no on_session_delete hook
+        emit_session_deleted = None
+    if emit_session_deleted is not None:
+        token = _OWN_DELETE.set(True)
+        try:
+            emit_session_deleted(writer, removed, reason="delete", primary=primary)
+        finally:
+            _OWN_DELETE.reset(token)
+    try:
+        from hermes_state_media import collect_retired_media
+    except ImportError:
+        return
+    try:
+        collect_retired_media(writer)
+    except Exception:  # noqa: BLE001 - the next native delete or prune collects them
+        logger.debug("[ocuclaw] retired media collection after delete failed", exc_info=True)
 
 
 class SharedSessionWriter:
@@ -147,6 +190,10 @@ class SharedSessionWriter:
                 from hermes_state_sessions import _delete_delegate_children
             except ImportError:
                 raise RuntimeError("session_writer_unsupported") from None
+            try:
+                from hermes_state_mutation_retirement import retire_sessions
+            except ImportError:  # before Hermes 0.22.1: no deletion fence to publish
+                retire_sessions = None
             execute = getattr(writer, "_execute_write", None)
             cleanup = getattr(writer, "_delete_unreferenced_system_prompts", None)
             remove_files = getattr(writer, "_remove_session_files", None)
@@ -186,6 +233,10 @@ class SharedSessionWriter:
                         ):
                             continue
                         raise RuntimeError("session_selection_changed")
+                if retire_sessions is not None:
+                    # Hermes 0.22.1 keeps settled admission and worker rows per session
+                    # (ON DELETE RESTRICT); its own delete path publishes this fence first.
+                    retire_sessions(conn, ids)
                 removed = _delete_delegate_children(conn, ids)
                 conn.execute(f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({placeholders})", ids)
                 conn.execute(f"DELETE FROM messages WHERE session_id IN ({placeholders})", ids)
@@ -198,6 +249,7 @@ class SharedSessionWriter:
                 return [*removed, *ids]
 
             removed = execute(delete)
+            _after_native_delete(writer, removed, ids[0])
             for session_id in removed:
                 remove_files(None, session_id)
             return ids

@@ -26,8 +26,11 @@ doctor names and a refusal setup prints can never disagree:
 3. **Does transport need to move?** The reporter's shape is OcuClaw's code
    and relay credential living in a secondary profile. :func:`move_plan` and
    :func:`apply_move` relocate them to the default profile *preserving the
-   credential byte for byte* — a regenerated credential is every paired
-   phone disconnected, silently.
+   credential value exactly* — a regenerated credential is every paired
+   phone disconnected, silently. The credential is read through Hermes's
+   secret scope and written with Hermes's own `.env` writers (catalogue
+   rule 11, #6402); the value each profile resolves is read back before the
+   next half of the move runs.
 
 Everything here is pure or takes an injected home, so a fixture directory is
 observed by exactly the code a real host is. No function in this module ever
@@ -45,6 +48,7 @@ import copy
 import hashlib
 import importlib
 import importlib.util
+import os
 from pathlib import Path
 import re
 import shutil
@@ -223,6 +227,12 @@ def agent_mode_recorded(
     engine that has since become 0.21.4+ is not a choice any more; the next
     setup pass records "multiple" without asking.
     """
+    # An UNSET switch is not a recorded "multiple", on any engine. Hermes 0.23
+    # settles an unset key at every boot, and a host with one profile boots
+    # standalone ("only one profile exists"), so the phone's "+" stays grey
+    # with nothing to say why. Treating unset as chosen made `/ocuclaw-setup`,
+    # the fix the phone points at, a no-op on exactly that host. Only an
+    # explicit `true` counts; setup writes it on every multiple branch.
     if not isinstance(multiplex, bool):
         return False
     if agent_mode == "multiple":
@@ -512,6 +522,12 @@ def migration_plan(
     if already:
         gate, may = GATE_ALREADY, True
         commands = [f"hermes config set --force {AGENT_MODE_KEY} multiple"]
+        if mode.get("configured") is not True:
+            # Live multiplex on an unset switch (Hermes's default applied at
+            # boot). Save it, so the switch survives a later single-profile
+            # boot, which Hermes 0.23 starts standalone when the key is unset,
+            # and so `agent_mode_recorded` sees a choice and setup stops here.
+            commands.insert(0, f"hermes config set --force {FLAG_KEY} true")
         if flag_only:
             commands.append("hermes gateway restart")
             say = (
@@ -639,64 +655,107 @@ MOVE_REFUSED_CREDENTIAL_CONFLICT = "move_refused_credential_conflict"
 MOVE_REFUSED_UNKNOWN_PROFILE = "move_refused_unknown_profile"
 
 
-def _read_env(path: Path) -> Tuple[List[str], str]:
+class CredentialNotCarried(RuntimeError):
+    """A Hermes ``.env`` write did not leave the relay credential where the
+    move needs it: refused (a managed key), silently altered, or a different
+    credential is already there. Raised BEFORE the next half of the move runs,
+    so the receipt still describes a duplicate, never a gap. Its type name is
+    what the receipt carries; it never carries a value.
+    """
+
+
+# Rule 11 (#6402): this module never opens a `.env`. Every read goes through
+# Hermes's secret scope (`secret_access.read_secret`) and every write through
+# Hermes's own `save_env_value` / `remove_env_value`, aimed at one profile by
+# `secret_access.profile_home_scope`.
+
+
+def _env_state(home: Path) -> str:
+    """Whether Hermes can read ``home``'s `.env` AND rewrite it losslessly.
+
+    ``"missing"``, ``"ok"`` or ``"unreadable"``. Hermes reads a `.env` two
+    ways: its loader (``load_env_file``: what the gateway sees) decodes bad
+    UTF-8 as latin-1, while its writers (``_read_env_lines``) decode with
+    ``errors="replace"``. When the two views of one file disagree, any
+    ``save_env_value`` / ``remove_env_value`` on it would silently rewrite the
+    other secrets in that file, so the move refuses, exactly as it refused a
+    `.env` it could not read itself. An unopenable file, or Hermes absent
+    (nothing may then read a secret at all), is "unreadable" too.
+    """
     try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return [], "missing"
-    except (OSError, UnicodeError):
-        return [], "unreadable"
-    return text.splitlines(), "ok"
+        from agent.secret_scope import _parse_env_text, load_env_file  # type: ignore
+        from hermes_cli.config import _read_env_lines  # type: ignore
+    except Exception:  # noqa: BLE001 - no Hermes, no secret reader: fail closed
+        return "unreadable"
+    path = Path(home) / ".env"
+    if not path.exists():
+        return "missing"
+    try:
+        writer_view = _parse_env_text("".join(_read_env_lines(path)))
+    except Exception:  # noqa: BLE001 - unopenable (permissions, a directory)
+        return "unreadable"
+    return "ok" if writer_view == load_env_file(path) else "unreadable"
 
 
-#: Which assignments a `.env` line defines, mirroring Hermes's own
-#: ``hermes_cli.config._env_line_defines_key``. ``load_env()`` accepts the
-#: bash-compatible ``export KEY=value`` form, so anything that removes or
-#: compares a key has to recognise it too. Missing it is not a cosmetic bug:
-#: a "removed" line that this pattern does not match survives, and the value
-#: resurrects on the next load.
-_ENV_ASSIGNMENT_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+def _relay_token(home: Path) -> str:
+    """``home``'s relay credential as Hermes resolves it for that profile.
 
-
-def _env_line_key(line: str) -> Optional[str]:
-    """The key this line assigns, or None for a comment/blank/other line."""
-    if line.lstrip().startswith("#"):
-        return None
-    match = _ENV_ASSIGNMENT_RE.match(line)
-    return match.group(1) if match is not None else None
-
-
-def _env_line_for(lines: Sequence[str], key: str) -> Optional[str]:
-    """The **raw** line assigning ``key``, verbatim.
-
-    Carrying the line rather than a parsed value is what makes "the
-    credential is carried across unchanged" literally true: quoting, the
-    `export` prefix and any spacing survive the move exactly as the user's
-    Hermes wrote them. Reserializing a parsed value silently turned
-    ``TOKEN="a b"`` into ``TOKEN=a b``, which is a different credential.
+    Compared and carried, never returned, printed or logged. Hermes's
+    tokenizer has already undone quoting and any ``export`` prefix, so two
+    spellings of one secret compare equal.
     """
-    for line in lines:
-        if _env_line_key(line) == key:
-            return line
-    return None
+    from .secret_access import read_secret
+
+    return read_secret(RELAY_TOKEN_ENV, home=home)
 
 
-def _env_value(lines: Sequence[str], key: str) -> Optional[str]:
-    """``key``'s value, normalised only enough to COMPARE two profiles.
+def _secure_env_file(home: Path) -> None:
+    # Deliberate, and the one thing kept from the old in-module writer:
+    # Hermes's writers preserve an existing file's mode, but a `.env` holds
+    # every secret on that profile, so the move leaves each `.env` it wrote at
+    # 0600 rather than inheriting a loose mode. Metadata only: never content.
+    path = Path(home) / ".env"
+    if path.is_file():
+        os.chmod(path, 0o600)
 
-    Used for one question — "are these the same credential?" — so quoting
-    differences must not read as a conflict. Never written back anywhere and
-    never printed; the raw line is what moves.
+
+def _save_relay_token(home: Path, value: str) -> None:
+    """Write ``value`` into ``home``'s `.env` through Hermes, then prove it.
+
+    ``profile_home_scope`` aims ``save_env_value`` at ``home`` and installs that
+    profile's secret scope, so for any home that is not this process's own,
+    Hermes publishes the change into that scope and never into the shared
+    ``os.environ`` (``_publish_env_value``'s routed branch, 0.21.4 and 0.22.5).
     """
-    line = _env_line_for(lines, key)
-    if line is None:
-        return None
-    _name, _, value = line.partition("=")
-    return value.strip().strip("'\"").strip()
+    if not value.isascii() or "\n" in value or "\r" in value:
+        # Hermes's writer strips non-ASCII and newlines. Refuse before writing
+        # rather than land a different credential and clean up after it.
+        raise CredentialNotCarried("credential cannot be written unchanged")
+    from hermes_cli.config import save_env_value  # type: ignore
+    from .secret_access import profile_home_scope
+
+    with profile_home_scope(home):
+        save_env_value(RELAY_TOKEN_ENV, value)
+    if _relay_token(home) != value:
+        # Refused (a managed key returns without raising) or altered: take our
+        # own write back out so `home` is left as it was, then stop the move.
+        _remove_relay_token(home, verify=False)
+        raise CredentialNotCarried("written credential does not read back")
+    _secure_env_file(home)
 
 
-def _without_key(lines: Sequence[str], key: str) -> List[str]:
-    return [line for line in lines if _env_line_key(line) != key]
+def _remove_relay_token(home: Path, *, verify: bool = True) -> None:
+    """Remove ``home``'s relay credential through Hermes, then prove it."""
+    from hermes_cli.config import remove_env_value  # type: ignore
+    from .secret_access import profile_home_scope
+
+    with profile_home_scope(home):
+        remove_env_value(RELAY_TOKEN_ENV)
+    if verify and _relay_token(home):
+        # A managed key, or a secret source outside `.env`, still supplies
+        # one. Saying "removed" here would be a lie the doctor then repeats.
+        raise CredentialNotCarried("credential still resolves after removal")
+    _secure_env_file(home)
 
 
 def _credential_fingerprint(value: Optional[str]) -> Optional[str]:
@@ -825,24 +884,25 @@ def move_plan(
         )
 
     # -- relay credential ---------------------------------------------------
-    source_env_lines, source_env_state = _read_env(source_home / ".env")
-    default_env_lines, default_env_state = _read_env(default_home / ".env")
-    source_token = _env_value(source_env_lines, RELAY_TOKEN_ENV)
-    default_token = _env_value(default_env_lines, RELAY_TOKEN_ENV)
-    credential_conflict = bool(
-        source_token and default_token and source_token != default_token
-    )
+    source_env_state = _env_state(source_home)
+    default_env_state = _env_state(default_home)
     if source_env_state == "unreadable" or default_env_state == "unreadable":
         return {
             "status": MOVE_REFUSED_CREDENTIAL_CONFLICT,
             "source": source,
             "mayApply": False,
             "reason": (
-                "A profile's `.env` could not be read, so the move cannot "
-                "prove it would preserve the existing pairing."
+                "A profile's `.env` could not be read, or Hermes could not "
+                "rewrite it without changing its other secrets, so the move "
+                "cannot prove it would preserve the existing pairing."
             ),
             "steps": [],
         }
+    source_token = _relay_token(source_home)
+    default_token = _relay_token(default_home)
+    credential_conflict = bool(
+        source_token and default_token and source_token != default_token
+    )
     conflict_report = (
         _credential_conflict_report(
             default_home=default_home, source_home=source_home
@@ -1185,31 +1245,38 @@ def _apply_step(
     if kind == "copy_tree":
         shutil.copytree(step["from"], step["to"])
     elif kind == "move_credential":
-        source_lines, _state = _read_env(source_home / ".env")
-        # The raw line, not a reparsed value: quoting and any `export` prefix
-        # travel with it, so what lands in the default profile is byte for
-        # byte what the secondary held.
-        raw = _env_line_for(source_lines, RELAY_TOKEN_ENV)
-        if raw is None:
+        # The value Hermes resolves for the secondary, written back through
+        # Hermes's own writer: Hermes re-quotes it in its canonical form, and
+        # the read-back in `_save_relay_token` proves the default profile now
+        # resolves exactly that value before the secondary loses its copy.
+        value = _relay_token(source_home)
+        if not value:
+            # Already carried (a replay after an interruption): nothing to do.
             return
-        default_path = default_home / ".env"
-        default_lines, _default_state = _read_env(default_path)
-        # Never let two assignments coexist, whatever shape the existing one
-        # is in. A *different* credential is either refused outright or
-        # removed first by `drop_default_credential`, which the plan orders
-        # ahead of this step, so anything still here is the same one.
-        body = _without_key(default_lines, RELAY_TOKEN_ENV)
-        if body and body[-1].strip():
-            body.append("")
-        body.append(raw)
-        _write_env(default_path, body)
-        _write_env(source_home / ".env", _without_key(source_lines, RELAY_TOKEN_ENV))
+        current = _relay_token(default_home)
+        if current and current != value:
+            # A *different* credential is either refused by the plan or
+            # removed first by `drop_default_credential`, which the plan
+            # orders ahead of this step. One still here arrived after the
+            # plan was made: never overwrite it, that would unpair its phones.
+            raise CredentialNotCarried("default profile holds another credential")
+        if current != value:
+            _save_relay_token(default_home, value)
+        # Default first, secondary last: an interruption between the two
+        # leaves a duplicate, never a gap. Hermes's writers replace the one
+        # assignment in place, so two never coexist in one `.env`.
+        _remove_relay_token(source_home)
     elif kind == "drop_default_credential":
-        default_path = default_home / ".env"
-        default_lines, _state = _read_env(default_path)
-        # Removed, never reissued: the line goes, and nothing takes its place
-        # until `move_credential` carries the chosen one in.
-        _write_env(default_path, _without_key(default_lines, RELAY_TOKEN_ENV))
+        # Removed, never reissued: the assignment goes, and nothing takes its
+        # place until `move_credential` carries the chosen one in. Only the
+        # credential the wearer chose to give up goes: the plan names it by
+        # fingerprint, so replaying a stale plan cannot drop the credential a
+        # finished move already carried in.
+        current = _relay_token(default_home)
+        if current:
+            if _credential_fingerprint(current) != step.get("fingerprint"):
+                raise CredentialNotCarried("default credential changed since the plan")
+            _remove_relay_token(default_home)
         marker = default_home / "state" / RELAY_CREDENTIAL_MARKER_FILENAME
         if marker.is_file():
             # The marker names the generation that just went. Leaving it
@@ -1218,8 +1285,13 @@ def _apply_step(
             # marker for the credential that is actually there.
             marker.unlink()
     elif kind == "drop_secondary_credential":
-        source_lines, _state = _read_env(source_home / ".env")
-        _write_env(source_home / ".env", _without_key(source_lines, RELAY_TOKEN_ENV))
+        value = _relay_token(source_home)
+        if value and _relay_token(default_home) != value:
+            # The plan saw the same credential in both. If the default no
+            # longer holds it, the secondary's is the only copy: keep it.
+            raise CredentialNotCarried("default profile no longer holds this credential")
+        if value:
+            _remove_relay_token(source_home)
     elif kind == "move_state":
         target = default_home / "state"
         target.mkdir(parents=True, exist_ok=True)
@@ -1243,22 +1315,6 @@ def _safe_name(value: Any) -> str:
     return value if isinstance(value, str) and PROFILE_NAME_RE.match(value) else "(invalid name)"
 
 
-def _write_env(path: Path, lines: Sequence[str]) -> None:
-    # Deliberate: `write_private` replaces the file at mode 0600 rather than
-    # preserving the original. A `.env` holds every secret on that profile,
-    # so narrowing a loose mode is the intended outcome, not a side effect.
-    # `_read_env`'s splitlines/join also normalises CRLF to LF.
-    from .profile_lifecycle import write_private
-
-    text = "\n".join(lines)
-    if text and not text.endswith("\n"):
-        text += "\n"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        path.touch(mode=0o600)
-    write_private(path, text)
-
-
 def _enable_in_default(default_home: Path) -> None:
     from hermes_cli.config import atomic_config_write, read_user_config_raw
 
@@ -1276,7 +1332,8 @@ def _enable_in_default(default_home: Path) -> None:
 
 
 def _clear_secondary_config(source_home: Path) -> None:
-    from hermes_cli.config import atomic_config_write, read_user_config_raw
+    from hermes_cli.config import read_user_config_raw
+    from .config_writer import replace_config
 
     path = source_home / "config.yaml"
     config = copy.deepcopy(read_user_config_raw(path))
@@ -1288,7 +1345,8 @@ def _clear_secondary_config(source_home: Path) -> None:
     platforms = config.get("platforms")
     if isinstance(platforms, dict):
         platforms.pop(PLATFORM_NAME, None)
-    atomic_config_write(path, config)
+    # Retiring the platform block is a deliberate deletion.
+    replace_config(path, config)
 
 
 # -- the whole preflight ------------------------------------------------------

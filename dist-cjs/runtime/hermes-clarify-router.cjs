@@ -1,13 +1,13 @@
-function cleanText(value) {
+function cleanText(value         ) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function positiveSeconds(value, fallback = 300) {
+function positiveSeconds(value         , fallback = 300) {
   const numeric = Number(value);
   return Number.isFinite(numeric) && numeric > 0 ? Math.floor(numeric) : fallback;
 }
 
-function createHermesClarifyRouter(deps = {}) {
+function createHermesClarifyRouter(deps      = {}) {
   const inject = typeof deps.inject === "function" ? deps.inject : () => {};
   const dismiss = typeof deps.dismiss === "function" ? deps.dismiss : () => {};
   const respond = typeof deps.respond === "function" ? deps.respond : null;
@@ -21,17 +21,17 @@ function createHermesClarifyRouter(deps = {}) {
   const bySession = new Map();
   const suppressed = new Set();
 
-  function forget(entry) {
+  function forget(entry     ) {
     if (bySurface.get(entry.surfaceId) === entry) bySurface.delete(entry.surfaceId);
     if (bySession.get(entry.sessionKey) === entry) bySession.delete(entry.sessionKey);
   }
 
-  function retire(entry, reason) {
+  function retire(entry     , reason     ) {
     forget(entry);
     dismiss({ surfaceId: entry.surfaceId, sessionKey: entry.sessionKey, reason });
   }
 
-  function handleRequest(raw) {
+  function handleRequest(raw     ) {
     const id = cleanText(raw && raw.id);
     const sessionKey = cleanText(raw && raw.sessionKey);
     const question = cleanText(raw && raw.question);
@@ -61,12 +61,14 @@ function createHermesClarifyRouter(deps = {}) {
       surfaceId: `hermes-clarify:${id}`,
       sessionKey,
       question,
-      options: choices.map((label) => ({ label, detail: null })),
+      options: choices.map((label     ) => ({ label, detail: null })),
       selectionMode,
       allowOther: raw && raw.allowOther === true && choices.length > 0,
       deadlineSec,
       expiresAtMs: Number.isFinite(raw.expiresAtMs)
         ? raw.expiresAtMs : now() + deadlineSec * 1000,
+
+      botScreen: raw && raw.botScreen === true,
       locked: false,
     };
     if (entry.expiresAtMs <= now()) return false;
@@ -85,11 +87,12 @@ function createHermesClarifyRouter(deps = {}) {
       selectionMode: entry.selectionMode,
       allowOther: entry.allowOther,
       options: entry.options,
+      ...(entry.botScreen ? { botScreen: true } : {}),
     });
     return true;
   }
 
-  function handleOutcome(raw) {
+  function handleOutcome(raw     ) {
     const surfaceId = cleanText(raw && raw.surfaceId);
     const entry = surfaceId ? bySurface.get(surfaceId) : null;
     if (!entry || entry.locked) return false;
@@ -130,18 +133,18 @@ function createHermesClarifyRouter(deps = {}) {
     if (entry.selectionMode === "multi") {
       const selectedIndices = Array.isArray(raw.selectedIndices) ? raw.selectedIndices : [];
       const unique = selectedIndices
-        .map((value) => Number(value))
-        .filter((value, index, all) => all.indexOf(value) === index);
+        .map((value     ) => Number(value))
+        .filter((value     , index     , all     ) => all.indexOf(value) === index);
       if (
         unique.length === 0 ||
-        unique.some((index) =>
+        unique.some((index     ) =>
           !Number.isInteger(index) || index < 0 || index >= entry.options.length
         )
       ) {
         onError({ reason: "clarify_indices_out_of_range", surfaceId, selectedIndices });
         return false;
       }
-      response = JSON.stringify(unique.map((index) => entry.options[index].label));
+      response = JSON.stringify(unique.map((index     ) => entry.options[index].label));
     } else {
       const selectedIndex = Number(raw.selectedIndex);
       if (
@@ -174,12 +177,20 @@ function createHermesClarifyRouter(deps = {}) {
     return true;
   }
 
+  function stopSession(rawSessionKey     ) {
+    const entry = bySession.get(cleanText(rawSessionKey));
+    if (!entry) return false;
+    retire(entry, "stopped");
+    suppressed.add(entry.id);
+    return true;
+  }
+
   function forgetAll(reason = "display_changed") {
     for (const entry of Array.from(bySession.values())) retire(entry, reason);
     suppressed.clear();
   }
 
-  function reconcile(snapshot) {
+  function reconcile(snapshot     ) {
     const sessionKey = cleanText(snapshot && snapshot.sessionKey);
     if (!sessionKey || !isCurrentSession(sessionKey)) return false;
     const request = snapshot.clarify;
@@ -197,11 +208,11 @@ function createHermesClarifyRouter(deps = {}) {
     return handleRequest(request);
   }
 
-  function activeSurfaceId(sessionKey) {
+  function activeSurfaceId(sessionKey     ) {
     return bySession.get(sessionKey)?.surfaceId || "";
   }
 
-  return { handleRequest, handleOutcome, forgetAll, activeSurfaceId, reconcile };
+  return { handleRequest, handleOutcome, forgetAll, activeSurfaceId, reconcile, stopSession };
 }
 
 module.exports = { createHermesClarifyRouter };

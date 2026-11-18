@@ -1,4 +1,9 @@
 const net = require("node:net");
+const { Duplex } = require("node:stream");
+
+const { startHostProcess } = require("../tools/host-process.cjs");
+
+const DIAL_TAILSCALE_NC = "tailscale-nc";
 
 const SOCKS_VERSION = 0x05;
 const SOCKS_NO_AUTH = 0x00;
@@ -162,6 +167,67 @@ function connectDirect(host     , port     , timeoutMs     ) {
   });
 }
 
+function connectThroughNc(ncArgv     , host     , port     , timeoutMs     , deps      = {}) {
+  return new Promise((resolve, reject) => {
+    if (typeof host !== "string" || !host.trim() || /\s/.test(host)) {
+      reject(failure("tailnet dial host is empty", "ENOTFOUND"));
+      return;
+    }
+    const start = typeof deps.startProcess === "function" ? deps.startProcess : startHostProcess;
+    let child     ;
+    try {
+      child = start(ncArgv[0], ncArgv.slice(1).concat(["nc", host.trim(), String(port)]), {
+        stdio: ["pipe", "pipe", "ignore"],
+      });
+    } catch (error     ) {
+      reject(failure(`tailscale nc could not start: ${(error && error.message) || error}`, "ECONNREFUSED"));
+      return;
+    }
+    let settled = false;
+    const kill = () => { try { if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM"); } catch (_) {  } };
+    const stream      = new Duplex({
+      read() { child.stdout.resume(); },
+      write(chunk     , encoding     , callback     ) {
+        if (!child.stdin || child.stdin.destroyed) { callback(failure("tailscale nc closed", "ECONNRESET")); return; }
+
+        child.stdin.write(chunk, encoding, (error     ) => {
+          callback(error ? failure("tailscale nc closed the connection", "ECONNRESET") : undefined);
+        });
+      },
+      final(callback     ) { try { child.stdin.end(); } catch (_) {  } callback(); },
+      destroy(error     , callback     ) { kill(); callback(error); },
+    });
+    let ended = false;
+    const end = () => { if (!ended) { ended = true; stream.push(null); } };
+    child.stdout.on("data", (chunk     ) => { if (!ended && !stream.push(chunk)) child.stdout.pause(); });
+    child.stdout.on("end", end);
+    if (child.stdin) child.stdin.on("error", () => {  });
+    child.once("error", (error     ) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(failure(`tailscale nc could not start: ${(error && error.message) || error}`, "ECONNREFUSED"));
+        return;
+      }
+      stream.destroy(failure(`tailscale nc failed: ${(error && error.message) || error}`, "ECONNRESET"));
+    });
+    child.once("exit", () => { if (settled) end(); });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      kill();
+      reject(failure("tailscale nc did not start in time", "ETIMEDOUT"));
+    }, timeoutMs);
+    child.once("spawn", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      stream.pause();
+      resolve(stream);
+    });
+  });
+}
+
 function dialTailnet(options      = {}) {
   const host = options.host;
   const port = Number(options.port);
@@ -172,8 +238,11 @@ function dialTailnet(options      = {}) {
   const socks5 = options.socks5 && typeof options.socks5 === "object"
     ? options.socks5
     : parseSocks5(options.socks5);
-  if (!socks5) return connectDirect(host, port, timeoutMs);
-  return connectThroughSocks5(socks5, host, port, timeoutMs);
+  if (socks5) return connectThroughSocks5(socks5, host, port, timeoutMs);
+  const ncArgv = Array.isArray(options.ncArgv) && options.ncArgv.length > 0
+    && options.ncArgv.every((part     ) => typeof part === "string" && part) ? options.ncArgv : null;
+  if (ncArgv) return connectThroughNc(ncArgv, host, port, timeoutMs, options);
+  return connectDirect(host, port, timeoutMs);
 }
 
-module.exports = { parseSocks5, dialTailnet };
+module.exports = { DIAL_TAILSCALE_NC, parseSocks5, dialTailnet };

@@ -1,7 +1,5 @@
 const fs = require("node:fs");
-
 const path = require("node:path");
-
 const { randomUUID, createHash } = require("node:crypto");
 const { setupInstallation, FIRST_USE_ERRORED_RUN_REASONS, firstUseSuccessLines } = require("./setup-journey.cjs");
 const { readJsonReceipt, writeJsonReceiptDurable } = require("./private-route.cjs");
@@ -543,4 +541,4 @@ function createFirstUseObserver(store     , options      = {}) {
   };
 }
 
-module.exports = { createFirstUseStore, createFirstUseObserver, runFirstUseOperation, firstUseResult, sameFirstUsePhone, firstUseBinding, classifyFirstUseReplyEvidence, firstUseReplyEvidenceReason, FIRST_USE_REPLY_EVIDENCE, FIRST_USE_REPLY_EVIDENCE_REASONS, FIRST_USE_RECEIPT_SETTLE_MAX_MS, FIRST_USE_ERRORED_RUN_REASONS, firstUseReplyWasProviderError, FIRST_USE_RELAY_ENDINGS, FIRST_USE_RELAY_STAGES, observeReplyEvidenceInto, firstUseAttemptHoldsSideWork, FIRST_USE_SIDE_WORK_HOLD_MAX_MS, firstUseAttemptPredatesPairing };
+module.exports = { FIRST_USE_RELAY_ENDINGS, FIRST_USE_RELAY_STAGES, FIRST_USE_REPLY_EVIDENCE, FIRST_USE_REPLY_EVIDENCE_REASONS, FIRST_USE_ERRORED_RUN_REASONS, firstUseReplyWasProviderError, firstUseReplyEvidenceReason, classifyFirstUseReplyEvidence, createFirstUseStore, sameFirstUsePhone, firstUseAttemptPredatesPairing, firstUsePhoneLandedLate, firstUseBinding, FIRST_USE_TOOL_OPERATIONS, FIRST_USE_WAIT_MAX_MS, FIRST_USE_RECEIPT_SETTLE_MAX_MS, FIRST_USE_SIDE_WORK_HOLD_MAX_MS, firstUseAttemptHoldsSideWork, validateFirstUseParams, runFirstUseOperation, observeReplyEvidenceInto, firstUseResult, createFirstUseObserver };

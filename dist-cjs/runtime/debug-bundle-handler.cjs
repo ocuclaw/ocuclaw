@@ -33,6 +33,46 @@ function computeAvailableSpanMs(dumpResult) {
   return Math.max(0, now - min);
 }
 
+function cardStudioRows(deps     , windowMs     , relayEvents       , phoneEvents       ) {
+  if (typeof deps.cardStudioRows !== "function") return [];
+  let rows;
+  try { rows = deps.cardStudioRows({ windowMs }); } catch { return []; }
+  return numberRows(rows, relayEvents, phoneEvents);
+}
+
+function numberRows(rows     , ...after         ) {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+  let seq = 0;
+  for (const list of after) {
+    for (const event of list || []) if (Number.isFinite(event && event.seq)) seq = Math.max(seq, Math.floor(event.seq));
+  }
+  return rows.filter((row     ) => row && typeof row === "object" && Number.isFinite(row.ts))
+    .map((row     ) => ({ ...row, seq: ++seq }));
+}
+
+const NO_CARD_STUDIO = { reservedEvents: [], files: [], names: null };
+
+async function cardStudioParts(deps     , windowMs     , redactionMode     , relayEvents       , phoneEvents       ) {
+  if (typeof deps.cardStudioReport !== "function") {
+    return { ...NO_CARD_STUDIO, reservedEvents: cardStudioRows(deps, windowMs, relayEvents, phoneEvents) };
+  }
+  let report     ;
+  try { report = await deps.cardStudioReport({ windowMs }); } catch { return NO_CARD_STUDIO; }
+  if (!report || typeof report !== "object") return NO_CARD_STUDIO;
+  const reservedEvents = numberRows(report.streamRows, relayEvents, phoneEvents);
+  if (redactionMode !== "off") return { ...NO_CARD_STUDIO, reservedEvents };
+  const cardRows = numberRows(report.cardRows, relayEvents, phoneEvents, reservedEvents);
+  const taskRows = numberRows(report.taskRows, relayEvents, phoneEvents, reservedEvents, cardRows);
+  const summary = report.summary || {};
+  const files                          = [];
+  const jsonl = (rows       ) => rows.map((row) => JSON.stringify(row)).join("\n") + "\n";
+  if ((summary.cards > 0 || summary.tasks > 0) && cardRows.length) files.push(["cards.jsonl", jsonl(cardRows)]);
+  if (taskRows.length) files.push(["tasks.jsonl", jsonl(taskRows)]);
+  const names = report.names && (report.names.cards?.length || report.names.tasks?.length)
+    ? { cards: report.names.cards || [], tasks: report.names.tasks || [] } : null;
+  return { reservedEvents, files, names: files.length ? names : null };
+}
+
 function mergePhoneFold(deps     , clientId     , msg     , dumpResult     , windowMs     ) {
   const result = deps.clientEvents || { status: "missing", fold: null };
   const fold = result.fold;
@@ -196,6 +236,8 @@ async function captureAndAssemble(deps     , clientId     , msg     ) {
 
   try {
     const { events: relayEvents, ...dump } = dumpResult;
+
+    const cardStudio = await cardStudioParts(deps, windowMs, msg.redactionMode || "structural", relayEvents, phone.events);
     const input = {
       dump,
       relayEvents,
@@ -215,6 +257,8 @@ async function captureAndAssemble(deps     , clientId     , msg     ) {
         })(),
         connectionHealthDocument,
         clientDiagnostics: parseClientReportDiagnostics(msg.clientDiagnosticsJson, { mode: msg.redactionMode }),
+        reservedEvents: cardStudio.reservedEvents,
+        extraFiles: cardStudio.files,
       },
     };
 
@@ -240,6 +284,8 @@ async function captureAndAssemble(deps     , clientId     , msg     ) {
       zipBytes: bundle.zip.length,
       availableSpanMs,
       fetchWindowParts: MAX_FETCH_WINDOW_PARTS,
+
+      ...(cardStudio.names ? { cardStudio: cardStudio.names } : {}),
     });
     deps.send(clientId, {
       type: "debug-bundle-meta",
@@ -355,4 +401,4 @@ async function handleDebugBundleFetch(deps, clientId, msg) {
   }
 }
 
-module.exports = { handleDebugBundleRequest, handleDebugBundleSave, handleDebugBundleFetch, deduplicateReportEvents };
+module.exports = { deduplicateReportEvents, handleDebugBundleRequest, handleDebugBundleSave, handleDebugBundleFetch };

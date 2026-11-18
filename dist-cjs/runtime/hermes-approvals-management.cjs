@@ -1,4 +1,24 @@
-const FIELDS = ["mode", "timeoutSeconds", "cronMode", "oneShotMode", "unattendedMode"];
+const FIELDS = ["mode", "timeoutSeconds", "cronMode", "oneShotMode", "unattendedMode", "explainerModel", "execMode", "askFallback"];
+const UNATTENDED = ["deny", "approve"];
+const UNATTENDED_SAVED = ["deny", "approve", "off", "allow", "yes", "false"];
+const EXEC_MODES = ["deny", "allowlist", "ask", "auto", "full"];
+const FALLBACKS = ["deny", "allowlist", "full"];
+
+const VALUES                           = {
+  mode: ["manual", "smart", "off"], cronMode: UNATTENDED, oneShotMode: UNATTENDED, unattendedMode: UNATTENDED,
+  execMode: EXEC_MODES, askFallback: FALLBACKS,
+};
+const RISKY                         = {
+  mode: "off", cronMode: "approve", oneShotMode: "approve", unattendedMode: "approve", execMode: "full", askFallback: "full",
+};
+
+const SAVED                           = {
+  mode: ["manual", "smart", "off", "false"], cronMode: UNATTENDED_SAVED, oneShotMode: UNATTENDED_SAVED,
+  unattendedMode: UNATTENDED_SAVED, execMode: EXEC_MODES, askFallback: FALLBACKS,
+};
+const modelKey = (value     ) => typeof value === "string" &&
+  /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}\|[A-Za-z0-9][A-Za-z0-9_./:+@-]{0,199}$/.test(value);
+const explainerValue = (value     ) => value === "inherit" || modelKey(value);
 const OPERATIONS = ["approvals.read", "approvals.update", "approvals.receipt", "approvals.recover"];
 const record = (value     ) => value && typeof value === "object" && !Array.isArray(value);
 const exact = (value     , keys          ) => record(value) && Object.keys(value).length === keys.length && Object.keys(value).every(key => keys.includes(key));
@@ -11,7 +31,7 @@ function approvalsRequest(operation        , payload     )      {
   if (operation === "approvals.receipt") return exact(payload, ["mutationId"]) && mutationId(payload.mutationId)
     ? { mutationId: payload.mutationId } : null;
   if (operation === "approvals.recover") return exact(payload, ["mutationId", "fields"]) && mutationId(payload.mutationId) &&
-    Array.isArray(payload.fields) && payload.fields.length > 0 && payload.fields.length <= 5 &&
+    Array.isArray(payload.fields) && payload.fields.length > 0 && payload.fields.length <= FIELDS.length &&
     new Set(payload.fields).size === payload.fields.length && payload.fields.every((field     ) => FIELDS.includes(field))
     ? { mutationId: payload.mutationId, fields: [...payload.fields] } : null;
   if (operation !== "approvals.update" || !exact(payload, ["mutationId", "changes", "expected", "confirmations"]) || !mutationId(payload.mutationId)) return null;
@@ -23,9 +43,13 @@ function approvalsRequest(operation        , payload     )      {
     const value = payload.changes[field];
     if (field === "timeoutSeconds") {
       if (!Number.isInteger(value) || value < 1 || value > 31536000) return null;
+    } else if (field === "explainerModel") {
+
+      if (!explainerValue(value)) return null;
+      if (value !== "inherit") risky.push(field);
     } else {
-      if (!(field === "mode" ? ["manual", "smart", "off"] : ["deny", "approve"]).includes(value)) return null;
-      if (value === (field === "mode" ? "off" : "approve")) risky.push(field);
+      if (!VALUES[field].includes(value)) return null;
+      if (value === RISKY[field]) risky.push(field);
     }
     changes[field] = value;
     expected[field] = payload.expected[field];
@@ -46,11 +70,13 @@ function approvalsSnapshot(raw     )      {
         !["absent", "recognized", "unrecognized"].includes(row.savedState) || !["managed", "user", "default"].includes(row.source) || !revision(row.revision)) return null;
     if (name === "timeoutSeconds") {
       if (typeof row.effectiveValue !== "string" || !/^-?[0-9]{1,12}$/.test(row.effectiveValue)) return null;
-    } else if (!(name === "mode" ? ["manual", "smart", "off"] : ["deny", "approve"]).includes(row.effectiveValue)) return null;
+    } else if (name === "explainerModel") {
+      if (!(explainerValue(row.effectiveValue) || row.effectiveValue === "unrecognized")) return null;
+    } else if (!VALUES[name].includes(row.effectiveValue)) return null;
     const saved = row.savedValue;
     if (row.savedState === "recognized") {
       if (typeof saved !== "string" || (name === "timeoutSeconds" ? !/^-?[0-9]{1,12}$/.test(saved) :
-          !(name === "mode" ? ["manual", "smart", "off", "false"] : ["deny", "approve", "off", "allow", "yes", "false"]).includes(saved))) return null;
+          name === "explainerModel" ? !explainerValue(saved) : !SAVED[name].includes(saved))) return null;
     } else if (saved != null) return null;
     if (row.savedPresent !== (row.savedState !== "absent")) return null;
     fields[name] = { savedPresent: row.savedPresent, savedState: row.savedState,
@@ -59,17 +85,27 @@ function approvalsSnapshot(raw     )      {
   }
   const result      = { fields, maxTimeoutSeconds: raw.maxTimeoutSeconds, applyTiming: raw.applyTiming,
     processYolo: raw.processYolo, sessionOverrides: "not_evaluated", roomOverrides: "not_evaluated" };
+
+  if (typeof raw.explainerTaskRegistered === "boolean") result.explainerTaskRegistered = raw.explainerTaskRegistered;
+  if (fields.explainerModel) {
+
+    if (!Array.isArray(raw.explainerModels) || raw.explainerModels[0] !== "inherit" || raw.explainerModels.length > 1000 ||
+        !raw.explainerModels.every(explainerValue) || typeof raw.explainerModelsTruncated !== "boolean" ||
+        !(raw.approvalModel === "main" || modelKey(raw.approvalModel)) || typeof raw.customExplainerRoute !== "boolean") return null;
+    Object.assign(result, { explainerModels: [...raw.explainerModels], explainerModelsTruncated: raw.explainerModelsTruncated,
+      approvalModel: raw.approvalModel, customExplainerRoute: raw.customExplainerRoute });
+  }
   if (raw.receipt != null) {
     const receipt = raw.receipt;
     if (!record(receipt) || !mutationId(receipt.mutationId) || !["committed", "unknown", "cancelled", "reconciled_unknown"].includes(receipt.outcome) ||
-        !Array.isArray(receipt.changedFields) || receipt.changedFields.length > 5 ||
+        !Array.isArray(receipt.changedFields) || receipt.changedFields.length > FIELDS.length ||
         new Set(receipt.changedFields).size !== receipt.changedFields.length || !receipt.changedFields.every((field     ) => FIELDS.includes(field))) return null;
     result.receipt = { mutationId: receipt.mutationId, outcome: receipt.outcome, changedFields: [...receipt.changedFields] };
   }
   return result;
 }
 
-const ERRORS                         = {
+const HERMES_ERRORS                         = {
   invalid_request: "Invalid approval change. Check the fields and confirmations.",
   unsupported: "This installed Hermes needs native configuration transaction compatibility before saving approvals.",
   profile_not_served: "This profile is not served by the connected gateway.",
@@ -78,9 +114,21 @@ const ERRORS                         = {
   config_conflict: "A changed field was edited elsewhere. Refresh and review your draft before saving.",
   native_write_failed: "Hermes rejected the save. No successful write was confirmed.",
   outcome_unknown: "Save outcome is unknown. Check its receipt and current saved state before making another change.",
+  model_unavailable: "That model is no longer available. Refresh and pick another.",
+  rate_limited: "Too many changes in a minute. Wait a moment, then try again.",
 };
 
-function approvalsManagementResult(identity     , raw     )      {
+const OPENCLAW_ERRORS                         = {
+  ...HERMES_ERRORS,
+  unsupported: "This OpenClaw host does not support changing this approval setting. Update OpenClaw and OcuClaw to a compatible version.",
+  profile_not_served: "This agent is no longer served here. Pick another one.",
+  native_read_failed: "OpenClaw could not read the approval policy. Refresh when connected.",
+  managed_setting: "This setting uses an older OpenClaw format. Run openclaw doctor --fix on the host to edit it here.",
+  native_write_failed: "OpenClaw rejected the save. No successful write was confirmed.",
+};
+
+function approvalsManagementResult(identity     , raw     , backend = "Hermes")      {
+  const ERRORS = backend === "OpenClaw" ? OPENCLAW_ERRORS : HERMES_ERRORS;
   const snapshot = raw.approvals == null ? null : approvalsSnapshot(raw.approvals);
   const expectedFields = identity.operation === "approvals.recover" ? [...(identity.approvals?.fields ?? [])].sort() : Object.keys(identity.approvals?.changes ?? {}).sort();
   const committedFieldsMatch = JSON.stringify([...(snapshot?.receipt?.changedFields ?? [])].sort()) === JSON.stringify(expectedFields);

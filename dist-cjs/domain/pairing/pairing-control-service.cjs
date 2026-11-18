@@ -1,9 +1,12 @@
 const { PAIRING_CONTROL_MAX_REQUEST_BODY_BYTES, PAIRING_ENDPOINT_CONTENT_TYPE } = require("./pairing-endpoint-address.cjs");
-
 const { randomBytes: nodeRandomBytes } = require("node:crypto");
 
 const { constantTimeEqual } = require("../constant-time-equal.cjs");
-const { renderPairingBootstrap, pairingBootstrapPayloadText, ASSUMED_TERMINAL } = require("./pairing-bootstrap-presenter.cjs");
+const { renderPairingBootstrap, pairingBootstrapPayloadText } = require("./pairing-bootstrap-presenter.cjs");
+
+const { phoneCodeStatus, phoneCodeServiceUrl, phoneCodeRequest } = require("./phone-code-client.cjs");
+const { isPhoneCodeAddress, normalizePhoneCode, sealPairingNote, verifyPhoneKeyCommitment } = require("./pairing-note.cjs");
+const { fromCanonicalBase64Url32, toBase64Url } = require("./base64url.cjs");
 
 const PAIRING_CONTROL_PROTOCOL_VERSION = 1;
 
@@ -16,42 +19,11 @@ const PAIRING_CONTROL_RATE_WINDOW_MS = 60_000;
 
 const CONTROL_SECRET_BYTES = 32;
 
-function parseTerminalCapabilities(value         )                       {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return ASSUMED_TERMINAL;
-  }
-  const record = value                           ;
-  const columns = record["columns"];
-  const rows = record["rows"];
-  return {
-    unicode: record["unicode"] === true,
-    color: record["color"] === true,
-
-    columns:
-      typeof columns === "number" && Number.isInteger(columns) && columns > 0 && columns <= 10000
-        ? columns
-        : 0,
-    rows: typeof rows === "number" && Number.isInteger(rows) && rows > 0 && rows <= 10000 ? rows : 0,
-
-    redraw: record["redraw"] === true,
-    zoom: record["zoom"] === "mac" || record["zoom"] === "pc" ? record["zoom"] : "any",
-  };
-}
-
 function refusal(status        )                             {
   return {
     status,
     json: { v: PAIRING_CONTROL_PROTOCOL_VERSION, error: "rejected" },
   };
-}
-
-function toBase64Url(bytes            )         {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
 }
 
 function defaultRandomBytes(size        )             {
@@ -81,8 +53,22 @@ function createPairingControlService(
   const randomBytes = options.randomBytes ?? defaultRandomBytes;
   const { exchangeHost, readRelayCredential } = options;
 
+  const customRoute = (parsed                         )          => {
+    if (parsed.customRoute === true) return true;
+    try {
+      const own = options.readPhoneAddress?.();
+      return typeof own === "string" && own.trim() !== "";
+    } catch {
+      return false;
+    }
+  };
+
   let session                                                = null;
   let creating = false;
+
+  function endSession()       {
+    session = null;
+  }
 
   function withinRateLimit()          {
     const at = now();
@@ -100,11 +86,11 @@ function createPairingControlService(
   function retireIfTerminal(snapshot                 )       {
     if (!session) return;
     if (snapshot.exchangeId !== session.exchangeId) {
-      session = null;
+      endSession();
       return;
     }
     if (snapshot.state === "completed" || snapshot.state === "failed") {
-      session = null;
+      endSession();
     }
   }
 
@@ -176,6 +162,11 @@ function createPairingControlService(
 
     const op = typeof parsed.op === "string" ? parsed.op : null;
 
+    if (op === "phone-code-status") {
+      return { status: 200, json: { v: PAIRING_CONTROL_PROTOCOL_VERSION,
+        ...await phoneCodeStatus(parsed.address, () => customRoute(parsed)) } };
+    }
+
     if (op === "create") {
 
       host.tick();
@@ -183,65 +174,112 @@ function createPairingControlService(
       if (creating || !["idle", "completed", "failed"].includes(existing.state)) {
         return refusal(409);
       }
-      const address = typeof parsed.address === "string" ? parsed.address : "";
-      let started                                                                      ;
       creating = true;
       try {
-        started = await host.beginBootstrapInitiation({ address });
-      } catch {
-        return refusal(503);
-      } finally {
-        creating = false;
-      }
-      if (!started.ok) {
+        const wantsPhoneCode = Object.prototype.hasOwnProperty.call(parsed, "phoneCode");
 
+        if (wantsPhoneCode) endSession();
+        const address = typeof parsed.address === "string" ? parsed.address : "";
+        const phoneCode = wantsPhoneCode ? normalizePhoneCode(parsed.phoneCode) : null;
+        const rejectedCode = (reason        )                             => ({ status: 200,
+          json: { v: PAIRING_CONTROL_PROTOCOL_VERSION, reason } });
+        if (phoneCode?.kind === "invalid") return rejectedCode("malformed");
+        if (phoneCode?.kind === "pairing-code") return rejectedCode("pairing_code_typed");
+        const base = phoneCodeServiceUrl();
+        let appKey                = null;
+        let commitment                    = null;
+        if (phoneCode?.kind === "phone-code" && base && isPhoneCodeAddress(address) && !customRoute(parsed)) {
+          const lookup = await phoneCodeRequest(base, `/v1/codes/${phoneCode.code}`);
+          if (!lookup.ok && lookup.reason !== "unavailable") return rejectedCode(lookup.reason);
+          if (lookup.ok && lookup.json.v === 1 && typeof lookup.json.appKey === "string" && lookup.json.appKey) {
+
+            commitment = fromCanonicalBase64Url32(lookup.json.commit);
+            if (commitment) appKey = lookup.json.appKey;
+          }
+        }
+        let started                                                                      ;
+        try {
+          started = await host.beginBootstrapInitiation({ address,
+            ...(commitment ? { phoneKeyCommitment: commitment, verifyPhoneKeyCommitment } : {}) });
+        } catch {
+          return refusal(503);
+        }
+        if (!started.ok) {
+
+          return {
+            status: 409,
+            json: {
+              v: PAIRING_CONTROL_PROTOCOL_VERSION,
+              error: "rejected",
+              reason: started.reason,
+              message: started.message,
+            },
+          };
+        }
+
+        let sent = false;
+        if (phoneCode?.kind === "phone-code" && base && appKey) {
+          try {
+            if (!isPhoneCodeAddress(started.qrPayload.address)) throw new Error("Pairing stopped");
+            const note = await sealPairingNote({ appKey, code: phoneCode.code,
+              payloadText: pairingBootstrapPayloadText(started.qrPayload) });
+            const delivered = await phoneCodeRequest(base, `/v1/codes/${phoneCode.code}/note`,
+              { method: "PUT", body: JSON.stringify(note) });
+            if (delivered.ok) {
+              sent = true;
+            } else if (delivered.reason !== "unavailable") {
+              host.cancel(started.exchangeId);
+              endSession();
+              return rejectedCode(delivered.reason);
+            }
+          } catch {  }
+          if (!sent) {
+
+            host.cancel(started.exchangeId);
+            endSession();
+            try { started = await host.beginBootstrapInitiation({ address }); }
+            catch { return refusal(503); }
+            if (!started.ok) return refusal(503);
+          }
+        }
+        let secret        ;
+        try {
+          const drawn = randomBytes(CONTROL_SECRET_BYTES);
+          if (!(drawn instanceof Uint8Array) || drawn.length !== CONTROL_SECRET_BYTES) throw new Error("short draw");
+          secret = toBase64Url(drawn);
+        } catch {
+          host.cancel(started.exchangeId);
+          return refusal(503);
+        }
+        session = { exchangeId: started.exchangeId, secret };
+        if (sent) {
+          return { status: 200, json: { v: PAIRING_CONTROL_PROTOCOL_VERSION,
+            exchangeId: started.exchangeId, controlSecret: secret,
+            expiresInSeconds: started.expiresInSeconds, delivery: "sent" } };
+        }
         return {
-          status: 409,
+          status: 200,
           json: {
             v: PAIRING_CONTROL_PROTOCOL_VERSION,
-            error: "rejected",
-            reason: started.reason,
-            message: started.message,
-          },
-        };
-      }
+            ...(wantsPhoneCode ? { delivery: "unavailable" } : {}),
+            exchangeId: started.exchangeId,
 
-      let secret        ;
-      try {
-        const drawn = randomBytes(CONTROL_SECRET_BYTES);
-        if (!(drawn instanceof Uint8Array) || drawn.length !== CONTROL_SECRET_BYTES) {
-          throw new Error("short draw");
-        }
-        secret = toBase64Url(drawn);
-      } catch {
+            controlSecret: secret,
 
-        host.cancel(started.exchangeId);
-        return refusal(503);
-      }
+            bootstrapBlock: renderPairingBootstrap({
+              qrPayload: started.qrPayload,
+              pairingCode: started.pairingCode,
+              expiresInSeconds: started.expiresInSeconds,
+            }),
 
-      session = { exchangeId: started.exchangeId, secret };
+            payloadText: pairingBootstrapPayloadText(started.qrPayload),
 
-      return {
-        status: 200,
-        json: {
-          v: PAIRING_CONTROL_PROTOCOL_VERSION,
-          exchangeId: started.exchangeId,
-
-          controlSecret: secret,
-
-          bootstrapBlock: renderPairingBootstrap({
-            qrPayload: started.qrPayload,
+            address: started.qrPayload.address,
             pairingCode: started.pairingCode,
             expiresInSeconds: started.expiresInSeconds,
-            lightTerminal: parsed.lightTerminal === true,
-
-            terminal: parseTerminalCapabilities(parsed.terminal),
-          }),
-
-          payloadText: pairingBootstrapPayloadText(started.qrPayload),
-          expiresInSeconds: started.expiresInSeconds,
-        },
-      };
+          },
+        };
+      } finally { creating = false; }
     }
 
     if (op === "state") {
@@ -316,4 +354,4 @@ function createPairingControlService(
   return { handleRequest };
 }
 
-module.exports = { PAIRING_CONTROL_PROTOCOL_VERSION, PAIRING_CONTROL_AUTH_HEADER, PAIRING_CONTROL_SECRET_HEADER, PAIRING_CONTROL_MAX_REQUESTS_PER_WINDOW, PAIRING_CONTROL_RATE_WINDOW_MS, createPairingControlService, resetPairingControlRateLimitForTests };
+module.exports = { PAIRING_CONTROL_PROTOCOL_VERSION, PAIRING_CONTROL_AUTH_HEADER, PAIRING_CONTROL_SECRET_HEADER, PAIRING_CONTROL_MAX_REQUESTS_PER_WINDOW, PAIRING_CONTROL_RATE_WINDOW_MS, resetPairingControlRateLimitForTests, createPairingControlService };

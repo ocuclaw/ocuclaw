@@ -19,41 +19,82 @@ def profile_tool_context():
         reset_secret_scope(token)
 
 
+# skill_search_dirs() tiers in its documented precedence order: project, local
+# (the profile's skills dir), create_dir, external.
+_TIER_ORIGINS = ("project", "profile", "profile", "external")
+
+
+def _public_catalog(s, config):
+    """``(directories, loadable names)`` from Hermes's public skills catalog
+    helpers (0.22.3+), else None for the legacy walk.
+
+    The public roots resolve project skills from the agent's working
+    directory. A served profile whose configured ``terminal.cwd`` names a
+    different directory keeps the legacy resolver, which reads that cwd."""
+    search_dirs, find_all = getattr(s, "skill_search_dirs", None), getattr(s, "find_all_skills", None)
+    if not callable(search_dirs) or not callable(find_all):
+        return None
+    cwd = (config.get("terminal") or {}).get("cwd")
+    if isinstance(cwd, str) and cwd.strip() and cwd.strip() not in {".", "auto", "cwd"}:
+        from agent.runtime_cwd import resolve_agent_cwd
+        try:
+            if Path(os.path.expanduser(cwd)).resolve() != resolve_agent_cwd().resolve():
+                return None
+        except OSError:
+            return None
+    roots, _active = search_dirs()
+    directories = [(path, _TIER_ORIGINS[tier] if 0 <= tier < len(_TIER_ORIGINS) else "external") for tier, path in roots]
+    # skip_disabled: the picker shows disabled skills; it owns their toggles.
+    return directories, {row["name"] for row in find_all(skip_disabled=True)}
+
+
+def _legacy_directories(u, s, config):
+    cwd = (config.get("terminal") or {}).get("cwd")
+    root = u.find_project_root(Path(os.path.expanduser(cwd))) if isinstance(cwd, str) and cwd else u.find_project_root()
+    project = u._candidate_project_skills_dirs(root) if root and u.is_project_root_trusted(root) and (config.get("skills") or {}).get("project_discovery") is not False else []
+    return [(p, "project") for p in project] + [(s._skills_dir(), "profile")] + [(p, "external") for p in u.get_external_skills_dirs()]
+
+
 def installed_skills(config):
     from agent import skill_utils as u
     from tools import skills_tool as s
     from agent.secret_scope import get_secret
-    cwd = (config.get("terminal") or {}).get("cwd")
-    root = u.find_project_root(Path(os.path.expanduser(cwd))) if isinstance(cwd, str) and cwd else u.find_project_root()
-    project = u._candidate_project_skills_dirs(root) if root and u.is_project_root_trusted(root) and (config.get("skills") or {}).get("project_discovery") is not False else []
-    directories = [(p, "project") for p in project] + [(s._skills_dir(), "profile")] + [(p, "external") for p in u.get_external_skills_dirs()]
+    public = _public_catalog(s, config)
+    directories = public[0] if public else _legacy_directories(u, s, config)
     candidates = {}
     for directory, origin in directories:
         if not directory.exists():
             continue
         iterator = u.iter_project_skill_files(directory) if origin == "project" else u.iter_skill_index_files(directory, "SKILL.md")
         for path in iterator:
-            if any(part in s._EXCLUDED_SKILL_DIRS for part in path.parts):
+            if any(part in u.EXCLUDED_SKILL_DIRS for part in path.parts):
                 continue
             content = path.read_bytes()
             if len(content) > 2_000_000:
                 raise ValueError("Installed skill exceeds the supported size.")
-            meta, _ = s._parse_frontmatter(content.decode("utf-8-sig", errors="replace")[:4000])
+            meta, _ = u.parse_frontmatter(content.decode("utf-8-sig", errors="replace")[:4000])
             name = meta.get("name", path.parent.name)
             if not isinstance(name, str) or not name or len(name) > s.MAX_NAME_LENGTH or any(ord(c) < 32 for c in name):
                 raise ValueError("Invalid native skill name.")
             reasons = []
-            platform_ok = s.skill_matches_platform(meta)
-            environment_ok = s.skill_matches_environment(meta)
-            if not platform_ok: reasons.append("Unsupported operating system")
-            if not environment_ok: reasons.append("Not offered in this runtime environment")
+            if public:
+                # Hermes decides what loads: OS, runtime environment, required
+                # apps, same-tier name collisions and project quarantine.
+                eligible = name in public[1]
+                if not eligible: reasons.append("Not offered in this runtime environment")
+            else:
+                platform_ok = s.skill_matches_platform(meta)
+                environment_ok = s.skill_matches_environment(meta)
+                eligible = platform_ok and environment_ok
+                if not platform_ok: reasons.append("Unsupported operating system")
+                if not environment_ok: reasons.append("Not offered in this runtime environment")
             required, commands = skill_requirements(s, meta)
             if any(not get_secret(item["name"]) for item in required): reasons.append("Required environment configuration is missing")
             if any(shutil.which(command) is None for command in commands): reasons.append("Required command dependency is missing")
             row = {"name": name, "description": " ".join(str(meta.get("description", "")).split())[:240], "origin": origin,
                    "contentRevision": hashlib.sha256(content).hexdigest(), "available": not reasons,
                    "reason": "; ".join(reasons), "essential": name in u.ESSENTIAL_SKILLS}
-            candidates.setdefault(name, []).append((platform_ok and environment_ok, row))
+            candidates.setdefault(name, []).append((eligible, row))
             if sum(map(len, candidates.values())) > 500:
                 raise ValueError("Installed catalog exceeds the supported size.")
     result = []

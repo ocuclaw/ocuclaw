@@ -14,6 +14,7 @@ import shlex
 import shutil
 from typing import Any, Callable, Mapping, NamedTuple, Optional, Tuple
 
+from . import custom_route
 from . import serve as serve_contract
 from .serve import normalize_dns_name
 
@@ -24,6 +25,14 @@ _TARGET_RE = re.compile(r"^http://(127\.0\.0\.1|localhost):([0-9]{1,5})$")
 _KNOWN_TOP_LEVEL_KEYS = frozenset(
     {"TCP", "Web", "AllowFunnel", "ETag", "Services", "Foreground"}
 )
+#: Each Runtime Bundle's Managed Serve Route port (docs/Tailscale.md). A
+#: TLS-terminated forward there for this node names that runtime's relay port,
+#: so a :8443 route to the same port belongs to that runtime.
+_PHONE_ROUTE_PORTS = (("hermes", serve_contract.SERVE_PORT_FALLBACK), ("openclaw", 8444))
+_FORWARD_RE = re.compile(r"^127\.0\.0\.1:([0-9]{1,5})$")
+#: BackendState values with nobody signed in, or turned off by ``tailscale
+#: down``. ``tailscale up`` is the fix for each.
+_SIGNED_OUT_STATES = frozenset({"NeedsLogin", "NoState", "Stopped"})
 
 
 class EvenAiRouteDecision(NamedTuple):
@@ -34,6 +43,8 @@ class EvenAiRouteDecision(NamedTuple):
     requires_approval: bool
     may_mutate: bool
     explanation: str
+    #: The other Runtime Bundle whose relay :8443 already targets, else None.
+    owner: Optional[str] = None
 
 
 def _valid_cli(argv: Any) -> bool:
@@ -76,6 +87,70 @@ def _agent_url(dns_name: Optional[str]) -> Optional[str]:
     )
 
 
+def custom_agent_url(phone_address: Any) -> Optional[str]:
+    """The Agent URL on the user's own private network, or ``None``.
+
+    The relay serves ``/v1/chat/completions`` on whatever address the phone
+    pairs with once Even AI is on, so a ``wss://name:port`` front door outside
+    Tailscale carries Even AI too. A ``.ts.net`` address keeps the :8443 route.
+    """
+    address = custom_route.canonical_address(phone_address)
+    if address is None:
+        return None
+    host, port = custom_route.split_address(address)
+    if host == "ts.net" or host.endswith(".ts.net"):
+        return None
+    return f"https://{host}{'' if port == 443 else f':{port}'}/v1/chat/completions"
+
+
+def host_cli_problem() -> Optional[str]:
+    """``"not_installed"`` when :func:`resolve_host_cli` found no CLI because
+    none exists: no receipt, and no ``tailscale`` on PATH or a managed host.
+    A broken receipt is not named."""
+    from . import cloudways, receipts
+
+    receipt_path = receipts.tailscale_cli_path()
+    if receipt_path is None or receipt_path.exists():
+        return None
+    if cloudways.detect().verdict != cloudways.DETECT_NO or shutil.which("tailscale") is None:
+        return "not_installed"
+    return None
+
+
+def tailscale_problem(read_code: str, node: Any) -> Optional[str]:
+    """Name what keeps Tailscale from serving the route, from one
+    ``tailscale status --json`` read: ``not_installed``, ``signed_out`` or
+    ``offline``. ``None`` when Tailscale is up or the read says too little."""
+    if read_code == serve_contract.READ_CLI_ABSENT:
+        return "not_installed"
+    if read_code in (serve_contract.READ_TIMEOUT, serve_contract.READ_FAILED):
+        return "offline"  # tailscaled or its socket did not answer.
+    backend = node.get("BackendState") if isinstance(node, Mapping) else None
+    if not isinstance(backend, str):
+        return None
+    if backend in _SIGNED_OUT_STATES:
+        return "signed_out"
+    own = node.get("Self")
+    if (backend == "Running" and isinstance(own, Mapping) and own.get("Online") is True
+            and own.get("ID") and normalize_dns_name(own.get("DNSName")) is not None):
+        return None
+    return "offline"
+
+
+def _phone_route_runtimes(tcp: Mapping[str, Any], dns_name: str) -> dict:
+    runtimes = {}
+    for name, port in _PHONE_ROUTE_PORTS:
+        entry = tcp.get(str(port))
+        if not isinstance(entry, Mapping) or entry.get("ProxyProtocol"):
+            continue
+        forward = entry.get("TCPForward")
+        match = _FORWARD_RE.match(forward) if isinstance(forward, str) else None
+        if (match and 1 <= int(match.group(1)) <= 65535
+                and normalize_dns_name(entry.get("TerminateTLS")) == dns_name):
+            runtimes[name] = int(match.group(1))
+    return runtimes
+
+
 def _decision(
     *,
     state: str,
@@ -85,6 +160,7 @@ def _decision(
     command: Optional[str] = None,
     requires_approval: bool = False,
     may_mutate: bool = False,
+    owner: Optional[str] = None,
 ) -> EvenAiRouteDecision:
     return EvenAiRouteDecision(
         state=state,
@@ -94,6 +170,7 @@ def _decision(
         requires_approval=requires_approval,
         may_mutate=may_mutate,
         explanation=explanation,
+        owner=owner,
     )
 
 
@@ -366,10 +443,12 @@ def plan(
             dns_name=dns_name,
             explanation="The tailnet-only :8443 route already targets the selected Primary Runtime.",
         )
+    # A known port wins; the live phone routes name the other runtime otherwise.
+    runtime_ports = {**_phone_route_runtimes(tcp, normalized_dns), **known_runtime_ports}
     other_runtime = next(
         (
             name
-            for name, port_value in known_runtime_ports.items()
+            for name, port_value in runtime_ports.items()
             if name != selected_runtime and port_value == target_port
         ),
         None,
@@ -383,6 +462,7 @@ def plan(
                 f"Port :8443 already targets the {other_runtime} Runtime Bundle; "
                 "the Primary Runtime will not be changed silently."
             ),
+            owner=other_runtime if other_runtime in ("hermes", "openclaw") else None,
         )
     return _decision(
         state="refused",
@@ -484,7 +564,10 @@ def verify_after_apply(
 __all__ = [
     "EVEN_AI_SERVE_PORT",
     "EvenAiRouteDecision",
+    "custom_agent_url",
+    "host_cli_problem",
     "plan",
     "plan_live",
+    "tailscale_problem",
     "verify_after_apply",
 ]

@@ -1,9 +1,9 @@
-function normalizeAgentCreateSetup(input) {
+function normalizeAgentCreateSetup(input     ) {
   if (input == null) return null;
   if (typeof input !== "object" || Array.isArray(input)) throw new Error("Invalid agent setup.");
   const allowed = ["instructions", "model", "provider", "workspace", "blockedTools"];
   if (Object.keys(input).some(key => !allowed.includes(key))) throw new Error("Unsupported agent setting.");
-  const result = {};
+  const result      = {};
   for (const [key, limit] of Object.entries({ instructions: 8000, model: 200, provider: 100, workspace: 500 })) {
     const value = input[key] ?? "";
     if (typeof value !== "string" || value.length > limit || value.includes("\0")) throw new Error(`Invalid ${key}.`);

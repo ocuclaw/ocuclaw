@@ -10,7 +10,7 @@ const WIRE_KIND_ENUM = [
   "paged_text_surface",
 ];
 
-const WIRE_TEMPLATE_FIELD_ENUM = ["image_caption", "graphic"];
+const WIRE_TEMPLATE_FIELD_ENUM = ["image_caption", "graphic", "graphic_v2", "duration_picker"];
 
 const TEMPLATE_STATUSES = ["shipped", "specified", "sketch"];
 const TEMPLATE_LANES = ["registry_entry_only", "kinds_licensed"];
@@ -145,8 +145,8 @@ const entries = [
         { name: "kind", type: "string", requirement: "required", limit: 'const "text_surface"', note: "" },
         { name: "template", type: "string", requirement: "required", limit: 'const "graphic"', note: "the wire template field" },
         { name: "body", type: "string", requirement: "required", limit: "1-64 chars", note: "the caption AND the fallback text; numbers lead the line" },
-        { name: "graphic", type: "object", requirement: "required", limit: "slots: 1-2 of metric, sparkline, bars, heatstrip, progress, ring, bullet, gauge, keyvalue, status", note: "metric = {type:\"metric\", value<=8 chars, unit?<=6, label?<=18, delta?:number, icon?: icon name}; keyvalue = {rows: 1-3 [key<=14, value<=10] text pairs, label?<=18}; status = {text<=28, icon?: icon name}; icon names are glyph's closed set of 140 (references/graphic-icons.md); sparkline = {values: 2-60 numbers, label?<=18}; bars = {values: 2-14 numbers, highlight?: index, label?<=18}; heatstrip = {values: 2-24 numbers in 0..1, label?<=18}; progress, ring = {value: number 0..1, label?<=18}; bullet = {value: number, target: number, max: number above 0, label?<=18}; gauge = {value: number, min?: number (default 0), max?: number (default 100) above min, label?<=18}; longer text is cut (text_truncated), a longer sparkline is downsampled (series_downsampled), longer bars/heatstrip keep the most recent (series_trimmed_to_recent), a progress/ring value above 1 and at most 100 is divided by 100 (percent_read_as_fraction), out-of-range heatstrip, progress, ring, bullet and gauge values are clamped (value_clamped), a third slot is dropped (slots_trimmed), a fourth key-value row is dropped (rows_trimmed), an unknown icon name is removed and never guessed (icon_dropped), a short or non-numeric series, a non-numeric goal number, a bullet max not above 0, a gauge max not above min, a row that is not a [key, value] pair or a blank key, value or status text is rejected (graphic_slot_data_invalid), an unknown type is rejected (graphic_slot_type_unknown)" },
-        { name: "title", type: "string", requirement: "forbidden", limit: "", note: "rejected with graphic_title_unsupported — one Name Line per page, same as image_caption" },
+        { name: "graphic", type: "object", requirement: "required", limit: "slots: 1-2 of metric, sparkline, bars, heatstrip, progress, ring, bullet, gauge, keyvalue, status", note: "metric = {type:\"metric\", value<=8 chars, unit?<=6, label?<=18, delta?:number, icon?: icon name}; keyvalue = {rows: 1-3 [key<=14, value<=10] text pairs, label?<=18}; status = {text<=28, icon?: icon name}; icon names are glyph's closed set of 140; sparkline = {values: 2-60 numbers, label?<=18}; bars = {values: 2-14 numbers, highlight?: index, label?<=18}; heatstrip = {values: 2-24 numbers in 0..1, label?<=18}; progress, ring = {value: number 0..1, label?<=18}; bullet = {value: number, target: number, max: number above 0, label?<=18}; gauge = {value: number, min?: number (default 0), max?: number (default 100) above min, label?<=18}; longer text is cut (text_truncated), a longer sparkline is downsampled (series_downsampled), longer bars/heatstrip keep the most recent (series_trimmed_to_recent), a progress/ring value above 1 and at most 100 is divided by 100 (percent_read_as_fraction), out-of-range heatstrip, progress, ring, bullet and gauge values are clamped (value_clamped), a third slot is dropped (slots_trimmed), a fourth key-value row is dropped (rows_trimmed), an unknown icon name is removed and never guessed (icon_dropped), a short or non-numeric series, a non-numeric goal number, a bullet max not above 0, a gauge max not above min, a row that is not a [key, value] pair or a blank key, value or status text is rejected (graphic_slot_data_invalid), an unknown type is rejected (graphic_slot_type_unknown)" },
+        { name: "title", type: "string", requirement: "forbidden", limit: "", note: "repaired: folded into a blank caption (graphic_title_folded) or dropped (graphic_title_dropped) — one Name Line per page, same as image_caption" },
         { name: "refresh", type: "object", requirement: "forbidden", limit: "", note: "rejected with graphic_refresh_unsupported — re-render with update:\"patch\"" },
         { name: "imageAsset", type: "string", requirement: "forbidden", limit: "", note: "image fields belong to image_caption" },
         { name: "imageBase64", type: "string", requirement: "forbidden", limit: "", note: "the Agent never supplies pixels" },
@@ -517,7 +517,7 @@ const entries = [
     dependencies: [],
     wireKind: { status: "existing", name: "text_surface" },
     wireTemplateField: null,
-    intent: "Keep one number in front of the wearer while it changes, with the agent idle.",
+    intent: "Keep one number on screen while it changes, with the agent idle.",
     summary:
       "A deterministic recipe ticks the body; zero tokens per tick. Numbers lead the line ('47% CPU', not 'CPU is at 47%'). Fire-and-forget: no timeout, terminal via the recipe's maxDuration.",
     fieldSet: {
@@ -1079,7 +1079,7 @@ const entries = [
     },
     layoutBudgets: {
       measured: true,
-      source: "paged_text_surface descriptor and DynamicUiScreen full-page renderer",
+      source: "paged_text_surface descriptor and the paged_text Preset (V2 pages)",
       budgets: { maxPages: 10, pageMaxChars: 600, localUpgradeCountPerFlip: 1 },
     },
     lifecycle: {
@@ -1122,7 +1122,7 @@ const entries = [
     codeAnchors: [
       "extensions/ocuclaw/src/tools/glasses-ui-descriptors.ts — pagedTextSurfaceDescriptor",
       "composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/screens/DynamicUiKindDescriptor.kt — PagedTextSurfaceDescriptor",
-      "composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/screens/DynamicUiScreen.kt — renderPagedText / movePage",
+      "composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/liveui/LiveUiPresetForm.kt — splitPages / selectedPage",
     ],
     relatedTo: ["walking_brief@1", "guided_procedure@1"],
     openQuestions: [],
@@ -1379,7 +1379,7 @@ const entries = [
     dependencies: [],
     wireKind: { status: "existing", name: "paged_text_surface" },
     wireTemplateField: null,
-    intent: "Carry the next step of a hands-busy procedure in front of the wearer.",
+    intent: "Show the next step of a procedure, one step at a time.",
     summary:
       "Prototype moment 3 (Guided work / stepper). Page movement is local; 'ask why' or 'this did not happen' returns the exact step to the agent as context plus intent. Differs from paged_briefing in that the active step is meaningful state, not just a scroll position.",
     fieldSet: {
@@ -1422,7 +1422,7 @@ const entries = [
     },
     provenance: {
       seedGroup: "experience_prototype_moment",
-      sources: [{ doc: "docs/design/liveui-research/liveui-experience-prototype.html", anchor: "moment 3 — 'Guided work · stepper / Carry the next step in front of you'" }],
+      sources: [{ doc: "docs/design/liveui-research/liveui-experience-prototype.html", anchor: "moment 3 — 'Guided work · stepper'" }],
     },
     codeAnchors: [],
     relatedTo: ["paged_briefing@1"],
@@ -1479,7 +1479,7 @@ const entries = [
     },
     provenance: {
       seedGroup: "experience_prototype_moment",
-      sources: [{ doc: "docs/design/liveui-research/liveui-experience-prototype.html", anchor: "moment 4 — 'Research · distillation / Turn a desk full of sources into a walking brief'" }],
+      sources: [{ doc: "docs/design/liveui-research/liveui-experience-prototype.html", anchor: "moment 4 — 'Research · distillation'" }],
     },
     codeAnchors: [],
     relatedTo: ["paged_briefing@1", "guided_procedure@1"],
@@ -1616,9 +1616,9 @@ const entries = [
     dependencies: [],
     wireKind: { status: "existing", name: "checklist_surface" },
     wireTemplateField: null,
-    intent: "Work a short physical checklist with hands full and the phone in a bag.",
+    intent: "Work through a short checklist, ticking items off one by one.",
     summary:
-      "Prototype moment 7 (Checklist / routine). Taps only change an on-device mark with zero round-trips and zero tokens. Double-tap closes with the full state; voice add/question requests are normal wearer turns. A check mark records a local mark, never proof that physical work happened.",
+      "Prototype moment 7 (Checklist / routine). Taps only change an on-device mark with zero round-trips and zero tokens. Double-tap closes with the full state; voice add/question requests are normal wearer turns. A check mark records a local mark, never proof that the work happened.",
     fieldSet: {
       closed: true,
       fields: [
@@ -1628,7 +1628,7 @@ const entries = [
         { name: "queueMode", type: "string", requirement: "required", limit: 'const "log"', note: "the one close outcome carries the complete item state" },
       ],
     },
-    layoutBudgets: { measured: true, source: "DynamicUiScreen checklist fake-list renderer", budgets: { visibleRowsBeforeFold: 6, maxItems: 20, labelMaxChars: 64, recommendedLabelMaxChars: 26, maxQueuedEvents: 32 } },
+    layoutBudgets: { measured: true, source: "the checklist Preset (V2 checklist)", budgets: { visibleRowsBeforeFold: 6, maxItems: 20, labelMaxChars: 64, recommendedLabelMaxChars: 26, maxQueuedEvents: 32 } },
     lifecycle: {
       move: "patch",
       timeoutMs: null,
@@ -1663,14 +1663,14 @@ const entries = [
     provenance: {
       seedGroup: "experience_prototype_moment",
       sources: [
-        { doc: "docs/design/liveui-research/liveui-experience-prototype.html", anchor: "moment 7 — 'Checklist · routine / Keep hands and phone free'" },
+        { doc: "docs/design/liveui-research/liveui-experience-prototype.html", anchor: "moment 7 — 'Checklist · routine'" },
         { doc: "docs/superpowers/plans/2026-07-04-liveui-master-plan.md", anchor: "Part 2 §B2 — checklist_surface" },
       ],
     },
     codeAnchors: [
       "extensions/ocuclaw/src/tools/glasses-ui-descriptors.ts — checklistSurfaceDescriptor",
       "composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/screens/DynamicUiKindDescriptor.kt — ChecklistSurfaceDescriptor",
-      "composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/screens/DynamicUiScreen.kt — renderChecklist / toggleChecklistItem",
+      "composeApp/src/webMain/kotlin/com/akelu/ocuclaw/glasses/liveui/LiveUiPresetForm.kt — checklistItems",
       "composeApp/src/webMain/kotlin/com/akelu/ocuclaw/connection/RelayProtocolSerializer.kt — serializeChecklistOutcome",
     ],
     relatedTo: ["collect_votes@1"],
@@ -1831,7 +1831,7 @@ const entries = [
       fields: [
         { name: "kind", type: "string", requirement: "required", limit: 'const "text_surface"', note: "" },
         { name: "body", type: "string", requirement: "required", limit: "<=1000 chars", note: "" },
-        { name: "refresh", type: "object", requirement: "optional", limit: "http tier; open_meteo_current@1 recommends 900000 ms", note: "see references/http-recipe-field-sets.json" },
+        { name: "refresh", type: "object", requirement: "optional", limit: "http tier; open_meteo_current@1 recommends 900000 ms", note: "see registry/http-recipe-field-sets.json" },
       ],
     },
     layoutBudgets: { measured: false, source: "none — one-line bullet", budgets: { bodyMaxChars: 1000 } },
@@ -1864,7 +1864,7 @@ const entries = [
       seedGroup: "control_center_glance_card",
       sources: [
         { doc: "docs/design/liveui-research/CONTROL-CENTER-RESEARCH.md", anchor: "§7 Routines and glance cards — 'weather/commute'" },
-        { doc: "extensions/ocuclaw/skills/glasses-ui/references/http-recipe-field-sets.json", anchor: "recipe open_meteo_current@1" },
+        { doc: "extensions/ocuclaw/registry/http-recipe-field-sets.json", anchor: "recipe open_meteo_current@1" },
       ],
     },
     codeAnchors: [],
@@ -2004,7 +2004,7 @@ const entries = [
     dependencies: [],
     wireKind: { status: "existing", name: "list_with_details_surface" },
     wireTemplateField: null,
-    intent: "Where the things you are waiting on have got to.",
+    intent: "Where the things you are expecting have got to.",
     summary: "Routine glance card ('package/watch-list status'). One-line bullet in source; a bounded http recipe is the obvious data path.",
     fieldSet: {
       closed: false,
@@ -2139,9 +2139,45 @@ const entries = [
   },
 ];
 
+const graphicBase = entries.find(e => e.name === "graphic");
+if(!graphicBase) throw new Error("graphic base registry entry is required");
+const extendedGraphicEntry      = {
+  ...graphicBase,
+  name: "graphic_v2", version: 1, wireTemplateField: "graphic_v2",
+  intent: "Read a day's bounded event spans or compare two aligned series on a shared scale.",
+  summary: "OcuClaw quiet lanes and quiet overlay. One full-width timeline or comparison, rendered with our bundled bitmap fonts. Older clients show body as plain text. No timer or interaction.",
+  fieldSet: {closed:true,fields:[
+    {name:"kind",type:"string",requirement:"required",limit:'const "text_surface"',note:""},
+    {name:"template",type:"string",requirement:"required",limit:'const "graphic_v2"',note:"unknown-template caption fallback"},
+    {name:"body",type:"string",requirement:"required",limit:"1-64 chars",note:"complete fallback summary"},
+    {name:"graphic",type:"object",requirement:"required",limit:"one timeline or comparison",note:"timeline: minute-of-day range 0..1440, supplied nowMinute, <=6 spans, <=2 overlap; comparison: min<max in -9999..9999, exactly 2 labelled aligned series of 2..30 numbers or null gaps, startLabel/endLabel. Labels <=18 chars."},
+  ]},
+  layoutBudgets:{...graphicBase.layoutBudgets,budgets:{plateWidthPx:288,plateHeightPx:144,captionMaxChars:64,slotsMax:1}},
+  example:{synthetic:true,renderableToday:true,note:"Synthetic day.",spec:{kind:"text_surface",template:"graphic_v2",body:"Focus 14-16; free until then",graphic:{slots:[{type:"timeline",startMinute:480,endMinute:1080,nowMinute:810,label:"YOUR DAY",events:[{startMinute:840,endMinute:960,label:"Focus"}]}]}}},
+  relatedTo:["graphic@1"],
+};
+entries.push(extendedGraphicEntry);
+const durationPickerEntry      = {
+  ...graphicBase,
+  name:"duration_picker",version:1,wireTemplateField:"duration_picker",wireKind:{status:"existing",name:"list_surface"},
+  intent:"Choose a duration locally; submit exactly once on a deliberate save tap.",
+  summary:"OcuClaw bounded stepper with a large value and full-range tick rail. Tap starts editing; swipes change a bounded draft; tap saves an existing selected(index,text) outcome. Double-tap backs out and discards the draft. No timer is started. Older clients show the matching duration list.",
+  fieldSet:{closed:true,fields:[
+    {name:"kind",type:"string",requirement:"required",limit:'const "list_surface"',note:""},
+    {name:"template",type:"string",requirement:"required",limit:'const "duration_picker"',note:""},
+    {name:"items",type:"array",requirement:"required",limit:"2-20 strings",note:"exact minute lattice formatted '<value> minutes'; fallback and outcome vocabulary"},
+    {name:"durationPicker",type:"object",requirement:"required",limit:"min/max/value/step integer minutes; label <=18 chars",note:"1<=min<max<=999, aligned endpoints/value, positive step, at most 20 choices; no title, children or refresh"},
+  ]},
+  lifecycle:{...graphicBase.lifecycle,outcomePolicy:"Only save tap produces selected. Draft changes are local. Back/dismiss, replacement and exit discard unsaved changes. No tick or expiry consequence."},
+  consent:{...graphicBase.consent,policy:"local_commit_only",assertion:"Only an explicit save tap submits a duration choice. Browsing, silence and expiry do not start a timer or authorize an action."},
+  example:{synthetic:true,renderableToday:true,note:"Synthetic focus choice.",spec:{kind:"list_surface",template:"duration_picker",durationPicker:{min:10,max:30,step:5,value:25,label:"FOCUS DURATION"},items:["10 minutes","15 minutes","20 minutes","25 minutes","30 minutes"]}},
+  relatedTo:["graphic_v2@1"],
+};
+entries.push(durationPickerEntry);
+
 const GLASSES_UI_TEMPLATE_REGISTRY = { entries };
 
-function templateId(entry) {
+function templateId(entry     ) {
   return `${entry.name}@${entry.version}`;
 }
 
@@ -2153,19 +2189,19 @@ function listTemplateIds() {
   return entries.map(templateId);
 }
 
-function getTemplateEntry(id) {
+function getTemplateEntry(id     ) {
   return entries.find((entry) => templateId(entry) === id);
 }
 
-function isRegisteredTemplateName(name) {
+function isRegisteredTemplateName(name     ) {
   return entries.some((entry) => entry.name === name);
 }
 
-function isWireKind(kind) {
+function isWireKind(kind     ) {
   return WIRE_KIND_ENUM.includes(kind);
 }
 
-function templatesForKind(kind) {
+function templatesForKind(kind     ) {
   return entries.filter((entry) => entry.wireKind.name === kind).map(templateId);
 }
 
@@ -2183,19 +2219,19 @@ function entriesByStatus() {
   return counts;
 }
 
-function isPlainObject(value) {
+function isPlainObject(value     ) {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-function isTimeout(value) {
+function isTimeout(value     ) {
   if (value === null || Number.isInteger(value)) return true;
   return isPlainObject(value) && Number.isInteger(value.min) && Number.isInteger(value.max) && value.min <= value.max;
 }
 
-function validateTemplateEntry(entry) {
-  const errors = [];
+function validateTemplateEntry(entry     ) {
+  const errors      = [];
   const at = isPlainObject(entry) && entry.name ? `${entry.name}@${entry.version}` : "<entry>";
-  const fail = (message) => errors.push(`${at}: ${message}`);
+  const fail = (message     ) => errors.push(`${at}: ${message}`);
 
   if (!isPlainObject(entry)) return { ok: false, errors: ["entry must be an object"] };
 
@@ -2370,7 +2406,7 @@ function validateTemplateEntry(entry) {
 }
 
 function validateTemplateRegistry(list = entries) {
-  const errors = [];
+  const errors      = [];
   const seen = new Set();
   for (const entry of list) {
     const result = validateTemplateEntry(entry);

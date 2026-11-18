@@ -1,5 +1,5 @@
-function findLiveuiTasksReferencingTemplate(taskLibrary, templateId) {
-  const references = [];
+function findLiveuiTasksReferencingTemplate(taskLibrary     , templateId     ) {
+  const references      = [];
   if (!taskLibrary || typeof taskLibrary.listItems !== "function" ||
       typeof taskLibrary.read !== "function") return references;
   const listed = taskLibrary.listItems();
@@ -14,7 +14,7 @@ function findLiveuiTasksReferencingTemplate(taskLibrary, templateId) {
   return references;
 }
 
-function createLiveuiTaskDeletionHookRegistry(opts = {}) {
+function createLiveuiTaskDeletionHookRegistry(opts      = {}) {
   const runRecordsHook = typeof opts.runRecordsOnTaskDeleted === "function"
     ? opts.runRecordsOnTaskDeleted
     : () => undefined;
@@ -23,11 +23,11 @@ function createLiveuiTaskDeletionHookRegistry(opts = {}) {
     : () => undefined;
 
   return {
-    onTaskDeleted(taskId, details = {}) {
+    onTaskDeleted(taskId     , details      = {}) {
       const preferredTemplateId = typeof details.preferredTemplateId === "string"
         ? details.preferredTemplateId
         : null;
-      const referencedTemplateIds = preferredTemplateId ? [preferredTemplateId] : [];
+      const referencedTemplateIds      = preferredTemplateId ? [preferredTemplateId] : [];
       runRecordsHook(taskId);
       secretsHook(taskId);
       if (

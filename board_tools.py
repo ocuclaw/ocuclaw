@@ -12,9 +12,9 @@ monkeypatch. Contract: docs/hermes-board/contract.md ("Voice tools (#3061)").
   platform is offered. It writes nothing.
 * **Enable** is the wearer's own ``hermes tools enable kanban --platform
   ocuclaw`` line, run as a subprocess with ``HERMES_HOME`` pinned to the served
-  profile's home, and only for a request that carries the phone's explicit
-  confirmation. It edits the user's own Hermes config, so the phone asks
-  first. Its exit code is never trusted: the read-back decides (a managed
+  profile's home, for a request that carries the phone's explicit
+  confirmation or, once per profile, as the default (below). It edits the
+  user's own Hermes config. Its exit code is never trusted: the read-back decides (a managed
   install, or a platform Hermes did not discover, exits 0 without writing).
   Nothing here writes ``config.yaml`` itself.
 * **Scope.** The command saves this one platform's list
@@ -31,6 +31,13 @@ toolset"), and its kanban tools look only at the profile-wide
 ``toolsets: [kanban]``. There the action is ``unsupported`` and the
 profile-wide list is never changed as a substitute; the voice path stays off.
 
+**On by default** (Matt, 2026-11-13: "turn it on by default"). The first Board
+answer for a served profile runs the same scoped enable once, as if the wearer
+had confirmed it (``apply_default``). OcuClaw's own store remembers that it
+did, per profile home, so a wearer who later turns the tools off in Hermes is
+never overridden. Only an ``available`` setup is acted on: blocked, managed,
+unsupported and unreadable configs are left exactly as they are.
+
 OcuClaw adds no task toolset. Voice card creation is an ordinary agent turn in
 which Hermes' own ``kanban_create`` does the work, behind Hermes' own
 eligibility checks (a dispatcher worker, a delegate child, the orchestrator
@@ -42,8 +49,10 @@ from __future__ import annotations
 import copy
 import importlib.util
 import os
+import sqlite3
 import subprocess
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -63,6 +72,15 @@ SETUP_STATES = ("uncertified", "unsupported", "unknown", "done", "blocked", "man
 CONFIRMED = {"confirmed": True}
 
 _ENABLE_LOCK = threading.Lock()
+
+#: Whether the first Board answer for a profile turns the tools on (Matt's
+#: ruling, 2026-11-13). The test suites switch it off except where they test it.
+DEFAULT_ON = True
+#: OcuClaw's record of the one default enable per profile home, in its Board store.
+_DEFAULT_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS board_tools_default ("
+    " home TEXT PRIMARY KEY, outcome TEXT NOT NULL, applied_at INTEGER NOT NULL)"
+)
 
 
 class ToolsError(Exception):
@@ -89,21 +107,25 @@ MESSAGES = {
 }
 
 
-def per_platform_toggle() -> bool:
+def per_platform_toggle() -> bool | None:
     """True when this engine has Hermes' per-platform kanban switch: ``kanban`` is
     a configurable toolset and its tools read the platform's selection. A feature
-    of the installed code, never of the version label."""
+    of the installed code, never of the version label. None means the structural
+    probe failed; it is not evidence that the installed feature is absent."""
     try:
+        import inspect
         import hermes_cli.tools_config as tools_config
         keys = {row[0] for row in tools_config.CONFIGURABLE_TOOLSETS}
+        inspect.signature(tools_config._get_platform_tools).bind({}, PLATFORM,
+                                                               include_default_mcp_servers=False)
     except Exception:
-        return False
+        return None
     if TOOLSET not in keys:
         return False
     try:
         return importlib.util.find_spec("tools.kanban_toolset_context") is not None
-    except (ImportError, ValueError):
-        return False
+    except Exception:
+        return None
 
 
 @contextmanager
@@ -170,28 +192,16 @@ def _state(config: dict, toggle: bool) -> tuple:
 
 
 def _managed() -> bool:
-    try:
-        from hermes_cli.config import is_managed
-        return bool(is_managed())
-    except Exception:
-        return False
+    # A failed permission/configuration probe must never offer a mutation.
+    from hermes_cli.config import is_managed
+    return bool(is_managed())
 
 
-def view(home, certified: bool) -> dict:
-    """The ``agentTools`` view for the served profile whose home is ``home``
-    (None when it cannot be resolved)."""
+def _view(config: dict, toggle: bool) -> dict:
+    """The existing setup vocabulary keeps native absence, unreadable facts,
+    a cross-platform block, managed config and a configured-off feature apart."""
     out = {"platform": PLATFORM}
-    if not certified:
-        return {**out, "state": "unknown", "setup": "uncertified"}
-    toggle = per_platform_toggle()
-    try:
-        if home is None:
-            raise ValueError("no home")
-        with _served(home):
-            config = _load_config(home)
-            state, scope = _state(config, toggle)
-    except Exception:
-        return {**out, "state": "unknown", "setup": "unsupported" if not toggle else "unknown"}
+    state, scope = _state(config, toggle)
     out["state"] = state
     if scope is not None:
         out["scope"] = scope
@@ -209,6 +219,25 @@ def view(home, certified: bool) -> dict:
     return out
 
 
+def view(home, certified: bool) -> dict:
+    """The ``agentTools`` view for the served profile whose home is ``home``
+    (None when it cannot be resolved)."""
+    out = {"platform": PLATFORM}
+    if not certified:
+        return {**out, "state": "unknown", "setup": "uncertified"}
+    toggle = per_platform_toggle()
+    if toggle is None:
+        return {**out, "state": "unknown", "setup": "unknown"}
+    try:
+        if home is None:
+            raise ValueError("no home")
+        with _served(home):
+            config = _load_config(home)
+            return _view(config, toggle)
+    except Exception:
+        return {**out, "state": "unknown", "setup": "unknown"}
+
+
 def capability(tools_view) -> dict:
     """The ``agent_tools`` capability row from the view. Voice creation needs
     Hermes' per-platform switch (0.21.3) and the tools on for OcuClaw; 0.21.1 is
@@ -224,6 +253,10 @@ def capability(tools_view) -> dict:
     if state == "on":
         return {"key": "agent_tools", "enabled": True}
     if state == "unknown":
+        # The view stays unknown when no profile could be read, but an engine
+        # without the switch (0.21.1) is unsupported whatever that profile says.
+        if per_platform_toggle() is False:
+            return {**row, "code": "unsupported"}
         return {**row, "code": "temporarily_unavailable"}
     return {**row, "code": "tools_off"}
 
@@ -276,19 +309,29 @@ def enable(home, certified: bool, payload) -> dict:
         setup = before_view["setup"]
         if setup == "done":
             return before_view
-        if setup == "uncertified":
-            raise ToolsError("uncertified", MESSAGES["uncertified"])
-        if setup == "unknown":
-            raise ToolsError("temporarily_unavailable", MESSAGES["unknown"])
-        if setup != "available":
-            raise ToolsError("unsupported", MESSAGES[setup])
+        _require_setup(setup)
         try:
             with _served(home):
                 before = _load_config(home)
                 others_before = _others(before)
+                # Re-read native support and current config at the mutation
+                # boundary, after the initial offered view. Never carry a phone
+                # or earlier server snapshot through an intervening withdrawal.
+                from . import board_management as bm
+                if not bm.board_enabled(bm.engine_identity()):
+                    raise ToolsError("uncertified", MESSAGES["uncertified"])
+                toggle = per_platform_toggle()
+                if toggle is None or any(on is None for on in others_before.values()):
+                    raise ToolsError("temporarily_unavailable", MESSAGES["unknown"])
+                current = _view(before, toggle)
+                if current["setup"] == "done":
+                    return current
+                _require_setup(current["setup"])
+                ran = _run(home)
+        except ToolsError:
+            raise
         except Exception:
             raise ToolsError("temporarily_unavailable", MESSAGES["unknown"]) from None
-        ran = _run(home)
         try:
             with _served(home):
                 after = _load_config(home)
@@ -296,6 +339,8 @@ def enable(home, certified: bool, payload) -> dict:
             after_view = view(home, certified)
         except Exception:
             raise ToolsError("outcome_unknown", MESSAGES["timeout"]) from None
+        if any(on is None for on in others_after.values()):
+            raise ToolsError("outcome_unknown", MESSAGES["timeout"])
         widened = [name for name, on in others_after.items() if on and others_before.get(name) is False]
         if widened or _names(after.get("toolsets")) != _names(before.get("toolsets")):
             raise ToolsError("outcome_unknown", MESSAGES["widened"])
@@ -306,3 +351,128 @@ def enable(home, certified: bool, payload) -> dict:
         if ran == "cannot_run":
             raise ToolsError("temporarily_unavailable", MESSAGES["cannot_run"])
         raise ToolsError("temporarily_unavailable", MESSAGES["not_saved"])
+
+
+def _require_setup(setup: str) -> None:
+    if setup == "uncertified":
+        raise ToolsError("uncertified", MESSAGES["uncertified"])
+    if setup == "unknown":
+        raise ToolsError("temporarily_unavailable", MESSAGES["unknown"])
+    if setup != "available":
+        # The existing wire contract uses unsupported for refused setup;
+        # distinct blocked/managed reasons remain in the view and curated copy.
+        raise ToolsError("unsupported", MESSAGES[setup])
+
+
+def _default_claim(home) -> bool:
+    """Record that the default enable ran for ``home``; False when it already
+    had (or the store cannot say), so the default runs at most once."""
+    from . import board_watch
+    key = str(Path(home).resolve())
+    try:
+        conn = board_watch._open(create=True)
+    except Exception:
+        return False
+    try:
+        conn.execute(_DEFAULT_SCHEMA)
+        cur = conn.execute("INSERT OR IGNORE INTO board_tools_default (home, outcome, applied_at) VALUES (?, ?, ?)",
+                           [key, "pending", int(time.time())])
+        return cur.rowcount == 1
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+
+def _default_outcome(home, outcome: str) -> None:
+    from . import board_watch
+    try:
+        conn = board_watch._open(create=True)
+    except Exception:
+        return
+    try:
+        conn.execute("UPDATE board_tools_default SET outcome = ? WHERE home = ?", [outcome, str(Path(home).resolve())])
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+
+
+def apply_default(home, certified: bool):
+    """On by default: the first time a served profile's Board is read, turn its
+    kanban tools on for OcuClaw with the same scoped enable the phone's Turn on
+    runs. Once per profile home, ever; only from an ``available`` setup. Returns
+    the view afterwards when it acted, else None. Never raises."""
+    if not DEFAULT_ON or not certified or home is None:
+        return None
+    try:
+        current = view(home, certified)
+        if current.get("setup") not in ("available", "done"):
+            # Unreadable, unsupported, blocked or managed: not ours to decide, and
+            # an unreadable one may read again later, so nothing is recorded.
+            return None
+        if not _default_claim(home):
+            return None
+        if current.get("setup") == "done":
+            # Already on: recorded, so turning it off later is the wearer's to keep.
+            _default_outcome(home, "already_on")
+            return None
+        try:
+            after = enable(home, certified, CONFIRMED)
+        except ToolsError as refusal:
+            _default_outcome(home, refusal.code)
+            return None
+        _default_outcome(home, "enabled")
+        return after
+    except Exception:
+        return None
+
+
+#: Matt, 2026-11-13: with the Board tools on, "card" and "task" each name more
+#: than one thing in an OcuClaw chat, and a real-model run in the sim showed the
+#: clash ("make me a card for fixing the leaky tap" offered a glasses card,
+#: "add a task to fix the leaky tap" went into Hermes' hidden todo list, and
+#: kanban_create was refused for a missing worker). One line per turn sorts them
+#: by what the wearer wants. ``{profile}`` is the chatting profile, the worker
+#: the phone's Say a card names too.
+WORDS_LINE = (
+    "In OcuClaw, \"card\" and \"task\" each mean more than one thing, so go by what the wearer wants, not the word. "
+    "Something to get done (a chore, a job, a follow-up, \"on my board\") is a Board card, even when they say \"make me a card\" or \"add a task\": "
+    "file it with kanban_create, triage true so nothing starts, assignee \"{profile}\" unless they name another worker. "
+    "Something they will tap or play again and again (a game, a scorer, a timer, a quiz) is a glasses card: ask_glasses_card. "
+    "\"Save this\" or \"keep this\" follows what is on the glasses now: an open glasses card is saved with save_glasses_card, "
+    "a LiveUI view is saved as a LiveUI Task with manage_liveui_tasks; with neither open, ask which they mean. "
+    "Never keep what the wearer asks for in todo_list: they never see it. "
+    "When it could be more than one, ask one short question that names the choices, such as \"On your Board, or a card for your glasses?\""
+)
+
+
+def words_line(kwargs) -> str | None:
+    """The line for an OcuClaw foreground turn whose agent has the kanban tools,
+    else None. Reads the served config through Hermes' cached reader. Never raises."""
+    try:
+        if str(kwargs.get("platform") or "").strip() != PLATFORM or str(kwargs.get("parent_session_id") or "").strip():
+            return None
+        toggle = per_platform_toggle()
+        if toggle is None:
+            return None
+        from hermes_cli.config import load_config_readonly
+        if _state(copy.deepcopy(load_config_readonly()), toggle)[0] != "on":
+            return None
+        return WORDS_LINE.replace("{profile}", _turn_profile())
+    except Exception:
+        return None
+
+
+def _turn_profile() -> str:
+    """The profile this turn runs for, from the home Hermes resolves for it (a
+    routed turn's served profile under the override). ``profile_name_for_home``
+    is Hermes' own namer from 0.21.6; older engines name it as health does."""
+    import hermes_constants
+    home = Path(hermes_constants.get_hermes_home())
+    namer = getattr(hermes_constants, "profile_name_for_home", None)
+    if callable(namer):
+        name = namer(home)
+    else:
+        name = home.name if home.parent.name == "profiles" else "default"
+    return str(name or "default")

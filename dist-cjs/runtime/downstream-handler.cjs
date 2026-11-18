@@ -1,91 +1,36 @@
-const { normalizeEvenAiRoutingMode, normalizeEvenAiDefaultAgent } = require("../even-ai/even-ai-settings-store.cjs");
 const { activeBackendDisplayName } = require("../gateway/backend-contract.cjs");
-const { projectSessionDriverFields } = require("./session-driver-projection.cjs");
-const { managementRequest, validManagementRequest, managementResult, managementFailure } = require("./hermes-management.cjs");
-const { boardMomentAck } = require("./hermes-board-moments.cjs");
-const { normalizeOcuClawDefaultModel, normalizeOcuClawDefaultThinking, normalizeOcuClawAgentProgressNotes, normalizeOcuClawSystemPrompt, normalizeOcuClawDefaultAgent, normalizeOcuClawEvenAiSection, normalizeOcuClawEvenAiPeer, normalizeOcuClawPathwayBinding, normalizeOcuClawPathways } = require("./ocuclaw-settings-store.cjs");
-const { formatMainOperationReceived, formatSendAck } = require("./relay-worker-protocol.cjs");
-const { CAPABILITY_SNAPSHOT_TYPE, PUSH_MESSAGE_TYPE } = require("./capability-snapshot.cjs");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
 const { validateGlassesUiInjectSpec } = require("../tools/glasses-ui-tool.cjs");
-const { normalizeSonioxTemporaryKeyErrorCodeForDownstream: normalizeSonioxTemporaryKeyErrorCode } = require("../domain/soniox-temp-key-errors.cjs");
 const { DEFAULT_EVEN_AI_DEDICATED_SESSION_KEY } = require("../domain/even-ai-session-keys.cjs");
-const { isAdoptableHermesSessionKey, isForeignHermesSessionKey } = require("./hermes-session-keys.cjs");
-const { normalizeSessionListFixture } = require("./session-list-fixture.cjs");
+const { parseStarMapForgetRequest } = require("../domain/star-map.cjs");
+const { normalizeReplyLanguageTag } = require("../domain/reply-language.cjs");
+const { isForeignHermesSessionKey } = require("./hermes-session-keys.cjs");
 const { APP_CLIENT_NAME } = require("./relay-client-names.cjs");
-const { normalizeAndValidateCustomSystemPrompt } = require("../domain/custom-system-prompt-limit.cjs");
+const { cardBuildTaskSendOf, cardChangeSendOf, cardCheckSendOf } = require("./card-build-phases.cjs");
 const { parseOptionalSetupRequest, optionalSetupFailure, optionalSetupResult } = require("../setup/optional-setup-protocol.cjs");
+const { parseModelSitesRequest, modelSitesFailure, modelSitesResult } = require("../setup/model-sites-protocol.cjs");
+const { APP_PROTOCOL } = require("./downstream-app-protocol.cjs");
+const { parseOptionalTrimmedString, parseOptionalInteger, parseOptionalNonNegativeNumber, parseOptionalPositiveInt } = require("./downstream-parse-optional.cjs");
+const { parseRemoteControl } = require("./downstream-remote-control.cjs");
+const { formatEntries, formatActivity, formatThinkingUpdate, formatThinkingFinalize, formatRunSignal, formatCardBuild, formatTyping, formatError, formatSendAckCompat, formatSessionAbortAck, formatOperationReceived, formatProtocol, formatStreaming, formatStreamClear, formatCapabilitySnapshot, formatPushMessage, createSnapshotFormatters } = require("./downstream-codec-core.cjs");
+const { formatSessions, formatSessionDiff, formatSessionSwitched, formatSessionSwitchRejected, formatSessionModelConfig, formatSessionModelConfigAck, formatSessionDriverState, createEvenAiSessionsFormatter, sessionInfoFingerprint } = require("./downstream-codec-sessions.cjs");
+const { formatModelsCatalog, formatSkillsCatalog, formatStarMapSnapshot, formatStarMapForgotten, formatCommandCatalog, formatAgentsCatalog, formatAgentCreateResult, formatAgentEmojiSetResult, formatAgentsRouteResult, formatAgentDescriptionSetResult, formatAgentDescriptionAutoResult, formatAgentSettingsResult, formatHostDefaultsResult, formatProviderUsageSnapshot } = require("./downstream-codec-catalogs.cjs");
+const { formatLiveuiLibrary, formatLiveuiLibraryOpenResult, formatProgramCardSaveRequest, formatProgramCardReview, formatLiveuiTasks, formatLiveuiTaskReviewAck, formatLiveuiTaskExecutors, formatLiveuiTaskExecutorAck, formatLiveuiTaskPreferredTemplateAck, formatLiveuiTaskContextAck, formatLiveuiPrefs, formatLiveuiPrefsAck, formatLiveuiGrantsSnapshot, formatLiveuiGrantsAck, formatLiveuiStatus, formatLiveuiTaskSettingsAck } = require("./downstream-codec-liveui.cjs");
+const { formatEvenAiSettings, formatEvenAiSettingsAck, formatOcuClawSettings, formatSavedPrompts, formatSavedPromptsAck, formatOcuClawSettingsAck } = require("./downstream-codec-settings.cjs");
+const { formatApprovalExplanation, formatApprovalExplanationPending, formatApprovalResolved, formatApprovalResponseAck, formatWaiting, createApprovalFormatter } = require("./downstream-codec-approval.cjs");
+const { formatSonioxModels, formatHermesSttTranscribeResult, formatTranscription, formatListenCommitted, formatEvenAiListenIntercepted, formatListenEnded, formatListenError, formatListenReady, formatScriptedListenReady, formatSonioxTemporaryKey, formatSonioxTemporaryKeyError, createHermesSttCapabilitiesFormatter } = require("./downstream-codec-voice.cjs");
+const { REALTIME_APP_PROTOCOL, createRealtimeTalkDownstreamHandlers } = require("./realtime-talk-lane.cjs");
+const { TTS_APP_PROTOCOL, createTtsDownstreamHandlers } = require("./tts-lane.cjs");
+const { PHONE_SETTINGS_APP_PROTOCOL } = require("../tools/phone-settings-tool.cjs");
+const { formatDebugSet, formatDebugDump, formatTraceLog, formatDebugConfigSnapshot, formatRemoteControl, formatRemoteControlAck, formatAutomationStateRequest, formatAutomationRegistryRequest, formatAutomationStateSnapshot, formatAutomationRegistry, formatReadinessProbeRequest, formatReadinessProbeAck } = require("./downstream-codec-debug.cjs");
+const { createLiveuiHandlers } = require("./downstream-handlers-liveui.cjs");
+const { createHermesHandlers } = require("./downstream-handlers-hermes.cjs");
+const { createSimulateHandlers } = require("./downstream-handlers-simulate.cjs");
+const { createSessionHandlers } = require("./downstream-handlers-sessions.cjs");
+const { createSettingsHandlers } = require("./downstream-handlers-settings.cjs");
+const { createVoiceHandlers } = require("./downstream-handlers-voice.cjs");
 
-const PROTOCOL_SECRET_KEYS = new Set([
-  "accesstoken",
-  "apikey",
-  "auth",
-  "authorization",
-  "cookie",
-  "credential",
-  "credentials",
-  "devicetoken",
-  "nonce",
-  "password",
-  "privatekey",
-  "refreshtoken",
-  "secret",
-  "setcookie",
-  "signature",
-  "token",
-]);
-
-function isProtocolSecretKey(key) {
-  const normalized = String(key).toLowerCase().replace(/[^a-z0-9]/g, "");
-  return (
-    PROTOCOL_SECRET_KEYS.has(normalized) ||
-    /(?:apikey|authorization|cookie|credential|nonce|password|privatekey|secret|signature|token)$/.test(normalized)
-  );
-}
-
-function sanitizeProtocolFrame(value, seen = new WeakSet(), depth = 0) {
-  if (value === null || typeof value !== "object") return value;
-  if (value.type === "ocuclaw.optional.setup.request") return { type: value.type, private: true };
-  if (depth >= 16 || seen.has(value)) return "[REDACTED]";
-  seen.add(value);
-  if (Array.isArray(value)) {
-    return value.map((entry) => sanitizeProtocolFrame(entry, seen, depth + 1));
-  }
-  const clean = {};
-  for (const [key, entry] of Object.entries(value)) {
-    clean[key] = isProtocolSecretKey(key)
-      ? "[REDACTED]"
-      : sanitizeProtocolFrame(entry, seen, depth + 1);
-  }
-  return clean;
-}
-
-const CODEX_APP_SERVER_APPROVAL_PLUGIN_ID = "openclaw-codex-app-server";
-const CODEX_APP_SERVER_APPROVAL_TITLE_PREFIX = "Codex app-server ";
-const CHAT_ESCAPE_ENTITIES = new Map([
-  ["&amp;", "&"],
-  ["&lt;", "<"],
-  ["&gt;", ">"],
-  ["&quot;", "\""],
-  ["&#39;", "'"],
-  ["&#x27;", "'"],
-  ["&apos;", "'"],
-]);
-const CHAT_ESCAPE_ENTITY_RE = /&(?:amp|lt|gt|quot|apos|#39|#x27);/g;
-
-function isChatEscapedApprovalRequest(request) {
-  if (!request || typeof request !== "object") return false;
-  if (request.pluginId === CODEX_APP_SERVER_APPROVAL_PLUGIN_ID) return true;
-  return (
-    typeof request.title === "string" &&
-    request.title.startsWith(CODEX_APP_SERVER_APPROVAL_TITLE_PREFIX)
-  );
-}
-
-function decodeChatEscapedText(value) {
-  if (typeof value !== "string" || value.indexOf("&") < 0) return value;
-  return value.replace(CHAT_ESCAPE_ENTITY_RE, (entity) => CHAT_ESCAPE_ENTITIES.get(entity) ?? entity);
-}
+const { sanitizeProtocolFrame } = require("./downstream-codec-core.cjs");
 
 function hasOwn(obj, key) {
   return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
@@ -125,10 +70,13 @@ function createDownstreamHandler(opts) {
   const onSimulateStreamCancel = opts.onSimulateStreamCancel || null;
   const onSimulateActivity = opts.onSimulateActivity || null;
   const onSimulateThinking = opts.onSimulateThinking || null;
+  const onSimulateRunSignal = opts.onSimulateRunSignal || null;
   const onSimulateModelCatalog = opts.onSimulateModelCatalog || null;
   const onSimulateSessionList = opts.onSimulateSessionList || null;
   const onSimulateTool = opts.onSimulateTool || null;
   const onSimulateApproval = opts.onSimulateApproval || null;
+  const approvalPurposeEnabled =
+    typeof opts.approvalPurposeEnabled === "function" ? opts.approvalPurposeEnabled : () => true;
   const onSimulateDemand = opts.onSimulateDemand || null;
   const onSimulateVoice = opts.onSimulateVoice || null;
   const onNewChat = opts.onNewChat;
@@ -144,19 +92,29 @@ function createDownstreamHandler(opts) {
   const onInputStarted = typeof opts.onInputStarted === "function" ? opts.onInputStarted : null;
   const onClientSessionSelected =
     typeof opts.onClientSessionSelected === "function" ? opts.onClientSessionSelected : null;
-
-  function noteClientSessionSelected(clientId, sessionKey) {
-    if (!onClientSessionSelected || typeof sessionKey !== "string" || !sessionKey) return;
-    try {
-      onClientSessionSelected(clientId, sessionKey);
-    } catch (err) {
-      logger.warn(`[downstream] client session note failed: ${err && err.message ? err.message : err}`);
-    }
-  }
   const onGetSkillsCatalog = opts.onGetSkillsCatalog;
+  const onGetStarMap = typeof opts.onGetStarMap === "function" ? opts.onGetStarMap : null;
+  const onForgetStar = typeof opts.onForgetStar === "function" ? opts.onForgetStar : null;
   const onGetLiveuiLibrary = opts.onGetLiveuiLibrary || null;
   const onOpenLiveuiLibraryItem = opts.onOpenLiveuiLibraryItem || null;
+  const onSaveProgramCard = typeof opts.onSaveProgramCard === "function" ? opts.onSaveProgramCard : null;
+  const onCheckpointProgramCard =
+    typeof opts.onCheckpointProgramCard === "function" ? opts.onCheckpointProgramCard : null;
+  const onOpenProgramCard = typeof opts.onOpenProgramCard === "function" ? opts.onOpenProgramCard : null;
+  const onGetProgramCardSource = typeof opts.onGetProgramCardSource === "function" ? opts.onGetProgramCardSource : null;
+  const onGetProgramCardRevisions =
+    typeof opts.onGetProgramCardRevisions === "function" ? opts.onGetProgramCardRevisions : null;
+  const onProgramCardRevision = typeof opts.onProgramCardRevision === "function" ? opts.onProgramCardRevision : null;
+  const onGetProgramCardSlots = typeof opts.onGetProgramCardSlots === "function" ? opts.onGetProgramCardSlots : null;
+  const onProgramCardSlot = typeof opts.onProgramCardSlot === "function" ? opts.onProgramCardSlot : null;
+  const onProgramCardReview = typeof opts.onProgramCardReview === "function" ? opts.onProgramCardReview : null;
+  const onProgramCardReviewApply =
+    typeof opts.onProgramCardReviewApply === "function" ? opts.onProgramCardReviewApply : null;
+  const onProgramCardRevisionPicture =
+    typeof opts.onProgramCardRevisionPicture === "function" ? opts.onProgramCardRevisionPicture : null;
   const onCancelLiveuiTaskLaunch = opts.onCancelLiveuiTaskLaunch || null;
+
+  const onProgramCardRequest = typeof opts.onProgramCardRequest === "function" ? opts.onProgramCardRequest : null;
   const onGetLiveuiTasksForPhone = opts.onGetLiveuiTasksForPhone || null;
   const onGetLiveuiTaskRunsForPhone = opts.onGetLiveuiTaskRunsForPhone || null;
   const onGetLiveuiTaskExecutors = opts.onGetLiveuiTaskExecutors || null;
@@ -168,15 +126,15 @@ function createDownstreamHandler(opts) {
     ? opts.isPhoneClient
     : () => false;
   const clientNameOf = typeof opts.clientNameOf === "function" ? opts.clientNameOf : () => null;
-  const logSafe = (value, max) =>
+  const logSafe = (value     , max     ) =>
     typeof value === "string" && value ? value.replace(/[^A-Za-z0-9._:@/-]/g, "?").slice(0, max) : "";
 
-  function admitPhoneOnlyWrite(clientId, operation) {
+  function admitPhoneOnlyWrite(clientId     , operation     ) {
     if (isPhoneClient(clientId) !== true) return false;
     let clientName = null;
     try {
       clientName = clientNameOf(clientId);
-    } catch (_err) {
+    } catch (_err     ) {
       clientName = null;
     }
     if (clientName !== APP_CLIENT_NAME) {
@@ -199,14 +157,37 @@ function createDownstreamHandler(opts) {
   const onCreateOpenClawAgent = opts.onCreateOpenClawAgent || null;
   const onCreateHermesProfile = opts.onCreateHermesProfile || null;
   const onHermesManagement = opts.onHermesManagement || null;
+
+  const getManagementBackendLabel = opts.getManagementBackendLabel || null;
   const onBoardMomentAck = opts.onBoardMomentAck || null;
+  const onBotScreenMessage = opts.onBotScreenMessage || null;
+  const onTaskPushAck = opts.onTaskPushAck || null;
+  const onGetTaskRows = opts.onGetTaskRows || null;
+  const onSetTaskLook = opts.onSetTaskLook || null;
+  const onActTaskReminder = opts.onActTaskReminder || null;
+  const onTaskSheet = opts.onTaskSheet || null;
+  const onWaitingAnswer = opts.onWaitingAnswer || null;
   const onSetAgentEmoji = opts.onSetAgentEmoji || null;
+  const onRouteAgent = opts.onRouteAgent || null;
+  const onAgentDescription = opts.onAgentDescription || null;
   const onGetAgentSettings = opts.onGetAgentSettings || null;
   const onSetAgentSettings = opts.onSetAgentSettings || null;
+  const onGetHostDefaults = opts.onGetHostDefaults || null;
+  const onSetHostDefaults = opts.onSetHostDefaults || null;
   const onGetSonioxModels = opts.onGetSonioxModels || null;
   const onGetHermesSttCapabilities = opts.onGetHermesSttCapabilities || null;
   const onHermesSttTranscribe = opts.onHermesSttTranscribe || null;
   const hermesSttUpload = opts.hermesSttUpload || null;
+
+  const realtimeTalkLane = opts.realtimeTalkLane || null;
+  const realtimeTalkHandlers = createRealtimeTalkDownstreamHandlers({ lane: realtimeTalkLane, isPhoneClient });
+  const ttsHandlers = createTtsDownstreamHandlers({ lane: opts.ttsLane || null });
+  const offlineTtsHandlers = createTtsDownstreamHandlers({ lane: null });
+
+  if (hermesSttUpload && typeof opts.unicast === "function") {
+    hermesSttUpload.setPartialSink?.((clientId     , frame     ) =>
+      opts.unicast(clientId, JSON.stringify(frame)));
+  }
   const onGetProviderUsageSnapshot = opts.onGetProviderUsageSnapshot || null;
   const onGetSessionModelConfig = opts.onGetSessionModelConfig;
   const onSetSessionModelConfig = opts.onSetSessionModelConfig;
@@ -217,8 +198,8 @@ function createDownstreamHandler(opts) {
   const onSetEvenAiSettings = opts.onSetEvenAiSettings;
   const onGetOcuClawSettings = opts.onGetOcuClawSettings;
   const onSetOcuClawSettings = opts.onSetOcuClawSettings;
-  const onGetSavedPrompts = opts.onGetSavedPrompts || null;
-  const onWriteSavedPrompts = opts.onWriteSavedPrompts || null;
+  const onGetSavedPrompts      = opts.onGetSavedPrompts || null;
+  const onWriteSavedPrompts      = opts.onWriteSavedPrompts || null;
   const onRequestSonioxTemporaryKey = opts.onRequestSonioxTemporaryKey || null;
   const onRequestCartesiaAccessToken = opts.onRequestCartesiaAccessToken || null;
   const onGetStatus = opts.onGetStatus || null;
@@ -256,13 +237,32 @@ function createDownstreamHandler(opts) {
   const onGlassesUiRenderReceipt = opts.onGlassesUiRenderReceipt || null;
 
   const onReplyRenderReceipt = opts.onReplyRenderReceipt || null;
+
+  const onLiveUiPictureWant = opts.onLiveUiPictureWant || null;
+
+  const onLiveUiVideoWant = opts.onLiveUiVideoWant || null;
   const onGlassesUiRenderError = opts.onGlassesUiRenderError || null;
+
+  const onLiveUiStateReport = opts.onLiveUiStateReport || null;
   const onDeviceInfoResponse = opts.onDeviceInfoResponse || null;
   const onGlassesPresenceChanged = opts.onGlassesPresenceChanged || null;
+  const onProgramCardFeeds = opts.onProgramCardFeeds || null;
+
+  const onProgramCardPictures = opts.onProgramCardPictures || null;
+  const onProgramCardJev = opts.onProgramCardJev || null;
+  const onProgramCardMcp = opts.onProgramCardMcp || null;
+  const onProgramCardModel = opts.onProgramCardModel || null;
+  const onProgramCardArt = opts.onProgramCardArt || null;
+
+  const onProgramCardLocation = opts.onProgramCardLocation || null;
   const onLocationResponse = opts.onLocationResponse || null;
+  const onProgramCardResponse = opts.onProgramCardResponse || null;
+  const onProgramCardLookProgress = opts.onProgramCardLookProgress || null;
+  const onProgramCardContext = opts.onProgramCardContext || null;
   const onSetUserSessionTitle = opts.onSetUserSessionTitle || null;
   const onSetSessionPinned = opts.onSetSessionPinned || null;
   const onSetSessionHidden = opts.onSetSessionHidden || null;
+  const onMarkAllSessionsRead = opts.onMarkAllSessionsRead || null;
   const onDeleteSessions = opts.onDeleteSessions || null;
   const onSearchTranscripts = opts.onSearchTranscripts || null;
   const onDebugBundleRequest = opts.onDebugBundleRequest || null;
@@ -277,7 +277,7 @@ function createDownstreamHandler(opts) {
       ? opts.defaultEvenAiDedicatedSessionKey.trim()
       : DEFAULT_EVEN_AI_DEDICATED_SESSION_KEY;
 
-  function resolveInjectedLiveUiSession(rawSessionKey) {
+  function resolveInjectedLiveUiSession(rawSessionKey     ) {
     const requestedSessionKey = parseOptionalTrimmedString(rawSessionKey) || null;
     if (!resolveLiveUiSessionContext) {
       return { sessionKey: requestedSessionKey, liveUiSessionGeneration: null };
@@ -307,273 +307,11 @@ function createDownstreamHandler(opts) {
     "external debug tools are disabled by plugin config";
 
   const approvalResolveCache = new Map();
-  const APP_PROTOCOL = {
-    activity: "ocuclaw.activity.update",
-    automationStateGet: "ocuclaw.automation.state.get",
-    automationStateSnapshot: "ocuclaw.automation.state.snapshot",
-    automationRegistryGet: "ocuclaw.automation.registry.get",
-    automationRegistry: "ocuclaw.automation.registry",
-    approvalRequest: "ocuclaw.approval.request",
-    approvalResolve: "ocuclaw.approval.resolve",
-    approvalResolveAck: "ocuclaw.approval.resolve.ack",
-    approvalResolved: "ocuclaw.approval.resolved",
-    commandCatalogGet: "ocuclaw.command.catalog.get",
-    commandCatalogSnapshot: "ocuclaw.command.catalog.snapshot",
-    commandSlash: "ocuclaw.command.slash",
-    debugConfigSnapshot: "ocuclaw.debug.config.snapshot",
-    debugEvent: "ocuclaw.debug.event",
-    evenAiSettingsGet: "ocuclaw.evenai.settings.get",
-    evenAiSessionList: "ocuclaw.evenai.session.list",
-    evenAiSessionListResult: "ocuclaw.evenai.session.list.result",
-    evenAiSettingsSet: "ocuclaw.evenai.settings.set",
-    evenAiSettingsSetAck: "ocuclaw.evenai.settings.set.ack",
-    evenAiSettingsSnapshot: "ocuclaw.evenai.settings.snapshot",
-    ocuClawSettingsGet: "ocuclaw.settings.get",
-    ocuClawSettingsSet: "ocuclaw.settings.set",
-    ocuClawSettingsSetAck: "ocuclaw.settings.set.ack",
-    ocuClawSettingsSnapshot: "ocuclaw.settings.snapshot",
 
-    savedPromptsGet: "ocuclaw.prompts.get",
-    savedPromptsSnapshot: "ocuclaw.prompts.snapshot",
-    savedPromptsWrite: "ocuclaw.prompts.write",
-    savedPromptsWriteAck: "ocuclaw.prompts.write.ack",
-    messageSend: "ocuclaw.message.send",
-    messageSendAck: "ocuclaw.message.send.ack",
-    messageStreamDelta: "ocuclaw.message.stream.delta",
-    messageStreamClear: "ocuclaw.message.stream.clear",
-    thinkingFinalize: "ocuclaw.thinking.finalize",
-    thinkingUpdate: "ocuclaw.thinking.update",
-    modelCatalogGet: "ocuclaw.model.catalog.get",
-    modelCatalogSnapshot: "ocuclaw.model.catalog.snapshot",
-    inputPredictionCapabilities: "ocuclaw.input.prediction.capabilities",
-    inputPredictionCapabilitiesResult: "ocuclaw.input.prediction.capabilities.result",
-    inputPredictionRequest: "ocuclaw.input.prediction.request",
-    inputPredictionResult: "ocuclaw.input.prediction.result",
-    inputPredictionOpen: "ocuclaw.input.prediction.open",
-    inputPredictionOpenResult: "ocuclaw.input.prediction.open.result",
-    inputPredictionCancel: "ocuclaw.input.prediction.cancel",
-    inputPredictionTest: "ocuclaw.input.prediction.test",
-    inputPredictionTestResult: "ocuclaw.input.prediction.test.result",
-
-    inputPredictionModelAllow: "ocuclaw.input.prediction.model.allow",
-    inputPredictionModelAllowResult: "ocuclaw.input.prediction.model.allow.result",
-
-    inputStarted: "ocuclaw.input.started",
-    providerUsageGet: "ocuclaw.provider.usage.get",
-    providerUsageSnapshot: "ocuclaw.provider.usage.snapshot",
-    skillsCatalogGet: "ocuclaw.skills.catalog.get",
-    skillsCatalogSnapshot: "ocuclaw.skills.catalog.snapshot",
-    liveuiLibraryGet: "ocuclaw.liveui.library.get",
-    liveuiLibrarySnapshot: "ocuclaw.liveui.library.snapshot",
-    liveuiLibraryOpen: "ocuclaw.liveui.library.open",
-    liveuiLibraryOpenResult: "ocuclaw.liveui.library.open.result",
-    liveuiTaskCancel: "ocuclaw.liveui.task.cancel",
-    liveuiTasksGet: "ocuclaw.liveui.tasks.get",
-    liveuiTasksSnapshot: "ocuclaw.liveui.tasks.snapshot",
-    liveuiTaskRunsGet: "ocuclaw.liveui.task.runs.get",
-    liveuiTaskRunsSnapshot: "ocuclaw.liveui.task.runs.snapshot",
-    liveuiTaskReview: "ocuclaw.liveui.task.review",
-    liveuiTaskReviewAck: "ocuclaw.liveui.task.review.ack",
-    liveuiTaskExecutorsGet: "ocuclaw.liveui.task.executors.get",
-    liveuiTaskExecutorsSnapshot: "ocuclaw.liveui.task.executors.snapshot",
-    liveuiTaskExecutorSet: "ocuclaw.liveui.task.executor.set",
-    liveuiTaskExecutorAck: "ocuclaw.liveui.task.executor.ack",
-    liveuiTaskPreferredTemplateSet: "ocuclaw.liveui.task.preferred_template.set",
-    liveuiTaskPreferredTemplateAck: "ocuclaw.liveui.task.preferred_template.ack",
-    liveuiTaskContextSet: "ocuclaw.liveui.task.context.set",
-    liveuiTaskContextAck: "ocuclaw.liveui.task.context.ack",
-    liveuiTaskSettingsSet: "ocuclaw.liveui.task.settings.set",
-    liveuiTaskSettingsAck: "ocuclaw.liveui.task.settings.ack",
-    liveuiLibraryOrganize: "ocuclaw.liveui.library.organize",
-    liveuiLibraryOrganizeAck: "ocuclaw.liveui.library.organize.ack",
-    liveuiPrefsGet: "ocuclaw.liveui.prefs.get",
-    liveuiPrefsSet: "ocuclaw.liveui.prefs.set",
-    liveuiPrefsSnapshot: "ocuclaw.liveui.prefs.snapshot",
-    liveuiPrefsAck: "ocuclaw.liveui.prefs.ack",
-    liveuiGrantsGet: "ocuclaw.liveui.grants.get",
-    liveuiGrantsSet: "ocuclaw.liveui.grants.set",
-    liveuiGrantsSnapshot: "ocuclaw.liveui.grants.snapshot",
-    liveuiGrantsAck: "ocuclaw.liveui.grants.ack",
-    liveuiStatusGet: "ocuclaw.liveui.status.get",
-    liveuiStatusSnapshot: "ocuclaw.liveui.status",
-    agentsCatalogGet: "ocuclaw.agent.catalog.get",
-    agentsCatalogSnapshot: "ocuclaw.agent.catalog.snapshot",
-    openclawAgentCreate: "ocuclaw.agent.openclaw.create",
-    openclawAgentCreateResult: "ocuclaw.agent.openclaw.create.result",
-    hermesProfileCreate: "ocuclaw.profile.hermes.create",
-    hermesManagement: "ocuclaw.hermes.management",
-
-    boardMoment: "ocuclaw.board.moment",
-    boardMomentAck: "ocuclaw.board.moment.ack",
-    hermesProfileCreateResult: "ocuclaw.profile.hermes.create.result",
-    agentEmojiSet: "ocuclaw.agent.emoji.set",
-    agentEmojiSetResult: "ocuclaw.agent.emoji.set.result",
-    agentSettingsGet: "ocuclaw.agent.settings.get",
-    agentSettingsSet: "ocuclaw.agent.settings.set",
-    agentSettingsResult: "ocuclaw.agent.settings.result",
-    entries: "ocuclaw.ledger.entries",
-    ledgerCursor: "ocuclaw.ledger.cursor",
-    ledgerResyncRequest: "ocuclaw.ledger.resync.request",
-    pages: "ocuclaw.view.pages.snapshot",
-    protocolSubscribe: "ocuclaw.protocol.tap.subscribe",
-    protocolFrame: "ocuclaw.protocol.tap.frame",
-    readinessProbeAck: "ocuclaw.readiness.probe.ack",
-    readinessProbeRequest: "ocuclaw.readiness.probe.request",
-    remoteControl: "ocuclaw.remote.control",
-    requestSonioxTemporaryKey: "requestSonioxTemporaryKey",
-    requestCartesiaAccessToken: "requestCartesiaAccessToken",
-    sonioxModelsGet: "ocuclaw.voice.soniox.models.get",
-    sonioxModelsSnapshot: "ocuclaw.voice.soniox.models.snapshot",
-    hermesSttCapabilitiesGet: "ocuclaw.voice.hermes.stt.capabilities.get",
-    hermesSttCapabilitiesSnapshot:
-      "ocuclaw.voice.hermes.stt.capabilities.snapshot",
-    hermesSttTranscribe: "ocuclaw.voice.hermes.stt.transcribe",
-    hermesSttTranscribeResult: "ocuclaw.voice.hermes.stt.transcribe.result",
-    sessionConfigGet: "ocuclaw.session.config.get",
-    sessionConfigSet: "ocuclaw.session.config.set",
-    sessionConfigSetAck: "ocuclaw.session.config.set.ack",
-    sessionConfigSnapshot: "ocuclaw.session.config.snapshot",
-    sessionAgentSet: "ocuclaw.session.agent.set",
-    sessionAgentSetAck: "ocuclaw.session.agent.set.ack",
-    sessionAbort: "ocuclaw.session.abort",
-    sessionAbortAck: "ocuclaw.session.abort.ack",
-    sessionCompact: "ocuclaw.session.compact",
-    sessionCompactAck: "ocuclaw.session.compact.ack",
-    sessionCreate: "ocuclaw.session.create",
-    sessionCopy: "ocuclaw.session.copy",
-    sessionCopyAck: "ocuclaw.session.copy.ack",
-    sessionAdopt: "ocuclaw.session.adopt",
-    sessionAdoptAck: "ocuclaw.session.adopt.ack",
-
-    sessionDriver: "ocuclaw.session.driver",
-    sessionDriverTakeOver: "ocuclaw.session.driver.takeover",
-    sessionHiddenSet: "ocuclaw.session.hidden.set",
-    sessionList: "ocuclaw.session.list",
-    sessionListDiff: "ocuclaw.session.list.diff",
-    sessionListDiffResult: "ocuclaw.session.list.diff.result",
-    sessionListResult: "ocuclaw.session.list.result",
-    sessionReset: "ocuclaw.session.reset",
-    sessionSteer: "ocuclaw.session.steer",
-    sessionSwitch: "ocuclaw.session.switch",
-    sessionSwitchApplied: "ocuclaw.session.switch.applied",
-    sessionSwitchRejected: "ocuclaw.session.switch.rejected",
-    sessionTitleSet: "ocuclaw.session.title.set",
-    sonioxTemporaryKey: "sonioxTemporaryKey",
-    sonioxTemporaryKeyError: "sonioxTemporaryKeyError",
-    cartesiaAccessToken: "cartesiaAccessToken",
-    cartesiaAccessTokenError: "cartesiaAccessTokenError",
-    capabilitySnapshot: CAPABILITY_SNAPSHOT_TYPE,
-    pushMessage: PUSH_MESSAGE_TYPE,
-    status: "ocuclaw.runtime.status",
-    statusGet: "ocuclaw.runtime.status.get",
-    typingUpdate: "ocuclaw.typing.update",
-  };
-
-  function formatPages(pages, meta) {
-    const fallbackRevision = getSnapshotRevision
-      ? getSnapshotRevision("pages")
-      : null;
-    const revision = Number.isFinite(meta && meta.revision)
-      ? Math.floor(meta.revision)
-      : Number.isFinite(fallbackRevision)
-        ? Math.floor(fallbackRevision)
-        : null;
-    const assistantCommit = meta && meta.assistantCommit;
-    const normalizedAssistantCommit =
-      assistantCommit &&
-      Number.isFinite(assistantCommit.generation) &&
-      typeof assistantCommit.text === "string" &&
-      typeof assistantCommit.sessionKey === "string" &&
-      assistantCommit.sessionKey
-        ? {
-            generation: Math.floor(assistantCommit.generation),
-            text: assistantCommit.text,
-            sessionKey: assistantCommit.sessionKey,
-          }
-        : null;
-    const msg = {
-      type: APP_PROTOCOL.pages,
-      pages,
-      ...(meta && typeof meta.ledgerV1 === "boolean" ? { ledgerV1: meta.ledgerV1 } : {}),
-      ...(revision !== null ? { revision } : {}),
-      ...(normalizedAssistantCommit ? { assistantCommit: normalizedAssistantCommit } : {}),
-    };
-    return JSON.stringify(msg);
-  }
-
-  function formatEntries(snapshot = {}, sessionId = "") {
-    const value = snapshot && typeof snapshot === "object" ? snapshot : {};
-    const rawBaseSeq = value.baseSeq;
-    const rawLastSeq = value.lastSeq;
-    return JSON.stringify({
-      type: APP_PROTOCOL.entries,
-      sessionId: typeof sessionId === "string" ? sessionId : null,
-      entriesRevision: Number.isFinite(Number(value.entriesRevision))
-        ? Math.max(0, Math.floor(Number(value.entriesRevision)))
-        : 0,
-      baseSeq: rawBaseSeq !== null && rawBaseSeq !== undefined &&
-        Number.isFinite(Number(rawBaseSeq))
-        ? Math.max(0, Math.floor(Number(rawBaseSeq)))
-        : 0,
-      lastSeq: rawLastSeq !== null && rawLastSeq !== undefined &&
-        Number.isFinite(Number(rawLastSeq))
-        ? Math.floor(Number(rawLastSeq))
-        : -1,
-      complete: value.complete !== false,
-      entries: Array.isArray(value.entries) ? value.entries : [],
-    });
-  }
-
-  function formatStatus(status, meta) {
-    const msg = { ...status, type: APP_PROTOCOL.status };
-    const fallbackRevision = getSnapshotRevision
-      ? getSnapshotRevision("status")
-      : null;
-    const revision = Number.isFinite(meta && meta.revision)
-      ? Math.floor(meta.revision)
-      : Number.isFinite(fallbackRevision)
-        ? Math.floor(fallbackRevision)
-        : null;
-    if (revision !== null) {
-      msg.revision = revision;
-    }
-    return JSON.stringify(msg);
-  }
-
-  function formatActivity(activity) {
-    return JSON.stringify({ ...activity, type: APP_PROTOCOL.activity });
-  }
-
-  function formatThinkingUpdate(update) {
-    return JSON.stringify({ ...update, type: APP_PROTOCOL.thinkingUpdate });
-  }
-
-  function formatThinkingFinalize(update) {
-    return JSON.stringify({ ...update, type: APP_PROTOCOL.thinkingFinalize });
-  }
-
-  function formatTyping(update) {
-    return JSON.stringify({ ...update, type: APP_PROTOCOL.typingUpdate });
-  }
-
-  function formatError(error, meta) {
-    const msg = {
-      type: "error",
-      error: error || "Unknown error",
-    };
-    if (meta && typeof meta === "object" && !Array.isArray(meta)) {
-      if (typeof meta.code === "string" && meta.code.trim()) {
-        msg.code = meta.code.trim();
-      }
-      if (typeof meta.requestId === "string" && meta.requestId.trim()) {
-        msg.requestId = meta.requestId.trim();
-      }
-      if (typeof meta.op === "string" && meta.op.trim()) {
-        msg.op = meta.op.trim();
-      }
-    }
-    return JSON.stringify(msg);
-  }
+  const { formatPages, formatStatus } = createSnapshotFormatters({ getSnapshotRevision });
+  const { formatEvenAiSessions } = createEvenAiSessionsFormatter({ defaultEvenAiDedicatedSessionKey });
+  const { formatApproval } = createApprovalFormatter({ approvalPurposeEnabled });
+  const { formatHermesSttCapabilities } = createHermesSttCapabilitiesFormatter({ hermesSttUpload });
 
   function isExternalDebugToolMessageType(messageType) {
     return (
@@ -593,6 +331,7 @@ function createDownstreamHandler(opts) {
       messageType === "simulateActivity" ||
       messageType === "simulateTool" ||
       messageType === "simulateThinking" ||
+      messageType === "simulateRunSignal" ||
       messageType === "simulateApproval" ||
       messageType === "simulateDemand" ||
       messageType === "simulateVoice" ||
@@ -601,1402 +340,8 @@ function createDownstreamHandler(opts) {
     );
   }
 
-  function formatSendAckCompat(id, status, error, errorCode, data = undefined) {
-    return formatSendAck(id, status, error, errorCode, data);
-  }
-
-  function formatSessionAbortAck(data = {}) {
-    const msg = {
-      type: APP_PROTOCOL.sessionAbortAck,
-      requestId: parseOptionalTrimmedString(data.requestId),
-      status: data.status || "accepted",
-    };
-    if (data.sessionKey !== undefined) msg.sessionKey = data.sessionKey;
-    if (typeof data.aborted === "boolean") msg.aborted = data.aborted;
-    if (data.abortedRunId !== undefined) msg.abortedRunId = data.abortedRunId;
-    if (data.error !== undefined) msg.error = data.error;
-    if (data.errorCode !== undefined) msg.errorCode = data.errorCode;
-    return JSON.stringify(msg);
-  }
-
-  function formatOperationReceived(data) {
-    return formatMainOperationReceived(data);
-  }
-
-  function formatProtocol(direction, frame) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.protocolFrame,
-      direction,
-      frame: sanitizeProtocolFrame(frame),
-    });
-  }
-
-  function formatStreaming(text, emojiSpans, paceSpans, meta = {}) {
-    const payload = {
-      type: APP_PROTOCOL.messageStreamDelta,
-      text,
-    };
-    if (typeof meta.runId === "string" && meta.runId) payload.runId = meta.runId;
-    if (
-      meta.seq !== null &&
-      meta.seq !== undefined &&
-      Number.isFinite(Number(meta.seq))
-    ) {
-      payload.seq = Math.max(0, Math.floor(Number(meta.seq)));
-    }
-    if (
-      meta.messageIndex !== null &&
-      meta.messageIndex !== undefined &&
-      Number.isFinite(Number(meta.messageIndex))
-    ) {
-      payload.messageIndex = Math.max(0, Math.floor(Number(meta.messageIndex)));
-    }
-    if (Array.isArray(emojiSpans) && emojiSpans.length > 0) {
-      payload.emojiSpans = emojiSpans;
-    }
-    if (Array.isArray(paceSpans) && paceSpans.length > 0) {
-      payload.paceSpans = paceSpans;
-    }
-    return JSON.stringify(payload);
-  }
-
-  function formatStreamClear(options) {
-    const opts = options && typeof options === "object" ? options : {};
-    const runId =
-      typeof opts.runId === "string" && opts.runId.trim() ? opts.runId.trim() : null;
-    const sessionKey =
-      typeof opts.sessionKey === "string" && opts.sessionKey.trim()
-        ? opts.sessionKey.trim()
-        : null;
-    const reason =
-      typeof opts.reason === "string" && opts.reason.trim()
-        ? opts.reason.trim()
-        : "stream_withdrawn";
-    return JSON.stringify({
-      type: APP_PROTOCOL.messageStreamClear,
-      runId,
-      sessionKey,
-      reason,
-    });
-  }
-
-  function formatSessions(sessions) {
-    return JSON.stringify({ type: APP_PROTOCOL.sessionListResult, sessions });
-  }
-
-  function sessionInfoFingerprint(session) {
-    const row = session && typeof session === "object" ? session : {};
-    const raw = [
-      row.key || "",
-      Number.isFinite(Number(row.updatedAt)) ? String(Math.floor(Number(row.updatedAt))) : "0",
-      row.preview || "",
-      row.firstUserMessage || "",
-      row.title || "",
-      row.pinned === true ? "true" : "false",
-      Number.isFinite(Number(row.pinnedAtMs)) ? String(Math.floor(Number(row.pinnedAtMs))) : "",
-      row.agentId || "",
-      row.agentName || "",
-      row.status || "",
-      row.activityDescription || "",
-
-      row.unread === true ? "true" : row.unread === false ? "false" : "",
-      row.hidden === true ? "true" : row.hidden === false ? "false" : "",
-      ...(row.agentStatus ? [
-        row.agentStatus.working === true ? "true" : "false",
-        row.agentStatus.needsYou === true ? "true" : "false",
-        row.agentStatus.failed === true ? "true" : "false",
-        String(Math.floor(Number(row.agentStatus.observedAtMs) || 0)),
-        row.agentStatus.unknown === true ? "true" : "false",
-      ] : []),
-    ].join("\u001f");
-    return fnv1a32Hex(raw);
-  }
-
-  function fnv1a32Hex(text) {
-    let hash = 0x811c9dc5;
-    for (let i = 0; i < text.length; i += 1) {
-      hash ^= text.charCodeAt(i);
-      hash = Math.imul(hash, 0x01000193);
-    }
-    return (hash >>> 0).toString(16).padStart(8, "0");
-  }
-
-  function normalizeSessionDiffLimit(limit) {
-    if (!Number.isFinite(Number(limit)) || Number(limit) <= 0) return 80;
-    return Math.min(200, Math.max(1, Math.floor(Number(limit))));
-  }
-
-  function normalizeSessionDiffKind(kind) {
-    const normalized = String(kind || "").trim().toLowerCase();
-    if (!normalized) return "ocuclaw";
-    if (normalized === "ocuclaw" || normalized === "evenai") {
-      return normalized;
-    }
-    return null;
-  }
-
   function isRetiredEvenTerminalSessionKey(key) {
     return typeof key === "string" && key.trim().toLowerCase().startsWith("et:");
-  }
-
-  function parseKnownSessionRows(msg) {
-    if (!msg || !Array.isArray(msg.known)) return [];
-    const out = [];
-    for (const item of msg.known) {
-      if (!item || typeof item !== "object") continue;
-      const key = typeof item.key === "string" ? item.key.trim() : "";
-      if (!key) continue;
-      out.push({
-        key,
-        updatedAt: Number.isFinite(Number(item.updatedAt))
-          ? Math.floor(Number(item.updatedAt))
-          : 0,
-        fingerprint:
-          typeof item.fingerprint === "string" ? item.fingerprint.trim() : "",
-      });
-    }
-    return out;
-  }
-
-  function buildSessionDiff({ kind, sessions, known, limit, dedicatedKey }) {
-    const normalizedKind = normalizeSessionDiffKind(kind);
-    if (!normalizedKind) throw new Error("invalid_session_diff_kind");
-    const normalizedLimit = normalizeSessionDiffLimit(limit);
-    const rows = Array.isArray(sessions) ? sessions : [];
-    const limitedRows = rows
-      .slice()
-      .sort((left, right) => (Number(right && right.updatedAt) || 0) - (Number(left && left.updatedAt) || 0))
-      .slice(0, normalizedLimit);
-    const knownByKey = new Map();
-    for (const row of Array.isArray(known) ? known : []) {
-      const key = typeof row.key === "string" ? row.key.trim().toLowerCase() : "";
-      if (!key) continue;
-      knownByKey.set(key, row);
-    }
-    const liveKeys = new Set();
-    const changed = [];
-    for (const row of limitedRows) {
-      const key = typeof row.key === "string" ? row.key.trim().toLowerCase() : "";
-      if (!key) continue;
-      liveKeys.add(key);
-      const knownRow = knownByKey.get(key);
-      const updatedAt = Number.isFinite(Number(row.updatedAt))
-        ? Math.floor(Number(row.updatedAt))
-        : 0;
-      const fingerprint = sessionInfoFingerprint(row);
-      if (
-        !knownRow ||
-        knownRow.updatedAt !== updatedAt ||
-        knownRow.fingerprint !== fingerprint
-      ) {
-        changed.push(row);
-      }
-    }
-    const deletedKeys = [];
-    for (const row of Array.isArray(known) ? known : []) {
-      const rawKey = typeof row.key === "string" ? row.key.trim() : "";
-      const key = rawKey.toLowerCase();
-      if (key && !liveKeys.has(key)) deletedKeys.push(rawKey);
-    }
-    const out = {
-      type: APP_PROTOCOL.sessionListDiffResult,
-      kind: normalizedKind,
-      sessions: changed,
-      deletedKeys,
-      limit: normalizedLimit,
-    };
-    if (typeof dedicatedKey === "string" && dedicatedKey) {
-      out.dedicatedKey = dedicatedKey;
-    }
-    return out;
-  }
-
-  function formatSessionDiff(payload) {
-    return JSON.stringify(buildSessionDiff(payload || {}));
-  }
-
-  function formatEmptySessionDiff(kind, limit, dedicatedKey) {
-    const normalizedKind = normalizeSessionDiffKind(kind);
-    if (!normalizedKind) throw new Error("invalid_session_diff_kind");
-    const out = {
-      type: APP_PROTOCOL.sessionListDiffResult,
-      kind: normalizedKind,
-      sessions: [],
-      deletedKeys: [],
-      limit: normalizeSessionDiffLimit(limit),
-    };
-    if (typeof dedicatedKey === "string" && dedicatedKey) {
-      out.dedicatedKey = dedicatedKey;
-    }
-    return JSON.stringify(out);
-  }
-
-  function formatSessionSwitched(
-    sessionKey,
-    requestId = "",
-    draft = false,
-    agentFallback = "",
-  ) {
-    const droppedAgentRef = parseOptionalTrimmedString(agentFallback);
-    return JSON.stringify({
-      type: APP_PROTOCOL.sessionSwitchApplied,
-      sessionKey,
-      ...(draft === true ? { draft: true } : {}),
-
-      ...(droppedAgentRef ? { agentFallback: droppedAgentRef } : {}),
-      ...(parseOptionalTrimmedString(requestId)
-        ? { requestId: parseOptionalTrimmedString(requestId) }
-        : {}),
-    });
-  }
-
-  function formatSessionSwitchRejected(payload = {}) {
-    const reason = typeof payload.reason === "string" && payload.reason.trim()
-      ? payload.reason.trim()
-      : "unsupported_session_key";
-    const sessionKey = typeof payload.sessionKey === "string" ? payload.sessionKey : "";
-    const currentSessionKey = typeof payload.currentSessionKey === "string" && payload.currentSessionKey.trim()
-      ? payload.currentSessionKey.trim()
-      : null;
-    return JSON.stringify({
-      type: APP_PROTOCOL.sessionSwitchRejected,
-      sessionKey,
-      status: "rejected",
-      reason,
-      currentSessionKey,
-    });
-  }
-
-  function formatModelsCatalog(payload) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.modelCatalogSnapshot,
-      models: Array.isArray(payload && payload.models) ? payload.models : [],
-      fetchedAtMs:
-        Number.isFinite(payload && payload.fetchedAtMs)
-          ? Math.floor(payload.fetchedAtMs)
-          : 0,
-      stale: !!(payload && payload.stale),
-    });
-  }
-
-  function formatSkillsCatalog(payload) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.skillsCatalogSnapshot,
-      skills: Array.isArray(payload && payload.skills) ? payload.skills : [],
-      fetchedAtMs:
-        Number.isFinite(payload && payload.fetchedAtMs)
-          ? Math.floor(payload.fetchedAtMs)
-          : Date.now(),
-      stale: !!(payload && payload.stale),
-    });
-  }
-
-  function formatLiveuiLibrary(items) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.liveuiLibrarySnapshot,
-      items: Array.isArray(items) ? items : [],
-    });
-  }
-
-  function formatLiveuiLibraryOpenResult(payload = {}) {
-    const status = payload.status === "accepted" ? "accepted" : "rejected";
-    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
-    return JSON.stringify({
-      type: APP_PROTOCOL.liveuiLibraryOpenResult,
-      itemType: typeof payload.itemType === "string" ? payload.itemType : "",
-      itemId: typeof payload.itemId === "string" ? payload.itemId : "",
-      status,
-      ...(status === "rejected" && code ? { code } : {}),
-    });
-  }
-
-  function normalizeLiveuiTaskRunning(value) {
-    if (!value || typeof value !== "object") return null;
-    const runId = typeof value.runId === "string" ? value.runId : "";
-    if (!runId) return null;
-    return {
-      since: Number.isSafeInteger(value.since) ? value.since : 0,
-      executor: typeof value.executor === "string" ? value.executor : "",
-      runId,
-    };
-  }
-
-  function formatLiveuiTasks(payload = {}) {
-    const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
-    return JSON.stringify({
-      type: APP_PROTOCOL.liveuiTasksSnapshot,
-      tasks: tasks.map((task) =>
-        task && typeof task === "object"
-          ? { ...task, running: normalizeLiveuiTaskRunning(task.running) }
-          : task,
-      ),
-      templates: Array.isArray(payload.templates) ? payload.templates : [],
-      invalid: Array.isArray(payload.invalid) ? payload.invalid : [],
-      organization: payload.organization && typeof payload.organization === "object"
-        ? payload.organization
-        : { schemaVersion: 1, order: [], hidden: [], digest: "" },
-      ...(typeof payload.organizationInvalid === "string" && payload.organizationInvalid
-        ? { organizationInvalid: payload.organizationInvalid }
-        : {}),
-    });
-  }
-
-  function formatLiveuiTaskRuns(taskId, records) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.liveuiTaskRunsSnapshot,
-      taskId: typeof taskId === "string" ? taskId : "",
-      records: Array.isArray(records) ? records : [],
-    });
-  }
-
-  function formatLiveuiTaskReviewAck(payload = {}) {
-    const status = payload.status === "accepted" ? "accepted" : "rejected";
-    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
-    return JSON.stringify({
-      type: APP_PROTOCOL.liveuiTaskReviewAck,
-      taskId: typeof payload.taskId === "string" ? payload.taskId : "",
-      action: typeof payload.action === "string" ? payload.action : "",
-      status,
-      ...(status === "rejected" && code ? { code } : {}),
-      ...(status === "rejected" && typeof payload.message === "string" && payload.message
-        ? { message: payload.message }
-        : {}),
-      ...(payload.task && typeof payload.task === "object" ? { task: payload.task } : {}),
-    });
-  }
-
-  function formatLiveuiTaskExecutors(payload = {}) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.liveuiTaskExecutorsSnapshot,
-      thisHost: payload.thisHost === "hermes" ? "hermes" : "openclaw",
-      executors: Array.isArray(payload.executors) ? payload.executors : [],
-    });
-  }
-
-  function formatLiveuiTaskExecutorAck(payload = {}) {
-    const status = payload.status === "accepted" ? "accepted" : "rejected";
-    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
-    return JSON.stringify({
-      type: APP_PROTOCOL.liveuiTaskExecutorAck,
-      taskId: typeof payload.taskId === "string" ? payload.taskId : "",
-      status,
-      ...(status === "rejected" && code ? { code } : {}),
-    });
-  }
-
-  function formatLiveuiTaskPreferredTemplateAck(payload = {}) {
-    const status = payload.status === "accepted" ? "accepted" : "rejected";
-    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
-    return JSON.stringify({
-      type: APP_PROTOCOL.liveuiTaskPreferredTemplateAck,
-      taskId: typeof payload.taskId === "string" ? payload.taskId : "",
-      status,
-      ...(status === "rejected" && code ? { code } : {}),
-      ...(payload.task && typeof payload.task === "object" ? { task: payload.task } : {}),
-    });
-  }
-
-  function formatLiveuiTaskContextAck(payload = {}) {
-    const status = payload.status === "accepted" ? "accepted" : "rejected";
-    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
-    return JSON.stringify({
-      type: APP_PROTOCOL.liveuiTaskContextAck,
-      taskId: typeof payload.taskId === "string" ? payload.taskId : "",
-      status,
-      ...(status === "rejected" && code ? { code } : {}),
-    });
-  }
-
-  function formatLiveuiPrefs(payload = {}) {
-    const prefs = payload && typeof payload === "object" ? payload : {};
-    return JSON.stringify({
-      type: APP_PROTOCOL.liveuiPrefsSnapshot,
-      enabled: prefs.enabled !== false,
-      defaultContext: prefs.defaultContext === "current_session" ? "current_session" : "isolated",
-      defaultExecutor: typeof prefs.defaultExecutor === "string" && prefs.defaultExecutor
-        ? prefs.defaultExecutor
-        : null,
-      pauseApps: prefs.pauseApps === true,
-      ...(typeof prefs.prefsInvalid === "string" && prefs.prefsInvalid
-        ? { prefsInvalid: prefs.prefsInvalid }
-        : {}),
-    });
-  }
-
-  function formatLiveuiPrefsAck(payload = {}) {
-    const status = payload.status === "accepted" ? "accepted" : "rejected";
-    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
-    return JSON.stringify({
-      type: APP_PROTOCOL.liveuiPrefsAck,
-      status,
-      ...(status === "rejected" && code ? { code } : {}),
-    });
-  }
-
-  function formatLiveuiGrantsSnapshot(payload = {}) {
-    const snapshot = payload && typeof payload === "object" ? payload : {};
-    const rows = (value, project) =>
-      (Array.isArray(value) ? value : []).map((entry) => project(
-        entry && typeof entry === "object" ? entry : {},
-      ));
-    return JSON.stringify({
-      type: APP_PROTOCOL.liveuiGrantsSnapshot,
-      httpHostPolicy: snapshot.httpHostPolicy === "owner-grants"
-        ? "owner-grants"
-        : "operator-only",
-      digest: typeof snapshot.digest === "string" ? snapshot.digest : null,
-      ...(typeof snapshot.grantsInvalid === "string" && snapshot.grantsInvalid
-        ? { grantsInvalid: snapshot.grantsInvalid }
-        : {}),
-      pending: rows(snapshot.pending, (entry) => ({
-        host: typeof entry.host === "string" ? entry.host : "",
-        method: typeof entry.method === "string" ? entry.method : "",
-        hasHeaders: entry.hasHeaders === true,
-        hasBody: entry.hasBody === true,
-        punycode: entry.punycode === true,
-        unicodeHost: typeof entry.unicodeHost === "string" ? entry.unicodeHost : null,
-        requestedAt: typeof entry.requestedAt === "string" ? entry.requestedAt : "",
-      })),
-      granted: rows(snapshot.granted, (entry) => ({
-        host: typeof entry.host === "string" ? entry.host : "",
-        grantedAt: typeof entry.grantedAt === "string" ? entry.grantedAt : "",
-      })),
-      denied: rows(snapshot.denied, (entry) => ({
-        host: typeof entry.host === "string" ? entry.host : "",
-        deniedAt: typeof entry.deniedAt === "string" ? entry.deniedAt : "",
-      })),
-    });
-  }
-
-  function formatLiveuiGrantsAck(payload = {}) {
-    const status = payload.status === "accepted" ? "accepted" : "rejected";
-    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
-    return JSON.stringify({
-      type: APP_PROTOCOL.liveuiGrantsAck,
-      status,
-      action: typeof payload.action === "string" ? payload.action : "",
-      host: typeof payload.host === "string" ? payload.host : "",
-      ...(status === "rejected" && code ? { code } : {}),
-      ...(status === "accepted" && Array.isArray(payload.clearedSessionKeys)
-        ? { clearedSessionKeys: payload.clearedSessionKeys.filter(
-            (sessionKey) => typeof sessionKey === "string" && sessionKey,
-          ) }
-        : {}),
-    });
-  }
-
-  function formatLiveuiStatus(payload = {}) {
-    const status = payload && typeof payload === "object" ? payload : {};
-    const asInt = (value) => (Number.isFinite(value) ? Math.floor(value) : 0);
-    return JSON.stringify({
-      type: APP_PROTOCOL.liveuiStatusSnapshot,
-      host: status.host === "hermes" ? "hermes" : "openclaw",
-      refreshEnabled: status.refreshEnabled !== false,
-      httpEnabled: status.httpEnabled === true,
-      httpHostPolicy: status.httpHostPolicy === "owner-grants"
-        ? "owner-grants"
-        : "operator-only",
-      allowedDomains: asInt(status.allowedDomains),
-      ownerGrants: asInt(status.ownerGrants),
-      llmEnabled: status.llmEnabled === true,
-      allowAgentModelOverride: status.allowAgentModelOverride === true,
-      tickModel: typeof status.tickModel === "string" && status.tickModel ? status.tickModel : null,
-      tickBackend: typeof status.tickBackend === "string" && status.tickBackend ? status.tickBackend : null,
-      tickAuth: status.tickAuth === "missing_key" || status.tickAuth === "no_backend"
-        ? status.tickAuth
-        : "ok",
-      ...(typeof status.grantsInvalid === "string" && status.grantsInvalid
-        ? { grantsInvalid: status.grantsInvalid }
-        : {}),
-      surfaces: asInt(status.surfaces),
-      maxSurfaces: Number.isFinite(status.maxSurfaces) ? Math.floor(status.maxSurfaces) : 1,
-      stageGraceMs: asInt(status.stageGraceMs),
-      approvalHudSupported: status.approvalHudSupported !== false,
-    });
-  }
-
-  function formatLiveuiTaskSettingsAck(payload = {}) {
-    const status = payload.status === "accepted" ? "accepted" : "rejected";
-    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
-    return JSON.stringify({
-      type: APP_PROTOCOL.liveuiTaskSettingsAck,
-      taskId: typeof payload.taskId === "string" ? payload.taskId : "",
-      status,
-      ...(status === "rejected" && code ? { code } : {}),
-      ...(status === "rejected" && Array.isArray(payload.invalid)
-        ? { invalid: payload.invalid.map((entry) => ({
-            key: entry && typeof entry.key === "string" ? entry.key : "",
-            code: entry && typeof entry.code === "string" ? entry.code : "setting_value_invalid",
-          })) }
-        : {}),
-      ...(payload.task && typeof payload.task === "object" ? { task: payload.task } : {}),
-    });
-  }
-
-  function formatLiveuiLibraryOrganizeAck(payload = {}) {
-    const status = payload.status === "accepted" ? "accepted" : "rejected";
-    const code = typeof payload.code === "string" && payload.code ? payload.code : null;
-    const message = typeof payload.message === "string" && payload.message ? payload.message : null;
-    return JSON.stringify({
-      type: APP_PROTOCOL.liveuiLibraryOrganizeAck,
-      action: typeof payload.action === "string" ? payload.action : "",
-      status,
-      ...(status === "rejected" && code ? { code } : {}),
-      ...(status === "rejected" && message ? { message } : {}),
-      ...(status === "accepted" && Array.isArray(payload.clearedPreferredTemplateTaskIds)
-        ? { clearedPreferredTemplateTaskIds: payload.clearedPreferredTemplateTaskIds }
-        : {}),
-    });
-  }
-
-  function formatCommandCatalog(payload) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.commandCatalogSnapshot,
-      commands: Array.isArray(payload && payload.commands) ? payload.commands : [],
-      fetchedAtMs:
-        Number.isFinite(payload && payload.fetchedAtMs)
-          ? Math.floor(payload.fetchedAtMs)
-          : Date.now(),
-      stale: !!(payload && payload.stale),
-      unsupported: !!(payload && payload.unsupported),
-      backendKind:
-        typeof (payload && payload.backendKind) === "string" && payload.backendKind
-          ? payload.backendKind
-          : "none",
-      executes: (payload && payload.executes) === "all" ? "all" : "intercepted-only",
-    });
-  }
-
-  function formatAgentsCatalog(payload) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.agentsCatalogSnapshot,
-      agents: Array.isArray(payload && payload.agents) ? payload.agents : [],
-      ...(payload && payload.hermesFleet ? { hermesFleet: payload.hermesFleet } : {}),
-      defaultId:
-        payload && typeof payload.defaultId === "string"
-          ? payload.defaultId
-          : null,
-      mainKey:
-        payload && typeof payload.mainKey === "string" ? payload.mainKey : null,
-      scope:
-        payload && typeof payload.scope === "string" ? payload.scope : null,
-      fetchedAtMs:
-        Number.isFinite(payload && payload.fetchedAtMs)
-          ? Math.floor(payload.fetchedAtMs)
-          : Date.now(),
-      stale: !!(payload && payload.stale),
-      unsupported: !!(payload && payload.unsupported),
-
-      ...(Array.isArray(payload && payload.enrolled)
-        ? {
-            enrolled: payload.enrolled
-              .filter((name) => typeof name === "string" && name.trim())
-              .map((name) => name.trim()),
-          }
-        : {}),
-    });
-  }
-
-  function formatAgentCreateResult(type, requestId, payload = {}) {
-    const itemKey = type === APP_PROTOCOL.hermesProfileCreateResult ? "profile" : "agent";
-    const item = payload && payload[itemKey] && typeof payload[itemKey] === "object"
-      ? payload[itemKey]
-      : null;
-    return JSON.stringify({
-      type,
-      requestId,
-      status: ["created", "partial"].includes(payload?.status) ? payload.status : "error",
-      ...(item ? { [itemKey]: item } : {}),
-      ...(type === APP_PROTOCOL.hermesProfileCreateResult || payload?.restartRequired === true
-        ? { restartRequired: payload && payload.restartRequired === true }
-        : {}),
-      ...(payload && typeof payload.errorCode === "string" && payload.errorCode
-        ? { errorCode: payload.errorCode }
-        : {}),
-      ...(payload && typeof payload.errorMessage === "string" && payload.errorMessage
-        ? { errorMessage: payload.errorMessage }
-        : {}),
-    });
-  }
-
-  function formatAgentEmojiSetResult(requestId, payload = {}) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.agentEmojiSetResult,
-      requestId,
-      status: payload && payload.status === "updated" ? "updated" : "error",
-      ...(payload && typeof payload.backend === "string" ? { backend: payload.backend } : {}),
-      ...(payload && typeof payload.agentId === "string" ? { agentId: payload.agentId } : {}),
-      emoji: payload && typeof payload.emoji === "string" ? payload.emoji : null,
-      ...(payload && typeof payload.errorCode === "string" && payload.errorCode
-        ? { errorCode: payload.errorCode }
-        : {}),
-      ...(payload && typeof payload.errorMessage === "string" && payload.errorMessage
-        ? { errorMessage: payload.errorMessage }
-        : {}),
-    });
-  }
-
-  function formatAgentSettingsResult(requestId, payload = {}) {
-    const setup = payload && payload.setup && typeof payload.setup === "object"
-      ? payload.setup
-      : null;
-    return JSON.stringify({
-      type: APP_PROTOCOL.agentSettingsResult,
-      requestId,
-      status: ["loaded", "updated"].includes(payload?.status) ? payload.status : "error",
-      ...(payload && typeof payload.backend === "string" ? { backend: payload.backend } : {}),
-      ...(payload && typeof payload.agentId === "string" ? { agentId: payload.agentId } : {}),
-      ...(payload && typeof payload.name === "string" ? { name: payload.name } : {}),
-      emoji: payload && typeof payload.emoji === "string" ? payload.emoji : null,
-      ...(setup ? { setup } : {}),
-      restartRequired: payload?.restartRequired === true,
-      ...(payload && typeof payload.errorCode === "string" && payload.errorCode
-        ? { errorCode: payload.errorCode }
-        : {}),
-      ...(payload && typeof payload.errorMessage === "string" && payload.errorMessage
-        ? { errorMessage: payload.errorMessage }
-        : {}),
-    });
-  }
-
-  function formatSonioxModels(payload) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.sonioxModelsSnapshot,
-      models: Array.isArray(payload && payload.models) ? payload.models : [],
-      fetchedAtMs:
-        Number.isFinite(payload && payload.fetchedAtMs)
-          ? Math.floor(payload.fetchedAtMs)
-          : 0,
-      stale: !!(payload && payload.stale),
-    });
-  }
-
-  function formatHermesSttCapabilities(payload = {}) {
-    const status =
-      payload && typeof payload.status === "string" && payload.status
-        ? payload.status
-        : "offline";
-    const frame = {
-      type: APP_PROTOCOL.hermesSttCapabilitiesSnapshot,
-      requestId:
-        payload && typeof payload.requestId === "string" && payload.requestId
-          ? payload.requestId
-          : null,
-      status,
-
-      providers:
-        payload && Array.isArray(payload.providers) ? payload.providers : [],
-    };
-    if (status === "ok" && payload.uploadProtocolVersion === 1 && hermesSttUpload) {
-      frame.uploadProtocolVersion = 1;
-    }
-    if (status === "error") {
-      const error = payload && payload.error ? payload.error : {};
-      frame.error = {
-        code:
-          typeof error.code === "string" && error.code
-            ? error.code
-            : "link_rpc_failed",
-        message:
-          typeof error.message === "string" && error.message
-            ? error.message
-            : "stt capability listing failed",
-      };
-    }
-    return JSON.stringify(frame);
-  }
-
-  function formatHermesSttTranscribeResult(payload = {}) {
-    const success = !!(payload && payload.success === true);
-    const frame = {
-      type: APP_PROTOCOL.hermesSttTranscribeResult,
-      requestId:
-        payload && typeof payload.requestId === "string" && payload.requestId
-          ? payload.requestId
-          : null,
-      success,
-      provider:
-        payload && typeof payload.provider === "string" && payload.provider
-          ? payload.provider
-          : null,
-    };
-    if (success) {
-      frame.transcript =
-        payload && typeof payload.transcript === "string"
-          ? payload.transcript
-          : "";
-      return JSON.stringify(frame);
-    }
-    const error = payload && payload.error ? payload.error : {};
-    frame.error = {
-      code:
-        typeof error.code === "string" && error.code
-          ? error.code
-          : "link_rpc_failed",
-      message:
-        typeof error.message === "string" && error.message
-          ? error.message
-          : "transcription failed",
-    };
-    return JSON.stringify(frame);
-  }
-
-  function formatProviderUsageSnapshot(payload) {
-    const provider =
-      payload && typeof payload.provider === "string" && payload.provider.trim()
-        ? payload.provider.trim()
-        : null;
-    const windows = Array.isArray(payload && payload.windows)
-      ? payload.windows.map((window) => Number.isFinite(window && window.usedPercent) ? ({
-          key:
-            window && typeof window.key === "string" && window.key.trim()
-              ? window.key.trim()
-              : null,
-          label:
-            window && typeof window.label === "string" && window.label.trim()
-              ? window.label.trim()
-              : null,
-          usedPercent: window.usedPercent,
-          resetAtMs:
-            Number.isFinite(window && window.resetAtMs)
-              ? Math.floor(window.resetAtMs)
-              : null,
-          sortOrder:
-            Number.isFinite(window && window.sortOrder)
-              ? Math.floor(window.sortOrder)
-              : null,
-        }) : null).filter(Boolean)
-      : [];
-    return JSON.stringify({
-      type: APP_PROTOCOL.providerUsageSnapshot,
-      sessionKey:
-        payload && typeof payload.sessionKey === "string" && payload.sessionKey.trim()
-          ? payload.sessionKey.trim()
-          : null,
-      provider,
-      displayName:
-        payload && typeof payload.displayName === "string" && payload.displayName.trim()
-          ? payload.displayName.trim()
-          : provider,
-      limitingWindowKey:
-        payload &&
-        typeof payload.limitingWindowKey === "string" &&
-        payload.limitingWindowKey.trim()
-          ? payload.limitingWindowKey.trim()
-          : null,
-      windows,
-      fetchedAtMs:
-        Number.isFinite(payload && payload.fetchedAtMs)
-          ? Math.floor(payload.fetchedAtMs)
-          : Date.now(),
-      stale: !!(payload && payload.stale),
-      poolStatus:
-        payload && (payload.poolStatus === "ready" || payload.poolStatus === "exhausted")
-          ? payload.poolStatus
-          : "unknown",
-      totalProfileCount:
-        Number.isFinite(payload && payload.totalProfileCount) && payload.totalProfileCount >= 0
-          ? Math.floor(payload.totalProfileCount)
-          : null,
-      unavailableReason:
-        payload &&
-        typeof payload.unavailableReason === "string" &&
-        payload.unavailableReason.trim()
-          ? payload.unavailableReason.trim()
-          : null,
-    });
-  }
-
-  function formatCapabilitySnapshot(payload) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.capabilitySnapshot,
-      source:
-        payload && typeof payload.source === "string" && payload.source.trim()
-          ? payload.source.trim()
-          : "openclaw",
-      displayName:
-        payload && typeof payload.displayName === "string" && payload.displayName.trim()
-          ? payload.displayName.trim()
-          : null,
-      generatedAtMs:
-        Number.isFinite(payload && payload.generatedAtMs)
-          ? Math.floor(payload.generatedAtMs)
-          : Date.now(),
-      stale: !!(payload && payload.stale),
-      families:
-        payload && payload.families && typeof payload.families === "object"
-          ? payload.families
-          : {},
-      agentCatalog:
-        payload && Array.isArray(payload.agentCatalog)
-          ? payload.agentCatalog
-          : [],
-    });
-  }
-
-  function formatPushMessage(payload) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.pushMessage,
-      preview:
-        payload && typeof payload.preview === "string" ? payload.preview : "",
-      sessionRef:
-        payload && typeof payload.sessionRef === "string" ? payload.sessionRef : null,
-      sessionKey:
-        payload && typeof payload.sessionKey === "string" ? payload.sessionKey : null,
-      pushOrigin:
-        payload && typeof payload.pushOrigin === "string" ? payload.pushOrigin : "agent",
-      urgency:
-        payload && typeof payload.urgency === "string" ? payload.urgency : "normal",
-      generatedAtMs:
-        Number.isFinite(payload && payload.generatedAtMs)
-          ? Math.floor(payload.generatedAtMs)
-          : Date.now(),
-    });
-  }
-
-  function formatSessionModelConfig(payload) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.sessionConfigSnapshot,
-      effectiveThinkingLevel:
-        payload && typeof payload.effectiveThinkingLevel === "string"
-          ? payload.effectiveThinkingLevel
-          : "",
-      ...(typeof payload?.thinkingDefault === "string" ? { thinkingDefault: payload.thinkingDefault } : {}),
-      ...(Array.isArray(payload?.thinkingLevels) ? { thinkingLevels: payload.thinkingLevels } : {}),
-      sessionKey: (payload && payload.sessionKey) || "",
-      modelProvider:
-        payload && typeof payload.modelProvider === "string"
-          ? payload.modelProvider
-          : null,
-      model:
-        payload && typeof payload.model === "string" ? payload.model : null,
-      thinkingLevel:
-        payload && typeof payload.thinkingLevel === "string"
-          ? payload.thinkingLevel
-          : "",
-      reasoningLevel:
-        payload && typeof payload.reasoningLevel === "string"
-          ? payload.reasoningLevel
-          : "off",
-      verboseLevel:
-        payload && typeof payload.verboseLevel === "string"
-          ? payload.verboseLevel
-          : "off",
-      fastMode: !!(payload && payload.fastMode === true),
-      ...(typeof payload?.fastModeSupported === "boolean"
-        ? { fastModeSupported: payload.fastModeSupported }
-        : {}),
-      elevatedLevel:
-        payload && typeof payload.elevatedLevel === "string"
-          ? payload.elevatedLevel
-          : "off",
-      agentId:
-        payload && typeof payload.agentId === "string" ? payload.agentId : "",
-    });
-  }
-
-  function formatSessionModelConfigAck(payload) {
-    const out = {
-      type: APP_PROTOCOL.sessionConfigSetAck,
-      status:
-        payload && typeof payload.status === "string"
-          ? payload.status
-          : "rejected",
-      ...(payload && payload.error !== undefined ? { error: payload.error } : {}),
-      ...(payload &&
-      typeof payload.requestId === "string" &&
-      payload.requestId.trim()
-        ? { requestId: payload.requestId.trim() }
-        : {}),
-    };
-    return JSON.stringify(out);
-  }
-
-  function formatCompactSessionAck(payload) {
-    const msg = {
-      type: APP_PROTOCOL.sessionCompactAck,
-      status:
-        payload && payload.status === "accepted" ? "accepted" : "rejected",
-    };
-    if (payload && payload.requestId) {
-      msg.requestId = String(payload.requestId);
-    }
-    if (msg.status === "rejected") {
-      msg.error =
-        payload && payload.error
-          ? String(payload.error)
-          : "compact failed";
-    }
-    return JSON.stringify(msg);
-  }
-
-  function formatEvenAiSettings(payload) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.evenAiSettingsSnapshot,
-      routingMode: normalizeEvenAiRoutingMode(
-        payload && typeof payload.routingMode === "string"
-          ? payload.routingMode
-          : undefined,
-      ),
-      systemPrompt:
-        payload && typeof payload.systemPrompt === "string"
-          ? payload.systemPrompt
-          : "",
-      defaultModel:
-        payload && typeof payload.defaultModel === "string"
-          ? payload.defaultModel
-          : "",
-      defaultThinking:
-        payload && typeof payload.defaultThinking === "string"
-          ? payload.defaultThinking
-          : "",
-      listenEnabled: payload && payload.listenEnabled === true,
-      defaultFastMode: !!(payload && payload.defaultFastMode === true),
-      defaultAgent: normalizeEvenAiDefaultAgent(
-        payload && typeof payload.defaultAgent === "string"
-          ? payload.defaultAgent
-          : undefined,
-      ),
-    });
-  }
-
-  function formatEvenAiSettingsAck(payload) {
-    const out = {
-      type: APP_PROTOCOL.evenAiSettingsSetAck,
-      status:
-        payload && typeof payload.status === "string"
-          ? payload.status
-          : "rejected",
-    };
-    if (payload && payload.error !== undefined) {
-      out.error = payload.error;
-    }
-    return JSON.stringify(out);
-  }
-
-  function formatOcuClawEvenAiSnapshot(value) {
-    const normalized = normalizeOcuClawEvenAiSection(value);
-    return {
-      peer: {
-        url: normalized.peer.url,
-        bearerTokenConfigured: !!normalized.peer.bearerToken,
-        forwardSecretConfigured: !!normalized.peer.forwardSecret,
-      },
-    };
-  }
-
-  function formatOcuClawSettings(payload) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.ocuClawSettingsSnapshot,
-      systemPrompt: normalizeOcuClawSystemPrompt(
-        payload && typeof payload.systemPrompt === "string"
-          ? payload.systemPrompt
-          : undefined,
-      ),
-      defaultModel: normalizeOcuClawDefaultModel(
-        payload && typeof payload.defaultModel === "string"
-          ? payload.defaultModel
-          : undefined,
-      ),
-      defaultThinking: normalizeOcuClawDefaultThinking(
-        payload && typeof payload.defaultThinking === "string"
-          ? payload.defaultThinking
-          : undefined,
-      ),
-      defaultFastMode: !!(payload && payload.defaultFastMode === true),
-      defaultAgent: normalizeOcuClawDefaultAgent(
-        payload && typeof payload.defaultAgent === "string"
-          ? payload.defaultAgent
-          : undefined,
-      ),
-      agentProgressNotes: normalizeOcuClawAgentProgressNotes(
-        payload && typeof payload.agentProgressNotes === "string"
-          ? payload.agentProgressNotes
-          : undefined,
-      ),
-      conversationToolProgress: !!(
-        payload && payload.conversationToolProgress === true
-      ),
-      pathways: normalizeOcuClawPathways(payload && payload.pathways),
-      evenAi: formatOcuClawEvenAiSnapshot(payload && payload.evenAi),
-    });
-  }
-
-  function formatSavedPromptRow(prompt) {
-    const source = prompt && typeof prompt === "object" ? prompt : {};
-    const rawRouting =
-      source.routing && typeof source.routing === "object" ? source.routing : {};
-    const routing = { target: rawRouting.target === "new" ? "new" : "current" };
-    for (const key of ["agentId", "modelId", "thinking"]) {
-      if (typeof rawRouting[key] === "string" && rawRouting[key]) {
-        routing[key] = rawRouting[key];
-      }
-    }
-    return {
-      id: typeof source.id === "string" ? source.id : "",
-      name: typeof source.name === "string" ? source.name : "",
-      body: typeof source.body === "string" ? source.body : "",
-      order: Number.isFinite(source.order) ? source.order : 0,
-      routing,
-      updatedAtMs: Number.isFinite(source.updatedAtMs) ? source.updatedAtMs : 0,
-    };
-  }
-
-  function savedPromptsBody(payload) {
-    const source = payload && typeof payload === "object" ? payload : {};
-    const prompts = Array.isArray(source.prompts) ? source.prompts : [];
-    return {
-      hostId: typeof source.hostId === "string" ? source.hostId : "",
-      cap: Number.isFinite(source.cap) ? source.cap : 0,
-      count: Number.isFinite(source.count) ? source.count : prompts.length,
-      orderUpdatedAtMs: Number.isFinite(source.orderUpdatedAtMs) ? source.orderUpdatedAtMs : 0,
-      prompts: prompts.map(formatSavedPromptRow),
-    };
-  }
-
-  function formatSavedPrompts(payload) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.savedPromptsSnapshot,
-      ...savedPromptsBody(payload),
-    });
-  }
-
-  function formatSavedPromptsAck(payload) {
-    const source = payload && typeof payload === "object" ? payload : {};
-    const out = {
-      type: APP_PROTOCOL.savedPromptsWriteAck,
-      status: source.status === "accepted" ? "accepted" : "rejected",
-    };
-
-    if (typeof source.hostId === "string" && source.hostId) {
-      Object.assign(out, savedPromptsBody(source));
-    }
-    if (out.status !== "accepted") {
-      out.reason = typeof source.reason === "string" && source.reason
-        ? source.reason
-        : "rejected";
-    }
-
-    if (typeof source.requestId === "string" && source.requestId) {
-      out.requestId = source.requestId;
-    }
-    return JSON.stringify(out);
-  }
-
-  function formatOcuClawSettingsAck(payload) {
-    const out = {
-      type: APP_PROTOCOL.ocuClawSettingsSetAck,
-      status:
-        payload && typeof payload.status === "string"
-          ? payload.status
-          : "rejected",
-    };
-    if (payload && payload.error !== undefined) {
-      out.error = payload.error;
-    }
-    if (payload && typeof payload.confirmationTitle === "string") {
-      Reflect.set(out, "confirmationTitle", payload.confirmationTitle);
-    }
-    if (payload && typeof payload.confirmationMessage === "string") {
-      Reflect.set(out, "confirmationMessage", payload.confirmationMessage);
-    }
-    return JSON.stringify(out);
-  }
-
-  function formatEvenAiSessions(payload) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.evenAiSessionListResult,
-      sessions: Array.isArray(payload && payload.sessions) ? payload.sessions : [],
-      dedicatedKey:
-        payload && typeof payload.dedicatedKey === "string"
-          ? payload.dedicatedKey
-          : defaultEvenAiDedicatedSessionKey,
-    });
-  }
-
-  function formatApproval(data) {
-    const request = data && data.request ? data.request : {};
-    const approvalKind =
-      (data && data.approvalKind === "plugin") ||
-      (data && typeof data.id === "string" && data.id.startsWith("plugin:")) ||
-      (typeof request.title === "string" && request.title.length > 0)
-        ? "plugin"
-        : "exec";
-    const isPluginApproval = approvalKind === "plugin";
-    const decodeText =
-      isPluginApproval && isChatEscapedApprovalRequest(request)
-        ? decodeChatEscapedText
-        : (value) => value;
-    const commandText = decodeText(
-      request.command ||
-      (request.host === "node" && request.systemRunPlan && typeof request.systemRunPlan.commandText === "string"
-        ? request.systemRunPlan.commandText
-        : "") ||
-      (isPluginApproval && typeof request.title === "string" ? request.title : "") ||
-      "",
-    );
-    const pluginDescription =
-      isPluginApproval && typeof request.description === "string" && request.description.length > 0
-        ? decodeText(request.description)
-        : null;
-    return JSON.stringify({
-      type: APP_PROTOCOL.approvalRequest,
-      id: data.id,
-      ...(isPluginApproval ? { approvalKind: "plugin" } : {}),
-      requestId:
-        (data && typeof data.requestId === "string" && data.requestId) ||
-        (request && typeof request.requestId === "string" && request.requestId) ||
-        null,
-      command: commandText,
-      cwd: request.cwd || pluginDescription || null,
-      agentId: request.agentId || null,
-      host: request.host || (isPluginApproval ? "plugin" : null),
-      security: request.security || (isPluginApproval && typeof request.severity === "string" ? request.severity : null),
-      ask: request.ask || null,
-      resolvedPath: request.resolvedPath || null,
-      sessionKey: request.sessionKey || null,
-      ...(isPluginApproval
-        ? {
-            pluginId: typeof request.pluginId === "string" ? request.pluginId : null,
-            toolName: typeof request.toolName === "string" ? request.toolName : null,
-            description: pluginDescription,
-          }
-        : {}),
-      createdAtMs: data.createdAtMs || 0,
-
-      expiresAtMs:
-        typeof data.expiresAtMs === "number" &&
-        Number.isFinite(data.expiresAtMs) &&
-        data.expiresAtMs > 0
-          ? data.expiresAtMs
-          : 0,
-      allowedDecisions: Array.isArray(request.allowedDecisions)
-        ? request.allowedDecisions.filter((d) => typeof d === "string")
-        : null,
-    });
-  }
-
-  function formatApprovalResolved(data) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.approvalResolved,
-      id: data.id,
-      requestId:
-        data && typeof data.requestId === "string" && data.requestId
-          ? data.requestId
-          : null,
-      decision: data.decision || null,
-    });
-  }
-
-  function formatApprovalResponseAck(data) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.approvalResolveAck,
-      id: data && data.id ? data.id : null,
-      decision: data && data.decision ? data.decision : null,
-      requestId:
-        data && data.requestId !== undefined && data.requestId !== null
-          ? data.requestId
-          : null,
-      status:
-        data && typeof data.status === "string" && data.status
-          ? data.status
-          : "rejected",
-      code:
-        data && typeof data.code === "string" && data.code
-          ? data.code
-          : null,
-      message:
-        data && typeof data.message === "string" && data.message
-          ? data.message
-          : null,
-      idempotent:
-        data && data.idempotent !== undefined
-          ? !!data.idempotent
-          : false,
-    });
-  }
-
-  function formatTranscription(text, isFinal) {
-    return JSON.stringify({
-      type: "transcription",
-      text,
-      final: !!isFinal,
-    });
-  }
-
-  function formatListenCommitted(text, source, sessionKey) {
-    return JSON.stringify({
-      type: "listen-committed",
-      text,
-      source,
-      sessionKey: sessionKey || null,
-    });
-  }
-
-  function formatEvenAiListenIntercepted(sessionKey) {
-    return JSON.stringify({
-      type: "even-ai-listen-intercepted",
-      sessionKey: sessionKey ?? null,
-    });
-  }
-
-  function formatListenEnded() {
-    return JSON.stringify({ type: "listen-ended" });
-  }
-
-  function formatListenError(error, code = null) {
-    const msg = { type: "listen-error", error };
-    if (typeof code === "string" && code.trim()) {
-      msg.code = code.trim();
-    }
-    return JSON.stringify(msg);
-  }
-
-  function formatListenReady() {
-    return JSON.stringify({ type: "listen-ready" });
-  }
-
-  function formatScriptedListenReady(sessionKey = null) {
-    return JSON.stringify({
-      type: "scripted-listen-ready",
-      sessionKey: sessionKey || null,
-    });
-  }
-
-  function formatSonioxTemporaryKey(payload) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.sonioxTemporaryKey,
-      voiceSessionId:
-        payload && typeof payload.voiceSessionId === "string"
-          ? payload.voiceSessionId
-          : "",
-      temporaryKey:
-        payload && typeof payload.temporaryKey === "string"
-          ? payload.temporaryKey
-          : "",
-      expiresAtMs:
-        payload && Number.isFinite(payload.expiresAtMs)
-          ? Math.floor(payload.expiresAtMs)
-          : 0,
-    });
-  }
-
-  function formatSonioxTemporaryKeyError(payload) {
-    const msg = {
-      type: APP_PROTOCOL.sonioxTemporaryKeyError,
-      voiceSessionId:
-        payload && typeof payload.voiceSessionId === "string"
-          ? payload.voiceSessionId
-          : "",
-      error:
-        payload && typeof payload.error === "string" && payload.error.trim()
-          ? payload.error.trim()
-          : "Soniox temporary-key request failed",
-    };
-    const code =
-      payload && typeof payload.code === "string" && payload.code.trim()
-        ? payload.code.trim()
-        : "";
-    if (code) {
-      msg.code = code;
-    }
-    return JSON.stringify(msg);
-  }
-
-  function parseRequestCartesiaAccessToken(msg) {
-    if (!msg || typeof msg !== "object") {
-      throw new Error("requestCartesiaAccessToken payload must be an object");
-    }
-
-    const voiceSessionId = parseOptionalTrimmedString(msg.voiceSessionId);
-    if (!voiceSessionId) {
-      throw new Error("voiceSessionId is required");
-    }
-
-    return {
-      voiceSessionId,
-      sessionKey: parseOptionalTrimmedString(msg.sessionKey),
-    };
-  }
-
-  function normalizeCartesiaAccessTokenErrorCode(err) {
-
-    const explicit = err && typeof err.code === "string" ? err.code.trim() : "";
-    if (explicit) return explicit;
-
-    const message =
-      err && typeof err.message === "string" && err.message.trim()
-        ? err.message.trim()
-        : "";
-    const lowered = message.toLowerCase();
-    if (!message) return "cartesia_access_token_failed";
-
-    if (err && err.name === "AbortError") {
-      return "cartesia_access_token_mint_timeout";
-    }
-    if (lowered.includes("api key is not configured")) {
-      return "cartesia_access_token_not_configured";
-    }
-    if (lowered.includes("fetch is not available")) {
-      return "cartesia_access_token_fetch_unavailable";
-    }
-    if (lowered.includes("voicesessionid is required")) {
-      return "cartesia_access_token_invalid_request";
-    }
-    if (lowered.includes("missing token")) {
-      return "cartesia_access_token_invalid_response";
-    }
-    const statusMatch = lowered.match(/\((\d{3})\)/);
-    if (statusMatch) {
-      return `cartesia_access_token_http_${statusMatch[1]}`;
-    }
-    return "cartesia_access_token_failed";
-  }
-
-  function formatCartesiaAccessToken(payload) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.cartesiaAccessToken,
-      voiceSessionId:
-        payload && typeof payload.voiceSessionId === "string" ? payload.voiceSessionId : "",
-      accessToken:
-        payload && typeof payload.accessToken === "string" ? payload.accessToken : "",
-      expiresAtMs:
-        payload && Number.isFinite(payload.expiresAtMs) ? Math.floor(payload.expiresAtMs) : 0,
-    });
-  }
-
-  function formatCartesiaAccessTokenError(payload) {
-    const msg = {
-      type: APP_PROTOCOL.cartesiaAccessTokenError,
-      voiceSessionId:
-        payload && typeof payload.voiceSessionId === "string" ? payload.voiceSessionId : "",
-      error:
-        payload && typeof payload.error === "string" && payload.error.trim()
-          ? payload.error.trim()
-          : "Cartesia access-token request failed",
-    };
-    const code =
-      payload && typeof payload.code === "string" && payload.code.trim()
-        ? payload.code.trim()
-        : "";
-    if (code) {
-      msg.code = code;
-    }
-    return JSON.stringify(msg);
-  }
-
-  function formatDebugSet(data) {
-    return JSON.stringify({
-      type: "debug-set",
-      ...data,
-    });
-  }
-
-  function formatDebugDump(data) {
-    return JSON.stringify({
-      type: "debug-dump",
-      ...data,
-    });
   }
 
   function parseTraceLogSet(msg) {
@@ -2007,160 +352,6 @@ function createDownstreamHandler(opts) {
       throw new Error("trace-log-set requires boolean 'enabled'");
     }
     return { enabled: msg.enabled };
-  }
-
-  function formatTraceLog(data) {
-    return JSON.stringify({ type: "trace-log", ...data });
-  }
-
-  function formatDebugConfigSnapshot(data) {
-    const enabled = Array.isArray(data && data.enabled)
-      ? data.enabled
-          .filter(
-            (entry) =>
-              entry &&
-              typeof entry.cat === "string" &&
-              entry.cat.trim() &&
-              Number.isFinite(Number(entry.expiresAtMs)),
-          )
-          .map((entry) => ({
-            cat: entry.cat.trim(),
-            expiresAtMs: Math.floor(Number(entry.expiresAtMs)),
-          }))
-      : [];
-    return JSON.stringify({
-      type: APP_PROTOCOL.debugConfigSnapshot,
-      serverNowMs:
-        Number.isFinite(data && data.serverNowMs)
-          ? Math.floor(data.serverNowMs)
-          : 0,
-      enabled,
-    });
-  }
-
-  function formatRemoteControl(data) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.remoteControl,
-      ...data,
-    });
-  }
-
-  function formatRemoteControlAck(data) {
-    return JSON.stringify({
-      type: "remote-control-ack",
-      ...data,
-    });
-  }
-
-  function formatAutomationStateRequest(data) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.automationStateGet,
-      requestId:
-        data && typeof data.requestId === "string" && data.requestId
-          ? data.requestId
-          : null,
-      sessionKey:
-        data && typeof data.sessionKey === "string" && data.sessionKey
-          ? data.sessionKey
-          : null,
-    });
-  }
-
-  function formatAutomationRegistryRequest() {
-    return JSON.stringify({
-      type: APP_PROTOCOL.automationRegistryGet,
-    });
-  }
-
-  function formatAutomationStateSnapshot(data) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.automationStateSnapshot,
-      ok: data && data.ok !== false,
-      requestId:
-        data && typeof data.requestId === "string" && data.requestId
-          ? data.requestId
-          : null,
-      state:
-        data && data.state && typeof data.state === "object" ? data.state : null,
-      reasonCode:
-        data && typeof data.reasonCode === "string" && data.reasonCode
-          ? data.reasonCode
-          : null,
-      message:
-        data && typeof data.message === "string" && data.message
-          ? data.message
-          : null,
-    });
-  }
-
-  function formatAutomationRegistry(data) {
-
-    const schemaVersion =
-      data && Number.isInteger(data.schemaVersion) && data.schemaVersion >= 1
-        ? data.schemaVersion
-        : 1;
-    return JSON.stringify({
-      type: APP_PROTOCOL.automationRegistry,
-      schemaVersion,
-      entries: data && Array.isArray(data.entries) ? data.entries : [],
-    });
-  }
-
-  function formatReadinessProbeRequest(data) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.readinessProbeRequest,
-      requestId:
-        data && typeof data.requestId === "string" && data.requestId
-          ? data.requestId
-          : null,
-      sinceMs:
-        data && Number.isFinite(Number(data.sinceMs))
-          ? Math.max(0, Math.floor(Number(data.sinceMs)))
-          : 0,
-      sessionKey:
-        data && typeof data.sessionKey === "string" && data.sessionKey
-          ? data.sessionKey
-          : null,
-    });
-  }
-
-  function formatReadinessProbeAck(data) {
-    return JSON.stringify({
-      type: APP_PROTOCOL.readinessProbeAck,
-      ok: data && data.ok !== false,
-      requestId:
-        data && typeof data.requestId === "string" && data.requestId
-          ? data.requestId
-          : null,
-      reasonCode:
-        data && typeof data.reasonCode === "string" && data.reasonCode
-          ? data.reasonCode
-          : null,
-      message:
-        data && typeof data.message === "string" && data.message
-          ? data.message
-          : null,
-      activeSessionKey:
-        data && typeof data.activeSessionKey === "string" && data.activeSessionKey
-          ? data.activeSessionKey
-          : null,
-      emittedAtMs:
-        data && Number.isFinite(Number(data.emittedAtMs))
-          ? Math.max(0, Math.floor(Number(data.emittedAtMs)))
-          : null,
-      clientId:
-        data && typeof data.clientId === "string" && data.clientId
-          ? data.clientId
-          : null,
-      clientName:
-        data && typeof data.clientName === "string" && data.clientName
-          ? data.clientName
-          : null,
-      clientVersion:
-        data && typeof data.clientVersion === "string" && data.clientVersion
-          ? data.clientVersion
-          : null,
-    });
   }
 
   function normalizeCategories(raw, fieldName) {
@@ -2245,738 +436,6 @@ function createDownstreamHandler(opts) {
     };
   }
 
-  function normalizeRemoteButton(raw) {
-    if (typeof raw !== "string" || !raw.trim()) {
-      throw new Error("remote-control button is required");
-    }
-    const normalized = raw.trim().toLowerCase();
-    if (
-      normalized === "click" ||
-      normalized === "tap" ||
-      normalized === "double-click" ||
-      normalized === "double_click" ||
-      normalized === "doubleclick" ||
-      normalized === "double-tap" ||
-      normalized === "double_tap" ||
-      normalized === "doubletap" ||
-
-      normalized === "double-click-left" ||
-      normalized === "double_click_left" ||
-      normalized === "doubleclickleft" ||
-      normalized === "double-tap-left" ||
-      normalized === "double_tap_left" ||
-      normalized === "doubletapleft" ||
-      normalized === "double-click-right" ||
-      normalized === "double_click_right" ||
-      normalized === "doubleclickright" ||
-      normalized === "double-tap-right" ||
-      normalized === "double_tap_right" ||
-      normalized === "doubletapright" ||
-      normalized === "long-press" ||
-      normalized === "long_press" ||
-      normalized === "longpress" ||
-      normalized === "long-press-release" ||
-      normalized === "long_press_release" ||
-      normalized === "longpressrelease" ||
-      normalized === "scroll-up" ||
-      normalized === "scroll_up" ||
-      normalized === "scrollup" ||
-      normalized === "up" ||
-      normalized === "scroll-down" ||
-      normalized === "scroll_down" ||
-      normalized === "scrolldown" ||
-      normalized === "down"
-    ) {
-      if (normalized === "tap") return "click";
-      if (
-        normalized === "double_click" ||
-        normalized === "doubleclick" ||
-        normalized === "double-tap" ||
-        normalized === "double_tap" ||
-        normalized === "doubletap"
-      ) {
-        return "double-click";
-      }
-      if (
-        normalized === "double_click_left" ||
-        normalized === "doubleclickleft" ||
-        normalized === "double-tap-left" ||
-        normalized === "double_tap_left" ||
-        normalized === "doubletapleft"
-      ) {
-        return "double-click-left";
-      }
-      if (
-        normalized === "double_click_right" ||
-        normalized === "doubleclickright" ||
-        normalized === "double-tap-right" ||
-        normalized === "double_tap_right" ||
-        normalized === "doubletapright"
-      ) {
-        return "double-click-right";
-      }
-      if (normalized === "long_press" || normalized === "longpress") {
-        return "long-press";
-      }
-      if (
-        normalized === "long_press_release" ||
-        normalized === "longpressrelease"
-      ) {
-        return "long-press-release";
-      }
-      if (normalized === "scroll_up" || normalized === "scrollup" || normalized === "up") {
-        return "scroll-up";
-      }
-      if (normalized === "scroll_down" || normalized === "scrolldown" || normalized === "down") {
-        return "scroll-down";
-      }
-      return normalized;
-    }
-    throw new Error(`unsupported remote-control button: ${raw}`);
-  }
-
-  function normalizeRemoteRelayAction(raw) {
-    if (typeof raw !== "string" || !raw.trim()) {
-      throw new Error("remote-control relayAction is required");
-    }
-    const normalized = raw.trim().toLowerCase();
-    if (
-      normalized === "perf-conversation-upgrade-probe" ||
-      normalized === "perf_conversation_upgrade_probe" ||
-      normalized === "perfconversationupgradeprobe" ||
-      normalized === "conversation-upgrade-probe" ||
-      normalized === "conversation_upgrade_probe" ||
-      normalized === "conversationupgradeprobe"
-    ) {
-      return "perf-conversation-upgrade-probe";
-    }
-    if (
-      normalized === "new-session" ||
-      normalized === "new_session" ||
-      normalized === "newsession"
-    ) {
-      return "new-session";
-    }
-    if (
-      normalized === "get-sessions" ||
-      normalized === "get_sessions" ||
-      normalized === "getsessions" ||
-      normalized === "sessions"
-    ) {
-      return "get-sessions";
-    }
-    if (
-      normalized === "switch-session" ||
-      normalized === "switch_session" ||
-      normalized === "switchsession"
-    ) {
-      return "switch-session";
-    }
-    if (normalized === "new-chat" || normalized === "new_chat" || normalized === "newchat") {
-      return "new-chat";
-    }
-    if (
-      normalized === "slash-command" ||
-      normalized === "slash_command" ||
-      normalized === "slash"
-    ) {
-      return "slash-command";
-    }
-    if (
-      normalized === "listen-start" ||
-      normalized === "listen_start" ||
-      normalized === "listenstart"
-    ) {
-      return "listen-start";
-    }
-    if (
-      normalized === "listen-stop" ||
-      normalized === "listen_stop" ||
-      normalized === "listenstop"
-    ) {
-      return "listen-stop";
-    }
-    if (
-      normalized === "listen-send" ||
-      normalized === "listen_send" ||
-      normalized === "listensend"
-    ) {
-      return "listen-send";
-    }
-    if (
-      normalized === "listen-retry" ||
-      normalized === "listen_retry" ||
-      normalized === "listenretry"
-    ) {
-      return "listen-retry";
-    }
-    if (
-      normalized === "ptt-confirm" ||
-      normalized === "ptt_confirm" ||
-      normalized === "pttconfirm"
-    ) {
-      return "ptt-confirm";
-    }
-    if (
-      normalized === "ptt-redo" ||
-      normalized === "ptt_redo" ||
-      normalized === "pttredo"
-    ) {
-      return "ptt-redo";
-    }
-    if (
-      normalized === "ptt-cancel" ||
-      normalized === "ptt_cancel" ||
-      normalized === "pttcancel"
-    ) {
-      return "ptt-cancel";
-    }
-    if (
-      normalized === "ptt-partial" ||
-      normalized === "ptt_partial" ||
-      normalized === "pttpartial"
-    ) {
-      return "ptt-partial";
-    }
-    if (normalized === "ptt-lab-confirmed-partial") {
-      return "ptt-lab-confirmed-partial";
-    }
-    if (["ptt-lab-hermes-start", "ptt-lab-pcm", "voice-lab-endpoint"].includes(normalized)) return normalized;
-    const tapLabAction = normalized.replace(/_/g, "-");
-    if (["ptt-lab-tap-start", "ptt-lab-tap-stop", "ptt-lab-endpoint", "ptt-lab-final"].includes(tapLabAction)) return tapLabAction;
-    if (
-      normalized === "ptt-lab-start" ||
-      normalized === "ptt_lab_start" ||
-      normalized === "pttlabstart"
-    ) {
-      return "ptt-lab-start";
-    }
-    if (
-      normalized === "ptt-lab-commit" ||
-      normalized === "ptt_lab_commit" ||
-      normalized === "pttlabcommit"
-    ) {
-      return "ptt-lab-commit";
-    }
-    if (
-      normalized === "ptt-lab-release" ||
-      normalized === "ptt_lab_release" ||
-      normalized === "pttlabrelease"
-    ) {
-      return "ptt-lab-release";
-    }
-    if (
-      normalized === "perf-reset-ladder" ||
-      normalized === "perf_reset_ladder" ||
-      normalized === "perfresetladder" ||
-      normalized === "reset-ladder" ||
-      normalized === "reset_ladder" ||
-      normalized === "resetladder"
-    ) {
-      return "perf-reset-ladder";
-    }
-    if (
-      normalized === "perf-relay-reconnect-only" ||
-      normalized === "perf_relay_reconnect_only" ||
-      normalized === "perfrelayreconnectonly" ||
-      normalized === "relay-reconnect-only" ||
-      normalized === "relay_reconnect_only" ||
-      normalized === "relayreconnectonly"
-    ) {
-      return "perf-relay-reconnect-only";
-    }
-    if (
-      normalized === "perf-sdk-page-recreate-only" ||
-      normalized === "perf_sdk_page_recreate_only" ||
-      normalized === "perfsdkpagerecreateonly" ||
-      normalized === "sdk-page-recreate-only" ||
-      normalized === "sdk_page_recreate_only" ||
-      normalized === "sdkpagerecreateonly"
-    ) {
-      return "perf-sdk-page-recreate-only";
-    }
-    if (
-      normalized === "perf-config" ||
-      normalized === "perf_config" ||
-      normalized === "perfconfig" ||
-      normalized === "perf-drift-config" ||
-      normalized === "perf_drift_config" ||
-      normalized === "perfdriftconfig"
-    ) {
-      return "perf-config";
-    }
-    if (
-      normalized === "waveform-demo" ||
-      normalized === "waveform_demo" ||
-      normalized === "waveformdemo"
-    ) {
-      return "waveform-demo";
-    }
-    if (
-      normalized === "debug-close-app-client" ||
-      normalized === "debug_close_app_client" ||
-      normalized === "debugcloseappclient" ||
-      normalized === "close-app-client" ||
-      normalized === "close_app_client" ||
-      normalized === "closeappclient"
-    ) {
-      return "debug-close-app-client";
-    }
-    throw new Error(`unsupported remote relayAction: ${raw}`);
-  }
-
-  function parseOptionalTrimmedString(raw) {
-    if (typeof raw !== "string") return null;
-    const trimmed = raw.trim();
-    return trimmed || null;
-  }
-
-  function parseOptionalInteger(raw) {
-    if (raw === null || raw === undefined) return null;
-    if (typeof raw === "string" && raw.trim() === "") return null;
-    return Number.isFinite(Number(raw)) ? Math.floor(Number(raw)) : null;
-  }
-
-  function parseOptionalBoolean(raw, fieldName) {
-    if (raw === undefined || raw === null) return undefined;
-    if (typeof raw === "boolean") return raw;
-    if (typeof raw === "number") return raw !== 0;
-    if (typeof raw !== "string") {
-      throw new Error(`${fieldName} must be a boolean`);
-    }
-    const normalized = raw.trim().toLowerCase();
-    if (["true", "1", "yes", "y", "on"].includes(normalized)) return true;
-    if (["false", "0", "no", "n", "off"].includes(normalized)) return false;
-    throw new Error(`${fieldName} must be a boolean`);
-  }
-
-  function parseOptionalPositiveNumber(raw, fieldName) {
-    if (raw === undefined || raw === null) return undefined;
-    const num = Number(raw);
-    if (!Number.isFinite(num) || num <= 0) {
-      throw new Error(`${fieldName} must be a positive number`);
-    }
-    return Math.floor(num);
-  }
-
-  function parseOptionalNonNegativeNumber(raw, fieldName) {
-    if (raw === undefined || raw === null) return undefined;
-    const num = Number(raw);
-    if (!Number.isFinite(num) || num < 0) {
-      throw new Error(`${fieldName} must be a non-negative number`);
-    }
-    return Math.floor(num);
-  }
-
-  function parseOptionalStringArray(raw, fieldName) {
-    if (raw === undefined || raw === null) return undefined;
-    if (!Array.isArray(raw)) {
-      throw new Error(`${fieldName} must be an array of strings`);
-    }
-    const values = [];
-    for (const entry of raw) {
-      if (typeof entry !== "string") {
-        throw new Error(`${fieldName} must be an array of strings`);
-      }
-      const trimmed = entry.trim();
-      if (trimmed) values.push(trimmed);
-    }
-    return values;
-  }
-
-  function parseSetSessionModelConfig(msg) {
-    if (!msg || typeof msg !== "object") {
-      throw new Error("setSessionModelConfig payload must be an object");
-    }
-
-    const payload = {};
-    let parsedModelRef = "";
-
-    if (Object.prototype.hasOwnProperty.call(msg, "modelRef")) {
-      if (typeof msg.modelRef !== "string") {
-        throw new Error("modelRef must be in provider/id format or blank");
-      }
-      const modelRef = msg.modelRef.trim();
-      if (!modelRef) {
-        payload.modelRef = "";
-      } else {
-        if (!modelRef.includes("/")) {
-          throw new Error("modelRef must be in provider/id format");
-        }
-        payload.modelRef = modelRef;
-        parsedModelRef = modelRef;
-      }
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "thinkingLevel")) {
-      if (typeof msg.thinkingLevel !== "string") {
-        throw new Error(
-          "thinkingLevel must be blank|off|minimal|low|medium|high|xhigh|max|ultra",
-        );
-      }
-      const normalized = msg.thinkingLevel.trim().toLowerCase();
-      if (
-        normalized &&
-        !["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(normalized)
-      ) {
-        throw new Error(
-          "thinkingLevel must be blank|off|minimal|low|medium|high|xhigh|max|ultra",
-        );
-      }
-      payload.thinkingLevel = normalized;
-    }
-
-    const oneTurn = parseOptionalBoolean(msg.oneTurn, "oneTurn");
-    if (oneTurn !== undefined) {
-      if (oneTurn && !parsedModelRef) {
-        throw new Error("oneTurn requires a non-blank modelRef");
-      }
-      Object.assign(payload, { oneTurn });
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "reasoningLevel")) {
-      if (typeof msg.reasoningLevel !== "string") {
-        throw new Error("reasoningLevel must be off|on|on.full");
-      }
-      const normalized = msg.reasoningLevel.trim().toLowerCase();
-      if (!["off", "on", "on.full"].includes(normalized)) {
-        throw new Error("reasoningLevel must be off|on|on.full");
-      }
-      Object.assign(payload, { reasoningLevel: normalized });
-    }
-
-    const reasoningEnabled = parseOptionalBoolean(
-      msg.reasoningEnabled,
-      "reasoningEnabled",
-    );
-    if (reasoningEnabled !== undefined) {
-      payload.reasoningEnabled = reasoningEnabled;
-    }
-
-    const verboseLevel = parseOptionalTrimmedString(msg.verboseLevel);
-    if (verboseLevel) {
-      const normalized = verboseLevel.toLowerCase();
-      if (!["off", "on", "full"].includes(normalized)) {
-        throw new Error("verboseLevel must be off|on|full");
-      }
-      payload.verboseLevel = normalized;
-    }
-
-    const fastMode = parseOptionalBoolean(msg.fastMode, "fastMode");
-    if (fastMode !== undefined) {
-      payload.fastMode = fastMode;
-    }
-
-    const elevatedLevel = parseOptionalTrimmedString(msg.elevatedLevel);
-    if (elevatedLevel) {
-      const normalized = elevatedLevel.toLowerCase();
-      if (!["off", "on", "ask", "full"].includes(normalized)) {
-        throw new Error("elevatedLevel must be off|on|ask|full");
-      }
-      payload.elevatedLevel = normalized;
-    }
-
-    if (Object.keys(payload).length === 0) {
-      throw new Error("setSessionModelConfig requires at least one field");
-    }
-
-    return payload;
-  }
-
-  function parseNewSession(msg = { agentRef: "", scope: "", requestId: "" }) {
-    const payload = {
-      scope: "once",
-      requestId: parseOptionalTrimmedString(msg && msg.requestId),
-    };
-    if (hasOwn(msg, "agentRef")) {
-      if (typeof msg.agentRef !== "string") {
-        throw new Error("agentRef must be a string");
-      }
-      Object.assign(payload, { agentRef: msg.agentRef.trim() });
-    }
-    if (hasOwn(msg, "scope")) {
-      if (typeof msg.scope !== "string") {
-        throw new Error("scope must be once|default");
-      }
-      const scope = msg.scope.trim().toLowerCase();
-      if (scope !== "once" && scope !== "default") {
-        throw new Error("scope must be once|default");
-      }
-      payload.scope = scope;
-    }
-    return payload;
-  }
-
-  function parseSetEvenAiSettings(msg) {
-    if (!msg || typeof msg !== "object") {
-      throw new Error("setEvenAiSettings payload must be an object");
-    }
-
-    const payload = {};
-
-    if (Object.prototype.hasOwnProperty.call(msg, "routingMode")) {
-      const routingMode = parseOptionalTrimmedString(msg.routingMode);
-      if (!routingMode) {
-        throw new Error("routingMode must be active|background|background_new");
-      }
-      const normalizedInput = routingMode.toLowerCase();
-      if (
-        ![
-          "active",
-          "background",
-          "background_new",
-          "dedicated",
-          "new",
-          "dedicated_shadow",
-          "new_shadow",
-        ].includes(normalizedInput)
-      ) {
-        throw new Error("routingMode must be active|background|background_new");
-      }
-      payload.routingMode = normalizeEvenAiRoutingMode(routingMode);
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "systemPrompt")) {
-      if (typeof msg.systemPrompt !== "string") {
-        throw new Error("systemPrompt must be a string");
-      }
-      payload.systemPrompt = normalizeAndValidateCustomSystemPrompt(msg.systemPrompt);
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "defaultModel")) {
-      if (typeof msg.defaultModel !== "string") {
-        throw new Error("defaultModel must be a string");
-      }
-      payload.defaultModel = msg.defaultModel.trim();
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "defaultThinking")) {
-      if (typeof msg.defaultThinking !== "string") {
-        throw new Error("defaultThinking must be a string");
-      }
-      const normalizedThinking = msg.defaultThinking.trim().toLowerCase();
-      if (
-        normalizedThinking &&
-        !["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(normalizedThinking)
-      ) {
-        throw new Error("defaultThinking must be off|minimal|low|medium|high|xhigh|max|ultra");
-      }
-      payload.defaultThinking = normalizedThinking;
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "listenEnabled")) {
-      if (typeof msg.listenEnabled !== "boolean") {
-        throw new Error("listenEnabled must be a boolean");
-      }
-      payload.listenEnabled = msg.listenEnabled;
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "defaultFastMode")) {
-      if (typeof msg.defaultFastMode !== "boolean") {
-        throw new Error("defaultFastMode must be a boolean");
-      }
-      payload.defaultFastMode = msg.defaultFastMode;
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "defaultAgent")) {
-      if (typeof msg.defaultAgent !== "string") {
-        throw new Error("defaultAgent must be a string");
-      }
-      payload.defaultAgent = normalizeEvenAiDefaultAgent(msg.defaultAgent);
-    }
-
-    if (Object.keys(payload).length === 0) {
-      throw new Error("setEvenAiSettings requires at least one field");
-    }
-
-    return payload;
-  }
-
-  function parseOcuClawEvenAiPatch(value) {
-    const patch = {};
-    if (!hasOwn(value, "peer")) {
-      return patch;
-    }
-    if (!value.peer || typeof value.peer !== "object" || Array.isArray(value.peer)) {
-      throw new Error("evenAi.peer must be an object");
-    }
-    const peerPatch = {};
-    if (hasOwn(value.peer, "url")) {
-      if (typeof value.peer.url !== "string") {
-        throw new Error("evenAi.peer.url must be a string");
-      }
-      peerPatch.url = normalizeOcuClawEvenAiPeer({ url: value.peer.url }).url;
-    }
-    if (hasOwn(value.peer, "bearerToken")) {
-      if (typeof value.peer.bearerToken !== "string") {
-        throw new Error("evenAi.peer.bearerToken must be a string");
-      }
-      peerPatch.bearerToken = normalizeOcuClawEvenAiPeer({
-        bearerToken: value.peer.bearerToken,
-      }).bearerToken;
-    }
-    if (hasOwn(value.peer, "forwardSecret")) {
-      if (typeof value.peer.forwardSecret !== "string") {
-        throw new Error("evenAi.peer.forwardSecret must be a string");
-      }
-      peerPatch.forwardSecret = normalizeOcuClawEvenAiPeer({
-        forwardSecret: value.peer.forwardSecret,
-      }).forwardSecret;
-    }
-    patch.peer = peerPatch;
-    return patch;
-  }
-
-  function parseOcuClawPathwaysPatch(value) {
-    const patch = {};
-    for (const key of ["heyEven", "app"]) {
-      if (!hasOwn(value, key)) {
-        continue;
-      }
-      const pathway = value[key];
-      if (!pathway || typeof pathway !== "object" || Array.isArray(pathway)) {
-        throw new Error(`pathways.${key} must be an object`);
-      }
-      const pathwayPatch = {};
-      if (hasOwn(pathway, "binding")) {
-        const binding = pathway.binding;
-        if (!binding || typeof binding !== "object" || Array.isArray(binding)) {
-          throw new Error(`pathways.${key}.binding must be an object`);
-        }
-        const bindingPatch = {};
-        if (hasOwn(binding, "backend")) {
-          if (typeof binding.backend !== "string") {
-            throw new Error(`pathways.${key}.binding.backend must be a string`);
-          }
-          bindingPatch.backend = normalizeOcuClawPathwayBinding({
-            backend: binding.backend,
-          }).backend;
-        }
-        if (hasOwn(binding, "agentRef")) {
-          if (typeof binding.agentRef !== "string") {
-            throw new Error(`pathways.${key}.binding.agentRef must be a string`);
-          }
-          bindingPatch.agentRef = normalizeOcuClawPathwayBinding({
-            agentRef: binding.agentRef,
-          }).agentRef;
-        }
-        pathwayPatch.binding = bindingPatch;
-      }
-      patch[key] = pathwayPatch;
-    }
-    return patch;
-  }
-
-  function parseSetOcuClawSettings(msg) {
-    if (!msg || typeof msg !== "object") {
-      throw new Error("setOcuClawSettings payload must be an object");
-    }
-
-    const payload = {};
-
-    if (Object.prototype.hasOwnProperty.call(msg, "systemPrompt")) {
-      if (typeof msg.systemPrompt !== "string") {
-        throw new Error("systemPrompt must be a string");
-      }
-      payload.systemPrompt = normalizeAndValidateCustomSystemPrompt(msg.systemPrompt);
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "defaultModel")) {
-      if (typeof msg.defaultModel !== "string") {
-        throw new Error("defaultModel must be a string");
-      }
-      payload.defaultModel = normalizeOcuClawDefaultModel(msg.defaultModel);
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "defaultThinking")) {
-      if (typeof msg.defaultThinking !== "string") {
-        throw new Error("defaultThinking must be a string");
-      }
-      payload.defaultThinking = normalizeOcuClawDefaultThinking(msg.defaultThinking);
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "defaultFastMode")) {
-      if (typeof msg.defaultFastMode !== "boolean") {
-        throw new Error("defaultFastMode must be a boolean");
-      }
-      payload.defaultFastMode = msg.defaultFastMode;
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "defaultAgent")) {
-      if (typeof msg.defaultAgent !== "string") {
-        throw new Error("defaultAgent must be a string");
-      }
-      payload.defaultAgent = normalizeOcuClawDefaultAgent(msg.defaultAgent);
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "confirmModelSelection")) {
-      if (typeof msg.confirmModelSelection !== "boolean") {
-        throw new Error("confirmModelSelection must be a boolean");
-      }
-      Reflect.set(payload, "confirmModelSelection", msg.confirmModelSelection);
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "agentProgressNotes")) {
-      if (typeof msg.agentProgressNotes !== "string") {
-        throw new Error("agentProgressNotes must be a string");
-      }
-      const normalizedNotes = msg.agentProgressNotes.trim().toLowerCase();
-      if (
-        normalizedNotes !== "off" &&
-        normalizedNotes !== "status" &&
-        normalizedNotes !== "conversation"
-      ) {
-        throw new Error(
-          "agentProgressNotes must be one of off|status|conversation",
-        );
-      }
-      payload.agentProgressNotes = normalizeOcuClawAgentProgressNotes(normalizedNotes);
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "conversationToolProgress")) {
-      if (typeof msg.conversationToolProgress !== "boolean") {
-        throw new Error("conversationToolProgress must be a boolean");
-      }
-      Reflect.set(payload, "conversationToolProgress", msg.conversationToolProgress);
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "pathways")) {
-      if (!msg.pathways || typeof msg.pathways !== "object" || Array.isArray(msg.pathways)) {
-        throw new Error("pathways must be an object");
-      }
-      payload.pathways = parseOcuClawPathwaysPatch(msg.pathways);
-    }
-
-    if (Object.prototype.hasOwnProperty.call(msg, "evenAi")) {
-      if (!msg.evenAi || typeof msg.evenAi !== "object" || Array.isArray(msg.evenAi)) {
-        throw new Error("evenAi must be an object");
-      }
-      payload.evenAi = parseOcuClawEvenAiPatch(msg.evenAi);
-    }
-
-    if (Object.keys(payload).length === 0) {
-      throw new Error("setOcuClawSettings requires at least one field");
-    }
-
-    return payload;
-  }
-
-  function parseRequestSonioxTemporaryKey(msg) {
-    if (!msg || typeof msg !== "object") {
-      throw new Error("requestSonioxTemporaryKey payload must be an object");
-    }
-
-    const voiceSessionId = parseOptionalTrimmedString(msg.voiceSessionId);
-    if (!voiceSessionId) {
-      throw new Error("voiceSessionId is required");
-    }
-
-    return {
-      voiceSessionId,
-      sessionKey: parseOptionalTrimmedString(msg.sessionKey),
-    };
-  }
-
   function parseApprovalResponsePayload(msg) {
     if (!msg || typeof msg !== "object") {
       throw new Error("ocuclaw.approval.resolve payload must be an object");
@@ -3014,696 +473,6 @@ function createDownstreamHandler(opts) {
       if (oldest.done) break;
       approvalResolveCache.delete(oldest.value);
     }
-  }
-
-  function parseRemoteControl(msg) {
-    if (!msg || typeof msg !== "object") {
-      throw new Error("remote-control payload must be an object");
-    }
-    const actionRaw = parseOptionalTrimmedString(msg.action);
-    if (!actionRaw) {
-      throw new Error("remote-control action is required");
-    }
-
-    const action = actionRaw.toLowerCase();
-    const payload = {
-      action,
-      requestId: parseOptionalTrimmedString(msg.requestId) || null,
-    };
-
-    if (action === "button") {
-      payload.button = normalizeRemoteButton(msg.button);
-      return payload;
-    }
-
-    if (action === "send-message") {
-      const text = typeof msg.text === "string" ? msg.text : "";
-      if (!text.trim()) {
-        throw new Error("remote-control send-message requires non-empty text");
-      }
-      payload.text = text;
-      const sessionKey = parseOptionalTrimmedString(msg.sessionKey);
-      if (sessionKey) payload.sessionKey = sessionKey;
-      return payload;
-    }
-
-    if (action === "setting-set") {
-      const settingKey = parseOptionalTrimmedString(msg.settingKey);
-
-      const value = typeof msg.value === "string" ? msg.value.trim() : null;
-      if (!settingKey) {
-        throw new Error("remote-control setting-set requires settingKey");
-      }
-      if (value === null) {
-        throw new Error("remote-control setting-set requires value");
-      }
-      payload.settingKey = settingKey;
-      payload.value = value;
-      return payload;
-    }
-
-    if (action === "webui-composer-set-text") {
-      payload.text = typeof msg.text === "string" ? msg.text : "";
-      return payload;
-    }
-
-    if (action === "webui-composer-submit") {
-      return payload;
-    }
-
-    if (action === "webui-silent-input-prediction-test") {
-      return payload;
-    }
-
-    if (action === "webui-open-tab") {
-      const value = parseOptionalTrimmedString(msg.value);
-      if (!value) {
-        throw new Error("remote-control webui-open-tab requires value");
-      }
-      payload.value = value;
-      return payload;
-    }
-
-    if (action === "webui-liveui-grant") {
-      const grantAction = parseOptionalTrimmedString(msg.value);
-      const host = parseOptionalTrimmedString(msg.text);
-      if (grantAction !== "allow" && grantAction !== "deny" && grantAction !== "remove") {
-        throw new Error("remote-control webui-liveui-grant requires value allow|deny|remove");
-      }
-      if (!host) {
-        throw new Error("remote-control webui-liveui-grant requires text (the host)");
-      }
-      return { ...payload, value: grantAction, text: host };
-    }
-
-    if (action === "webui-sessions-search") {
-      const operation = parseOptionalTrimmedString(msg.value);
-      if (!["set-query", "submit", "clear", "select-result", "subtab", "selection-enter", "selection-exit", "selection-toggle"].includes(operation || "")) {
-        throw new Error("remote-control webui-sessions-search requires a supported search operation");
-      }
-      return { ...payload, value: operation, text: typeof msg.text === "string" ? msg.text : "" };
-    }
-    if (action === "webui-session-select") {
-      const sessionKey = parseOptionalTrimmedString(msg.sessionKey);
-      if (!sessionKey) {
-        throw new Error("remote-control webui-session-select requires sessionKey");
-      }
-      payload.sessionKey = sessionKey;
-      return payload;
-    }
-    if (action === "webui-session-sheet") {
-      const value = parseOptionalTrimmedString(msg.value);
-
-      if (!value || !["open", "rename", "preview", "input", "save", "done", "cancel", "backdrop", "scroll-start", "scroll-end", "close", "pin", "hide", "confirm-hide", "switch", "continue", "copy", "take-over", "delete"].includes(value)) {
-        throw new Error("remote-control webui-session-sheet requires a supported value");
-      }
-      if ((value === "open" || value === "input") && typeof msg.text !== "string") {
-        throw new Error("remote-control webui-session-sheet open/input requires text");
-      }
-
-      return { ...payload, value, ...(typeof msg.text === "string" ? { text: msg.text } : {}) };
-    }
-
-    if (action === "webui-agent-menu-open") {
-      return payload;
-    }
-
-    if (action === "webui-agent-select") {
-      const agentId = parseOptionalTrimmedString(msg.text);
-      if (!agentId) {
-        throw new Error("remote-control webui-agent-select requires text (the agent id)");
-      }
-      return { ...payload, text: agentId };
-    }
-
-    if (action === "webui-agent-enrol" || action === "webui-agent-remove" || action === "webui-agent-retry") {
-      const agentId = parseOptionalTrimmedString(msg.text);
-      if (!agentId || agentId.length > 160) {
-        throw new Error(`remote-control ${action} requires a bounded agent id in text`);
-      }
-      return { ...payload, text: agentId };
-    }
-
-    if (action === "webui-default-agent-set") {
-      const surface = parseOptionalTrimmedString(msg.value);
-      if (surface !== "ocuclaw" && surface !== "even-ai") {
-        throw new Error("remote-control webui-default-agent-set requires value ocuclaw|even-ai");
-      }
-      const agentId = parseOptionalTrimmedString(msg.text) || "";
-      if (agentId.length > 160) {
-        throw new Error("remote-control webui-default-agent-set requires a bounded agent id in text");
-      }
-      return { ...payload, value: surface, text: agentId };
-    }
-
-    if (action === "webui-machine-browse" || action === "webui-machine-profile") {
-      const identity = parseOptionalTrimmedString(msg.text);
-      if (!identity || identity.length > 160) {
-        throw new Error(`remote-control ${action} requires a bounded inventory id in text`);
-      }
-      return { ...payload, text: identity };
-    }
-    if (action === "webui-machine-settings") {
-      const operation = parseOptionalTrimmedString(msg.value);
-      if (!["open", "select", "refresh", "favourite"].includes(operation)) {
-        throw new Error("remote-control webui-machine-settings requires open|select|refresh|favourite");
-      }
-      const text = parseOptionalTrimmedString(msg.text);
-      if ((operation === "select" && (!text || text.length > 160)) ||
-          (operation === "favourite" && text !== "true" && text !== "false")) {
-        throw new Error("remote-control webui-machine-settings requires a valid selection or preference");
-      }
-      return { ...payload, value: operation, ...(text ? { text } : {}) };
-    }
-    if (action === "webui-silent-input-word") {
-
-      const operation = parseOptionalTrimmedString(msg.value);
-
-      const storeOps = ["add", "remove", "favourite", "unfavourite", "hide", "restore"];
-      const sectionOps = [
-        "open", "open-words", "back", "search", "draft", "submit", "edit", "edit-draft", "save", "cancel", "remove-row", "star", "undo", "dismiss", "replace-stored",
-        "hide-row", "restore-row", "find", "hide-found", "favourite-found", "restore-hidden",
-
-        "row-menu",
-
-        "storage-fault",
-
-        "forget-spelled",
-      ];
-      if (!operation || (!storeOps.includes(operation) && !sectionOps.includes(operation))) {
-        throw new Error("remote-control webui-silent-input-word requires a supported operation");
-      }
-      if (storeOps.includes(operation)) {
-        const word = parseOptionalTrimmedString(msg.text);
-        if (!word || !/^[A-Za-z]{1,31}$/.test(word)) {
-          throw new Error("remote-control webui-silent-input-word requires text: 1-31 English letters");
-        }
-        return { ...payload, value: operation, text: word };
-      }
-      const text = typeof msg.text === "string" ? msg.text : "";
-      if (text.length > 200 || text.includes("\n")) {
-        throw new Error("remote-control webui-silent-input-word requires a single line of at most 200 chars");
-      }
-      return { ...payload, value: operation, text };
-    }
-    if (action === "webui-silent-input-suggestions") {
-
-      const operation = parseOptionalTrimmedString(msg.value);
-      const ops = [
-        "check:ranking", "check:replies", "off:ranking", "off:replies",
-        "add-key-open", "add-key-paste", "add-key-save", "add-key-cancel",
-      ];
-
-      const modelPick = /^model:[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$/.test(operation || "");
-      if (!operation || (!ops.includes(operation) && !modelPick)) {
-        throw new Error("remote-control webui-silent-input-suggestions requires a supported operation");
-      }
-      if (operation === "add-key-paste") {
-        const key = typeof msg.text === "string" ? msg.text.trim() : "";
-        if (!key || !/^[\x21-\x7e]{1,4096}$/.test(key)) {
-          throw new Error("remote-control webui-silent-input-suggestions add-key-paste requires text: one printable line of at most 4096 chars");
-        }
-        return { ...payload, value: operation, text: key };
-      }
-      return { ...payload, value: operation, text: "" };
-    }
-    if (action === "webui-temple-editor") {
-
-      const operation = parseOptionalTrimmedString(msg.value);
-      if (!operation || !["open", "picker", "search", "choose", "back", "set", "cancel", "apply"].includes(operation)) {
-        throw new Error(
-          "remote-control webui-temple-editor requires open|picker|search|choose|back|set|cancel|apply",
-        );
-      }
-      const text = typeof msg.text === "string" ? msg.text : "";
-
-      if (operation === "set" && !/^(LEFT|RIGHT)=[^|,\r\n]{0,200}$/.test(text)) {
-        throw new Error(
-          "remote-control webui-temple-editor set requires LEFT=<token> or RIGHT=<token> " +
-            "(empty for Default; no ',', '|' or newline; max 200 chars)",
-        );
-      }
-      if (operation === "picker" && !/^(LEFT|RIGHT)$/.test(text)) {
-        throw new Error("remote-control webui-temple-editor picker requires text LEFT or RIGHT");
-      }
-
-      if (operation === "choose" &&
-          (typeof msg.text !== "string" || !/^[^|,\r\n]{0,200}$/.test(text))) {
-        throw new Error(
-          "remote-control webui-temple-editor choose requires a storage token in text " +
-            "(empty string for Default; no ',', '|' or newline; max 200 chars)",
-        );
-      }
-      if (operation === "search" &&
-          (typeof msg.text !== "string" || text.length > 200 || /[\r\n]/.test(text))) {
-        throw new Error(
-          "remote-control webui-temple-editor search requires text: a single line of at most 200 chars",
-        );
-      }
-      const carriesText = operation === "set" || operation === "picker" ||
-        operation === "choose" || operation === "search";
-      return { ...payload, value: operation, text: carriesText ? text : "" };
-    }
-    if (action === "webui-saved-prompts") {
-
-      const operation = parseOptionalTrimmedString(msg.value);
-      if (!operation || !["list", "close", "open", "new", "set", "choose", "apply",
-        "cancel", "delete"].includes(operation)) {
-        throw new Error(
-          "remote-control webui-saved-prompts requires " +
-            "list|close|open|new|set|choose|apply|cancel|delete",
-        );
-      }
-      const text = typeof msg.text === "string" ? msg.text : "";
-
-      if ((operation === "set" || operation === "choose") &&
-          (typeof msg.text !== "string" || !/^[A-Z]{1,16}=[\s\S]{0,4000}$/.test(text))) {
-        throw new Error(
-          `remote-control webui-saved-prompts ${operation} requires FIELD=value in text ` +
-            "(max 4000 chars)",
-        );
-      }
-      if (operation === "open" && !/^[^|,\r\n]{1,200}$/.test(text)) {
-        throw new Error("remote-control webui-saved-prompts open requires a prompt id in text");
-      }
-      const carriesText = operation === "set" || operation === "choose" || operation === "open";
-      return { ...payload, value: operation, text: carriesText ? text : "" };
-    }
-    if (action === "webui-menu-editor") {
-      const operation = parseOptionalTrimmedString(msg.value);
-      if (!operation || !["open", "picker", "search", "review", "select", "add", "up", "down", "highlight-up", "highlight-down", "remove", "cancel", "apply"].includes(operation)) {
-        throw new Error("remote-control webui-menu-editor requires a supported editor operation");
-      }
-      if (typeof msg.text !== "string" || msg.text.length > 8192) {
-        throw new Error("remote-control webui-menu-editor requires bounded text");
-      }
-      return { ...payload, value: operation, text: msg.text };
-    }
-
-    if (action === "webui-new-session-in-agent") {
-      const agentId = parseOptionalTrimmedString(msg.text);
-      if (!agentId) {
-        throw new Error(
-          "remote-control webui-new-session-in-agent requires text (the agent id)",
-        );
-      }
-      return { ...payload, text: agentId };
-    }
-
-    if (
-
-      action === "webui-setup-help-open" ||
-      action === "webui-setup-help-dismiss" ||
-      action === "webui-agent-create-open" ||
-      action === "webui-agent-create-tap" ||
-      action === "webui-agent-create-next" ||
-      action === "webui-agent-create-submit" ||
-      action === "webui-agent-create-restart" ||
-      action === "webui-agent-create-dismiss"
-    ) {
-      return payload;
-    }
-
-    if (action === "webui-agent-create-edit") {
-      const text = parseOptionalTrimmedString(msg.text);
-      if (!text || text.length > 8500 || !text.includes("=")) throw new Error("agent-create-edit requires key=value");
-      return { ...payload, text };
-    }
-    if (action === "webui-agent-create-set-name") {
-      const name = parseOptionalTrimmedString(msg.text);
-      if (!name) {
-        throw new Error("remote-control webui-agent-create-set-name requires text (the name)");
-      }
-      return { ...payload, text: name };
-    }
-
-    if (
-      action === "webui-agent-emoji-open" ||
-      action === "webui-agent-emoji-set" ||
-      action === "webui-agent-settings-open" ||
-      action === "webui-agent-settings-icon-set"
-    ) {
-      const value = parseOptionalTrimmedString(msg.text);
-      if (!value) {
-        throw new Error(`remote-control ${action} requires text`);
-      }
-      return { ...payload, text: value };
-    }
-
-    if (action === "webui-agent-actions-menu") {
-      const text = parseOptionalTrimmedString(msg.text);
-      if (!text || !["open", "settings", "dismiss"].includes(text)) throw new Error("Invalid agent actions menu action");
-      return { ...payload, text };
-    }
-
-    if (action === "webui-agent-icon-picker") {
-      const text = parseOptionalTrimmedString(msg.text);
-      if (!text || !["open", "dismiss"].includes(text)) throw new Error("Invalid agent icon picker action");
-      return { ...payload, text };
-    }
-
-    if (action === "webui-hermes-jobs") {
-      const text = parseOptionalTrimmedString(msg.text);
-      if (!text || !/^(refresh|history|toggle|run|confirm|dismiss|receipt|cancel|acknowledge)(:[A-Za-z0-9_-]{1,128})?$/.test(text)) throw new Error("Invalid Hermes jobs action");
-      return { ...payload, text };
-    }
-    if (action === "webui-hermes-automations") {
-      const text = parseOptionalTrimmedString(msg.text);
-      if (!text || text.length > 16500 || !["refresh", "blank", "edit", "template", "field", "slot", "preview", "delete", "confirm", "dismiss", "close", "receipt", "cancel", "acknowledge"].includes(text.split(":", 1)[0])) throw new Error("Invalid Hermes automation action");
-      return { ...payload, text };
-    }
-    if (action === "webui-hermes-health") {
-      const text = parseOptionalTrimmedString(msg.text);
-      if (!text || !/^(refresh|result|cancel|acknowledge|period:(7|30|90)|start:(doctor|security))$/.test(text)) throw new Error("Invalid Hermes health action");
-      return { ...payload, text };
-    }
-    if (action === "webui-settings-scroll") {
-      const text = parseOptionalTrimmedString(msg.text);
-
-      const direction = text?.startsWith("sheet:") ? text.slice("sheet:".length) : text;
-      if (!direction || !(["start", "end", "up", "down"].includes(direction) || /^to:\d{1,6}$/.test(direction) || (direction === text && /^anchor:[a-z0-9-]{1,64}$/.test(direction)))) throw new Error("Invalid settings scroll direction");
-      return { ...payload, text };
-    }
-    if (action === "webui-hermes-approvals-edit") {
-      const text = parseOptionalTrimmedString(msg.text);
-      if (!text || !/^(mode|timeoutSeconds|cronMode|oneShotMode|unattendedMode)=[^=]{0,12}$/.test(text)) {
-        throw new Error("Approval edit requires an allowed field=value");
-      }
-      return { ...payload, text };
-    }
-    if (action === "webui-hermes-permissions") {
-      const text = typeof msg.text === "string" ? msg.text : "";
-      if (!/^(?:(?:revoke|deny-edit|deny-remove):[0-9]{1,3}|deny-add|confirm|cancel|preview|refresh|recover|(?:pattern|command):[^\x00]{0,512})$/.test(text)) {
-        throw new Error("Invalid Hermes permission action");
-      }
-      return { ...payload, text };
-    }
-    if (action === "webui-hermes-tools") {
-      const text = typeof msg.text === "string" ? msg.text : "";
-      if (!/^(?:block:(?:web|files|terminal)|skill:[^\x00-\x1f]{1,160}|confirm|cancel|refresh|recover)$/.test(text)) throw new Error("Invalid Hermes tool action");
-      return { ...payload, text };
-    }
-    if (action === "webui-hermes-connections") {
-      const text = typeof msg.text === "string" ? msg.text : "";
-      if (!/^(?:(?:mcp-enabled|test|reauth|channel-enabled|pause|resume):[^\x00-\x1f]{1,160}|confirm|cancel|refresh|cancel-auth|review-unknown|authorize)$/.test(text)) throw new Error("Invalid Hermes connection action");
-      return { ...payload, text };
-    }
-    if (action === "webui-hermes-disclosure") {
-
-      const text = typeof msg.text === "string" ? msg.text : "";
-      if (!/^[a-z][a-z0-9-]{0,39}(?::(?:open|close|toggle))?$/.test(text)) throw new Error("Invalid Hermes disclosure action");
-      return { ...payload, text };
-    }
-    if (action === "webui-hermes-needs-you") {
-
-      const text = typeof msg.text === "string" ? msg.text : "";
-      if (!/^[a-z][a-z_-]{0,31}$/.test(text)) throw new Error("Invalid Hermes needs-you action");
-      return { ...payload, text };
-    }
-    if (action === "webui-hermes-try-again") {
-
-      return payload;
-    }
-    if (action === "webui-hermes-board") {
-
-      const text = typeof msg.text === "string" ? msg.text : "";
-
-      if (!/^(?:settings|open-board|default:[a-z0-9][a-z0-9_-]{0,63}|lane:[a-z][a-z_]{0,31}=(?:on|off)|initial:[a-z][a-z_]{0,31}|watch:(?:off|notify|notify_wake)|watch-(?:bell|cancel)|new-card|create-(?:save|check|retry|close|more|open|done|voice)|create-title:[A-Za-z0-9][A-Za-z0-9 .,'!?-]{0,79}|create-lane:(?:triage|ready)|create-watch:(?:off|notify)|create-priority:[0-2]|create-worker:(?:[a-z0-9][a-z0-9_-]{0,63})?|verdict:(?:approve|request_changes)|verdict-(?:send|cancel|check)|verdict-reason:[A-Za-z0-9][A-Za-z0-9 .,'!?-]{0,79}|moment|moment-dismiss|moments:(?:on|off)|done:(?:on|off)|quiet:(?:off|(?:[01][0-9]|2[0-3]):[0-5][0-9]-(?:[01][0-9]|2[0-3]):[0-5][0-9])|quiet-zone:phone|rule:(?:[a-z0-9][a-z0-9_-]{0,63}\/)?[A-Za-z0-9][A-Za-z0-9_.-]{0,63}:(?:off|notify|failures|notify_failures)|board:[a-z0-9][a-z0-9_-]{0,63}|filter:[a-z][a-z_]{0,31}|list-more|refresh|card:[A-Za-z0-9_.:-]{1,64}|home|stat:(?:needs_you|running|failed|total)|queue:[A-Za-z0-9_.:-]{1,64}|say-card|picker|comment|comment-(?:send|cancel|check)|comment-text:[A-Za-z0-9][A-Za-z0-9 .,'!?-]{0,79}|answer|tools-enable|tools-confirm|tools-cancel|reason-lab|more|card-action:(?:make_ready|reassign|set_model|retry|split|archive)|card-worker:(?:[a-z0-9][a-z0-9_-]{0,63})?|card-model:(?:[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,63})?|card-(?:confirm|cancel|check)|create-parent:[A-Za-z0-9_.:-]{1,64}|create-split|create-split-check|maint|maint-(?:refresh|export|confirm|cancel|check)|maint-reclaim:[A-Za-z0-9_.:-]{1,64}|maint-attachments:(?:on|off)|maint-logs:(?:on|off)|artifact:[0-9]{1,15}|artifact-(?:save|close|source|scripts(?:-(?:run|cancel|stop))?))$/.test(text)) throw new Error("Invalid Hermes board action");
-      return { ...payload, text };
-    }
-    if (action === "webui-hermes-learning") {
-      const text = typeof msg.text === "string" ? msg.text : "";
-      if (!/^(?:refresh|save|confirm|cancel|recover|section:(?:pending|saved|behaviour)|edit:(?:memoryApproval|skillApproval|reviewEnabled|reviewModel|notifications)=[A-Za-z0-9_./:+@|=-]{1,281})$/.test(text)) throw new Error("Invalid Hermes learning action");
-      return { ...payload, text };
-    }
-    if (["webui-hermes-approvals-confirm", "webui-hermes-approvals-cancel", "webui-hermes-approvals-save", "webui-hermes-approvals-refresh", "webui-hermes-approvals-recover"].includes(action)) {
-      return payload;
-    }
-    if (action === "webui-agent-settings-edit") {
-      const text = parseOptionalTrimmedString(msg.text);
-      if (!text || text.length > 8500 || !text.includes("=")) {
-        throw new Error("agent-settings-edit requires key=value");
-      }
-      return { ...payload, text };
-    }
-    if (action === "webui-hermes-saved") {
-      const text = msg.text;
-      if (typeof text !== "string" || text.length > 262150 || text.includes("\u0000") ||
-          !(/^(show|list|receipt|preview|remove|save|recover|confirm|cancel)$/.test(text) ||
-            /^open:[a-f0-9]{64}$/.test(text) || text.startsWith("edit:"))) {
-        throw new Error("Invalid saved learning phone action");
-      }
-      return { ...payload, text };
-    }
-    if (action === "webui-hermes-memory" || action === "webui-hermes-skills") {
-      const text = parseOptionalTrimmedString(msg.text);
-      if (!text || !/^(pending|receipt|approve|reject|review:[A-Za-z0-9_-]{1,128})$/.test(text)) {
-        throw new Error("Invalid native memory phone action");
-      }
-      return { ...payload, text };
-    }
-    if (action === "webui-settings-scroll") {
-      const text = parseOptionalTrimmedString(msg.text);
-      const direction = text?.startsWith("sheet:") ? text.slice("sheet:".length) : text;
-      if (!direction || !(["start", "end", "up", "down"].includes(direction) || /^to:\d{1,6}$/.test(direction) || (direction === text && /^anchor:[a-z0-9-]{1,64}$/.test(direction)))) throw new Error("Invalid settings scroll direction");
-      return { ...payload, text };
-    }
-
-    if (
-      action === "webui-agent-emoji-submit" ||
-      action === "webui-agent-emoji-retry" ||
-      action === "webui-agent-emoji-clear" ||
-      action === "webui-agent-emoji-dismiss" ||
-      action === "webui-agent-settings-icon-clear" ||
-      action === "webui-agent-settings-save" ||
-      action === "webui-agent-settings-dismiss"
-    ) {
-      return payload;
-    }
-
-    if (action === "webui-connection-toggle") {
-      return payload;
-    }
-    if (action === "webui-connection-control") {
-      const value = parseOptionalTrimmedString(msg.value)?.toLowerCase();
-      if (!["manual-open", "manual-close", "connect", "reconnect", "disconnect", "pair", "setup", "discord"].includes(value || "")) {
-        throw new Error("remote-control webui-connection-control requires a supported connection action");
-      }
-      return { ...payload, value };
-    }
-
-    if (action === "webui-session-chips-scroll") {
-      const direction = parseOptionalTrimmedString(msg.text)?.toLowerCase();
-      if (direction !== "start" && direction !== "end") {
-        throw new Error(
-          "remote-control webui-session-chips-scroll requires text start|end",
-        );
-      }
-      return { ...payload, text: direction };
-    }
-
-    if (action === "webui-document-visibility") {
-      const state = parseOptionalTrimmedString(msg.value)?.toLowerCase();
-      if (state !== "hidden" && state !== "visible") {
-        throw new Error(
-          "remote-control webui-document-visibility requires value hidden|visible",
-        );
-      }
-      return { ...payload, value: state };
-    }
-
-    if (action === "webui-graphic-fault") {
-      const code = parseOptionalTrimmedString(msg.value)?.toLowerCase();
-      if (
-        code !== "atlas_invalid" &&
-        code !== "atlas_face_missing" &&
-        code !== "raster_failed" &&
-        code !== "slot_overflow" &&
-        code !== "off"
-      ) {
-        throw new Error(
-          "remote-control webui-graphic-fault requires value atlas_invalid|atlas_face_missing|raster_failed|slot_overflow|off",
-        );
-      }
-      return { ...payload, value: code };
-    }
-
-    if (action === "webui-system-appearance") {
-      const value = parseOptionalTrimmedString(msg.value)?.toLowerCase();
-      if (value !== "dark" && value !== "light" && value !== "reset") {
-        throw new Error(
-          "remote-control webui-system-appearance requires value dark|light|reset",
-        );
-      }
-      return { ...payload, value };
-    }
-
-    if (action === "webui-overlay") {
-      const target = parseOptionalTrimmedString(msg.value)?.toLowerCase();
-      const text = typeof msg.text === "string" ? msg.text.trim() : "";
-      const patterns = new Map([
-        ["channel-update", /^(stable|beta|hermes)(:prompt)?$/],
-        ["whats-new", /^$/],
-        ["setting-help", /^[A-Z][A-Z0-9_]{1,80}$/],
-        ["language-hints", /^(open|dismiss)?$/],
-        ["voice-setup", /^(open|dismiss|select-soniox)$/],
-        ["voice-test", /^start$/],
-        ["voice-test-hint", /^dismiss$/],
-        ["optional-home", /^(voice|even-ai|dismiss)$/],
-        ["voice-activation-home", /^(activate|cancel|later|dismiss|status|fixture:(due|confirm|progress|reconnecting|ready|clear))$/],
-        ["display-debug", /^(expand|collapse|diagnostics)$/],
-        ["manual-even-ai", /^(open|dismiss|unlock-agent-configuration|store-private-secret|enable-runtime|verify-private-route|configure-even-realities-app|exercise-glasses-request)?$/],
-        ["agent-filter", /^(open|dismiss)?$/],
-        ["liveui", /^((review|task|edit|delete):[^\x00-\x1f]{1,200}|dismiss)$/],
-        ["dismiss", /^$/],
-      ]);
-      const pattern = target ? patterns.get(target) : undefined;
-      if (!pattern || !pattern.test(text)) {
-        throw new Error("remote-control webui-overlay requires a supported target and argument");
-      }
-      return { ...payload, value: target, ...(text ? { text } : {}) };
-    }
-    if (action === "webui-optional-setup") {
-      const value = parseOptionalTrimmedString(msg.value)?.toLowerCase();
-      if (!/^(open|close|status|dismiss-home|refresh|next|back|test-voice|test-even-ai|open-even-ai-test|press-even-ai-test|cancel-even-ai-test|activation-(review|cancel)|route-(review|cancel)|skip-(voice|even_ai)|resume-(voice|even_ai)|diagnostics-(open|back|cancel|review|access-(allow|deny)|handoff-(allow|deny)))$/.test(value || "")) {
-        throw new Error("remote-control webui-optional-setup requires a supported visible action");
-      }
-      return { ...payload, value };
-    }
-    if (action === "webui-relay-offline") {
-      const value = parseOptionalTrimmedString(msg.value)?.toLowerCase();
-      const ms = value && /^\d{4,6}$/.test(value) ? Number(value) : NaN;
-      if (value !== "restore" && !(ms >= 1000 && ms <= 120000)) {
-        throw new Error("remote-control webui-relay-offline requires value 1000..120000 or restore");
-      }
-      return { ...payload, value };
-    }
-
-    if (
-      action === "webui-debug-upload-open" ||
-      action === "webui-debug-upload-export" ||
-      action === "webui-debug-upload-send" ||
-      action === "webui-debug-upload-dismiss"
-    ) {
-      if (action === "webui-debug-upload-open" && msg.text) {
-        if (typeof msg.text !== "string" || !/^\d{1,5}$/.test(msg.text) || Number(msg.text) < 1 || Number(msg.text) > 30000) throw new Error("invalid debug upload delay");
-        return { ...payload, text: msg.text };
-      }
-      return payload;
-    }
-
-    if (action === "webui-debug-upload-set-note" || action === "webui-debug-upload-set-contact") {
-      payload.text = typeof msg.text === "string" ? msg.text : "";
-      return payload;
-    }
-
-    if (
-      action === "webui-pair-open" ||
-      action === "webui-pair-phrase-match" ||
-      action === "webui-pair-phrase-mismatch" ||
-      action === "webui-pair-dismiss"
-    ) {
-      return payload;
-    }
-
-    if (action === "webui-pair-scan-payload") {
-      const text = parseOptionalTrimmedString(msg.text);
-      if (!text) {
-        throw new Error("remote-control webui-pair-scan-payload requires text");
-      }
-      return { ...payload, text };
-    }
-
-    if (action === "webui-pair-manual") {
-
-      const text = parseOptionalTrimmedString(msg.text);
-      const value = parseOptionalTrimmedString(msg.value);
-      if (!text) {
-        throw new Error("remote-control webui-pair-manual requires text (the address)");
-      }
-      if (!value) {
-        throw new Error("remote-control webui-pair-manual requires value (the pairing code)");
-      }
-      return { ...payload, text, value };
-    }
-
-    if (action === "relay-action") {
-      const normalizedRelayAction = normalizeRemoteRelayAction(msg.relayAction);
-      payload.relayAction = normalizedRelayAction;
-      if (
-        normalizedRelayAction === "listen-start" ||
-        normalizedRelayAction === "listen-stop" ||
-        normalizedRelayAction === "listen-send" ||
-        normalizedRelayAction === "listen-retry"
-      ) {
-        throw new Error(
-          `remote-control relayAction ${normalizedRelayAction} was removed; voice stays local to the app`,
-        );
-      }
-      const sessionKey = parseOptionalTrimmedString(msg.sessionKey);
-      const command = parseOptionalTrimmedString(msg.command);
-      if (normalizedRelayAction === "switch-session" && !sessionKey) {
-        throw new Error("remote-control switch-session requires sessionKey");
-      }
-      if (normalizedRelayAction === "slash-command" && !command) {
-        throw new Error("remote-control slash-command requires command");
-      }
-      if (
-        (normalizedRelayAction === "ptt-partial" || normalizedRelayAction === "ptt-lab-confirmed-partial" || normalizedRelayAction === "ptt-lab-commit") &&
-        !command
-      ) {
-        throw new Error(`remote-control ${normalizedRelayAction} requires command`);
-      }
-      if (sessionKey) payload.sessionKey = sessionKey;
-
-      const explicitLabFinal = ["ptt-lab-tap-stop", "ptt-lab-endpoint", "ptt-lab-final"].includes(normalizedRelayAction) &&
-        typeof msg.command === "string";
-      if (command || explicitLabFinal) payload.command = command || "";
-      const endpointDetection = parseOptionalBoolean(msg.endpointDetection, "endpointDetection");
-      if (endpointDetection !== undefined) payload.endpointDetection = endpointDetection;
-      const maxEndpointDelayMs = parseOptionalPositiveNumber(
-        msg.maxEndpointDelayMs,
-        "maxEndpointDelayMs",
-      );
-      if (maxEndpointDelayMs !== undefined) payload.maxEndpointDelayMs = maxEndpointDelayMs;
-      const model = parseOptionalTrimmedString(msg.model);
-      if (model) payload.model = model;
-      const languageHints = parseOptionalStringArray(msg.languageHints, "languageHints");
-      if (languageHints !== undefined) payload.languageHints = languageHints;
-      return payload;
-    }
-
-    if (action === "list-click") {
-      const index = parseOptionalNonNegativeNumber(msg.index, "index");
-      if (index === undefined) {
-        throw new Error("remote-control list-click requires index");
-      }
-      payload.index = index;
-      const containerId = parseOptionalNonNegativeNumber(msg.containerId, "containerId");
-      const containerName = parseOptionalTrimmedString(msg.containerName);
-      if (containerId !== undefined) payload.containerId = containerId;
-      if (containerName) payload.containerName = containerName;
-      return payload;
-    }
-
-    if (action === "menu-item-click") {
-      const itemId = Number(msg.itemId);
-      if (!Number.isInteger(itemId) || itemId < 1 || itemId > 0xffff_ffff) {
-        throw new Error("remote-control menu-item-click requires itemId to be a non-zero uint32");
-      }
-      return { ...payload, itemId };
-    }
-
-    if (action === "text-event") {
-      payload.eventType = normalizeRemoteButton(msg.eventType || msg.button);
-      const containerId = parseOptionalNonNegativeNumber(msg.containerId, "containerId");
-      const containerName = parseOptionalTrimmedString(msg.containerName);
-      if (containerId !== undefined) payload.containerId = containerId;
-      if (containerName) payload.containerName = containerName;
-      return payload;
-    }
-
-    throw new Error(`unsupported remote-control action: ${actionRaw}`);
   }
 
   function parseReadinessProbe(msg) {
@@ -3748,13 +517,6 @@ function createDownstreamHandler(opts) {
     if (!value.startsWith("data:")) return value;
     const comma = value.indexOf(",");
     return comma >= 0 ? value.slice(comma + 1) : value;
-  }
-
-  function parseOptionalPositiveInt(value) {
-    if (value === undefined || value === null) return null;
-    const num = Number(value);
-    if (!Number.isFinite(num) || num <= 0) return null;
-    return Math.floor(num);
   }
 
   function rejectAttachment(errorCode, error) {
@@ -3887,17 +649,26 @@ function createDownstreamHandler(opts) {
     };
     const state = coerceState(raw.neuralEmojiReactorState);
     const paceState = coerceState(raw.neuralPaceModulatorState);
+    const speckState = coerceState(raw.neuralSpeckReactorState);
     const enabledRaw = raw.neuralSessionNamesEnabled;
     const neuralSessionNamesEnabled =
       typeof enabledRaw === "boolean" ? enabledRaw : true;
     const naturalTextFlowEnabled = raw.naturalTextFlowEnabled === true;
 
+    const replyLanguage = normalizeReplyLanguageTag(raw.replyLanguage);
+
     return {
       neuralEmojiReactorState: state,
       neuralPaceModulatorState: paceState,
+      neuralSpeckReactorState: speckState,
       neuralSessionNamesEnabled,
       naturalTextFlowEnabled,
+      ...(replyLanguage ? { replyLanguage } : {}),
     };
+  }
+
+  function parseSendOrigin(raw         )                             {
+    return raw === "phone" || raw === "glasses" ? raw : null;
   }
 
   function handleSend(clientId, msg) {
@@ -3912,7 +683,7 @@ function createDownstreamHandler(opts) {
       };
     }
 
-    const parsedAttachment = parseAttachment(msg.attachment);
+    const parsedAttachment      = parseAttachment(msg.attachment);
     if (!parsedAttachment.ok) {
       return {
         unicast: formatSendAckCompat(
@@ -3996,8 +767,15 @@ function createDownstreamHandler(opts) {
       clientDisplaySignals,
       typeof opts.isPhoneClient === "function" && opts.isPhoneClient(clientId) === true,
       clientId,
+      parseSendOrigin(msg.origin),
+
+      cardBuildTaskSendOf(msg.taskBuild),
+
+      cardChangeSendOf(msg.cardChange),
+
+      cardCheckSendOf(msg.cardCheck),
     ).then(
-      (result) => {
+      (result     ) => {
         const status = (result && result.status) || "accepted";
         const frame = formatSendAckCompat(
           requestId,
@@ -4014,7 +792,7 @@ function createDownstreamHandler(opts) {
         }
         return { unicast: frame };
       },
-      (err) => {
+      (err     ) => {
         const frame = formatSendAckCompat(
           requestId,
           "rejected",
@@ -4043,13 +821,13 @@ function createDownstreamHandler(opts) {
   }
 
   function handleLedgerSync(
-    msg = {},
-    callback = () => null,
+    msg      = {},
+    callback      = () => null,
   ) {
     const sessionId = parseOptionalTrimmedString(msg.sessionId);
     if (!sessionId || typeof callback !== "function") return null;
     try {
-      const payload = {
+      const payload      = {
         sessionId,
         lastSeq: parseOptionalInteger(msg.lastSeq),
         entriesRevision: parseOptionalInteger(msg.entriesRevision),
@@ -4233,6 +1011,8 @@ function createDownstreamHandler(opts) {
       sessionKey,
       message,
       attachment: parsedAttachment.attachment,
+      wearerOrigin: isPhoneClient(clientId) === true,
+      origin: parseSendOrigin(msg.origin),
     })).then(
       (result) => ({
         unicast: formatSendAckCompat(
@@ -4254,760 +1034,37 @@ function createDownstreamHandler(opts) {
     );
   }
 
-  function handleSimulate(clientId, msg) {
-    const pages = onSimulate(
-      msg.sender || "Simulator",
-      msg.text || "",
-      parseOptionalTrimmedString(msg.id) || undefined,
-    );
-    return { broadcast: formatPages(pages) };
-  }
-
-  function handleSimulateStream(clientId, msg) {
-    const id = parseOptionalTrimmedString(msg.id);
-    if (!id) {
-      return {
-        unicast: formatSendAckCompat(
-          msg.id || null,
-          "rejected",
-          "Missing required field: id",
-        ),
-      };
-    }
-
-    if (!onSimulateStream) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateStream not supported by relay",
-        ),
-      };
-    }
-
-    const text = typeof msg.text === "string" ? msg.text : "";
-    if (!text.trim()) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateStream requires non-empty text",
-        ),
-      };
-    }
-
-    let chunkChars;
-    let chunkIntervalMs;
-    let startDelayMs;
-    let thinkingTailMs;
-    try {
-      chunkChars = parseOptionalPositiveNumber(msg.chunkChars, "chunkChars");
-      chunkIntervalMs = parseOptionalPositiveNumber(msg.chunkIntervalMs, "chunkIntervalMs");
-      startDelayMs = parseOptionalNonNegativeNumber(msg.startDelayMs, "startDelayMs");
-      thinkingTailMs = parseOptionalNonNegativeNumber(msg.thinkingTailMs, "thinkingTailMs");
-    } catch (err) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          err && err.message ? err.message : "Invalid simulateStream parameters",
-        ),
-      };
-    }
-
-    const messageKind = parseOptionalTrimmedString(msg.messageKind);
-    if (messageKind && messageKind !== "narration") {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateStream messageKind must be narration when set",
-          undefined,
-        ),
-      };
-    }
-
-    const request = {
-      id,
-
-      sender:
-        parseOptionalTrimmedString(msg.sender) ||
-        (msg.nativeLifecycle === true ? null : "Simulator"),
-      text,
-      sessionKey: parseOptionalTrimmedString(msg.sessionKey) || null,
-      chunkChars,
-      chunkIntervalMs,
-      startDelayMs,
-      thinkingTailMs,
-      runId: parseOptionalTrimmedString(msg.runId) || null,
-      nativeLifecycle: msg.nativeLifecycle === true,
-
-      continuesRun: msg.continuesRun === true,
-
-      messageKind: messageKind || null,
-      messageId: parseOptionalTrimmedString(msg.messageId) || null,
-    };
-
-    return Promise.resolve(onSimulateStream(request)).then(
-      (result) => {
-        const status = result && result.status ? result.status : "accepted";
-        const error = result && result.error ? result.error : undefined;
-        const errorCode = result && result.errorCode ? result.errorCode : undefined;
-        const runId = result && result.runId ? result.runId : request.runId;
-        return { unicast: formatSendAckCompat(id, status, error, errorCode, { runId }) };
-      },
-      (err) => ({
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          err && err.message ? err.message : "simulateStream failed",
-          err && err.code ? err.code : undefined,
-        ),
-      }),
-    );
-  }
-
-  function handleSimulateStreamCancel(clientId, msg) {
-    const id = parseOptionalTrimmedString(msg.id);
-    if (!id) {
-      return {
-        unicast: formatSendAckCompat(
-          msg.id || null,
-          "rejected",
-          "Missing required field: id",
-          "missing_id",
-        ),
-      };
-    }
-
-    const runId = parseOptionalTrimmedString(msg.runId);
-    if (!runId) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateStreamCancel requires non-empty runId",
-          "missing_run_id",
-        ),
-      };
-    }
-
-    if (!onSimulateStreamCancel) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateStreamCancel not supported by relay",
-          "unsupported_operation",
-          { runId },
-        ),
-      };
-    }
-
-    const request = {
-      id,
-      runId,
-      sessionKey: parseOptionalTrimmedString(msg.sessionKey) || null,
-    };
-    return Promise.resolve(onSimulateStreamCancel(request)).then(
-      (result) => {
-        const status = result && result.status ? result.status : "accepted";
-        const error = result && result.error ? result.error : undefined;
-        const errorCode = result && result.errorCode ? result.errorCode : undefined;
-        return {
-          unicast: formatSendAckCompat(id, status, error, errorCode, { runId }),
-        };
-      },
-      (err) => ({
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          err && err.message ? err.message : "simulateStreamCancel failed",
-          err && err.code ? err.code : undefined,
-          { runId },
-        ),
-      }),
-    );
-  }
-
-  function ackSimulateVerb(id, verb, callbackResult) {
-    return Promise.resolve(callbackResult).then(
-      (result) => {
-        const status = result && result.status ? result.status : "accepted";
-        const error = result && result.error ? result.error : undefined;
-        const errorCode = result && result.errorCode ? result.errorCode : undefined;
-        return { unicast: formatSendAckCompat(id, status, error, errorCode) };
-      },
-      (err) => ({
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          err && err.message ? err.message : `${verb} failed`,
-        ),
-      }),
-    );
-  }
-
-  function handleSimulateActivity(clientId, msg) {
-    const id = parseOptionalTrimmedString(msg.id);
-    if (!id) {
-      return {
-        unicast: formatSendAckCompat(
-          msg.id || null,
-          "rejected",
-          "Missing required field: id",
-        ),
-      };
-    }
-    if (!onSimulateActivity) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateActivity not supported by relay",
-        ),
-      };
-    }
-    const state = parseOptionalTrimmedString(msg.state);
-    if (state !== "thinking" && state !== "idle") {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateActivity state must be thinking|idle",
-        ),
-      };
-    }
-    return ackSimulateVerb(id, "simulateActivity", onSimulateActivity({
-      id,
-      state,
-      sessionKey: parseOptionalTrimmedString(msg.sessionKey) || null,
-      runId: parseOptionalTrimmedString(msg.runId) || null,
-      summary: parseOptionalTrimmedString(msg.summary) || null,
-      nativeLifecycle: msg.nativeLifecycle === true,
-    }));
-  }
-
-  function handleSimulateModelCatalog(msg) {
-
-    const reject = (ackId, reason) => ({
-      unicast: formatSendAckCompat(ackId, "rejected", reason, undefined),
-    });
-    const id = parseOptionalTrimmedString(msg.id);
-    if (!id) return reject(msg.id || null, "Missing required field: id");
-    if (!onSimulateModelCatalog) {
-      return reject(id, "simulateModelCatalog not supported by relay");
-    }
-    let models = null;
-    if (msg.models !== undefined && msg.models !== null) {
-      if (!Array.isArray(msg.models)) {
-        return reject(id, "simulateModelCatalog models must be an array or null");
-      }
-      models = [];
-      for (const row of msg.models) {
-        const provider = parseOptionalTrimmedString(row && row.provider);
-        const modelId = parseOptionalTrimmedString(row && row.id);
-        if (!provider || !modelId) {
-          return reject(
-            id,
-            "simulateModelCatalog rows need a non-empty provider and id",
-          );
-        }
-        models.push({
-          provider,
-          id: modelId,
-          name: parseOptionalTrimmedString(row.name) || modelId,
-          ...(Number.isFinite(row.contextWindow)
-            ? { contextWindow: Math.floor(row.contextWindow) }
-            : {}),
-          ...(typeof row.reasoning === "boolean" ? { reasoning: row.reasoning } : {}),
-        });
-      }
-    }
-    return ackSimulateVerb(id, "simulateModelCatalog", onSimulateModelCatalog({
-      id,
-      models,
-    }));
-  }
-
-  function handleSimulateSessionList(msg) {
-    const reject = (ackId, reason) => ({
-      unicast: formatSendAckCompat(ackId, "rejected", reason, undefined),
-    });
-    const id = parseOptionalTrimmedString(msg.id);
-    if (!id) return reject(msg.id || null, "Missing required field: id");
-    if (!onSimulateSessionList) {
-      return reject(id, "simulateSessionList not supported by relay");
-    }
-    let rows = null;
-    if (msg.rows !== undefined && msg.rows !== null) {
-      const normalized = normalizeSessionListFixture(msg.rows);
-      if (!normalized.ok) {
-        return reject(id, `simulateSessionList ${normalized.error}`);
-      }
-      rows = msg.rows;
-    }
-    return Promise.resolve(onSimulateSessionList({ id, rows })).then(
-      (result) => {
-        const status = result && result.status ? result.status : "accepted";
-        const ack = JSON.parse(
-          formatSendAckCompat(id, status, result && result.error ? result.error : undefined),
-        );
-        if (result && result.sessionList) ack.sessionList = result.sessionList;
-        return { unicast: JSON.stringify(ack) };
-      },
-      (err) => reject(id, err && err.message ? err.message : "simulateSessionList failed"),
-    );
-  }
-
-  function handleSimulateTool(clientId, msg) {
-    const id = parseOptionalTrimmedString(msg.id);
-    if (!id) {
-      return {
-        unicast: formatSendAckCompat(
-          msg.id || null,
-          "rejected",
-          "Missing required field: id",
-        ),
-      };
-    }
-    if (!onSimulateTool) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateTool not supported by relay",
-        ),
-      };
-    }
-    const runId = parseOptionalTrimmedString(msg.runId);
-    if (!runId) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateTool requires runId (pairs start/result)",
-        ),
-      };
-    }
-    const phase = parseOptionalTrimmedString(msg.phase);
-    if (phase !== "start" && phase !== "result") {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateTool phase must be start|result",
-        ),
-      };
-    }
-    const tool = parseOptionalTrimmedString(msg.tool);
-    if (!tool) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateTool requires tool (real tool name, label derives relay-side)",
-        ),
-      };
-    }
-    let elapsedMs;
-    try {
-      elapsedMs = parseOptionalNonNegativeNumber(msg.elapsedMs, "elapsedMs");
-    } catch (err) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          err && err.message ? err.message : "Invalid simulateTool parameters",
-        ),
-      };
-    }
-    return ackSimulateVerb(id, "simulateTool", onSimulateTool({
-      id,
-      runId,
-      phase,
-      tool,
-      sessionKey: parseOptionalTrimmedString(msg.sessionKey) || null,
-      argsPreview:
-        msg.argsPreview &&
-        typeof msg.argsPreview === "object" &&
-        !Array.isArray(msg.argsPreview)
-          ? msg.argsPreview
-          : null,
-      isError: msg.isError === true,
-      elapsedMs,
-      toolPhase: msg.toolPhase === true,
-      toolCallId: parseOptionalTrimmedString(msg.toolCallId) || null,
-      nativeLifecycle: msg.nativeLifecycle === true,
-    }));
-  }
-
-  function handleSimulateThinking(clientId = "", msg = JSON.parse("{}")) {
-
-    const reject = (ackId = JSON.parse("null"), reason = "") => ({
-      unicast: formatSendAckCompat(ackId, "rejected", reason, undefined),
-    });
-    const id = parseOptionalTrimmedString(msg.id);
-    if (!id) return reject(msg.id || null, "Missing required field: id");
-    if (!onSimulateThinking) return reject(id, "simulateThinking not supported by relay");
-    const runId = parseOptionalTrimmedString(msg.runId);
-    if (!runId) {
-      return reject(id, "simulateThinking requires runId (thinking frames are run-scoped)");
-    }
-    const phase = parseOptionalTrimmedString(msg.phase);
-    if (phase !== "update" && phase !== "finalize") {
-      return reject(id, "simulateThinking phase must be update|finalize");
-    }
-    const delta = typeof msg.delta === "string" ? msg.delta : "";
-    if (phase === "update" && !delta.trim()) {
-      return reject(id, "simulateThinking update requires a non-empty delta");
-    }
-    return ackSimulateVerb(id, "simulateThinking", onSimulateThinking({
-      id,
-      runId,
-      phase,
-      sessionKey: parseOptionalTrimmedString(msg.sessionKey) || null,
-      delta: phase === "update" ? delta : null,
-      reason: phase === "finalize"
-        ? parseOptionalTrimmedString(msg.reason) || "response_started"
-        : null,
-    }));
-  }
-
-  function handleSimulateApproval(clientId, msg) {
-    const id = parseOptionalTrimmedString(msg.id);
-    if (!id) {
-      return {
-        unicast: formatSendAckCompat(
-          msg.id || null,
-          "rejected",
-          "Missing required field: id",
-        ),
-      };
-    }
-    if (!onSimulateApproval) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateApproval not supported by relay",
-        ),
-      };
-    }
-    const approvalId = parseOptionalTrimmedString(msg.approvalId);
-    if (!approvalId) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateApproval requires approvalId (pairs request/resolve)",
-        ),
-      };
-    }
-    const phase = parseOptionalTrimmedString(msg.phase);
-    if (phase !== "request" && phase !== "resolve") {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateApproval phase must be request|resolve",
-        ),
-      };
-    }
-    if (phase === "request") {
-      const command = parseOptionalTrimmedString(msg.command);
-      if (!command) {
-        return {
-          unicast: formatSendAckCompat(
-            id,
-            "rejected",
-            "simulateApproval request requires command",
-          ),
-        };
-      }
-      let expiresInMs;
-      try {
-        expiresInMs = parseOptionalPositiveNumber(msg.expiresInMs, "expiresInMs");
-      } catch (err) {
-        return {
-          unicast: formatSendAckCompat(
-            id,
-            "rejected",
-            err && err.message ? err.message : "Invalid simulateApproval parameters",
-          ),
-        };
-      }
-      const allowedDecisions =
-        Array.isArray(msg.allowedDecisions) &&
-        msg.allowedDecisions.some((d) => typeof d === "string")
-          ? msg.allowedDecisions.filter((d) => typeof d === "string")
-          : ["allow-once", "deny"];
-      return ackSimulateVerb(id, "simulateApproval", onSimulateApproval({
-        id,
-        phase,
-        approvalId,
-        command,
-        ask: parseOptionalTrimmedString(msg.ask) || null,
-        allowedDecisions,
-        expiresInMs: expiresInMs || 120000,
-        sessionKey: parseOptionalTrimmedString(msg.sessionKey) || null,
-        nativeLifecycle: msg.nativeLifecycle === true,
-      }));
-    }
-    const decision = parseOptionalTrimmedString(msg.decision);
-    if (!decision) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateApproval resolve requires decision",
-        ),
-      };
-    }
-    return ackSimulateVerb(id, "simulateApproval", onSimulateApproval({
-      id,
-      phase,
-      approvalId,
-      decision,
-      sessionKey: parseOptionalTrimmedString(msg.sessionKey) || null,
-      nativeLifecycle: msg.nativeLifecycle === true,
-    }));
-  }
-
-  function handleSimulateDemand(clientId, msg) {
-    const id = parseOptionalTrimmedString(msg.id);
-    if (!id) {
-      return {
-        unicast: formatSendAckCompat(
-          msg.id || null,
-          "rejected",
-          "Missing required field: id",
-        ),
-      };
-    }
-    if (!onSimulateDemand) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateDemand not supported by relay",
-        ),
-      };
-    }
-    const surfaceId = parseOptionalTrimmedString(msg.surfaceId);
-    if (!surfaceId) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateDemand requires surfaceId",
-        ),
-      };
-    }
-    const question = parseOptionalTrimmedString(msg.question);
-    if (!question) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateDemand requires question",
-        ),
-      };
-    }
-    const options = Array.isArray(msg.options)
-      ? msg.options
-          .map((option) => ({
-            label: parseOptionalTrimmedString(option && option.label) || "",
-            detail: parseOptionalTrimmedString(option && option.detail) || null,
-          }))
-          .filter((option) => option.label)
-      : [];
-
-    let presentationError = null;
-    if (
-      msg.presentation !== undefined &&
-      msg.presentation !== "reel" &&
-      msg.presentation !== "adaptive"
-    ) {
-      presentationError = "simulateDemand presentation must be reel or adaptive";
-    } else if (
-      msg.selectionMode !== undefined &&
-      msg.selectionMode !== "single" &&
-      msg.selectionMode !== "multi" &&
-      msg.selectionMode !== "open"
-    ) {
-      presentationError = "simulateDemand selectionMode must be single, multi, or open";
-    } else if (msg.allowOther !== undefined && typeof msg.allowOther !== "boolean") {
-      presentationError = "simulateDemand allowOther must be boolean";
-    }
-    if (presentationError) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          presentationError,
-          "invalid_demand_presentation",
-        ),
-      };
-    }
-    const selectionMode = msg.selectionMode || "single";
-
-    if (!options.length && selectionMode !== "open") {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateDemand requires at least one option with a label",
-        ),
-      };
-    }
-    return ackSimulateVerb(id, "simulateDemand", onSimulateDemand({
-      id,
-      surfaceId,
-      question,
-      options,
-      kind: msg.kind === "permission" ? "permission" : "question",
-      title: parseOptionalTrimmedString(msg.title) || "question",
-      deadlineSec: Number.isFinite(msg.deadlineSec) && msg.deadlineSec > 0
-        ? msg.deadlineSec
-        : 120,
-
-      questionIndex: Number.isInteger(msg.questionIndex) && msg.questionIndex >= 0
-        ? msg.questionIndex
-        : 0,
-      questionCount: Number.isInteger(msg.questionCount) && msg.questionCount >= 0
-        ? msg.questionCount
-        : 0,
-      presentation: msg.presentation || "reel",
-      selectionMode,
-      allowOther: msg.allowOther === true,
-      sessionKey: parseOptionalTrimmedString(msg.sessionKey) || null,
-    }));
-  }
-
-  function handleSimulateVoice(clientId, msg) {
-    const id = parseOptionalTrimmedString(msg.id);
-    if (!id) {
-      return {
-        unicast: formatSendAckCompat(
-          msg.id || null,
-          "rejected",
-          "Missing required field: id",
-        ),
-      };
-    }
-    if (!onSimulateVoice) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateVoice not supported by relay",
-        ),
-      };
-    }
-    const phase = parseOptionalTrimmedString(msg.phase);
-    if (
-      phase !== "arm" &&
-      phase !== "disarm" &&
-      phase !== "partial" &&
-      phase !== "commit" &&
-      phase !== "end" &&
-      phase !== "reopen" &&
-      phase !== "await-send"
-    ) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "simulateVoice phase must be arm|disarm|partial|commit|end|reopen|await-send",
-        ),
-      };
-    }
-    const text = typeof msg.text === "string" ? msg.text : "";
-    if ((phase === "partial" || phase === "commit") && !text.trim()) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          `simulateVoice ${phase} requires text`,
-        ),
-      };
-    }
-    return ackSimulateVerb(id, "simulateVoice", onSimulateVoice({
-      id,
-      phase,
-      text,
-      sessionKey: parseOptionalTrimmedString(msg.sessionKey) || null,
-
-      ...(phase === "commit" && msg.awaitAppSend === true ? { awaitAppSend: true } : {}),
-      ...(phase === "commit" && msg.awaitAppSend === true && parseOptionalTrimmedString(msg.runId)
-        ? { runId: parseOptionalTrimmedString(msg.runId) }
-        : {}),
-      ...(phase === "await-send" && Number.isFinite(msg.timeoutMs) ? { timeoutMs: msg.timeoutMs } : {}),
-    }));
-  }
-
-  function handleGlassesUiSurfaceUpdateInject(clientId, msg) {
-    const id = parseOptionalTrimmedString(msg.id);
-    if (!id) {
-      return {
-        unicast: formatSendAckCompat(
-          msg.id || null,
-          "rejected",
-          "Missing required field: id",
-        ),
-      };
-    }
-    if (!onGlassesUiSurfaceUpdateInject) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "glasses_ui_surface_update not supported by relay",
-        ),
-      };
-    }
-    const surfaceId = parseOptionalTrimmedString(msg.surfaceId);
-    if (!surfaceId) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "glasses_ui_surface_update requires surfaceId",
-        ),
-      };
-    }
-    const patch =
-      msg.patch && typeof msg.patch === "object" && !Array.isArray(msg.patch)
-        ? msg.patch
-        : null;
-    if (!patch || Object.keys(patch).length === 0) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          "glasses_ui_surface_update requires a non-empty patch",
-        ),
-      };
-    }
-    try {
-      const liveUiSession = resolveInjectedLiveUiSession(msg.sessionKey);
-      onGlassesUiSurfaceUpdateInject({
-        surfaceId,
-        patch,
-        ...liveUiSession,
-      });
-    } catch (err) {
-      return {
-        unicast: formatSendAckCompat(
-          id,
-          "rejected",
-          err && err.message ? err.message : "glasses_ui_surface_update failed",
-        ),
-      };
-    }
-    return { unicast: formatSendAckCompat(id, "accepted") };
-  }
+  const {
+    handleSimulate,
+    handleSimulateStream,
+    handleSimulateStreamCancel,
+    handleSimulateActivity,
+    handleSimulateModelCatalog,
+    handleSimulateSessionList,
+    handleSimulateTool,
+    handleSimulateThinking,
+    handleSimulateRunSignal,
+    handleSimulateApproval,
+    handleSimulateDemand,
+    handleSimulateVoice,
+    handleGlassesUiSurfaceUpdateInject,
+  } = createSimulateHandlers({
+    formatPages,
+    resolveInjectedLiveUiSession,
+    onSimulate,
+    onSimulateStream,
+    onSimulateStreamCancel,
+    onSimulateActivity,
+    onSimulateThinking,
+    onSimulateRunSignal,
+    onSimulateModelCatalog,
+    onSimulateSessionList,
+    onSimulateTool,
+    onSimulateApproval,
+    onSimulateDemand,
+    onSimulateVoice,
+    onGlassesUiSurfaceUpdateInject,
+  });
 
   function handleSubscribeProtocol(clientId) {
     protocolSubscribers.add(clientId);
@@ -5119,107 +1176,20 @@ function createDownstreamHandler(opts) {
     });
   }
 
-  function handleNewChat(clientId) {
-    return onNewChat().then(
-      (result) => {
-        if (result && typeof result === "object" && typeof result.sessionKey === "string") {
-
-          noteClientSessionSelected(clientId, result.sessionKey);
-          return {
-            broadcast: [
-              formatSessionSwitched(result.sessionKey, "", result.draft === true),
-              formatPages(Array.isArray(result.pages) ? result.pages : []),
-            ],
-          };
-        }
-        return { broadcast: formatPages(result) };
-      },
-      (err) => {
-        logger.error(`[downstream] newChat failed: ${err.message}`);
-        return null;
-      },
-    );
-  }
-
-  function handleGetSessions(clientId) {
-    return onGetSessions().then(
-      (sessions) => ({ unicast: formatSessions(sessions) }),
-      (err) => {
-        logger.error(`[downstream] getSessions failed: ${err.message}`);
-        return { unicast: formatSessions([]) };
-      },
-    );
-  }
-
-  function handleGetSessionDiff(clientId, msg) {
-    const kind = normalizeSessionDiffKind(msg && msg.kind);
-    if (!kind) {
-      return Promise.resolve({
-        unicast: formatError("invalid_session_diff_kind", {}),
-      });
-    }
-    const known = parseKnownSessionRows(msg);
-    const limit = normalizeSessionDiffLimit(msg && msg.limit);
-    if (kind === "evenai") {
-      if (!onGetEvenAiSessions) {
-        return Promise.resolve({
-          unicast: formatEmptySessionDiff(
-            kind,
-            limit,
-            defaultEvenAiDedicatedSessionKey,
-          ),
-        });
-      }
-      return Promise.resolve(onGetEvenAiSessions()).then(
-        (payload) => ({
-          unicast: formatSessionDiff({
-            kind,
-            sessions: payload && payload.sessions,
-            known,
-            limit,
-            dedicatedKey:
-              payload && typeof payload.dedicatedKey === "string"
-                ? payload.dedicatedKey
-                : defaultEvenAiDedicatedSessionKey,
-          }),
-        }),
-        (err) => {
-          logger.error(`[downstream] getEvenAiSessionDiff failed: ${err.message}`);
-          return {
-            unicast: formatEmptySessionDiff(
-              kind,
-              limit,
-              defaultEvenAiDedicatedSessionKey,
-            ),
-          };
-        },
-      );
-    }
-    return onGetSessions().then(
-      (sessions) => ({
-        unicast: formatSessionDiff({ kind, sessions, known, limit }),
-      }),
-      (err) => {
-        logger.error(`[downstream] getSessionDiff failed: ${err.message}`);
-        return { unicast: formatEmptySessionDiff(kind, limit) };
-      },
-    );
-  }
-
-  function handleInputStarted(clientId, msg) {
+  function handleInputStarted(clientId     , msg     ) {
     if (!onInputStarted) return null;
     try {
       onInputStarted(clientId, {
         source: typeof msg.source === "string" ? msg.source : "",
         sessionKey: typeof msg.sessionKey === "string" && msg.sessionKey ? msg.sessionKey : null,
       });
-    } catch (err) {
+    } catch (err     ) {
       logger.warn(`[downstream] input started handler threw: ${err && err.message ? err.message : err}`);
     }
     return null;
   }
 
-  function handleInputPrediction(clientId, op, msg) {
+  function handleInputPrediction(clientId     , op     , msg     ) {
     const payload = msg && typeof msg === "object" ? msg : {};
     const requestId = typeof payload.requestId === "string" ? payload.requestId : "";
 
@@ -5237,14 +1207,14 @@ function createDownstreamHandler(opts) {
                 ? APP_PROTOCOL.inputPredictionModelAllowResult
                 : APP_PROTOCOL.inputPredictionResult;
 
-    const modelAllowFailure = (status) => ({
+    const modelAllowFailure = (status     ) => ({
       requestId: testRequestId,
       status,
       activation: { required: false, mode: "none" },
     });
 
     const noIdentity = { agentId: "", profileId: "", sessionKey: "" };
-    const frame = (body) => ({
+    const frame = (body     ) => ({
       unicast: JSON.stringify({
         type: resultType,
         ...(op === "cancel" || op === "modelAllow" ? {} : noIdentity),
@@ -5346,651 +1316,125 @@ function createDownstreamHandler(opts) {
     );
   }
 
-  function handleGetLiveuiLibrary(clientId) {
-    if (!onGetLiveuiLibrary) return { unicast: formatLiveuiLibrary([]) };
-    return Promise.resolve(onGetLiveuiLibrary()).then(
-      (items) => ({ unicast: formatLiveuiLibrary(items) }),
-      (err) => {
-        logger.error(`[downstream] get LiveUI Library failed: ${err.message}`);
-        return { unicast: formatLiveuiLibrary([]) };
-      },
-    );
-  }
-
-  function handleOpenLiveuiLibraryItem(clientId, msg) {
-    const itemType = typeof msg.itemType === "string" ? msg.itemType : "";
-    const itemId = typeof msg.itemId === "string" ? msg.itemId : "";
-    if (!onOpenLiveuiLibraryItem) {
+  function handleGetStarMap(clientId     ) {
+    if (!onGetStarMap) {
       return {
-        unicast: formatLiveuiLibraryOpenResult({
-          itemType,
-          itemId,
-          status: "rejected",
-          code: "item_unavailable",
-        }),
+        unicast: formatStarMapSnapshot({ status: "unsupported", errorCode: "unsupported" }),
       };
     }
-    return Promise.resolve(onOpenLiveuiLibraryItem({ clientId, itemType, itemId })).then(
-      (result) => ({
-        unicast: formatLiveuiLibraryOpenResult({ itemType, itemId, ...(result || {}) }),
-      }),
-      (err) => {
-        logger.error(`[downstream] open LiveUI Library item failed: ${err.message}`);
-        return {
-          unicast: formatLiveuiLibraryOpenResult({
-            itemType,
-            itemId,
-            status: "rejected",
-            code: "template_open_failed",
-          }),
-        };
-      },
-    );
-  }
-
-  function handleCancelLiveuiTaskLaunch(clientId, msg) {
-    const taskId = typeof msg.taskId === "string" ? msg.taskId : "";
-    if (!onCancelLiveuiTaskLaunch) return null;
-    try {
-      const result = onCancelLiveuiTaskLaunch({ clientId, taskId });
-      if (result && typeof result.then === "function") {
-        return result.then(
-          () => null,
-          (err) => {
-            logger.warn(
-              `[downstream] cancel LiveUI Task launch failed: ${err && err.message ? err.message : err}`,
-            );
-            return null;
-          },
-        );
-      }
-      return null;
-    } catch (err) {
-      logger.warn(
-        `[downstream] cancel LiveUI Task launch failed: ${err && err.message ? err.message : err}`,
-      );
-      return null;
-    }
-  }
-
-  function handleGetLiveuiTasksForPhone(clientId) {
-    if (!onGetLiveuiTasksForPhone) {
-      return { unicast: formatLiveuiTasks({ tasks: [], templates: [], invalid: [] }) };
-    }
-    return Promise.resolve(onGetLiveuiTasksForPhone()).then(
-      (payload) => ({ unicast: formatLiveuiTasks(payload || {}) }),
-      (err) => {
-        logger.error(`[downstream] get LiveUI Tasks failed: ${err.message}`);
-        return { unicast: formatLiveuiTasks({ tasks: [], templates: [], invalid: [] }) };
-      },
-    );
-  }
-
-  function handleGetLiveuiTaskRunsForPhone(clientId, msg) {
-    const taskId = typeof msg.taskId === "string" ? msg.taskId.trim() : "";
-    if (!isPhoneClient(clientId)) {
-      return { unicast: formatError("liveui_task_runs_phone_only", {}) };
-    }
-    if (!taskId) {
-      return { unicast: formatError("liveui_task_runs_task_id_required", {}) };
-    }
-    if (!onGetLiveuiTaskRunsForPhone) {
-      return { unicast: formatLiveuiTaskRuns(taskId, []) };
-    }
-    return Promise.resolve(onGetLiveuiTaskRunsForPhone(taskId)).then(
-      (records) => ({ unicast: formatLiveuiTaskRuns(taskId, records) }),
-      (err) => {
-        logger.error(`[downstream] get LiveUI Task Runs failed: ${err.message}`);
-        return { unicast: formatLiveuiTaskRuns(taskId, []) };
-      },
-    );
-  }
-
-  function handleReviewLiveuiTask(clientId, msg) {
-    const taskId = typeof msg.taskId === "string" ? msg.taskId : "";
-    const action = typeof msg.action === "string" ? msg.action : "";
-    const expectedDigest = typeof msg.expectedDigest === "string" ? msg.expectedDigest : "";
-    if (!admitPhoneOnlyWrite(clientId, APP_PROTOCOL.liveuiTaskReview)) {
-      return {
-        unicast: formatLiveuiTaskReviewAck({
-          taskId,
-          action,
-          status: "rejected",
-          code: "phone_only",
-        }),
-      };
-    }
-    if (!onReviewLiveuiTask) {
-      return {
-        unicast: formatLiveuiTaskReviewAck({
-          taskId,
-          action,
-          status: "rejected",
-          code: "item_unavailable",
-        }),
-      };
-    }
-    const failure = (err) => {
-      logger.error(`[downstream] review LiveUI Task failed: ${err.message}`);
-      return {
-        unicast: formatLiveuiTaskReviewAck({
-          taskId,
-          action,
-          status: "rejected",
-          code: "task_review_failed",
-        }),
-      };
-    };
-    return Promise.resolve(onReviewLiveuiTask({ clientId, taskId, action, expectedDigest })).then(
-      (result) => {
-        const ack = formatLiveuiTaskReviewAck({ taskId, action, ...(result || {}) });
-        if (!result || result.status !== "accepted") return { unicast: ack };
-        return Promise.all([
-          onGetLiveuiTasksForPhone ? Promise.resolve(onGetLiveuiTasksForPhone()) : Promise.resolve({}),
-          onGetLiveuiLibrary ? Promise.resolve(onGetLiveuiLibrary()) : Promise.resolve([]),
-        ]).then(([tasks, library]) => ({
-          unicast: ack,
-          broadcast: [formatLiveuiTasks(tasks || {}), formatLiveuiLibrary(library)],
-        }));
-      },
-      failure,
-    ).catch(failure);
-  }
-
-  function handleGetLiveuiTaskExecutors(clientId) {
-    if (!isPhoneClient(clientId)) {
-      return { unicast: formatError("phone_only", { code: "phone_only" }) };
-    }
-    if (!onGetLiveuiTaskExecutors) {
-      return { unicast: formatLiveuiTaskExecutors({ executors: [] }) };
-    }
-    return Promise.resolve(onGetLiveuiTaskExecutors()).then(
-      (payload) => ({ unicast: formatLiveuiTaskExecutors(payload || {}) }),
-      (err) => {
-        logger.error(`[downstream] get LiveUI Task Executors failed: ${err.message}`);
-        return { unicast: formatLiveuiTaskExecutors({ executors: [] }) };
-      },
-    );
-  }
-
-  function handleSetLiveuiTaskExecutor(clientId, msg) {
-    const taskId = typeof msg.taskId === "string" ? msg.taskId : "";
-    const executor = msg.executor && typeof msg.executor === "object"
-      ? {
-          host: typeof msg.executor.host === "string" ? msg.executor.host : "",
-          agentId: typeof msg.executor.agentId === "string" ? msg.executor.agentId : "",
-        }
-      : { host: "", agentId: "" };
-    if (!admitPhoneOnlyWrite(clientId, APP_PROTOCOL.liveuiTaskExecutorSet)) {
-      return {
-        unicast: formatLiveuiTaskExecutorAck({
-          taskId,
-          status: "rejected",
-          code: "phone_only",
-        }),
-      };
-    }
-    if (!onSetLiveuiTaskExecutor) {
-      return {
-        unicast: formatLiveuiTaskExecutorAck({
-          taskId,
-          status: "rejected",
-          code: "item_unavailable",
-        }),
-      };
-    }
-    const failure = (err) => {
-      logger.error(`[downstream] set LiveUI Task Executor failed: ${err.message}`);
-      return {
-        unicast: formatLiveuiTaskExecutorAck({
-          taskId,
-          status: "rejected",
-          code: "task_executor_update_failed",
-        }),
-      };
-    };
-    return Promise.resolve(onSetLiveuiTaskExecutor({ clientId, taskId, executor })).then(
-      (result) => {
-        const ack = formatLiveuiTaskExecutorAck({ taskId, ...(result || {}) });
-        if (!result || result.status !== "accepted") return { unicast: ack };
-        return Promise.all([
-          onGetLiveuiTasksForPhone ? Promise.resolve(onGetLiveuiTasksForPhone()) : Promise.resolve({}),
-          onGetLiveuiLibrary ? Promise.resolve(onGetLiveuiLibrary()) : Promise.resolve([]),
-        ]).then(([tasks, library]) => ({
-          unicast: ack,
-          broadcast: [formatLiveuiTasks(tasks || {}), formatLiveuiLibrary(library)],
-        }));
-      },
-      failure,
-    ).catch(failure);
-  }
-
-  function handleSetLiveuiTaskPreferredTemplate(clientId, msg) {
-    const taskId = typeof msg.taskId === "string" ? msg.taskId : "";
-    const expectedDigest = typeof msg.expectedDigest === "string" ? msg.expectedDigest : "";
-    const templateId = msg.templateId === null
-      ? null
-      : typeof msg.templateId === "string"
-        ? msg.templateId
-        : "";
-    if (!admitPhoneOnlyWrite(clientId, APP_PROTOCOL.liveuiTaskPreferredTemplateSet)) {
-      return {
-        unicast: formatLiveuiTaskPreferredTemplateAck({
-          taskId,
-          status: "rejected",
-          code: "phone_only",
-        }),
-      };
-    }
-    if (!onSetLiveuiTaskPreferredTemplate) {
-      return {
-        unicast: formatLiveuiTaskPreferredTemplateAck({
-          taskId,
-          status: "rejected",
-          code: "item_unavailable",
-        }),
-      };
-    }
-    const failure = (err) => {
-      logger.error(`[downstream] set LiveUI Task Preferred Template failed: ${err.message}`);
-      return {
-        unicast: formatLiveuiTaskPreferredTemplateAck({
-          taskId,
-          status: "rejected",
-          code: "task_preferred_template_update_failed",
-        }),
-      };
-    };
-    return Promise.resolve(onSetLiveuiTaskPreferredTemplate({
-      clientId,
-      taskId,
-      expectedDigest,
-      templateId,
-    })).then(
-      (result) => {
-        const ack = formatLiveuiTaskPreferredTemplateAck({ taskId, ...(result || {}) });
-        if (!result || result.status !== "accepted") return { unicast: ack };
-        return Promise.all([
-          onGetLiveuiTasksForPhone ? Promise.resolve(onGetLiveuiTasksForPhone()) : Promise.resolve({}),
-          onGetLiveuiLibrary ? Promise.resolve(onGetLiveuiLibrary()) : Promise.resolve([]),
-        ]).then(([tasks, library]) => ({
-          unicast: ack,
-          broadcast: [formatLiveuiTasks(tasks || {}), formatLiveuiLibrary(library)],
-        }));
-      },
-      failure,
-    ).catch(failure);
-  }
-
-  function handleSetLiveuiTaskContext(clientId, msg) {
-    const taskId = typeof msg.taskId === "string" ? msg.taskId : "";
-    const context = typeof msg.context === "string" ? msg.context : "";
-    if (!admitPhoneOnlyWrite(clientId, APP_PROTOCOL.liveuiTaskContextSet)) {
-      return {
-        unicast: formatLiveuiTaskContextAck({
-          taskId,
-          status: "rejected",
-          code: "phone_only",
-        }),
-      };
-    }
-    if (!onSetLiveuiTaskContext) {
-      return {
-        unicast: formatLiveuiTaskContextAck({
-          taskId,
-          status: "rejected",
-          code: "item_unavailable",
-        }),
-      };
-    }
-    const failure = (err) => {
-      logger.error(`[downstream] set LiveUI Task context failed: ${err.message}`);
-      return {
-        unicast: formatLiveuiTaskContextAck({
-          taskId,
-          status: "rejected",
-          code: "task_context_update_failed",
-        }),
-      };
-    };
-    return Promise.resolve(onSetLiveuiTaskContext({ clientId, taskId, context })).then(
-      (result) => {
-        const ack = formatLiveuiTaskContextAck({ taskId, ...(result || {}) });
-        if (!result || result.status !== "accepted") return { unicast: ack };
-        return Promise.all([
-          onGetLiveuiTasksForPhone ? Promise.resolve(onGetLiveuiTasksForPhone()) : Promise.resolve({}),
-          onGetLiveuiLibrary ? Promise.resolve(onGetLiveuiLibrary()) : Promise.resolve([]),
-        ]).then(([tasks, library]) => ({
-          unicast: ack,
-          broadcast: [formatLiveuiTasks(tasks || {}), formatLiveuiLibrary(library)],
-        }));
-      },
-      failure,
-    ).catch(failure);
-  }
-
-  function handleGetLiveuiPrefs(clientId) {
-    if (!isPhoneClient(clientId)) {
-      return { unicast: formatLiveuiPrefsAck({ status: "rejected", code: "phone_only" }) };
-    }
-    if (!onGetLiveuiPrefs) {
-      return { unicast: formatLiveuiPrefsAck({ status: "rejected", code: "item_unavailable" }) };
-    }
-    const failure = (err) => {
-      logger.error(`[downstream] get LiveUI prefs failed: ${err.message}`);
-      return {
-        unicast: formatError("LiveUI prefs unavailable", {
-          code: "prefs_read_failed",
-          op: "ocuclaw.liveui.prefs.get",
-        }),
-      };
-    };
-    return Promise.resolve().then(() => onGetLiveuiPrefs()).then(
-      (result) => ({
-        unicast: formatLiveuiPrefs({
-          ...((result && result.prefs) || {}),
-          ...(result && result.prefsInvalid ? { prefsInvalid: result.prefsInvalid } : {}),
-        }),
-      }),
-      failure,
-    ).catch(failure);
-  }
-
-  function handleSetLiveuiPrefs(clientId, msg) {
-    if (!admitPhoneOnlyWrite(clientId, APP_PROTOCOL.liveuiPrefsSet)) {
-      return { unicast: formatLiveuiPrefsAck({ status: "rejected", code: "phone_only" }) };
-    }
-    if (!onSetLiveuiPrefs) {
-      return { unicast: formatLiveuiPrefsAck({ status: "rejected", code: "item_unavailable" }) };
-    }
-    const patch = {};
-    if (typeof msg.enabled === "boolean") patch.enabled = msg.enabled;
-    if (typeof msg.pauseApps === "boolean") patch.pauseApps = msg.pauseApps;
-    if (typeof msg.defaultContext === "string") patch.defaultContext = msg.defaultContext;
-    if (msg.defaultExecutor === null || typeof msg.defaultExecutor === "string") {
-      patch.defaultExecutor = msg.defaultExecutor;
-    }
-    const failure = (err) => {
-      logger.error(`[downstream] set LiveUI prefs failed: ${err.message}`);
-      return { unicast: formatLiveuiPrefsAck({ status: "rejected", code: "prefs_update_failed" }) };
-    };
-    return Promise.resolve(onSetLiveuiPrefs({ clientId, patch })).then(
-      (result) => {
-        const ack = formatLiveuiPrefsAck(result || {});
-        if (!result || result.status !== "accepted") return { unicast: ack };
-
-        return Promise.resolve(onGetLiveuiStatus ? onGetLiveuiStatus() : null).then((status) => ({
-          unicast: ack,
-          broadcast: [
-            formatLiveuiPrefs(result.prefs || {}),
-            ...(status ? [formatLiveuiStatus(status)] : []),
-          ],
-        }));
-      },
-      failure,
-    ).catch(failure);
-  }
-
-  function handleGetLiveuiGrants(clientId) {
-    if (!isPhoneClient(clientId)) {
-      return {
-        unicast: formatLiveuiGrantsAck({ status: "rejected", code: "phone_only" }),
-      };
-    }
-    if (!onGetLiveuiGrants) {
-      return {
-        unicast: formatLiveuiGrantsAck({ status: "rejected", code: "item_unavailable" }),
-      };
-    }
-    const failure = (err) => {
-      logger.error(`[downstream] get LiveUI grants failed: ${err.message}`);
-      return {
-        unicast: formatError("LiveUI grants unavailable", {
-          code: "grants_read_failed",
-          op: APP_PROTOCOL.liveuiGrantsGet,
-        }),
-      };
-    };
-    return Promise.resolve().then(() => onGetLiveuiGrants()).then(
-      (result) => {
-        if (result && result.status === "rejected") {
+    return Promise.resolve()
+      .then(() => onGetStarMap(clientId))
+      .then(
+        (payload     ) => ({ unicast: formatStarMapSnapshot(payload || {}) }),
+        (err     ) => {
+          logger.error(`[downstream] starmap.get failed: ${err && err.message ? err.message : err}`);
           return {
-            unicast: formatLiveuiGrantsAck({
-              status: "rejected",
-              code: result.code || "item_unavailable",
-            }),
+            unicast: formatStarMapSnapshot({ status: "error", errorCode: "starmap_failed" }),
           };
-        }
-        return { unicast: formatLiveuiGrantsSnapshot(result || {}) };
-      },
-      failure,
-    ).catch(failure);
+        },
+      );
   }
 
-  function handleSetLiveuiGrant(clientId, msg) {
-    const action = typeof msg.action === "string" ? msg.action : "";
-    const host = typeof msg.host === "string" ? msg.host : "";
-    if (!admitPhoneOnlyWrite(clientId, APP_PROTOCOL.liveuiGrantsSet)) {
-      return {
-        unicast: formatLiveuiGrantsAck({ action, host, status: "rejected", code: "phone_only" }),
-      };
-    }
-    if (!onSetLiveuiGrant) {
-      return {
-        unicast: formatLiveuiGrantsAck({
-          action,
-          host,
-          status: "rejected",
-          code: "item_unavailable",
-        }),
-      };
-    }
-    if (action !== "allow" && action !== "deny" && action !== "remove") {
-      return {
-        unicast: formatLiveuiGrantsAck({
-          action,
-          host,
-          status: "rejected",
-          code: "grant_invalid_action",
-        }),
-      };
-    }
-    if (typeof msg.host !== "string") {
-      return {
-        unicast: formatLiveuiGrantsAck({
-          action,
-          host,
-          status: "rejected",
-          code: "grant_invalid_host",
-        }),
-      };
-    }
-    if (msg.baseDigest !== null && typeof msg.baseDigest !== "string") {
-      return {
-        unicast: formatLiveuiGrantsAck({
-          action,
-          host,
-          status: "rejected",
-          code: "grant_base_required",
-        }),
-      };
-    }
-    const failure = (err) => {
-      logger.error(`[downstream] set LiveUI grant failed: ${err.message}`);
-      return {
-        unicast: formatLiveuiGrantsAck({
-          action,
-          host,
-          status: "rejected",
-          code: "grants_write_failed",
-        }),
-      };
+  function handleForgetStar(clientId     , msg     ) {
+    const echo = {
+      requestId: msg && typeof msg.requestId === "string" ? msg.requestId : "",
+      id: msg && typeof msg.id === "string" ? msg.id : "",
     };
-    return Promise.resolve().then(() => onSetLiveuiGrant({
-      clientId,
-      action,
-      host,
-      baseDigest: msg.baseDigest,
-    })).then(
-      (result) => {
-        const ack = formatLiveuiGrantsAck({ ...(result || {}), action, host });
-        if (!result || result.status !== "accepted") return { unicast: ack };
-        return {
-          unicast: ack,
-          broadcast: [formatLiveuiGrantsSnapshot(result.snapshot || {})],
-        };
-      },
-      failure,
-    ).catch(failure);
+    if (!onForgetStar) {
+      return {
+        unicast: formatStarMapForgotten({ ...echo, status: "unsupported", errorCode: "unsupported" }),
+      };
+    }
+    const request = parseStarMapForgetRequest(msg);
+    if (!request) {
+      return {
+        unicast: formatStarMapForgotten({ ...echo, status: "refused", errorCode: "bad_request" }),
+      };
+    }
+    const answer = { requestId: request.requestId, id: request.id };
+
+    if (!admitPhoneOnlyWrite(clientId, msg.type)) {
+      return { unicast: formatStarMapForgotten({ ...answer, status: "refused", errorCode: "phone_only" }) };
+    }
+    return Promise.resolve()
+      .then(() => onForgetStar(clientId, request))
+      .then(
+        (payload     ) => ({
+          unicast: formatStarMapForgotten({ ...(payload && typeof payload === "object" ? payload : {}), ...answer }),
+        }),
+        (err     ) => {
+          logger.error(`[downstream] starmap.forget failed: ${err && err.message ? err.message : err}`);
+          return {
+            unicast: formatStarMapForgotten({ ...answer, status: "error", errorCode: "forget_failed" }),
+          };
+        },
+      );
   }
 
-  function handleGetLiveuiStatus(clientId) {
-    if (!isPhoneClient(clientId)) {
-      return {
-        unicast: formatError("LiveUI status is phone-only", {
-          code: "phone_only",
-          op: "ocuclaw.liveui.status.get",
-        }),
-      };
-    }
-    if (!onGetLiveuiStatus) {
-      return {
-        unicast: formatError("LiveUI status unavailable", {
-          code: "item_unavailable",
-          op: "ocuclaw.liveui.status.get",
-        }),
-      };
-    }
-    const failure = (err) => {
-      logger.error(`[downstream] get LiveUI status failed: ${err.message}`);
-      return {
-        unicast: formatError("LiveUI status unavailable", {
-          code: "status_read_failed",
-          op: "ocuclaw.liveui.status.get",
-        }),
-      };
-    };
-    return Promise.resolve().then(() => onGetLiveuiStatus()).then(
-      (status) => ({ unicast: formatLiveuiStatus(status || {}) }),
-      failure,
-    ).catch(failure);
-  }
-
-  function handleSetLiveuiTaskSettingValues(clientId, msg) {
-    const taskId = typeof msg.taskId === "string" ? msg.taskId : "";
-    const expectedDigest = typeof msg.expectedDigest === "string" ? msg.expectedDigest : "";
-    const values = msg.values && typeof msg.values === "object" && !Array.isArray(msg.values)
-      ? msg.values
-      : {};
-    if (!admitPhoneOnlyWrite(clientId, APP_PROTOCOL.liveuiTaskSettingsSet)) {
-      return {
-        unicast: formatLiveuiTaskSettingsAck({
-          taskId,
-          status: "rejected",
-          code: "phone_only",
-        }),
-      };
-    }
-    if (!onSetLiveuiTaskSettingValues) {
-      return {
-        unicast: formatLiveuiTaskSettingsAck({
-          taskId,
-          status: "rejected",
-          code: "item_unavailable",
-        }),
-      };
-    }
-    const failure = (err) => {
-      logger.error(`[downstream] set LiveUI Task Settings failed: ${err.message}`);
-      return {
-        unicast: formatLiveuiTaskSettingsAck({
-          taskId,
-          status: "rejected",
-          code: "task_setting_values_update_failed",
-        }),
-      };
-    };
-    return Promise.resolve(onSetLiveuiTaskSettingValues({
-      clientId,
-      taskId,
-      expectedDigest,
-      values,
-    })).then(
-      (result) => {
-        const ack = formatLiveuiTaskSettingsAck({ taskId, ...(result || {}) });
-        if (!result || result.status !== "accepted") return { unicast: ack };
-        return Promise.all([
-          onGetLiveuiTasksForPhone ? Promise.resolve(onGetLiveuiTasksForPhone()) : Promise.resolve({}),
-          onGetLiveuiLibrary ? Promise.resolve(onGetLiveuiLibrary()) : Promise.resolve([]),
-        ]).then(([tasks, library]) => ({
-          unicast: ack,
-          broadcast: [formatLiveuiTasks(tasks || {}), formatLiveuiLibrary(library)],
-        }));
-      },
-      failure,
-    ).catch(failure);
-  }
-
-  function handleOrganizeLiveuiLibrary(clientId, msg) {
-    const params = {
-      clientId,
-      action: typeof msg.action === "string" ? msg.action : "",
-      expectedDigest: typeof msg.expectedDigest === "string" ? msg.expectedDigest : "",
-      ...(typeof msg.itemType === "string" ? { itemType: msg.itemType } : {}),
-      ...(typeof msg.itemId === "string" ? { itemId: msg.itemId } : {}),
-      ...(Array.isArray(msg.order) ? { order: msg.order } : {}),
-      ...(Object.prototype.hasOwnProperty.call(msg, "name") ? { name: msg.name } : {}),
-      ...(Object.prototype.hasOwnProperty.call(msg, "description")
-        ? { description: msg.description }
-        : {}),
-      ...(Object.prototype.hasOwnProperty.call(msg, "icon") ? { icon: msg.icon } : {}),
-    };
-    if (!admitPhoneOnlyWrite(clientId, APP_PROTOCOL.liveuiLibraryOrganize)) {
-      return {
-        unicast: formatLiveuiLibraryOrganizeAck({
-          action: params.action,
-          status: "rejected",
-          code: "phone_only",
-        }),
-      };
-    }
-    if (!onOrganizeLiveuiLibrary) {
-      return {
-        unicast: formatLiveuiLibraryOrganizeAck({
-          action: params.action,
-          status: "rejected",
-          code: "item_unavailable",
-        }),
-      };
-    }
-    const failure = (err) => {
-      logger.error(`[downstream] organize LiveUI Library failed: ${err.message}`);
-      return {
-        unicast: formatLiveuiLibraryOrganizeAck({
-          action: params.action,
-          status: "rejected",
-          code: "library_organize_failed",
-        }),
-      };
-    };
-    return Promise.resolve(onOrganizeLiveuiLibrary(params)).then(
-      (result) => {
-        const ack = formatLiveuiLibraryOrganizeAck({
-          action: params.action,
-          ...(result || {}),
-        });
-        if (!result || result.status !== "accepted") return { unicast: ack };
-        return Promise.all([
-          onGetLiveuiTasksForPhone ? Promise.resolve(onGetLiveuiTasksForPhone()) : Promise.resolve({}),
-          onGetLiveuiLibrary ? Promise.resolve(onGetLiveuiLibrary()) : Promise.resolve([]),
-        ]).then(([phone, glasses]) => ({
-          unicast: ack,
-          broadcast: [formatLiveuiTasks(phone || {}), formatLiveuiLibrary(glasses)],
-        }));
-      },
-      failure,
-    ).catch(failure);
-  }
+  const {
+    handleGetLiveuiLibrary,
+    handleOpenLiveuiLibraryItem,
+    handleSaveProgramCard,
+    handleCheckpointProgramCard,
+    handleGetProgramCardSource,
+    handleGetProgramCardRevisions,
+    handleProgramCardRevision,
+    handleProgramCardReview,
+    handleProgramCardReviewLookStep,
+    handleProgramCardRevisionPicture,
+    handleGetProgramCardSlots,
+    handleProgramCardSlot,
+    handleProgramCardReviewApply,
+    handleCancelLiveuiTaskLaunch,
+    handleGetLiveuiTasksForPhone,
+    handleGetLiveuiTaskRunsForPhone,
+    handleReviewLiveuiTask,
+    handleGetLiveuiTaskExecutors,
+    handleSetLiveuiTaskExecutor,
+    handleSetLiveuiTaskPreferredTemplate,
+    handleSetLiveuiTaskContext,
+    handleGetLiveuiPrefs,
+    handleSetLiveuiPrefs,
+    handleGetLiveuiGrants,
+    handleSetLiveuiGrant,
+    handleGetLiveuiStatus,
+    handleSetLiveuiTaskSettingValues,
+    handleOrganizeLiveuiLibrary,
+    handleLiveuiVideoRoute,
+  } = createLiveuiHandlers({
+    logger,
+    isPhoneClient,
+    admitPhoneOnlyWrite,
+    onGetLiveuiLibrary,
+    onOpenLiveuiLibraryItem,
+    onCancelLiveuiTaskLaunch,
+    onGetLiveuiTasksForPhone,
+    onGetLiveuiTaskRunsForPhone,
+    onGetLiveuiTaskExecutors,
+    onSetLiveuiTaskExecutor,
+    onSetLiveuiTaskSettingValues,
+    onSetLiveuiTaskPreferredTemplate,
+    onReviewLiveuiTask,
+    onSetLiveuiTaskContext,
+    onGetLiveuiPrefs,
+    onSetLiveuiPrefs,
+    onGetLiveuiGrants,
+    onSetLiveuiGrant,
+    onGetLiveuiStatus,
+    onOrganizeLiveuiLibrary,
+    onLiveuiVideoRoute: opts.onLiveuiVideoRoute || null,
+    onSaveProgramCard,
+    onCheckpointProgramCard,
+    onOpenProgramCard,
+    onGetProgramCardSource,
+    onGetProgramCardRevisions,
+    onProgramCardRevision,
+    onProgramCardReview,
+    onProgramCardReviewApply,
+    onProgramCardRevisionPicture,
+    onGetProgramCardSlots,
+    onProgramCardSlot,
+  });
 
   function handleGetCommandCatalog(clientId) {
     if (!onGetCommandCatalog) {
@@ -6025,7 +1469,7 @@ function createDownstreamHandler(opts) {
     );
   }
 
-  function handleGetAgentsCatalog(clientId, msg = {}) {
+  function handleGetAgentsCatalog(clientId, msg      = {}) {
     if (!onGetAgentsCatalog) {
       return {
         unicast: formatAgentsCatalog({
@@ -6053,7 +1497,7 @@ function createDownstreamHandler(opts) {
     );
   }
 
-  function normalizeAgentCreateRequest(msg) {
+  function normalizeAgentCreateRequest(msg     ) {
     const requestId = typeof msg.requestId === "string" ? msg.requestId.trim() : "";
     const name = typeof msg.name === "string" ? msg.name.trim() : "";
     if (!requestId) return { errorCode: "missing_request_id", errorMessage: "Missing request id." };
@@ -6068,16 +1512,17 @@ function createDownstreamHandler(opts) {
     return { requestId, name, ...(msg.setup != null ? { setup: msg.setup } : {}) };
   }
 
-  function handleAgentCreate(clientId, msg, options) {
-    const parsed = normalizeAgentCreateRequest(msg);
+  function handleAgentCreate(clientId     , msg     , options     ) {
+    const parsed      = normalizeAgentCreateRequest(msg);
     const requestId = parsed.requestId || "";
     const resultType = options.resultType;
-    const failure = (err) => ({
+    const failure = (err     ) => ({
       unicast: formatAgentCreateResult(resultType, requestId, {
         status: "error",
         errorCode:
           err && typeof err.code === "string" && err.code ? err.code : "create_failed",
         errorMessage: err && err.message ? err.message : options.failureMessage,
+        ...(err && err.retryable === true ? { retryable: true } : {}),
       }),
     });
     if (parsed.errorCode) {
@@ -6098,14 +1543,14 @@ function createDownstreamHandler(opts) {
     return Promise.resolve().then(() => options.handler({ name: parsed.name,
       ...(parsed.setup != null ? { setup: parsed.setup, requestId } : {}),
     })).then(
-      (payload) => ({
+      (payload     ) => ({
         unicast: formatAgentCreateResult(resultType, requestId, payload || {}),
       }),
       failure,
     ).catch(failure);
   }
 
-  function handleCreateOpenClawAgent(clientId, msg) {
+  function handleCreateOpenClawAgent(clientId     , msg     ) {
     return handleAgentCreate(clientId, msg, {
       handler: onCreateOpenClawAgent,
       resultType: APP_PROTOCOL.openclawAgentCreateResult,
@@ -6114,45 +1559,51 @@ function createDownstreamHandler(opts) {
     });
   }
 
-  async function handleHermesManagement(clientId, msg) {
-    const identity = managementRequest(msg);
-    const reply = (payload) => ({ unicast: JSON.stringify({ type: "ocuclaw.hermes.management.result", ...payload }) });
-    if (!admitPhoneOnlyWrite(clientId, `${APP_PROTOCOL.hermesManagement}:${identity.operation}`)) return reply(managementFailure(identity, "phone_only"));
-    if (!validManagementRequest(identity)) return reply(managementFailure(identity, "invalid_request"));
-    if (typeof onHermesManagement !== "function") return reply(managementFailure(identity, "unsupported", true));
-    try {
-      return reply(managementResult(identity, await onHermesManagement(identity)));
-    } catch (error) {
-      return reply(managementFailure(identity, "management_unavailable", error?.code === -32601 || error?.code === "capability_unavailable"));
-    }
-  }
+  const {
+    handleHermesManagement,
+    handleBoardMomentAck,
+    handleBotScreen,
+    handleTaskPushAck,
+    handleTaskRowsGet,
+    handleTaskLookSet,
+    handleTaskReminder,
+    handleTaskSheet,
+    handleTaskProposal,
+    handleAgentDraft,
+    handleTaskWords,
+    handleTaskPage,
+    handleTaskTest,
+    handleCreateHermesProfile,
+    handleWaitingAnswer,
+  } = createHermesHandlers({
+    logger,
+    isPhoneClient,
+    admitPhoneOnlyWrite,
+    handleAgentCreate,
+    onHermesManagement,
+    getManagementBackendLabel,
+    onBoardMomentAck,
+    onBotScreenMessage,
+    onTaskPushAck,
+    onGetTaskRows,
+    onSetTaskLook,
+    onActTaskReminder,
+    onTaskSheet,
+    onTaskProposal: opts.onTaskProposal,
+    onTaskTest: opts.onTaskTest,
+    onAgentDraft: opts.onAgentDraft,
+    onTaskWords: opts.onTaskWords,
+    onGetLiveuiTasksForPhone,
+    onGetLiveuiLibrary,
+    onCreateHermesProfile,
+    onWaitingAnswer,
+  });
 
-  function handleBoardMomentAck(clientId, msg) {
-    if (!isPhoneClient(clientId)) return null;
-    const ack = boardMomentAck(msg);
-    if (!ack || typeof onBoardMomentAck !== "function") return null;
-    try {
-      onBoardMomentAck(ack);
-    } catch (err) {
-      logger.warn(`[downstream] board moment ack failed: ${err && err.message ? err.message : err}`);
-    }
-    return null;
-  }
-
-  function handleCreateHermesProfile(clientId, msg) {
-    return handleAgentCreate(clientId, msg, {
-      handler: onCreateHermesProfile,
-      resultType: APP_PROTOCOL.hermesProfileCreateResult,
-      unavailableMessage: "Hermes profile creation is not available.",
-      failureMessage: "Hermes could not create the profile.",
-    });
-  }
-
-  function handleSetAgentEmoji(clientId, msg) {
+  function handleSetAgentEmoji(clientId     , msg     ) {
     const requestId = typeof msg.requestId === "string" ? msg.requestId.trim() : "";
     const agentId = typeof msg.agentId === "string" ? msg.agentId.trim() : "";
     const emoji = msg.emoji == null || msg.emoji === "" ? null : msg.emoji;
-    const fail = (errorCode, errorMessage) => ({
+    const fail = (errorCode     , errorMessage     ) => ({
       unicast: formatAgentEmojiSetResult(requestId, {
         status: "error", agentId, emoji, errorCode, errorMessage,
       }),
@@ -6164,17 +1615,88 @@ function createDownstreamHandler(opts) {
     }
     if (!admitPhoneOnlyWrite(clientId, APP_PROTOCOL.agentEmojiSet)) return fail("phone_only", "Agent emoji changes are phone-only.");
     if (typeof onSetAgentEmoji !== "function") return fail("unsupported", "Agent emoji changes are not available.");
-    const failure = (err) => fail(
+    const failure = (err     ) => fail(
       err && typeof err.code === "string" && err.code ? err.code : "update_failed",
       err && err.message ? err.message : "Could not update the emoji.",
     );
     return Promise.resolve(onSetAgentEmoji({ agentId, emoji })).then(
-      (payload) => ({ unicast: formatAgentEmojiSetResult(requestId, payload || {}) }),
+      (payload     ) => ({ unicast: formatAgentEmojiSetResult(requestId, payload || {}) }),
       failure,
     ).catch(failure);
   }
 
-  function agentSettingsFailure(requestId, agentId, err) {
+  const AGENTS_ROUTE_MAX_TEXT = 4000;
+
+  const agentsRouteInFlight = new Set     ();
+  function handleAgentsRoute(clientId     , msg     ) {
+    const requestId = typeof msg.requestId === "string" ? msg.requestId.trim() : "";
+    const text = typeof msg.text === "string" ? msg.text.slice(0, AGENTS_ROUTE_MAX_TEXT) : "";
+    const fallbackAgentRef = typeof msg.fallbackAgentRef === "string" && msg.fallbackAgentRef.trim()
+      ? msg.fallbackAgentRef.trim()
+      : null;
+    const fail = (errorCode     , errorMessage     ) => ({
+      unicast: formatAgentsRouteResult(requestId, { status: "error", errorCode, errorMessage }),
+    });
+    if (!requestId) return fail("missing_request_id", "Missing request id.");
+    if (!text.trim()) return fail("invalid_text", "Say something first.");
+    if (typeof onRouteAgent !== "function") return fail("unsupported", "Auto is not available.");
+    if (agentsRouteInFlight.has(clientId)) return fail("route_busy", "Auto is still picking an agent.");
+    const failure = (err     ) => fail(
+      err && typeof err.code === "string" && err.code ? err.code : "route_failed",
+      err && err.message ? err.message : "Auto could not pick an agent.",
+    );
+    agentsRouteInFlight.add(clientId);
+    return Promise.resolve()
+      .then(() => onRouteAgent({ text, requestId, fallbackAgentRef }))
+      .then(
+        (payload     ) => ({ unicast: formatAgentsRouteResult(requestId, { status: "ok", ...(payload || {}) }) }),
+        failure,
+      )
+      .catch(failure)
+      .finally(() => agentsRouteInFlight.delete(clientId));
+  }
+
+  const AGENT_DESCRIPTION_MAX_CHARS = 280;
+
+  const AGENT_DESCRIBE_MAX_AGENTS = 4;
+  function handleAgentDescription(clientId     , msg     , op                ) {
+    const requestId = typeof msg.requestId === "string" ? msg.requestId.trim() : "";
+    const format = op === "auto" ? formatAgentDescriptionAutoResult : formatAgentDescriptionSetResult;
+    const agentId = typeof msg.agentId === "string" ? msg.agentId.trim() : "";
+    const agentIds           = Array.isArray(msg.agentIds)
+      ? Array.from(new Set        (msg.agentIds
+        .filter((id     ) => typeof id === "string" && id.trim())
+        .map((id        ) => id.trim())))
+      : [];
+    const description = typeof msg.description === "string" ? msg.description.trim() : "";
+    const fail = (errorCode     , errorMessage     ) => ({
+      unicast: format(requestId, { status: "error", agentId, errorCode, errorMessage }),
+    });
+    if (!requestId) return fail("missing_request_id", "Missing request id.");
+    if (op === "set") {
+      if (!agentId) return fail("invalid_agent_id", "Choose an agent.");
+      if (typeof msg.description !== "string" || description.length > AGENT_DESCRIPTION_MAX_CHARS ||
+          /[\u0000]/.test(description)) {
+        return fail("invalid_description", "Keep it to one or two sentences.");
+      }
+    } else if (!agentIds.length || agentIds.length > AGENT_DESCRIBE_MAX_AGENTS) {
+      return fail("invalid_agent_id", "Choose an agent.");
+    }
+    const type = op === "auto" ? APP_PROTOCOL.agentDescriptionAuto : APP_PROTOCOL.agentDescriptionSet;
+    if (!admitPhoneOnlyWrite(clientId, type)) return fail("phone_only", "Agent descriptions are phone-only.");
+    if (typeof onAgentDescription !== "function") return fail("unsupported", "Agent descriptions are not available.");
+    const failure = (err     ) => fail(
+      err && typeof err.code === "string" && err.code ? err.code : "update_failed",
+      err && err.message ? err.message : "Could not update the description.",
+    );
+    const request = op === "auto" ? { op, agentIds } : { op, agentId, description };
+    return Promise.resolve(onAgentDescription(request)).then(
+      (payload     ) => ({ unicast: format(requestId, { ...(payload || {}), agentId }) }),
+      failure,
+    ).catch(failure);
+  }
+
+  function agentSettingsFailure(requestId     , agentId     , err     ) {
     return {
       unicast: formatAgentSettingsResult(requestId, {
         status: "error",
@@ -6185,7 +1707,7 @@ function createDownstreamHandler(opts) {
     };
   }
 
-  function normalizeAgentSettingsIdentity(msg) {
+  function normalizeAgentSettingsIdentity(msg     ) {
     const requestId = typeof msg.requestId === "string" ? msg.requestId.trim() : "";
     const agentId = typeof msg.agentId === "string" ? msg.agentId.trim() : "";
     if (!requestId) return { requestId, agentId, error: "Missing request id." };
@@ -6193,19 +1715,19 @@ function createDownstreamHandler(opts) {
     return { requestId, agentId, error: null };
   }
 
-  function handleGetAgentSettings(clientId, msg) {
+  function handleGetAgentSettings(clientId     , msg     ) {
     const parsed = normalizeAgentSettingsIdentity(msg);
     if (parsed.error) return agentSettingsFailure(parsed.requestId, parsed.agentId, new Error(parsed.error));
     if (!isPhoneClient(clientId)) return agentSettingsFailure(parsed.requestId, parsed.agentId, Object.assign(new Error("Agent settings are phone-only."), { code: "phone_only" }));
     if (typeof onGetAgentSettings !== "function") return agentSettingsFailure(parsed.requestId, parsed.agentId, Object.assign(new Error("Agent settings are not available."), { code: "unsupported" }));
-    const failure = (error) => agentSettingsFailure(parsed.requestId, parsed.agentId, error);
+    const failure = (error     ) => agentSettingsFailure(parsed.requestId, parsed.agentId, error);
     return Promise.resolve(onGetAgentSettings({ agentId: parsed.agentId })).then(
-      (payload) => ({ unicast: formatAgentSettingsResult(parsed.requestId, payload || {}) }),
+      (payload     ) => ({ unicast: formatAgentSettingsResult(parsed.requestId, payload || {}) }),
       failure,
     ).catch(failure);
   }
 
-  function handleSetAgentSettings(clientId, msg) {
+  function handleSetAgentSettings(clientId     , msg     ) {
     const parsed = normalizeAgentSettingsIdentity(msg);
     if (parsed.error) return agentSettingsFailure(parsed.requestId, parsed.agentId, new Error(parsed.error));
     const emoji = msg.emoji == null || msg.emoji === "" ? null : msg.emoji;
@@ -6217,140 +1739,71 @@ function createDownstreamHandler(opts) {
     }
     if (!admitPhoneOnlyWrite(clientId, APP_PROTOCOL.agentSettingsSet)) return agentSettingsFailure(parsed.requestId, parsed.agentId, Object.assign(new Error("Agent settings are phone-only."), { code: "phone_only" }));
     if (typeof onSetAgentSettings !== "function") return agentSettingsFailure(parsed.requestId, parsed.agentId, Object.assign(new Error("Agent settings are not available."), { code: "unsupported" }));
-    const failure = (error) => agentSettingsFailure(parsed.requestId, parsed.agentId, error);
+    const failure = (error     ) => agentSettingsFailure(parsed.requestId, parsed.agentId, error);
     return Promise.resolve(onSetAgentSettings({ agentId: parsed.agentId, emoji, setup: msg.setup,
       ...(msg.producedAtMs !== undefined || msg.expiresAtMs !== undefined ? { producedAtMs: msg.producedAtMs, expiresAtMs: msg.expiresAtMs } : {}) })).then(
-      (payload) => ({ unicast: formatAgentSettingsResult(parsed.requestId, payload || {}) }),
+      (payload     ) => ({ unicast: formatAgentSettingsResult(parsed.requestId, payload || {}) }),
       failure,
     ).catch(failure);
   }
 
-  function handleGetSonioxModels(clientId) {
-    if (!onGetSonioxModels) {
-      return {
-        unicast: formatSonioxModels({
-          models: [],
-          fetchedAtMs: Date.now(),
-          stale: true,
-        }),
-      };
-    }
-    return Promise.resolve(onGetSonioxModels()).then(
-      (payload) => ({
-        unicast: formatSonioxModels(payload || {}),
+  function hostDefaultsFailure(requestId     , err     ) {
+    return {
+      unicast: formatHostDefaultsResult(requestId, {
+        status: "error",
+        errorCode: err && typeof err.code === "string" && err.code ? err.code : "defaults_failed",
+        errorMessage: err && err.message ? err.message : "Could not load or save the defaults for all chats.",
       }),
-      (err) => {
-        logger.error(`[downstream] getSonioxModels failed: ${err.message}`);
-        return {
-          unicast: formatSonioxModels({
-            models: [],
-            fetchedAtMs: Date.now(),
-            stale: true,
-          }),
-        };
-      },
-    );
+    };
   }
 
-  function handleGetHermesSttCapabilities(msg = {}) {
-    const requestId = parseOptionalTrimmedString(msg && msg.requestId);
-    if (!onGetHermesSttCapabilities) {
-      return {
-        unicast: formatHermesSttCapabilities({
-          requestId,
-          status: "offline",
-          providers: [],
-        }),
-      };
-    }
-    return Promise.resolve(onGetHermesSttCapabilities()).then(
-      (payload) => ({
-        unicast: formatHermesSttCapabilities({
-          ...(payload || {}),
-          requestId,
-        }),
-      }),
-      (err) => {
-        logger.error(
-          `[downstream] hermes stt capabilities failed: ${
-            err && err.message ? err.message : err
-          }`,
-        );
-        return {
-          unicast: formatHermesSttCapabilities({
-            requestId,
-            status: "error",
-            providers: [],
-            error: {
-              code: "link_rpc_failed",
-              message:
-                err && err.message
-                  ? String(err.message)
-                  : "stt capability listing failed",
-            },
-          }),
-        };
-      },
-    );
+  function hostDefaultsRequestId(msg     ) {
+    return typeof msg.requestId === "string" ? msg.requestId.trim() : "";
   }
 
-  function handleHermesSttTranscribe(msg = {}) {
-    const requestId = parseOptionalTrimmedString(msg && msg.requestId);
-    const provider = parseOptionalTrimmedString(msg && msg.provider);
-    if (!onHermesSttTranscribe) {
-      return {
-        unicast: formatHermesSttTranscribeResult({
-          requestId,
-          success: false,
-          provider,
-          error: {
-            code: "offline",
-            message:
-              "no live Hermes link: speech-to-text is unavailable on this host",
-          },
-        }),
-      };
-    }
-
-    return Promise.resolve(
-      onHermesSttTranscribe({
-        provider: msg ? msg.provider : undefined,
-        model: msg ? msg.model : undefined,
-        language: msg ? msg.language : undefined,
-        prompt: msg ? msg.prompt : undefined,
-        audio: msg ? msg.audio : undefined,
-      }),
-    ).then(
-      (payload) => ({
-        unicast: formatHermesSttTranscribeResult({
-          provider,
-          ...(payload || {}),
-          requestId,
-        }),
-      }),
-      (err) => {
-        logger.error(
-          `[downstream] hermes stt transcribe failed: ${
-            err && err.message ? err.message : err
-          }`,
-        );
-        return {
-          unicast: formatHermesSttTranscribeResult({
-            requestId,
-            success: false,
-            provider,
-            error: {
-              code: "link_rpc_failed",
-              message:
-                err && err.message
-                  ? String(err.message)
-                  : "transcription failed",
-            },
-          }),
-        };
-      },
-    );
+  function handleGetHostDefaults(clientId     , msg     ) {
+    const requestId = hostDefaultsRequestId(msg);
+    if (!requestId) return hostDefaultsFailure(requestId, new Error("Missing request id."));
+    if (!isPhoneClient(clientId)) return hostDefaultsFailure(requestId, Object.assign(new Error("Defaults for all chats are phone-only."), { code: "phone_only" }));
+    if (typeof onGetHostDefaults !== "function") return hostDefaultsFailure(requestId, Object.assign(new Error("Defaults for all chats are not available."), { code: "unsupported" }));
+    const failure = (error     ) => hostDefaultsFailure(requestId, error);
+    return Promise.resolve(onGetHostDefaults()).then(
+      (payload     ) => ({ unicast: formatHostDefaultsResult(requestId, payload || {}) }),
+      failure,
+    ).catch(failure);
   }
+
+  function handleSetHostDefaults(clientId     , msg     ) {
+    const requestId = hostDefaultsRequestId(msg);
+    if (!requestId) return hostDefaultsFailure(requestId, new Error("Missing request id."));
+    if (!msg.changes || typeof msg.changes !== "object" || Array.isArray(msg.changes)) {
+      return hostDefaultsFailure(requestId, Object.assign(new Error("Nothing to change."), { code: "invalid_defaults" }));
+    }
+    if (!admitPhoneOnlyWrite(clientId, APP_PROTOCOL.hostDefaultsSet)) return hostDefaultsFailure(requestId, Object.assign(new Error("Defaults for all chats are phone-only."), { code: "phone_only" }));
+    if (typeof onSetHostDefaults !== "function") return hostDefaultsFailure(requestId, Object.assign(new Error("Defaults for all chats are not available."), { code: "unsupported" }));
+    const failure = (error     ) => hostDefaultsFailure(requestId, error);
+    const baseHash = typeof msg.baseHash === "string" ? msg.baseHash.trim() : "";
+    return Promise.resolve(onSetHostDefaults({ changes: msg.changes, baseHash })).then(
+      (payload     ) => ({ unicast: formatHostDefaultsResult(requestId, payload || {}) }),
+      failure,
+    ).catch(failure);
+  }
+
+  const {
+    handleGetSonioxModels,
+    handleGetHermesSttCapabilities,
+    handleHermesSttTranscribe,
+    handleRequestSonioxTemporaryKey,
+    handleRequestCartesiaAccessToken,
+  } = createVoiceHandlers({
+    logger,
+    formatHermesSttCapabilities,
+    onGetSonioxModels,
+    onGetHermesSttCapabilities,
+    onHermesSttTranscribe,
+    onRequestSonioxTemporaryKey,
+    onRequestCartesiaAccessToken,
+  });
 
   function handleGetProviderUsageSnapshot(clientId) {
     const emptySnapshot = () => ({
@@ -6394,723 +1847,72 @@ function createDownstreamHandler(opts) {
     }
   }
 
-  function handleGetSessionModelConfig(clientId) {
-    if (!onGetSessionModelConfig) {
-      return { unicast: formatError("getSessionModelConfig is not available") };
-    }
-    return Promise.resolve(onGetSessionModelConfig()).then(
-      (payload) => ({
-        unicast: formatSessionModelConfig(payload || {}),
-      }),
-      (err) => {
-        logger.error(`[downstream] getSessionModelConfig failed: ${err.message}`);
-        return { unicast: formatError(err.message || "getSessionModelConfig failed") };
-      },
-    );
-  }
+  const {
+    handleGetEvenAiSettings,
+    handleGetEvenAiSessions,
+    handleSetEvenAiSettings,
+    handleGetOcuClawSettings,
+    handleSetOcuClawSettings,
+    handleGetSavedPrompts,
+    handleWriteSavedPrompts,
+  } = createSettingsHandlers({
+    logger,
+    formatEvenAiSessions,
+    hasOwn,
+    onGetEvenAiSettings,
+    onGetEvenAiSessions,
+    onSetEvenAiSettings,
+    onGetOcuClawSettings,
+    onSetOcuClawSettings,
+    onGetSavedPrompts,
+    onWriteSavedPrompts,
+  });
 
-  function formatSessionAgentAck(payload) {
-    const out = {
-      type: APP_PROTOCOL.sessionAgentSetAck,
-      status:
-        payload && typeof payload.status === "string"
-          ? payload.status
-          : "rejected",
-    };
-    if (payload && payload.error !== undefined) {
-      out.error = payload.error;
-    }
-    return JSON.stringify(out);
-  }
-
-  function parseSetSessionAgent(msg) {
-    if (!msg || typeof msg !== "object") {
-      throw new Error("setSessionAgent payload must be an object");
-    }
-    if (!Object.prototype.hasOwnProperty.call(msg, "agentId")) {
-      throw new Error("setSessionAgent requires an agentId field");
-    }
-    if (msg.agentId !== null && typeof msg.agentId !== "string") {
-      throw new Error("agentId must be a string or null");
-    }
-    return { agentId: typeof msg.agentId === "string" ? msg.agentId.trim() : "" };
-  }
-
-  function handleSetSessionAgent(clientId, msg) {
-    if (!onSetSessionAgent) {
-      return {
-        unicast: formatSessionAgentAck({
-          status: "rejected",
-          error: "setSessionAgent is not available",
-        }),
-      };
-    }
-    let payload;
-    try {
-      payload = parseSetSessionAgent(msg);
-    } catch (err) {
-      return {
-        unicast: formatSessionAgentAck({
-          status: "rejected",
-          error: err && err.message ? err.message : "invalid setSessionAgent payload",
-        }),
-      };
-    }
-    return Promise.resolve(onSetSessionAgent(payload)).then(
-      (result) => ({
-        unicast: formatSessionAgentAck(result || { status: "accepted" }),
-      }),
-      (err) => ({
-        unicast: formatSessionAgentAck({
-          status: "rejected",
-          error: err && err.message ? err.message : "setSessionAgent failed",
-        }),
-      }),
-    );
-  }
-
-  function handleSetSessionModelConfig(clientId, msg) {
-    const requestId =
-      msg && typeof msg.requestId === "string" && msg.requestId.trim()
-        ? msg.requestId.trim()
-        : undefined;
-    const formatAck = (payload) =>
-      formatSessionModelConfigAck(
-        requestId === undefined ? payload : { ...payload, requestId },
-      );
-
-    if (!onSetSessionModelConfig) {
-      return {
-        unicast: formatAck({
-          status: "rejected",
-          error: "setSessionModelConfig is not available",
-        }),
-      };
-    }
-
-    let payload;
-    try {
-      payload = parseSetSessionModelConfig(msg);
-    } catch (err) {
-      return {
-        unicast: formatAck({
-          status: "rejected",
-          error: err && err.message ? err.message : "invalid setSessionModelConfig payload",
-        }),
-      };
-    }
-
-    return Promise.resolve(onSetSessionModelConfig(payload)).then(
-      (result) =>
-        ({
-          unicast: formatAck(result || { status: "accepted" }),
-        }),
-      (err) =>
-        ({
-          unicast: formatAck({
-            status: "rejected",
-            error: err && err.message ? err.message : "setSessionModelConfig failed",
-          }),
-        }),
-    );
-  }
-
-  function handleCompactSession(clientId, msg) {
-    if (!onCompactSession) {
-      return Promise.resolve({
-        unicast: formatCompactSessionAck({
-          status: "rejected",
-          requestId: msg && msg.requestId,
-          error: "compactSession is not available",
-        }),
-      });
-    }
-    const sessionKey =
-      msg && typeof msg.sessionKey === "string" && msg.sessionKey
-        ? msg.sessionKey
-        : null;
-    if (!sessionKey) {
-      return Promise.resolve({
-        unicast: formatCompactSessionAck({
-          status: "rejected",
-          requestId: msg && msg.requestId,
-          error: "sessionKey is required",
-        }),
-      });
-    }
-    return Promise.resolve(onCompactSession({ sessionKey })).then(
-      (result) => ({
-        unicast: formatCompactSessionAck({
-          ...(result || { status: "accepted" }),
-          requestId: msg.requestId,
-        }),
-      }),
-      (err) => ({
-        unicast: formatCompactSessionAck({
-          status: "rejected",
-          requestId: msg.requestId,
-          error: err && err.message ? err.message : "compactSession failed",
-        }),
-      }),
-    );
-  }
-
-  function handleGetEvenAiSettings(clientId) {
-    if (!onGetEvenAiSettings) {
-      return { unicast: formatError("getEvenAiSettings is not available") };
-    }
-    return Promise.resolve(onGetEvenAiSettings()).then(
-      (payload) => ({
-        unicast: formatEvenAiSettings(payload || {}),
-      }),
-      (err) => {
-        logger.error(`[downstream] getEvenAiSettings failed: ${err.message}`);
-        return { unicast: formatError(err.message || "getEvenAiSettings failed") };
-      },
-    );
-  }
-
-  function handleGetEvenAiSessions(clientId) {
-    if (!onGetEvenAiSessions) {
-      return { unicast: formatError("getEvenAiSessions is not available") };
-    }
-    return Promise.resolve(onGetEvenAiSessions()).then(
-      (payload) => ({
-        unicast: formatEvenAiSessions(payload || {}),
-      }),
-      (err) => {
-        logger.error(`[downstream] getEvenAiSessions failed: ${err.message}`);
-        return { unicast: formatEvenAiSessions({ sessions: [] }) };
-      },
-    );
-  }
-
-  function handleSetEvenAiSettings(clientId, msg) {
-    if (!onSetEvenAiSettings) {
-      return {
-        unicast: formatEvenAiSettingsAck({
-          status: "rejected",
-          error: "setEvenAiSettings is not available",
-        }),
-      };
-    }
-
-    let payload;
-    try {
-      payload = parseSetEvenAiSettings(msg);
-    } catch (err) {
-      return {
-        unicast: formatEvenAiSettingsAck({
-          status: "rejected",
-          error: err && err.message ? err.message : "invalid setEvenAiSettings payload",
-        }),
-      };
-    }
-
-    return Promise.resolve(onSetEvenAiSettings(payload)).then(
-      (result) => ({
-        unicast: formatEvenAiSettingsAck(result || { status: "accepted" }),
-      }),
-      (err) => ({
-        unicast: formatEvenAiSettingsAck({
-          status: "rejected",
-          error: err && err.message ? err.message : "setEvenAiSettings failed",
-        }),
-      }),
-    );
-  }
-
-  function handleGetOcuClawSettings(clientId) {
-    if (!onGetOcuClawSettings) {
-      return { unicast: formatError("getOcuClawSettings is not available") };
-    }
-    return Promise.resolve(onGetOcuClawSettings()).then(
-      (payload) => ({
-        unicast: formatOcuClawSettings(payload || {}),
-      }),
-      (err) => {
-        logger.error(`[downstream] getOcuClawSettings failed: ${err.message}`);
-        return { unicast: formatError(err.message || "getOcuClawSettings failed") };
-      },
-    );
-  }
-
-  function handleSetOcuClawSettings(clientId, msg) {
-    if (!onSetOcuClawSettings) {
-      return {
-        unicast: formatOcuClawSettingsAck({
-          status: "rejected",
-          error: "setOcuClawSettings is not available",
-        }),
-      };
-    }
-
-    let payload;
-    try {
-      payload = parseSetOcuClawSettings(msg);
-    } catch (err) {
-      return {
-        unicast: formatOcuClawSettingsAck({
-          status: "rejected",
-          error: err && err.message ? err.message : "invalid setOcuClawSettings payload",
-        }),
-      };
-    }
-
-    return Promise.resolve(onSetOcuClawSettings(payload)).then(
-      (result) => ({
-        unicast: formatOcuClawSettingsAck(result || { status: "accepted" }),
-      }),
-      (err) => ({
-        unicast: formatOcuClawSettingsAck({
-          status: "rejected",
-          error: err && err.message ? err.message : "setOcuClawSettings failed",
-        }),
-      }),
-    );
-  }
-
-  function handleGetSavedPrompts(clientId) {
-    if (!onGetSavedPrompts) {
-      return {
-        unicast: formatError("saved prompts are not available", {
-          code: "saved_prompts_unavailable",
-          op: APP_PROTOCOL.savedPromptsGet,
-        }),
-      };
-    }
-
-    return Promise.resolve()
-      .then(() => onGetSavedPrompts())
-      .then(
-        (payload) => ({ unicast: formatSavedPrompts(payload || {}) }),
-        (err) => {
-          const message = err && err.message ? err.message : "getSavedPrompts failed";
-          logger.error(`[downstream] getSavedPrompts failed: ${message}`);
-          return {
-            unicast: formatError(message, {
-              code: "saved_prompts_read_failed",
-              op: APP_PROTOCOL.savedPromptsGet,
-            }),
-          };
-        },
-      );
-  }
-
-  function handleWriteSavedPrompts(clientId, msg) {
-    const requestId = msg && typeof msg.requestId === "string" ? msg.requestId : "";
-    if (!onWriteSavedPrompts) {
-
-      return {
-        unicast: formatError("saved prompts are not available", {
-          code: "saved_prompts_unavailable",
-          op: APP_PROTOCOL.savedPromptsWrite,
-          requestId,
-        }),
-      };
-    }
-    const request = {
-      op: msg && typeof msg.op === "string" ? msg.op : "",
-      prompt: msg && typeof msg.prompt === "object" ? msg.prompt : null,
-      id: msg && typeof msg.id === "string" ? msg.id : "",
-      ids: msg && Array.isArray(msg.ids) ? msg.ids : null,
-      updatedAtMs: Number.isFinite(msg && msg.updatedAtMs) ? msg.updatedAtMs : undefined,
-    };
-    return Promise.resolve()
-      .then(() => onWriteSavedPrompts(request))
-      .then(
-      (result) => {
-        const payload = result || { status: "rejected", reason: "rejected" };
-        const action = {
-          unicast: formatSavedPromptsAck({ ...payload, requestId }),
-        };
-        if (payload.status === "accepted") {
-          action.broadcast = [formatSavedPrompts(payload)];
-        }
-        return action;
-      },
-      (err) => {
-        const message = err && err.message ? err.message : "writeSavedPrompts failed";
-        logger.error(`[downstream] writeSavedPrompts failed: ${message}`);
-
-        return {
-          unicast: formatError(message, {
-            code: "saved_prompts_write_failed",
-            op: APP_PROTOCOL.savedPromptsWrite,
-            requestId,
-          }),
-        };
-      },
-    );
-  }
-
-  function handleSwitchSession(clientId, msg) {
-    if (!msg.sessionKey) return null;
-    if (isRetiredEvenTerminalSessionKey(msg.sessionKey)) {
-      return {
-        broadcast: [
-          formatSessionSwitchRejected({
-            sessionKey: msg.sessionKey,
-            reason: "unsupported_session_key",
-          }),
-        ],
-      };
-    }
-    return onSwitchSession(msg.sessionKey).then(
-      (pages) => {
-        noteClientSessionSelected(clientId, msg.sessionKey);
-        return {
-          broadcast: [
-            formatSessionSwitched(msg.sessionKey),
-            formatPages(pages),
-          ],
-        };
-      },
-      (err) => {
-
-        if (
-          err &&
-          (err.reason === "session_switch_superseded" ||
-            err.code === "session_switch_superseded")
-        ) {
-          return null;
-        }
-        logger.error(`[downstream] switchSession failed: ${err.message}`);
-        if (err && (err.reason === "unsupported_session_key" || err.code === "unsupported_session_key")) {
-          return {
-            broadcast: [
-              formatSessionSwitchRejected({
-                sessionKey: msg.sessionKey,
-                reason: "unsupported_session_key",
-                currentSessionKey: err.currentSessionKey,
-              }),
-            ],
-          };
-        }
-        return null;
-      },
-    );
-  }
-
-  function handleCopySession(clientId, msg) {
-    if (!msg.sessionKey) return null;
-    if (!isForeignHermesSessionKey(msg.sessionKey)) {
-      return {
-        unicast: JSON.stringify({
-          type: APP_PROTOCOL.sessionCopyAck,
-          ok: false,
-          copiedFrom: msg.sessionKey,
-          error: "foreign_session_copy_requires_foreign_source",
-        }),
-      };
-    }
-    return onCopySession(msg.sessionKey).then(
-      (result) => {
-        const ack = {
-          unicast: JSON.stringify({
-            type: APP_PROTOCOL.sessionCopyAck,
-            ok: true,
-            key: result.sessionKey,
-            copiedFrom: msg.sessionKey,
-          }),
-        };
-
-        if (result.superseded === true) return ack;
-        noteClientSessionSelected(clientId, result.sessionKey);
-        return {
-          ...ack,
-          broadcast: [
-            formatSessionSwitched(result.sessionKey),
-            formatPages(result.pages),
-          ],
-        };
-      },
-      (err) => {
-        logger.error(`[downstream] copySession failed: ${err.message}`);
-        return {
-          unicast: JSON.stringify({
-            type: APP_PROTOCOL.sessionCopyAck,
-            ok: false,
-            copiedFrom: msg.sessionKey,
-            error: err.message,
-          }),
-        };
-      },
-    );
-  }
-
-  function formatSessionDriverState(snapshot) {
-    const s = snapshot && typeof snapshot === "object" ? snapshot : {};
-    return JSON.stringify({
-      type: APP_PROTOCOL.sessionDriver,
-      ...projectSessionDriverFields(s),
-      holdPid: Number.isFinite(s.holdPid) ? s.holdPid : null,
-      updatedAtMs: Number.isFinite(s.updatedAtMs) ? s.updatedAtMs : Date.now(),
-    });
-  }
-
-  function handleSessionDriverTakeOver(clientId, msg) {
-    const sessionKey = parseOptionalTrimmedString(msg && msg.sessionKey);
-    if (!sessionKey) return null;
-    const refused = (error, snapshot) => ({
-      unicast: JSON.stringify({
-        ...JSON.parse(formatSessionDriverState(snapshot || { sessionKey })),
-        error,
-      }),
-    });
-    if (typeof onSessionDriverTakeOver !== "function") {
-      return refused("session_driver_unsupported", null);
-    }
-    return Promise.resolve(onSessionDriverTakeOver(sessionKey)).then(
-      (result) => {
-        if (!result || result.ok !== true) {
-          return refused((result && result.error) || "take_over_refused", result && result.snapshot);
-        }
-        return { broadcast: [formatSessionDriverState(result.snapshot)] };
-      },
-      (err) => {
-        logger.error(`[downstream] sessionDriverTakeOver failed: ${err.message}`);
-        return refused(err.message, null);
-      },
-    );
-  }
-
-  function handleAdoptSession(clientId, msg) {
-    if (!msg.sessionKey) return null;
-
-    const rejected = (error, holdState = null) => ({
-      unicast: JSON.stringify({
-        type: APP_PROTOCOL.sessionAdoptAck,
-        ok: false,
-        adoptedFrom: msg.sessionKey,
-        error,
-        ...(typeof holdState === "string" && holdState.trim() ? { holdState: holdState.trim() } : {}),
-      }),
-    });
-    if (!isAdoptableHermesSessionKey(msg.sessionKey)) {
-      return rejected("foreign_session_adopt_requires_external_source");
-    }
-    if (typeof onAdoptSession !== "function") {
-      return rejected("foreign_session_adopt_unsupported");
-    }
-    const options = msg.takeOver === true ? { takeOver: true } : {};
-    return onAdoptSession(msg.sessionKey, options).then(
-      (result) => {
-        const ack = {
-          unicast: JSON.stringify({
-            type: APP_PROTOCOL.sessionAdoptAck,
-            ok: true,
-            key: result.sessionKey,
-            adoptedFrom: msg.sessionKey,
-          }),
-        };
-        if (result.superseded === true) return ack;
-        noteClientSessionSelected(clientId, result.sessionKey);
-        return {
-          ...ack,
-          broadcast: [
-            formatSessionSwitched(result.sessionKey),
-            formatPages(result.pages, undefined),
-          ],
-        };
-      },
-      (err) => {
-        logger.error(`[downstream] adoptSession failed: ${err.message}`);
-        return rejected(err.message, err && err.holdState);
-      },
-    );
-  }
-
-  function handleNewSession(
-    clientId,
-    msg = { agentRef: "", scope: "", requestId: "" },
-  ) {
-    let payload;
-    try {
-      payload = parseNewSession(msg);
-    } catch (err) {
-      return {
-        unicast: formatError(
-          err instanceof Error ? err.message : "invalid newSession payload",
-          {
-            requestId: parseOptionalTrimmedString(msg && msg.requestId),
-            op: APP_PROTOCOL.sessionCreate,
-          },
-        ),
-      };
-    }
-    return Promise.resolve(onNewSession(payload)).then(
-      (result) => {
-        noteClientSessionSelected(clientId, result && result.sessionKey);
-        const broadcast = [
-          formatSessionSwitched(
-            result.sessionKey,
-            payload.requestId,
-            result.draft,
-            result && result.agentFallback,
-          ),
-          formatPages(result.pages),
-        ];
-        if (result && result.sessionModelConfig) {
-          broadcast.push(formatSessionModelConfig(result.sessionModelConfig));
-        }
-        return { broadcast };
-      },
-      (err) => {
-        logger.error(`[downstream] newSession failed: ${err.message}`);
-        return {
-          unicast: formatError(
-            err instanceof Error ? err.message : "newSession failed",
-            {
-              requestId: payload.requestId,
-              op: APP_PROTOCOL.sessionCreate,
-            },
-          ),
-        };
-      },
-    );
-  }
-
-  function handleSetUserSessionTitle(clientId, msg) {
-    if (typeof onSetUserSessionTitle !== "function") return null;
-    const sessionKey =
-      typeof msg.sessionKey === "string" ? msg.sessionKey.trim() : "";
-    const title = typeof msg.title === "string" ? msg.title.trim() : "";
-    if (!sessionKey || !title) return null;
-    if (title.length > 55) return null;
-
-    const errorAction = (code) => ({
-      unicast: formatError(code, {
-        code,
-        op: "session.title.set",
-      }),
-    });
-    if (isForeignHermesSessionKey(sessionKey)) {
-      return errorAction("session_not_renamable");
-    }
-
-    const failure = (err) => {
-      const message = err && err.message ? err.message : String(err || "");
-      const conflict = /already in use|unique/i.test(message);
-      const code = conflict
-        ? "session_title_conflict"
-        : "session_title_update_failed";
-      return errorAction(code);
-    };
-
-    const finish = (resolved) => {
-      if (!resolved || resolved.ok !== false) return null;
-      return resolved.code === "session_title_conflict"
-        ? errorAction("session_title_conflict")
-        : failure(new Error(resolved.code || "title update rejected"));
-    };
-    try {
-      const result = onSetUserSessionTitle(sessionKey, title);
-      if (result && typeof result.then === "function") {
-        return result.then(finish, failure);
-      }
-      return finish(result);
-    } catch (err) {
-      return failure(err);
-    }
-  }
-
-  function handleSetSessionPinned(clientId, msg) {
-    if (typeof onSetSessionPinned !== "function") return null;
-    const sessionKey =
-      typeof msg.sessionKey === "string" ? msg.sessionKey.trim() : "";
-    const pinned = msg.pinned === true;
-    const kind = msg.kind;
-    if (
-      !sessionKey ||
-      isForeignHermesSessionKey(sessionKey) ||
-      (kind !== "ocuclaw" && kind !== "evenai")
-    ) {
-      return { unicast: formatError("invalid_session_pin_request") };
-    }
-    const result = onSetSessionPinned(sessionKey, pinned, kind);
-    if (result && result.ok === false) {
-      const code = result.reason === "cap" ? "pin_cap_reached" : "invalid_session_pin_request";
-      return { unicast: formatError(code) };
-    }
-    return null;
-  }
-
-  function handleSetSessionHidden(clientId, msg) {
-    if (typeof onSetSessionHidden !== "function") return null;
-    const sessionKey =
-      typeof msg.sessionKey === "string" ? msg.sessionKey.trim() : "";
-    if (!sessionKey) {
-      return {
-        unicast: formatError("invalid_session_hidden_request", {
-          code: "invalid_session_hidden_request",
-          op: "session.hidden.set",
-        }),
-      };
-    }
-    const hidden = msg.hidden === true;
-    const finish = (result) => {
-      if (result && result.ok === false) {
-        const code =
-          typeof result.code === "string"
-            ? result.code
-            : "invalid_session_hidden_request";
-        return {
-          unicast: formatError(code, { code, op: "session.hidden.set" }),
-        };
-      }
-      return null;
-    };
-    const failure = (err) => {
-      logger.warn(
-        `[handler] session.hidden.set failed: ${err && err.message ? err.message : err}`,
-      );
-      return {
-        unicast: formatError("session_hidden_update_failed", {
-          code: "session_hidden_update_failed",
-          op: "session.hidden.set",
-        }),
-      };
-    };
-    try {
-      const result = onSetSessionHidden(sessionKey, hidden);
-      if (result && typeof result.then === "function") {
-        return result.then(finish, failure);
-      }
-      return finish(result);
-    } catch (err) {
-      return failure(err);
-    }
-  }
-
-  function handleDeleteSessions(clientId, msg) {
-    if (typeof onDeleteSessions !== "function") return null;
-    const sessionKeys = Array.isArray(msg.sessionKeys) ? msg.sessionKeys.filter((k) => typeof k === "string" && k) : [];
-    const kind = msg.kind;
-    const switchBeforeDelete = msg.switchBeforeDelete === true;
-    if (
-      sessionKeys.length === 0 ||
-      sessionKeys.some(isForeignHermesSessionKey) ||
-      (kind !== "ocuclaw" && kind !== "evenai")
-    ) {
-      return { unicast: formatError("invalid_session_delete_request") };
-    }
-    onDeleteSessions(sessionKeys, kind, switchBeforeDelete);
-    return null;
-  }
-
-  function handleSearchTranscripts(clientId, msg) {
-    if (typeof onSearchTranscripts !== "function") return null;
-    const query = typeof msg.query === "string" ? msg.query : "";
-    const kind = msg.kind;
-    const requestId = typeof msg.requestId === "string" && msg.requestId.trim()
-      ? msg.requestId.trim() : undefined;
-    if (!query.trim() || (kind !== "ocuclaw" && kind !== "evenai")) {
-      return { unicast: formatError("invalid_transcript_search_request", { requestId }) };
-    }
-    onSearchTranscripts(clientId, query, kind, requestId);
-    return null;
-  }
+  const {
+    handleNewChat,
+    handleGetSessions,
+    handleGetSessionDiff,
+    handleGetSessionModelConfig,
+    handleSetSessionAgent,
+    handleSetSessionModelConfig,
+    handleCompactSession,
+    handleSwitchSession,
+    handleCopySession,
+    handleSessionDriverTakeOver,
+    handleAdoptSession,
+    handleNewSession,
+    handleSetUserSessionTitle,
+    handleSetSessionPinned,
+    handleSetSessionHidden,
+    handleMarkAllSessionsRead,
+    handleDeleteSessions,
+    handleSearchTranscripts,
+  } = createSessionHandlers({
+    logger,
+    formatPages,
+    defaultEvenAiDedicatedSessionKey,
+    hasOwn,
+    isRetiredEvenTerminalSessionKey,
+    onClientSessionSelected,
+    onNewChat,
+    onGetSessions,
+    onGetEvenAiSessions,
+    onSwitchSession,
+    onCopySession,
+    onAdoptSession,
+    onSessionDriverTakeOver,
+    onNewSession,
+    onGetSessionModelConfig,
+    onSetSessionModelConfig,
+    onSetSessionAgent,
+    onCompactSession,
+    onSetUserSessionTitle,
+    onSetSessionPinned,
+    onSetSessionHidden,
+    onMarkAllSessionsRead,
+    onDeleteSessions,
+    onSearchTranscripts,
+  });
 
   function handleSlashCommand(clientId, msg) {
     if (!msg.command) return null;
@@ -7150,114 +1952,6 @@ function createDownstreamHandler(opts) {
         `${messageType} was removed; hybrid-local voice stays local to the app`,
       ),
     };
-  }
-
-  function handleRequestSonioxTemporaryKey(clientId, msg) {
-    let payload;
-    try {
-      payload = parseRequestSonioxTemporaryKey(msg);
-    } catch (err) {
-      return {
-        unicast: formatSonioxTemporaryKeyError({
-          voiceSessionId:
-            msg && typeof msg.voiceSessionId === "string" ? msg.voiceSessionId : "",
-          error: err && err.message ? err.message : "requestSonioxTemporaryKey failed",
-          code: normalizeSonioxTemporaryKeyErrorCode(err),
-        }),
-      };
-    }
-
-    if (!onRequestSonioxTemporaryKey) {
-      return {
-        unicast: formatSonioxTemporaryKeyError({
-          voiceSessionId: payload.voiceSessionId,
-          error: "requestSonioxTemporaryKey is not available",
-          code: "soniox_temp_key_unavailable",
-        }),
-      };
-    }
-
-    try {
-      const result = onRequestSonioxTemporaryKey(clientId, payload);
-      if (result && typeof result.then === "function") {
-        return result.then(
-          (resolved) => ({ unicast: formatSonioxTemporaryKey(resolved || payload) }),
-          (err) => {
-            const error =
-              err && err.message
-                ? err.message
-                : "requestSonioxTemporaryKey failed";
-            return {
-              unicast: formatSonioxTemporaryKeyError({
-                voiceSessionId: payload.voiceSessionId,
-                error,
-                code: normalizeSonioxTemporaryKeyErrorCode(err),
-              }),
-            };
-          },
-        );
-      }
-      return { unicast: formatSonioxTemporaryKey(result || payload) };
-    } catch (err) {
-      return {
-        unicast: formatSonioxTemporaryKeyError({
-          voiceSessionId: payload.voiceSessionId,
-          error: err && err.message ? err.message : "requestSonioxTemporaryKey failed",
-          code: normalizeSonioxTemporaryKeyErrorCode(err),
-        }),
-      };
-    }
-  }
-
-  function handleRequestCartesiaAccessToken(clientId, msg) {
-    let payload;
-    try {
-      payload = parseRequestCartesiaAccessToken(msg);
-    } catch (err) {
-      return {
-        unicast: formatCartesiaAccessTokenError({
-          voiceSessionId:
-            msg && typeof msg.voiceSessionId === "string" ? msg.voiceSessionId : "",
-          error: err && err.message ? err.message : "requestCartesiaAccessToken failed",
-          code: normalizeCartesiaAccessTokenErrorCode(err),
-        }),
-      };
-    }
-
-    if (!onRequestCartesiaAccessToken) {
-      return {
-        unicast: formatCartesiaAccessTokenError({
-          voiceSessionId: payload.voiceSessionId,
-          error: "requestCartesiaAccessToken is not available",
-          code: "cartesia_access_token_unavailable",
-        }),
-      };
-    }
-
-    try {
-      const result = onRequestCartesiaAccessToken(clientId, payload);
-      if (result && typeof result.then === "function") {
-        return result.then(
-          (resolved) => ({ unicast: formatCartesiaAccessToken(resolved || payload) }),
-          (err) => ({
-            unicast: formatCartesiaAccessTokenError({
-              voiceSessionId: payload.voiceSessionId,
-              error: err && err.message ? err.message : "requestCartesiaAccessToken failed",
-              code: normalizeCartesiaAccessTokenErrorCode(err),
-            }),
-          }),
-        );
-      }
-      return { unicast: formatCartesiaAccessToken(result || payload) };
-    } catch (err) {
-      return {
-        unicast: formatCartesiaAccessTokenError({
-          voiceSessionId: payload.voiceSessionId,
-          error: err && err.message ? err.message : "requestCartesiaAccessToken failed",
-          code: normalizeCartesiaAccessTokenErrorCode(err),
-        }),
-      };
-    }
   }
 
   function handleDebugSet(clientId, msg) {
@@ -7595,8 +2289,8 @@ function createDownstreamHandler(opts) {
 
   return {
 
-    handleMessage(clientId, raw, transportContext = {}) {
-      let msg;
+    handleMessage(clientId, raw, transportContext      = {}) {
+      let msg     ;
       try {
         msg = JSON.parse(raw);
       } catch {
@@ -7615,16 +2309,52 @@ function createDownstreamHandler(opts) {
       }
 
       switch (msg.type) {
+        case "ocuclaw.model_sites.request": {
+          const request = parseModelSitesRequest(msg);
+          const respond = (result     ) => ({ unicast: JSON.stringify({ type: "ocuclaw.model_sites.result", ...result }) });
+          if (!admitPhoneOnlyWrite(clientId, msg.type)) return respond(modelSitesFailure(msg, "phone_only"));
+          if (!request) return respond(modelSitesFailure(msg, "invalid_request"));
+          if (typeof opts.onModelSites !== "function") return respond(modelSitesFailure(request, "unsupported", "unsupported"));
+          return Promise.resolve().then(() => opts.onModelSites(clientId, request, transportContext.workerEpoch))
+            .then((result     ) => respond(modelSitesResult(request, result)))
+            .catch(() => respond(modelSitesFailure(request, "unavailable", "outcome_unknown")))
+            .finally(() => { if (request.credential) request.credential = ""; msg = null; });
+        }
         case "ocuclaw.optional.setup.request": {
           const request = parseOptionalSetupRequest(msg);
-          const respond = (result) => ({ unicast: JSON.stringify({ type: "ocuclaw.optional.setup.result", ...result }) });
+          const respond = (result     ) => ({ unicast: JSON.stringify({ type: "ocuclaw.optional.setup.result", ...result }) });
           if (!admitPhoneOnlyWrite(clientId, msg.type)) return respond(optionalSetupFailure(msg, "phone_only"));
           if (!request) return respond(optionalSetupFailure(msg, "invalid_request"));
           if (typeof opts.onOptionalSetup !== "function") return respond(optionalSetupFailure(request, "unsupported", "unsupported"));
           return Promise.resolve().then(() => opts.onOptionalSetup(clientId, request, transportContext.workerEpoch))
-            .then((result) => respond(optionalSetupResult(request, result)))
+            .then((result     ) => respond(optionalSetupResult(request, result)))
             .catch(() => respond(optionalSetupFailure(request, "unavailable", "outcome_unknown")))
             .finally(() => { if (request.credential) request.credential = ""; msg = null; });
+        }
+        case "ocuclaw.secret.answer": {
+
+          const requestId = typeof msg.requestId === "string" ? msg.requestId.slice(0, 128) : "";
+          const id = typeof msg.id === "string" ? msg.id.trim().slice(0, 256) : "";
+          const respond = (result     ) => ({
+            unicast: JSON.stringify({
+              type: "ocuclaw.secret.result",
+              requestId,
+              id,
+              status: result && typeof result.status === "string" ? result.status : "failed",
+              reason: result && typeof result.reason === "string" ? result.reason : null,
+            }),
+          });
+          const answer      = { id, skip: msg.skip === true };
+          if (!answer.skip) answer.value = typeof msg.value === "string" ? msg.value : "";
+          if (Array.isArray(msg.allowedHosts)) answer.allowedHosts = msg.allowedHosts.filter((host     ) => typeof host === "string");
+          msg = null;
+          if (!admitPhoneOnlyWrite(clientId, "ocuclaw.secret.answer")) return respond({ status: "refused", reason: "phone_only" });
+          if (!requestId || !id) return respond({ status: "refused", reason: "invalid_request" });
+          if (typeof opts.onSecretAnswer !== "function") return respond({ status: "refused", reason: "unsupported" });
+          return Promise.resolve().then(() => opts.onSecretAnswer(clientId, answer))
+            .then((result     ) => respond(result))
+            .catch(() => respond({ status: "failed", reason: "unavailable" }))
+            .finally(() => { answer.value = ""; });
         }
         case APP_PROTOCOL.ledgerCursor:
           return handleLedgerSync(msg, onLedgerCursor);
@@ -7652,6 +2382,8 @@ function createDownstreamHandler(opts) {
           return handleSimulateTool(clientId, msg);
         case "simulateThinking":
           return handleSimulateThinking(clientId, msg);
+        case "simulateRunSignal":
+          return handleSimulateRunSignal(clientId, msg);
         case "simulateApproval":
           return handleSimulateApproval(clientId, msg);
         case "simulateDemand":
@@ -7664,6 +2396,8 @@ function createDownstreamHandler(opts) {
           return handleSubscribeProtocol(clientId);
         case APP_PROTOCOL.approvalResolve:
           return handleApprovalResponse(clientId, msg);
+        case APP_PROTOCOL.waitingAnswer:
+          return handleWaitingAnswer(clientId, msg);
         case APP_PROTOCOL.sessionReset:
           return handleNewChat(clientId);
         case APP_PROTOCOL.sessionList:
@@ -7686,6 +2420,8 @@ function createDownstreamHandler(opts) {
           return handleSetSessionPinned(clientId, msg);
         case APP_PROTOCOL.sessionHiddenSet:
           return handleSetSessionHidden(clientId, msg);
+        case APP_PROTOCOL.sessionReadAll:
+          return handleMarkAllSessionsRead(clientId, msg);
         case "ocuclaw.session.delete":
           return handleDeleteSessions(clientId, msg);
         case "ocuclaw.session.transcripts.search":
@@ -7720,16 +2456,83 @@ function createDownstreamHandler(opts) {
         case APP_PROTOCOL.skillsCatalogGet:
         case "getSkills":
           return handleGetSkillsCatalog(clientId);
+        case APP_PROTOCOL.starmapGet:
+          return handleGetStarMap(clientId);
+        case APP_PROTOCOL.starmapForget:
+          return handleForgetStar(clientId, msg);
         case APP_PROTOCOL.liveuiLibraryGet:
           return handleGetLiveuiLibrary(clientId);
         case APP_PROTOCOL.liveuiLibraryOpen:
           return handleOpenLiveuiLibraryItem(clientId, msg);
+        case APP_PROTOCOL.programCardSave:
+          return handleSaveProgramCard(clientId, msg);
+        case APP_PROTOCOL.programCardCheckpoint:
+          return handleCheckpointProgramCard(clientId, msg);
+        case APP_PROTOCOL.programCardSourceGet:
+          return handleGetProgramCardSource(clientId, msg);
+        case APP_PROTOCOL.programCardRevisionsGet:
+          return handleGetProgramCardRevisions(clientId, msg);
+        case APP_PROTOCOL.programCardRevision:
+          return handleProgramCardRevision(clientId, msg);
+        case APP_PROTOCOL.programCardRevisionPicture:
+          return handleProgramCardRevisionPicture(clientId, msg);
+        case APP_PROTOCOL.programCardSlotsGet:
+          return handleGetProgramCardSlots(clientId, msg);
+        case APP_PROTOCOL.programCardSlot:
+          return handleProgramCardSlot(clientId, msg);
+        case APP_PROTOCOL.programCardReviewLookStep:
+          return handleProgramCardReviewLookStep(clientId, msg);
+        case APP_PROTOCOL.programCardReviewGet:
+        case APP_PROTOCOL.programCardReviewStart:
+        case APP_PROTOCOL.programCardReviewCancel:
+        case APP_PROTOCOL.programCardReviewRetry:
+        case APP_PROTOCOL.programCardReviewRetryCancel:
+        case APP_PROTOCOL.programCardReviewDecide:
+          return handleProgramCardReview(clientId, msg);
+        case APP_PROTOCOL.programCardReviewApply:
+          return handleProgramCardReviewApply(clientId, msg);
         case APP_PROTOCOL.liveuiTaskCancel:
           return handleCancelLiveuiTaskLaunch(clientId, msg);
         case APP_PROTOCOL.liveuiTasksGet:
           return handleGetLiveuiTasksForPhone(clientId);
         case APP_PROTOCOL.liveuiTaskRunsGet:
           return handleGetLiveuiTaskRunsForPhone(clientId, msg);
+        case "ocuclaw.program_card.drafts": {
+          if (!onProgramCardRequest || !admitPhoneOnlyWrite(clientId, msg.type)) return null;
+          return Promise.resolve(onProgramCardRequest({ clientId, type: msg.type, msg, ownerWrite: true }));
+        }
+        case APP_PROTOCOL.programBindingsGet:
+        case APP_PROTOCOL.programBindingSet:
+        case APP_PROTOCOL.programBindingClear:
+        case APP_PROTOCOL.programBindingRelink:
+        case APP_PROTOCOL.programBindingFixNotNow:
+        case APP_PROTOCOL.programBindingFixStart:
+        case APP_PROTOCOL.programBindingFixSave:
+        case APP_PROTOCOL.programBindingFixClose:
+        case APP_PROTOCOL.programBindingFixUndo:
+        case APP_PROTOCOL.programBindingParts:
+        case APP_PROTOCOL.programBindingLink:
+        case APP_PROTOCOL.programBindingOpenUpdate:
+        case APP_PROTOCOL.programOpened:
+        case APP_PROTOCOL.programClosed:
+        case APP_PROTOCOL.programRefresh:
+        case APP_PROTOCOL.programAgentRefresh:
+        case APP_PROTOCOL.programCheckAgain: {
+          if (!onProgramCardRequest) return null;
+          const ownerWrite = msg.type === APP_PROTOCOL.programBindingSet || msg.type === APP_PROTOCOL.programBindingClear ||
+            msg.type === APP_PROTOCOL.programBindingRelink || msg.type === APP_PROTOCOL.programBindingOpenUpdate ||
+            msg.type === APP_PROTOCOL.programBindingFixNotNow || msg.type === APP_PROTOCOL.programBindingFixStart ||
+            msg.type === APP_PROTOCOL.programBindingFixSave || msg.type === APP_PROTOCOL.programBindingFixClose ||
+            msg.type === APP_PROTOCOL.programBindingFixUndo ||
+            msg.type === APP_PROTOCOL.programBindingParts || msg.type === APP_PROTOCOL.programBindingLink ||
+            msg.type === APP_PROTOCOL.programAgentRefresh || msg.type === APP_PROTOCOL.programCheckAgain
+            ? admitPhoneOnlyWrite(clientId, msg.type)
+            : false;
+          return Promise.resolve(onProgramCardRequest({ clientId, type: msg.type, msg, ownerWrite })).catch((err     ) => {
+            logger.error(`[downstream] program card request failed: ${err && err.message ? err.message : err}`);
+            return null;
+          });
+        }
         case APP_PROTOCOL.liveuiTaskReview:
           return handleReviewLiveuiTask(clientId, msg);
         case APP_PROTOCOL.liveuiTaskExecutorsGet:
@@ -7752,6 +2555,8 @@ function createDownstreamHandler(opts) {
           return handleSetLiveuiGrant(clientId, msg);
         case APP_PROTOCOL.liveuiStatusGet:
           return handleGetLiveuiStatus(clientId);
+        case APP_PROTOCOL.liveuiVideoRoute:
+          return handleLiveuiVideoRoute(clientId, msg);
         case APP_PROTOCOL.liveuiLibraryOrganize:
           return handleOrganizeLiveuiLibrary(clientId, msg);
         case APP_PROTOCOL.commandCatalogGet:
@@ -7764,16 +2569,74 @@ function createDownstreamHandler(opts) {
           return handleCreateOpenClawAgent(clientId, msg);
         case APP_PROTOCOL.hermesProfileCreate:
           return handleCreateHermesProfile(clientId, msg);
+        case APP_PROTOCOL.management:
         case APP_PROTOCOL.hermesManagement:
           return handleHermesManagement(clientId, msg);
         case APP_PROTOCOL.boardMomentAck:
           return handleBoardMomentAck(clientId, msg);
+        case APP_PROTOCOL.botScreenOpen:
+        case APP_PROTOCOL.botScreenClose:
+        case APP_PROTOCOL.botScreenStatusGet:
+        case APP_PROTOCOL.botScreenWant:
+        case APP_PROTOCOL.botScreenControl:
+        case APP_PROTOCOL.botScreenAim:
+        case APP_PROTOCOL.botScreenStart:
+          return handleBotScreen(clientId, msg);
+        case APP_PROTOCOL.pushAck:
+          return handleTaskPushAck(clientId, msg);
+        case APP_PROTOCOL.taskRowsGet:
+          return handleTaskRowsGet(clientId);
+        case APP_PROTOCOL.taskReminder:
+          return handleTaskReminder(clientId, msg);
+        case APP_PROTOCOL.taskLookSet:
+          return handleTaskLookSet(clientId, msg);
+        case APP_PROTOCOL.taskSheetSave:
+          return handleTaskSheet(clientId, msg, "save");
+        case APP_PROTOCOL.taskProposalStart:
+        case APP_PROTOCOL.taskProposalCancel:
+        case APP_PROTOCOL.taskProposalPreview:
+        case APP_PROTOCOL.taskProposalRevision:
+        case APP_PROTOCOL.taskProposalApplyRevision:
+          return handleTaskProposal(clientId, msg);
+        case APP_PROTOCOL.agentDraftStart:
+        case APP_PROTOCOL.agentDraftCancel:
+          return handleAgentDraft(clientId, msg);
+        case APP_PROTOCOL.taskWordsStart:
+        case APP_PROTOCOL.taskWordsCancel:
+          return handleTaskWords(clientId, msg);
+        case APP_PROTOCOL.taskSheetRun:
+          return handleTaskSheet(clientId, msg, "run");
+        case APP_PROTOCOL.taskSheetQuiet:
+          return handleTaskSheet(clientId, msg, "quiet");
+        case APP_PROTOCOL.taskPageGet:
+          return handleTaskPage(clientId, msg, "page");
+        case APP_PROTOCOL.taskPageAct:
+          return handleTaskPage(clientId, msg, "act");
+        case APP_PROTOCOL.taskTestRun:
+        case APP_PROTOCOL.taskTestAct:
+        case APP_PROTOCOL.taskTestStop:
+        case APP_PROTOCOL.taskTestDrop:
+        case APP_PROTOCOL.taskTestStarterReport:
+        case APP_PROTOCOL.taskCardDrop:
+        case APP_PROTOCOL.taskCardSave:
+        case APP_PROTOCOL.taskCardUndo:
+          return handleTaskTest(clientId, msg);
         case APP_PROTOCOL.agentEmojiSet:
           return handleSetAgentEmoji(clientId, msg);
+        case APP_PROTOCOL.agentsRoute:
+          return handleAgentsRoute(clientId, msg);
+        case APP_PROTOCOL.agentDescriptionSet:
+          return handleAgentDescription(clientId, msg, "set");
+        case APP_PROTOCOL.agentDescriptionAuto:
+          return handleAgentDescription(clientId, msg, "auto");
         case APP_PROTOCOL.agentSettingsGet:
           return handleGetAgentSettings(clientId, msg);
         case APP_PROTOCOL.agentSettingsSet:
           return handleSetAgentSettings(clientId, msg);
+        case APP_PROTOCOL.hostDefaultsGet:
+          return handleGetHostDefaults(clientId, msg);
+        case APP_PROTOCOL.hostDefaultsSet:
+          return handleSetHostDefaults(clientId, msg);
         case APP_PROTOCOL.sonioxModelsGet:
         case "getSonioxModels":
           return handleGetSonioxModels(clientId);
@@ -7781,6 +2644,40 @@ function createDownstreamHandler(opts) {
           return handleGetHermesSttCapabilities(msg);
         case APP_PROTOCOL.hermesSttTranscribe:
           return handleHermesSttTranscribe(msg);
+
+        case REALTIME_APP_PROTOCOL.capabilitiesGet:
+        case REALTIME_APP_PROTOCOL.start:
+        case REALTIME_APP_PROTOCOL.audio:
+        case REALTIME_APP_PROTOCOL.markAck:
+        case REALTIME_APP_PROTOCOL.interrupt:
+        case REALTIME_APP_PROTOCOL.stop:
+          return realtimeTalkHandlers.handle(clientId, msg);
+
+        case TTS_APP_PROTOCOL.capabilitiesGet:
+          return isPhoneClient(clientId)
+            ? ttsHandlers.handleGetTtsCapabilities(msg)
+            : offlineTtsHandlers.handleGetTtsCapabilities(msg);
+        case TTS_APP_PROTOCOL.speak:
+          return isPhoneClient(clientId)
+            ? ttsHandlers.handleTtsSpeak(msg)
+            : offlineTtsHandlers.handleTtsSpeak(msg);
+
+        case PHONE_SETTINGS_APP_PROTOCOL.snapshot:
+          if (isPhoneClient(clientId) && typeof opts.onPhoneSettingsSnapshot === "function") {
+            opts.onPhoneSettingsSnapshot(msg);
+          }
+          return null;
+        case PHONE_SETTINGS_APP_PROTOCOL.result:
+          if (isPhoneClient(clientId) && typeof opts.onPhoneSettingsResult === "function") {
+            opts.onPhoneSettingsResult(msg);
+          }
+          return null;
+
+        case APP_PROTOCOL.botScreenShowResult:
+          if (isPhoneClient(clientId) && typeof opts.onBotScreenShowResult === "function") {
+            opts.onBotScreenShowResult(msg);
+          }
+          return null;
         case "ocuclaw.voice.hermes.stt.upload.begin":
         case "ocuclaw.voice.hermes.stt.upload.chunk":
         case "ocuclaw.voice.hermes.stt.upload.commit":
@@ -7914,6 +2811,10 @@ function createDownstreamHandler(opts) {
                 phoneClient: isPhoneClient(clientId),
                 surfaceId: typeof msg.surfaceId === "string" ? msg.surfaceId : "",
                 outcome: msg.outcome,
+
+                reportAuthoritative: transportContext.liveuiStateReportAuthority?.eligible === true,
+                reportAuthorityReason: transportContext.liveuiStateReportAuthority?.eligible === true
+                  ? null : transportContext.liveuiStateReportAuthority?.reason || "unbound_send",
               });
             } catch (err) {
               logger.warn(
@@ -7928,6 +2829,8 @@ function createDownstreamHandler(opts) {
           const result =
             msg.result === "selected" ||
             msg.result === "await_text" ||
+
+            msg.result === "await_text_cancelled" ||
             msg.result === "dismissed"
               ? msg.result
               : "";
@@ -7953,12 +2856,21 @@ function createDownstreamHandler(opts) {
           }
           if (typeof onDemandResponse === "function") {
             try {
-              const frame = { surfaceId, result };
+              const frame      = { surfaceId, result };
+              if (surfaceId.startsWith("draft-launch-")) frame.clientId = clientId;
               if (result === "selected") frame.selectedIndex = selectedIndex;
               if (result === "selected" && validSelectedIndices) {
                 delete frame.selectedIndex;
                 frame.selectedIndices = selectedIndices;
               }
+
+              if (result === "selected" && Array.isArray(msg.shownSites)) {
+                const shown = msg.shownSites
+                  .filter((host     ) => typeof host === "string" && host.length <= 253).slice(0, 8);
+                if (shown.length) frame.shownSites = shown;
+              }
+
+              if (result === "dismissed" && msg.exit === "double_tap") frame.exit = "double_tap";
               onDemandResponse(frame);
             } catch (err) {
               logger.warn(
@@ -7968,6 +2880,25 @@ function createDownstreamHandler(opts) {
           }
           return null;
         }
+        case "liveui_state_report":
+
+          if (typeof onLiveUiStateReport === "function") {
+            try {
+              const { type: _type, ...report } = msg;
+              onLiveUiStateReport({
+                clientId,
+                report,
+                authoritative: transportContext.liveuiStateReportAuthority?.eligible === true,
+                authorityReason: transportContext.liveuiStateReportAuthority?.eligible === true
+                  ? null : transportContext.liveuiStateReportAuthority?.reason || "unbound_send",
+              });
+            } catch (err     ) {
+              logger.warn(
+                `[downstream] liveui_state_report handler threw: ${err && err.message ? err.message : err}`,
+              );
+            }
+          }
+          return null;
         case "glasses_ui_render_error":
           if (typeof onGlassesUiRenderError === "function") {
             onGlassesUiRenderError({
@@ -7994,9 +2925,32 @@ function createDownstreamHandler(opts) {
                 surfaceId: typeof msg.surfaceId === "string" ? msg.surfaceId : "",
                 seq: Number.isFinite(msg.seq) ? Math.floor(msg.seq) : null,
               });
-            } catch (err) {
+            } catch (err     ) {
               logger.warn(
                 `[downstream] surface_render_receipt handler threw: ${err && err.message ? err.message : err}`,
+              );
+            }
+          }
+          return null;
+        case "liveui_picture_want":
+
+          if (typeof onLiveUiPictureWant === "function") {
+            try {
+              onLiveUiPictureWant(clientId, msg);
+            } catch (err     ) {
+              logger.warn(
+                `[downstream] liveui_picture_want handler threw: ${err && err.message ? err.message : err}`,
+              );
+            }
+          }
+          return null;
+        case "liveui_video_want":
+          if (typeof onLiveUiVideoWant === "function") {
+            try {
+              onLiveUiVideoWant(clientId, msg);
+            } catch (err     ) {
+              logger.warn(
+                `[downstream] liveui_video_want handler threw: ${err && err.message ? err.message : err}`,
               );
             }
           }
@@ -8009,7 +2963,7 @@ function createDownstreamHandler(opts) {
                 { clientId, clientKind: isPhoneClient(clientId) === true ? "app" : "debug" },
                 msg,
               );
-            } catch (err) {
+            } catch (err     ) {
               logger.warn(
                 `[downstream] reply_render_receipt handler threw: ${err && err.message ? err.message : err}`,
               );
@@ -8074,7 +3028,7 @@ function createDownstreamHandler(opts) {
           } catch (_) {
             glassesUiLiveConfig = undefined;
           }
-          let hostCheck = null;
+          let hostCheck      = null;
           try {
             hostCheck = getLiveuiHostCheck ? getLiveuiHostCheck() : null;
           } catch (_) {
@@ -8142,9 +3096,133 @@ function createDownstreamHandler(opts) {
               onGlassesPresenceChanged({
                 presence: typeof msg.presence === "string" ? msg.presence : "unknown",
               });
-            } catch (err) {
+            } catch (err     ) {
               logger.warn(
                 `[downstream] glasses_presence_changed handler threw: ${err && err.message ? err.message : err}`,
+              );
+            }
+          }
+          return null;
+        case "program_card_feeds":
+
+          if (typeof onProgramCardFeeds === "function" && admitPhoneOnlyWrite(clientId, msg.type)) {
+            try {
+              onProgramCardFeeds({
+                op: msg.op === "subscribe" || msg.op === "unsubscribe" ? msg.op : "",
+                sub: typeof msg.sub === "string" ? msg.sub : "",
+                card: typeof msg.card === "string" ? msg.card : "",
+                feeds: Array.isArray(msg.feeds) ? msg.feeds : [],
+
+                block: Array.isArray(msg.block) ? msg.block : [],
+                ...(msg.sites === "ask" || msg.sites === "off" ? { sites: msg.sites } : {}),
+              });
+            } catch (err     ) {
+              logger.warn(
+                `[downstream] program_card_feeds handler threw: ${err && err.message ? err.message : err}`,
+              );
+            }
+          }
+          return null;
+        case "program_card_pictures":
+
+          if (typeof onProgramCardPictures === "function" && admitPhoneOnlyWrite(clientId, msg.type)) {
+            try {
+              onProgramCardPictures(clientId, msg);
+            } catch (err     ) {
+              logger.warn(
+                `[downstream] program_card_pictures handler threw: ${err && err.message ? err.message : err}`,
+              );
+            }
+          }
+          return null;
+        case "program_card_jev":
+
+          if (typeof onProgramCardJev === "function" && admitPhoneOnlyWrite(clientId, msg.type)) {
+            try {
+              onProgramCardJev({
+                op: typeof msg.op === "string" ? msg.op : "",
+                sub: typeof msg.sub === "string" ? msg.sub : "",
+                ...(msg.card && typeof msg.card === "object" && !Array.isArray(msg.card) ? { card: msg.card } : {}),
+                ...(Array.isArray(msg.uses) ? { uses: msg.uses } : {}),
+                ...(typeof msg.from === "string" ? { from: msg.from } : {}),
+                ...(Array.isArray(msg.asks) ? { asks: msg.asks } : {}),
+                ...(typeof msg.key === "string" ? { key: msg.key } : {}),
+                ...(typeof msg.digest === "string" ? { digest: msg.digest } : {}),
+                ...(typeof msg.allow === "boolean" ? { allow: msg.allow } : {}),
+              });
+            } catch (err     ) {
+              logger.warn(
+                `[downstream] program_card_jev handler threw: ${err && err.message ? err.message : err}`,
+              );
+            }
+          }
+          return null;
+        case "program_card_model":
+          if (typeof onProgramCardModel === "function" && admitPhoneOnlyWrite(clientId, msg.type)) {
+            onProgramCardModel(msg, clientId);
+          }
+          return null;
+        case "program_card_art":
+
+          if (typeof onProgramCardArt === "function" && admitPhoneOnlyWrite(clientId, msg.type)) {
+            try {
+              onProgramCardArt({
+                op: typeof msg.op === "string" ? msg.op : "",
+                ...(typeof msg.detail === "string" ? { detail: msg.detail } : {}),
+              }, clientId);
+            } catch (err     ) {
+              logger.warn(`[downstream] program_card_art handler threw: ${err && err.message ? err.message : err}`);
+            }
+          }
+          return null;
+        case "program_card_location":
+
+          if (typeof onProgramCardLocation === "function" && admitPhoneOnlyWrite(clientId, msg.type)) {
+            try {
+              onProgramCardLocation(clientId, msg);
+            } catch (err     ) {
+              logger.warn(
+                `[downstream] program_card_location handler threw: ${err && err.message ? err.message : err}`,
+              );
+            }
+          }
+          return null;
+        case "program_card_mcp":
+
+          if (typeof onProgramCardMcp === "function" && admitPhoneOnlyWrite(clientId, msg.type)) {
+            try {
+              onProgramCardMcp({
+                op: typeof msg.op === "string" ? msg.op : "",
+                sub: typeof msg.sub === "string" ? msg.sub : "",
+                ...(msg.card && typeof msg.card === "object" && !Array.isArray(msg.card) ? { card: msg.card } : {}),
+                ...(Array.isArray(msg.uses) ? { uses: msg.uses } : {}),
+                ...(typeof msg.from === "string" ? { from: msg.from } : {}),
+                ...(Array.isArray(msg.calls) ? { calls: msg.calls } : {}),
+                ...(typeof msg.key === "string" ? { key: msg.key } : {}),
+                ...(typeof msg.digest === "string" ? { digest: msg.digest } : {}),
+                ...(typeof msg.allow === "boolean" ? { allow: msg.allow } : {}),
+                ...(typeof msg.server === "string" ? { server: msg.server } : {}),
+
+                ...(typeof msg.id === "string" ? { id: msg.id } : {}),
+                ...(typeof msg.send === "boolean" ? { send: msg.send } : {}),
+                ...(typeof msg.via === "string" ? { via: msg.via } : {}),
+                ...(typeof msg.request === "string" ? { request: msg.request } : {}),
+                ...(typeof msg.use === "string" ? { use: msg.use } : {}),
+                ...(typeof msg.level === "string" ? { level: msg.level } : {}),
+                ...(typeof msg.autoSend === "boolean" ? { autoSend: msg.autoSend } : {}),
+                ...(typeof msg.tool === "string" ? { tool: msg.tool } : {}),
+                ...(typeof msg.write === "boolean" ? { write: msg.write } : {}),
+
+                ...(typeof msg.on === "boolean" ? { on: msg.on } : {}),
+                ...(typeof msg.warned === "boolean" ? { warned: msg.warned } : {}),
+                ...(typeof msg.part === "string" ? { part: msg.part } : {}),
+
+                ...(typeof msg.action === "string" ? { action: msg.action } : {}),
+                ...(typeof msg.name === "string" ? { name: msg.name } : {}),
+              });
+            } catch (err     ) {
+              logger.warn(
+                `[downstream] program_card_mcp handler threw: ${err && err.message ? err.message : err}`,
               );
             }
           }
@@ -8166,6 +3244,57 @@ function createDownstreamHandler(opts) {
             }
           }
           return null;
+        case APP_PROTOCOL.programCardLookProgress:
+          if (typeof onProgramCardLookProgress === "function") {
+            onProgramCardLookProgress({ clientId, sessionKey: typeof msg.sessionKey === "string" ? msg.sessionKey : null,
+              requestId: typeof msg.requestId === "string" ? msg.requestId : "", detail: typeof msg.detail === "string" ? msg.detail : "",
+
+              ...(msg.frameLayout && typeof msg.frameLayout === "object" && !Array.isArray(msg.frameLayout) ? { frameLayout: msg.frameLayout } : {}) });
+          }
+          return null;
+        case "program_card_response":
+          if (typeof onProgramCardResponse === "function") {
+            try {
+              onProgramCardResponse({
+                clientId,
+                sessionKey: typeof msg.sessionKey === "string" ? msg.sessionKey : null,
+                requestId: typeof msg.requestId === "string" ? msg.requestId : "",
+                ok: msg.ok === true,
+                shown: msg.shown === true,
+                error: typeof msg.error === "string" ? msg.error : null,
+
+                ...(msg.result && typeof msg.result === "object" && !Array.isArray(msg.result) ? { result: msg.result } : {}),
+
+                ...(msg.jev && typeof msg.jev === "object" && !Array.isArray(msg.jev) ? { jev: msg.jev } : {}),
+
+                ...(msg.mcp && typeof msg.mcp === "object" && !Array.isArray(msg.mcp) ? { mcp: msg.mcp } : {}),
+                ...(msg.model && typeof msg.model === "object" && !Array.isArray(msg.model) ? { model: msg.model } : {}),
+
+                ...(msg.refresh && typeof msg.refresh === "object" && !Array.isArray(msg.refresh) ? { refresh: msg.refresh } : {}),
+              });
+            } catch (err     ) {
+              logger.warn(
+                `[downstream] program_card_response handler threw: ${err && err.message ? err.message : err}`,
+              );
+            }
+          }
+          return null;
+
+        case "program_card_context":
+          if (typeof onProgramCardContext === "function" && typeof msg.sessionKey === "string" && msg.sessionKey) {
+            try {
+              onProgramCardContext({
+                clientId,
+                sessionKey: msg.sessionKey,
+                card: msg.card && typeof msg.card === "object" && !Array.isArray(msg.card) ? msg.card : { open: false },
+              });
+            } catch (err     ) {
+              logger.warn(
+                `[downstream] program_card_context handler threw: ${err && err.message ? err.message : err}`,
+              );
+            }
+          }
+          return null;
         default:
           return null;
       }
@@ -8177,6 +3306,8 @@ function createDownstreamHandler(opts) {
     formatActivity,
     formatThinkingUpdate,
     formatThinkingFinalize,
+    formatRunSignal,
+    formatCardBuild,
     formatTyping,
     formatSendAck: formatSendAckCompat,
     formatProtocol,
@@ -8192,6 +3323,8 @@ function createDownstreamHandler(opts) {
     formatSkillsCatalog,
     formatLiveuiLibrary,
     formatLiveuiLibraryOpenResult,
+    formatProgramCardSaveRequest,
+    formatProgramCardReview,
     formatLiveuiTasks,
     formatLiveuiTaskReviewAck,
     formatLiveuiTaskExecutors,
@@ -8224,8 +3357,11 @@ function createDownstreamHandler(opts) {
     formatEvenAiSettingsAck,
     formatOcuClawSettingsAck,
     formatApproval,
+    formatApprovalExplanation,
+    formatApprovalExplanationPending,
     formatApprovalResolved,
     formatApprovalResponseAck,
+    formatWaiting,
     formatTranscription,
     formatListenCommitted,
     formatEvenAiListenIntercepted,
@@ -8254,9 +3390,11 @@ function createDownstreamHandler(opts) {
     removeClient(clientId) {
       protocolSubscribers.delete(clientId);
       if (typeof opts.onOptionalSetupDisconnect === "function") opts.onOptionalSetupDisconnect(clientId);
+      if (typeof opts.onModelSitesDisconnect === "function") opts.onModelSitesDisconnect(clientId);
+      realtimeTalkLane?.removeClient(clientId);
       return hermesSttUpload?.removeClient(clientId);
     },
   };
 }
 
-module.exports = { createDownstreamHandler, parseEventDebug, sanitizeProtocolFrame };
+module.exports = { sanitizeProtocolFrame, parseEventDebug, createDownstreamHandler };

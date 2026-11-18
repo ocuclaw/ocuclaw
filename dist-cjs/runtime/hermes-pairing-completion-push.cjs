@@ -10,14 +10,14 @@ function createHermesPairingCompletionPush({
   retryDelayMs = DEFAULT_RETRY_DELAY_MS,
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
-}) {
+}     ) {
   let disposed = false;
   let inFlight = false;
-  let retryTimer = null;
+  let retryTimer      = null;
 
   const queue = new Map();
 
-  function warn(err) {
+  function warn(err     ) {
     if (!logger || typeof logger.warn !== "function") return;
     logger.warn(
       `[hermes-pairing] completion receipt push failed: ${err && err.message ? err.message : err}`,
@@ -33,12 +33,12 @@ function createHermesPairingCompletionPush({
     if (retryTimer && typeof retryTimer.unref === "function") retryTimer.unref();
   }
 
-  function refused(result) {
+  function refused(result     ) {
     warn(new Error(`receipt refused: ${result?.error || "unknown"}`));
     scheduleRetry();
   }
 
-  function failed(err) {
+  function failed(err     ) {
     warn(err);
     scheduleRetry();
   }
@@ -47,7 +47,7 @@ function createHermesPairingCompletionPush({
     if (disposed || inFlight || retryTimer !== null || queue.size === 0) return;
     const completionId = queue.keys().next().value;
     inFlight = true;
-    let pending;
+    let pending     ;
     try {
       pending = link.request(LINK_PAIRING_COMPLETED_METHOD, { completionId });
     } catch (err) {
@@ -56,7 +56,7 @@ function createHermesPairingCompletionPush({
       return;
     }
     Promise.resolve(pending).then(
-      (result) => {
+      (result     ) => {
         if (disposed) return;
         inFlight = false;
         if (!result || result.ok !== true) {
@@ -66,7 +66,7 @@ function createHermesPairingCompletionPush({
         queue.delete(completionId);
         drain();
       },
-      (err) => {
+      (err     ) => {
         if (disposed) return;
         inFlight = false;
         failed(err);
@@ -74,7 +74,7 @@ function createHermesPairingCompletionPush({
     );
   }
 
-  function push(completionId) {
+  function push(completionId     ) {
     if (disposed) return;
     if (typeof completionId !== "string" || !COMPLETION_ID_PATTERN.test(completionId)) {
       warn(new Error("invalid completion ID"));

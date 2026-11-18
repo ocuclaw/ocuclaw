@@ -1,0 +1,59 @@
+{
+  "name": "property-graph",
+  "version": "4.1.0",
+  "description": "Base for creating objects that behave like a Property Graph.",
+  "type": "module",
+  "sideEffects": false,
+  "types": "./dist/index.d.mts",
+  "exports": {
+    "types": "./dist/index.d.mts",
+    "default": "./dist/index.mjs"
+  },
+  "repository": "github:donmccurdy/property-graph",
+  "author": "Don McCurdy <dm@donmccurdy.com>",
+  "license": "MIT",
+  "browserslist": [
+    "defaults",
+    "not IE 11",
+    "node >= 14"
+  ],
+  "scripts": {
+    "build": "tsdown src/index.ts --dts",
+    "watch": "tsdown src/index.ts --dts --watch",
+    "test": "ava --no-worker-threads test/*.ts",
+    "coverage": "c8 --reporter=lcov --reporter=text ava --no-worker-threads test/*.ts --tap",
+    "coverage:report": "c8 report --reporter=text-lcov > coverage/coverage.lcov",
+    "lint": "biome check src test",
+    "lint:ci": "biome ci src test",
+    "clean": "rm -rf dist/* || true",
+    "release": "yarn postversion:commit && yarn npm publish && yarn postversion:push",
+    "prerelease": "yarn postversion:commit && yarn npm publish --tag alpha && yarn postversion:push",
+    "postversion:commit": "git add -u && git commit -m \"chore(release): v$npm_package_version\" && git tag -a v$npm_package_version -m v$npm_package_version",
+    "postversion:push": "git push && git push --tags && yarn coverage:report",
+    "prepublish": "yarn lint && yarn test",
+    "prepack": "yarn clean && yarn build"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.4",
+    "ava": "^6.0.1",
+    "c8": "^10.0.0",
+    "tsdown": "^0.16.0",
+    "typescript": "5.9.3"
+  },
+  "files": [
+    "dist/",
+    "src/",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "ava": {
+    "extensions": {
+      "ts": "module"
+    },
+    "nodeArguments": [
+      "--experimental-strip-types"
+    ]
+  },
+  "packageManager": "yarn@4.12.0"
+}

@@ -1,21 +1,38 @@
-const { createGlassesUiToolHandler, DEFAULT_RENDER_GLASSES_UI_TIMEOUT_MS, GET_GLASSES_UI_STATE_TOOL_DESCRIPTION, GLASSES_UI_TOOL_DESCRIPTION, getGlassesUiStateParametersSchema, glassesUiParametersSchema } = require("../tools/glasses-ui-tool.cjs");
+const { createGlassesUiToolHandler, DEFAULT_RENDER_GLASSES_UI_TIMEOUT_MS, GET_GLASSES_UI_STATE_TOOL_DESCRIPTION, getGlassesUiStateParametersSchema } = require("../tools/glasses-ui-tool.cjs");
 
 const { readAgentRunId } = require("../tools/glasses-ui-wake.cjs");
 const { normalizeGlassesSessionKey } = require("../tools/glasses-ui-surfaces.cjs");
 
 const { isLiveuiSwitchedOff, liveuiDisabledError, liveuiDisabledResult } = require("../tools/glasses-ui-prefs.cjs");
 const { writeCompanionSnapshot } = require("../tools/glasses-ui-companion-snapshot.cjs");
-const { createLiveuiGlassesLibraryController, dispatchLiveuiTemplateOperation, LIVEUI_TEMPLATE_TOOL_DESCRIPTION, LIVEUI_TEMPLATE_TOOL_NAME, liveuiTemplateToolParametersSchema, runLiveuiTemplateRenderLifecycle } = require("../tools/glasses-ui-template-library.cjs");
+const { surfaceDecisionLineForHermes } = require("../domain/glasses-ui-surface-decision.cjs");
+const { DEFAULT_REPLY_LANGUAGE, composeReplyLanguageFragment } = require("../domain/reply-language.cjs");
+const { createLiveuiGlassesLibraryController, dispatchLiveuiTemplateOperation, LIVEUI_TEMPLATE_TOOL_DESCRIPTION, LIVEUI_TEMPLATE_TOOL_NAME, liveuiTemplateToolParametersSchemaFor, runLiveuiTemplateRenderLifecycle } = require("../tools/glasses-ui-template-library.cjs");
+const { isLiveuiTemplateComposed } = require("../tools/glasses-ui-template-v2.cjs");
 const { dispatchLiveuiTaskOperation, LIVEUI_TASK_TOOL_DESCRIPTION, LIVEUI_TASK_TOOL_NAME, liveuiTaskToolParametersSchema } = require("../tools/glasses-ui-task-library.cjs");
-const { composeChannelTwoFragment, composeEvenAiTurnChannelTwoFragment } = require("../domain/prompt-channel-fragments.cjs");
+const { runCardCheck, withTaskRunHealth } = require("../tools/program-card-health.cjs");
+const { TASK_PUSH_CAPABILITY } = require("./hermes-task-push.cjs");
+const { COMPOSE_GLASSES_UI_TOOL_DESCRIPTION, COMPOSE_GLASSES_UI_TOOL_NAME, composeGlassesUiParametersSchema, composeGlassesUi } = require("../tools/glasses-ui-compose-tool.cjs");
+const { composeChannelTwoFragment, composeEvenAiTurnChannelTwoFragment, VIEWER_TURN_NOTICE } = require("../domain/prompt-channel-fragments.cjs");
+const { buildLiveuiContextFence } = require("../tools/glasses-ui-context-fence.cjs");
+const { PROGRAM_CARD_CAPABILITY, PROGRAM_CARD_WHEN } = require("../tools/program-card-tool.cjs");
+const { composeOpenCardFragment, createOpenCardStore, programCardCheckAskOf, programCardDoneSaves, programCardHealthOf } = require("../tools/program-card-context.cjs");
+const { cardFixCheckInTurn } = require("../tools/program-card-fix-playbook.cjs");
+const { PROGRAM_CARD_HOST_COMMANDS_ON_LINE, PROGRAM_CARD_JEV_ON_LINE, PROGRAM_CARD_LOOK_POINTER, PROGRAM_CARD_LIVE_CAPTURE_GUIDE, PROGRAM_CARD_FIRMWARE_TEXT_GUIDE, programCardMcpOnLines } = require("../tools/program-card-guide.cjs");
+const { PROGRAM_CARD_MCP_CAPABILITY } = require("../tools/glasses-ui-program-card-mcp.cjs");
+const { CARD_DIRECTIONS_MAX, CARD_DIRECTIONS_MIN, CARD_PLAN_LINE_TARGET, CARD_PLAN_MAX_LINES, CARD_PLAN_MIN_LINES, CARD_PLAN_PROVABLE_SHORT, CARD_PLAN_SITES_MAX } = require("../tools/program-card-plan.cjs");
+const { ASK_CARD_TOOL_NAME } = require("../domain/glasses-ui-jev-card.cjs");
+const { PROGRAM_CARD_LOOK_CAPABILITY, PROGRAM_CARD_LIVE_CAPTURE_CAPABILITY, PROGRAM_CARD_FIRMWARE_TEXT_CAPABILITY } = require("../tools/program-card-look.cjs");
+const { PROGRAM_CARD_ACTIONS_CAPABILITY, PROGRAM_CARD_ACTIONS_GUIDE, PROGRAM_CARD_ACTIONS_ON_LINE } = require("../tools/program-card-guide.cjs");
+const { PROGRAM_CARD_MODELS_3D_CAPABILITY, PROGRAM_CARD_PICTURES_CAPABILITY, programCardPicturesGuide } = require("../tools/program-card-guide.cjs");
 const { formatLiveuiTaskIndex, projectLiveuiTaskIndexRows } = require("../tools/glasses-ui-task-index.cjs");
 const { DEFAULT_STAGE_GRACE_MS } = require("../tools/glasses-ui-limits.cjs");
 const { DEFAULT_HERMES_NAMESPACE, HERMES_FOREIGN_KEY_MARKER, HERMES_SESSION_KEY_PREFIX, OCUCLAW_CHAT_TYPE_SEGMENT, OCUCLAW_PLATFORM_SEGMENT, isHermesSessionKey, mintedHermesSessionKey, parseHermesPublicKey, stripAgentNamespace } = require("./hermes-session-keys.cjs");
 
-const LIVEUI_TOOL_NAME = "render_glasses_ui";
 const LIVEUI_TOOLSET = "ocuclaw";
 
 const LINK_LIVEUI_METHODS = Object.freeze({
+
   render: "liveui.render",
   abort: "liveui.abort",
   prompt: "liveui.prompt",
@@ -26,9 +43,38 @@ const LINK_LIVEUI_METHODS = Object.freeze({
   uiState: "liveui.uiState",
   templates: "liveui.templates",
   tasks: "liveui.tasks",
+
+  compose: "liveui.compose",
 });
 
 const LIVEUI_STATE_TOOL_NAME = "get_glasses_ui_state";
+
+const HERMES_SURFACE_DECISION_MAX_WAIT_MS = 1500;
+
+const PROGRAM_CARD_ASK_ARGUMENTS_EXAMPLE = {
+  reason: "one line: why a card beats a screen or a chat reply",
+  title: "the card's name",
+  plan: [{ line: "one thing the card does that you can test" }],
+
+  say: ["2 to 3 action-first sentences on how you will build it"],
+};
+
+const PROGRAM_CARD_DIRECTIONS_SHAPE_FOR_HERMES =
+  `When the ask does not say what the card shows ("a card for my morning"), do not guess: leave "plan" out and add "directions", ${CARD_DIRECTIONS_MIN} or ${CARD_DIRECTIONS_MAX} of {"label", "plan"}, each a different card ("label": what it shows, in a few words), one from the wearer's own data when a tool can read it; the yes names their pick in "picked".`;
+
+const PROGRAM_CARD_SITES_SHAPE_FOR_HERMES =
+  `For a card that reads live data from a website, add "sites": its hostnames ("api.open-meteo.com"), ${CARD_PLAN_SITES_MAX} at most; the yes allows them ("sitesAllowed").`;
+const PROGRAM_CARD_ASK_SHAPE_FOR_HERMES =
+  `Ask through tool_call, no tool_describe needed: name "${ASK_CARD_TOOL_NAME}", arguments ${JSON.stringify(PROGRAM_CARD_ASK_ARGUMENTS_EXAMPLE)}, with ${CARD_PLAN_MIN_LINES} to ${CARD_PLAN_MAX_LINES} plan lines of about ${CARD_PLAN_LINE_TARGET} characters, one the touch that makes it special. ${CARD_PLAN_PROVABLE_SHORT} Add "jev" or "mcp", one line each, only when it asks Jev or reads MCP tools. ${PROGRAM_CARD_SITES_SHAPE_FOR_HERMES} For a game, add "game": true and aim high: plan it deep. To change a saved card not open on the glasses, add "savedCard": its name or id, and plan only the change; never edit first. ${PROGRAM_CARD_DIRECTIONS_SHAPE_FOR_HERMES}`;
+
+const PROGRAM_CARD_NOTES_RULE_FOR_HERMES =
+  "In a turn that builds a card, don't load or edit skills (no skill_view or skill_manage), before the ask or after it: the card guide in the card tools is current, and your card notes come with the ask's yes. " +
+  "Saving card lessons is not part of the build: Hermes's review saves them after your reply, only in the skill the yes names as card_notes_skill: short rules within 1,500 characters, no reference files, only what the card guide doesn't already say.";
+
+const PROGRAM_CARD_HINT_FOR_HERMES =
+  `Programmable cards are on (ask_glasses_card first, then write_glasses_card on a yes). ${PROGRAM_CARD_WHEN} ${PROGRAM_CARD_ASK_SHAPE_FOR_HERMES} ${PROGRAM_CARD_NOTES_RULE_FOR_HERMES}`;
+
+const PROGRAM_CARD_JEV_HINT_FOR_HERMES = PROGRAM_CARD_JEV_ON_LINE;
 
 const DEFAULT_LIVEUI_CONFIG = Object.freeze({
   enabled: true,
@@ -48,11 +94,23 @@ const DEFAULT_LIVEUI_CONFIG = Object.freeze({
   includeLastRenderInOutcome: false,
 });
 
-function mergeLiveConfig(raw) {
-  return {
+function offSwitch(value         , defaultValue         )          {
+  if (value === undefined || value === null || value === "") return defaultValue;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  return String(value).toLowerCase() !== "false";
+}
+
+function mergeLiveConfig(raw     ) {
+  const merged = {
     ...DEFAULT_LIVEUI_CONFIG,
     ...(raw && typeof raw === "object" ? raw : {}),
   };
+
+  merged.enabled = offSwitch(merged.enabled, DEFAULT_LIVEUI_CONFIG.enabled);
+  merged.httpEnabled = offSwitch(merged.httpEnabled, DEFAULT_LIVEUI_CONFIG.httpEnabled);
+  merged.llmEnabled = offSwitch(merged.llmEnabled, DEFAULT_LIVEUI_CONFIG.llmEnabled);
+  return merged;
 }
 
 function silentLogger() {
@@ -89,7 +147,7 @@ function displayStates(relay, method, sessionKey) {
   }
 }
 
-function neuralSessionNamesEnabled(relay, sessionKey) {
+function neuralSessionNamesEnabled(relay     , sessionKey     ) {
   try {
     return relay && typeof relay.isNeuralSessionNamesEnabled === "function"
       ? relay.isNeuralSessionNamesEnabled(sessionKey) !== false
@@ -152,23 +210,10 @@ function normalizeSessionKeyFromParams(params) {
 }
 
 function buildPromptFence(fragments, taskIndex = "") {
-  const usable = fragments.filter((f) => f && typeof f.text === "string" && f.text.trim());
-  const usableTaskIndex = typeof taskIndex === "string" ? taskIndex : "";
-  if (usable.length === 0 && !usableTaskIndex) return null;
-  return [
-    "<ocuclaw_liveui_context_v1>",
-    JSON.stringify({
-      source: "ocuclaw-plugin",
-      provenance: "plugin-generated",
-      target: "user_message_ephemeral",
-      fragments: usable.map((f) => ({ kind: f.kind, text: f.text })),
-      ...(usableTaskIndex ? { task_index: usableTaskIndex } : {}),
-    }),
-    "</ocuclaw_liveui_context_v1>",
-  ].join("\n");
+  return buildLiveuiContextFence(fragments, taskIndex);
 }
 
-function buildHermesToolDescriptor(name, description, parameters, methods) {
+function buildHermesToolDescriptor(name     , description     , parameters     , methods     ) {
   return {
     name,
     toolset: LIVEUI_TOOLSET,
@@ -176,20 +221,6 @@ function buildHermesToolDescriptor(name, description, parameters, methods) {
     schema: { name, description, parameters },
     methods,
   };
-}
-
-function buildHermesLiveUiToolDescriptor() {
-  return buildHermesToolDescriptor(
-    LIVEUI_TOOL_NAME,
-    GLASSES_UI_TOOL_DESCRIPTION,
-    glassesUiParametersSchema,
-    {
-      render: LINK_LIVEUI_METHODS.render,
-      abort: LINK_LIVEUI_METHODS.abort,
-      prompt: LINK_LIVEUI_METHODS.prompt,
-      promptAck: LINK_LIVEUI_METHODS.promptAck,
-    },
-  );
 }
 
 function buildHermesLiveUiStateToolDescriptor() {
@@ -203,11 +234,11 @@ function buildHermesLiveUiStateToolDescriptor() {
   );
 }
 
-function buildHermesLiveUiTemplateToolDescriptor() {
+function buildHermesLiveUiTemplateToolDescriptor(opts      = {}) {
   return buildHermesToolDescriptor(
     LIVEUI_TEMPLATE_TOOL_NAME,
     LIVEUI_TEMPLATE_TOOL_DESCRIPTION,
-    liveuiTemplateToolParametersSchema,
+    liveuiTemplateToolParametersSchemaFor(opts && opts.liveuiTemplatesSchema),
     {
       templates: LINK_LIVEUI_METHODS.templates,
     },
@@ -225,13 +256,24 @@ function buildHermesLiveUiTaskToolDescriptor() {
   );
 }
 
-function buildHermesLiveUiHelloPayload() {
+function buildHermesLiveUiComposeToolDescriptor() {
+  return buildHermesToolDescriptor(
+    COMPOSE_GLASSES_UI_TOOL_NAME,
+    COMPOSE_GLASSES_UI_TOOL_DESCRIPTION,
+    composeGlassesUiParametersSchema,
+    {
+      compose: LINK_LIVEUI_METHODS.compose,
+    },
+  );
+}
+
+function buildHermesLiveUiHelloPayload(opts      = {}) {
   return {
     tools: [
-      buildHermesLiveUiToolDescriptor(),
       buildHermesLiveUiStateToolDescriptor(),
-      buildHermesLiveUiTemplateToolDescriptor(),
+      buildHermesLiveUiTemplateToolDescriptor(opts),
       buildHermesLiveUiTaskToolDescriptor(),
+      buildHermesLiveUiComposeToolDescriptor(),
     ],
     methods: { ...LINK_LIVEUI_METHODS },
   };
@@ -253,6 +295,16 @@ function createHermesLiveUiBridge(opts = {}) {
   const activeCalls = new Map();
   const depthBySession = new Map();
   let taskIndexPromptFailureLogged = false;
+
+  const replyLanguageBySession = new Map();
+
+  const openCards = createOpenCardStore({ keyOf: normalizeHermesLiveUiSessionKey });
+  const unsubscribeOpenCards =
+    typeof relay.onProgramCardContext === "function"
+      ? relay.onProgramCardContext((frame     ) => {
+          if (frame && typeof frame.sessionKey === "string") openCards.report(frame.sessionKey, frame.card);
+        }) || (() => {})
+      : () => {};
 
   function emitLifecycle(event, severity, data) {
     try {
@@ -335,6 +387,49 @@ function createHermesLiveUiBridge(opts = {}) {
       sendGlassesUiSurfaceUpdate: (msg) => relay.sendGlassesUiSurfaceUpdate(msg),
       onGlassesUiResult: (cb) => relay.onGlassesUiResult(cb),
 
+      onLiveUiV2Outcome:
+        typeof relay.onLiveUiV2Outcome === "function"
+          ? (cb) => relay.onLiveUiV2Outcome(cb)
+          : undefined,
+      collectLiveUiV2State:
+        typeof relay.collectLiveUiV2State === "function"
+          ? (sessionKey) => relay.collectLiveUiV2State(sessionKey)
+          : undefined,
+      isLiveUiV2TapOwed:
+        typeof relay.isLiveUiV2TapOwed === "function"
+          ? (sessionKey, eventId) => relay.isLiveUiV2TapOwed(sessionKey, eventId)
+          : undefined,
+
+      writeLiveUiV2Data:
+        typeof relay.writeLiveUiV2Data === "function"
+          ? (sessionKey, surfaceId, patch) => relay.writeLiveUiV2Data(sessionKey, surfaceId, patch)
+          : undefined,
+
+      prefetchLiveUiV2Picture:
+        typeof relay.prefetchLiveUiV2Picture === "function"
+          ? (sessionKey     , surfaceId     , src     , componentId     ) => relay.prefetchLiveUiV2Picture(sessionKey, surfaceId, src, componentId)
+          : undefined,
+      isLiveUiV2SurfaceLive:
+        typeof relay.isLiveUiV2SurfaceLive === "function"
+          ? (sessionKey, surfaceId) => relay.isLiveUiV2SurfaceLive(sessionKey, surfaceId)
+          : undefined,
+      setLiveUiV2Inputs:
+        typeof relay.setLiveUiV2Inputs === "function"
+          ? (sessionKey, surfaceId, inputs, values) => relay.setLiveUiV2Inputs(sessionKey, surfaceId, inputs, values)
+          : undefined,
+      liveUiV2TopSurface:
+        typeof relay.liveUiV2TopSurface === "function"
+          ? (sessionKey, opts) => relay.liveUiV2TopSurface(sessionKey, opts)
+          : undefined,
+      openLiveUiV2Records:
+        typeof relay.openLiveUiV2Records === "function"
+          ? (sessionKey, input) => relay.openLiveUiV2Records(sessionKey, input)
+          : undefined,
+      withdrawLiveUiV2Surface:
+        typeof relay.withdrawLiveUiV2Surface === "function"
+          ? (sessionKey, surfaceId, reason) => relay.withdrawLiveUiV2Surface(sessionKey, surfaceId, reason)
+          : undefined,
+
       onGlassesUiRenderReceipt:
         typeof relay.onGlassesUiRenderReceipt === "function"
           ? (cb) => relay.onGlassesUiRenderReceipt(cb)
@@ -352,6 +447,19 @@ function createHermesLiveUiBridge(opts = {}) {
         typeof relay.onGlassesPresenceChanged === "function"
           ? (cb) => relay.onGlassesPresenceChanged(cb)
           : undefined,
+
+      onProgramCardFeeds:
+        typeof relay.onProgramCardFeeds === "function"
+          ? (cb) => relay.onProgramCardFeeds(cb)
+          : undefined,
+      sendProgramCardData:
+        typeof relay.sendProgramCardData === "function"
+          ? (frame) => relay.sendProgramCardData(frame)
+          : undefined,
+      askLiveuiSite:
+        typeof relay.askLiveuiSite === "function"
+          ? (request) => relay.askLiveuiSite(request)
+          : undefined,
     },
     emitLifecycle,
     getGlassesUiLiveConfig: liveConfig,
@@ -367,7 +475,7 @@ function createHermesLiveUiBridge(opts = {}) {
           typeof relay.getAppViewedSessionKeys === "function"
             ? relay.getAppViewedSessionKeys()
             : null;
-        return Array.isArray(keys) ? keys.map((key) => normalizeHermesLiveUiSessionKey(key)) : null;
+        return Array.isArray(keys) ? keys.map((key     ) => normalizeHermesLiveUiSessionKey(key)) : null;
       } catch {
         return null;
       }
@@ -407,6 +515,33 @@ function createHermesLiveUiBridge(opts = {}) {
     host: "hermes",
     now: typeof injectedNow === "function" ? injectedNow : undefined,
     describeToolApprovalBehaviour,
+
+    taskScheduleRequest:
+      link && typeof link.request === "function"
+        ? (identity     ) => link.request("gw.hermes.management", identity)
+        : null,
+
+    taskSyncChanged: () => {
+      if (typeof relay.taskRowsChanged === "function") relay.taskRowsChanged();
+    },
+
+    scheduledTasksEnabled: () =>
+      typeof relay.hasConnectedAppClientCapability === "function" &&
+      relay.hasConnectedAppClientCapability(TASK_PUSH_CAPABILITY) === true,
+
+    presentTaskConfirm: (request     ) => {
+      if (typeof relay.presentTaskConfirm !== "function") return { presented: false, reason: "unavailable" };
+      const sessionKey = request && typeof request.sessionKey === "string" && request.sessionKey
+        ? request.sessionKey
+        : typeof relay.getConnectedAppActiveSessionKey === "function"
+          ? relay.getConnectedAppActiveSessionKey()
+          : null;
+      return relay.presentTaskConfirm({ ...request, sessionKey });
+    },
+
+    onTaskLookOffer: (offer     ) => {
+      if (relay && typeof relay.sendTaskLookOffer === "function") relay.sendTaskLookOffer(offer);
+    },
   });
 
   const publishConnectedAppSnapshot = () => {
@@ -417,14 +552,14 @@ function createHermesLiveUiBridge(opts = {}) {
     if (!sessionKey) return;
     try {
       handler.publishCompanionSnapshot(sessionKey);
-    } catch (err) {
+    } catch (err     ) {
       logger.warn(
         `[hermes-liveui] companion snapshot refresh failed: ${err && err.message ? err.message : err}`,
       );
     }
   };
 
-  const replayAfterGrace = (event) => {
+  const replayAfterGrace = (event     ) => {
     const reason = event && typeof event === "object" ? event.reason : event;
     if (reason !== "grace_resumed") return;
     const viewed =
@@ -433,14 +568,14 @@ function createHermesLiveUiBridge(opts = {}) {
     for (const sessionKey of viewed) {
       try {
         handler.replaySessionTop(normalizeHermesLiveUiSessionKey(sessionKey), "grace_resumed");
-      } catch (err) {
+      } catch (err     ) {
         logger.warn(
           `[hermes-liveui] reconnect replay failed: ${err && err.message ? err.message : err}`,
         );
       }
     }
   };
-  const onAppPresenceChanged = (event) => {
+  const onAppPresenceChanged = (event     ) => {
     publishConnectedAppSnapshot();
     replayAfterGrace(event);
   };
@@ -450,8 +585,10 @@ function createHermesLiveUiBridge(opts = {}) {
       : () => {};
   const unsubscribeAgentTurn =
     typeof relay.onAgentTurnChanged === "function"
-      ? relay.onAgentTurnChanged(({ sessionKey }) => {
+      ? relay.onAgentTurnChanged(({ sessionKey, busy }     ) => {
           if (sessionKey) handler.refreshMarkerForAgentTurn(sessionKey);
+
+          if (sessionKey && busy === false) handler.agentTurnEnded(sessionKey);
           publishConnectedAppSnapshot();
         })
       : () => {};
@@ -459,7 +596,7 @@ function createHermesLiveUiBridge(opts = {}) {
     ? relay.onSessionDriverChanged(publishConnectedAppSnapshot) : () => {};
   publishConnectedAppSnapshot();
 
-  const companionRefreshTimer = setInterval(publishConnectedAppSnapshot, 15_000);
+  const companionRefreshTimer      = setInterval(publishConnectedAppSnapshot, 15_000);
   if (companionRefreshTimer && typeof companionRefreshTimer.unref === "function") {
     companionRefreshTimer.unref();
   }
@@ -475,7 +612,7 @@ function createHermesLiveUiBridge(opts = {}) {
   }
 
   if (typeof relay.onAppClientSessionLeft === "function") {
-    relay.onAppClientSessionLeft(({ sessionKey, nextSessionKey } = {}) => {
+    relay.onAppClientSessionLeft(({ sessionKey, nextSessionKey }      = {}) => {
       if (!sessionKey) return;
       const normalizedSessionKey = normalizeHermesLiveUiSessionKey(sessionKey);
       const drained = handler.drainSession(normalizedSessionKey, {
@@ -493,7 +630,7 @@ function createHermesLiveUiBridge(opts = {}) {
   }
 
   if (typeof relay.onLogicalSessionReset === "function") {
-    relay.onLogicalSessionReset(({ sessionKey, reason } = {}) => {
+    relay.onLogicalSessionReset(({ sessionKey, reason }      = {}) => {
       if (!sessionKey) return;
       const normalizedSessionKey = normalizeHermesLiveUiSessionKey(sessionKey);
       const drained = handler.drainSession(normalizedSessionKey, {
@@ -559,19 +696,19 @@ function createHermesLiveUiBridge(opts = {}) {
     opts.hostHooks.on("agent_end", handleAgentEnd);
   }
 
-  async function withActiveCall(params, run) {
+  async function withActiveCall(params     , run     ) {
     const sessionKey = normalizeSessionKeyFromParams(params);
     const callId = normalizeCallId(params);
     const controller = new AbortController();
     activeCalls.set(callId, { controller, sessionKey });
     try {
-      return await run({ sessionKey, signal: controller.signal });
+      return await run({ sessionKey, signal: controller.signal, callId });
     } finally {
       activeCalls.delete(callId);
     }
   }
 
-  function toolResultEnvelope(result) {
+  function toolResultEnvelope(result     ) {
     return {
       result,
       content: [{ type: "text", text: JSON.stringify(result) }],
@@ -587,7 +724,7 @@ function createHermesLiveUiBridge(opts = {}) {
     const spec = normalizeToolArgs(params);
 
     const validateOnly = Boolean(spec && spec.validateOnly === true);
-    return withActiveCall(params, async ({ sessionKey, signal }) => {
+    return withActiveCall(params, async ({ sessionKey, signal }     ) => {
       try {
         const outcome = await handler.runDynamicUi({
           sessionKey,
@@ -596,6 +733,8 @@ function createHermesLiveUiBridge(opts = {}) {
           signal,
 
           requireViewedSession: !(params && params.hostOriginated === true),
+
+          origin: params && params.hostOriginated === true ? "task" : "agent",
         });
         return toolResultEnvelope(outcome);
       } catch (err) {
@@ -606,6 +745,14 @@ function createHermesLiveUiBridge(opts = {}) {
         throw err;
       }
     });
+  }
+
+  async function compose(params     ) {
+    if (liveuiSwitchedOff()) throw liveuiDisabledError();
+    const args = normalizeToolArgs(params);
+    return withActiveCall(params, async ({ sessionKey, callId }     ) =>
+      toolResultEnvelope(await composeGlassesUi(relay, sessionKey, args, { callId, handler })),
+    );
   }
 
   function abort(params) {
@@ -628,12 +775,14 @@ function createHermesLiveUiBridge(opts = {}) {
     return { status: "accepted", aborted };
   }
 
-  function prompt(params) {
+  async function prompt(params) {
     const sessionKey = normalizeSessionKeyFromParams(params);
     const fragments = [];
     let voicemailAckToken = null;
+
+    const viewerTurn = !!(params && params.viewerTurn === true);
     const queuedOwnership =
-      typeof relay.consumePromptTurnOwnership === "function"
+      !viewerTurn && typeof relay.consumePromptTurnOwnership === "function"
         ? relay.consumePromptTurnOwnership(sessionKey)
         : null;
     const promptOwner =
@@ -647,6 +796,23 @@ function createHermesLiveUiBridge(opts = {}) {
       includeNeuralGuidance: promptOwner !== "even-ai",
     });
     if (channelTwo) fragments.push({ kind: "channel_two", text: channelTwo });
+    if (viewerTurn && promptOwner !== "even-ai") {
+      fragments.push({ kind: "viewer_turn", text: VIEWER_TURN_NOTICE });
+    }
+
+    const ticketLanguage = queuedOwnership && queuedOwnership.replyLanguage;
+    if (ticketLanguage) {
+      const previous = replyLanguageBySession.get(sessionKey);
+      if (!replyLanguageBySession.has(sessionKey) && replyLanguageBySession.size >= 512) {
+        replyLanguageBySession.clear();
+      }
+      replyLanguageBySession.set(sessionKey, ticketLanguage);
+      const show =
+        ticketLanguage !== DEFAULT_REPLY_LANGUAGE ||
+        (!!previous && previous !== ticketLanguage);
+      const replyLanguage = show ? composeReplyLanguageFragment(ticketLanguage) : undefined;
+      if (replyLanguage) fragments.push({ kind: "reply_language", text: replyLanguage });
+    }
 
     if (promptOwner === "even-ai") {
       try {
@@ -710,6 +876,81 @@ function createHermesLiveUiBridge(opts = {}) {
         `[hermes-liveui] feedback injection failed: ${err && err.message ? err.message : err}`,
       );
     }
+    try {
+
+      if (
+        !viewerTurn &&
+        promptOwner !== "even-ai" &&
+        typeof relay.takeSurfaceDecisionForPrompt === "function"
+      ) {
+        const decided = await relay.takeSurfaceDecisionForPrompt(sessionKey, {
+          text: params && typeof params.text === "string" ? params.text : undefined,
+          maxWaitMs: HERMES_SURFACE_DECISION_MAX_WAIT_MS,
+        });
+        if (decided && decided.oneLine) {
+
+          fragments.push({ kind: "surface_decision", text: surfaceDecisionLineForHermes(decided.oneLine) });
+        }
+      }
+
+      if (promptOwner !== "even-ai" && typeof relay.takeLiveUiV2FenceFragments === "function") {
+        const v2Fragments = relay.takeLiveUiV2FenceFragments(sessionKey);
+        if (Array.isArray(v2Fragments)) fragments.push(...v2Fragments);
+      }
+    } catch (err) {
+      logger.warn(
+        `[hermes-liveui] surface decision injection failed: ${err && err.message ? err.message : err}`,
+      );
+    }
+
+    if (
+      promptOwner !== "even-ai" &&
+      typeof relay.hasConnectedAppClientCapability === "function" &&
+      relay.hasConnectedAppClientCapability(PROGRAM_CARD_CAPABILITY) === true
+    ) {
+      const jevOn = typeof relay.programCardJevTaught === "function" && relay.programCardJevTaught() === true;
+
+      const mcpLines = programCardMcpOnLines(
+        typeof relay.programCardMcpTools === "function" ? relay.programCardMcpTools() : "",
+      );
+
+      const hostLine = typeof relay.programCardHostCommandsOn === "function" && relay.programCardHostCommandsOn() === true &&
+        relay.hasConnectedAppClientCapability(PROGRAM_CARD_MCP_CAPABILITY) === true ? PROGRAM_CARD_HOST_COMMANDS_ON_LINE : "";
+      fragments.push({
+        kind: "program_card",
+        text: [PROGRAM_CARD_HINT_FOR_HERMES, jevOn ? PROGRAM_CARD_JEV_HINT_FOR_HERMES : "", mcpLines, hostLine,
+
+          relay.hasConnectedAppClientCapability(PROGRAM_CARD_LOOK_CAPABILITY) === true ? PROGRAM_CARD_LOOK_POINTER : "",
+          relay.hasConnectedAppClientCapability(PROGRAM_CARD_LIVE_CAPTURE_CAPABILITY) === true ? PROGRAM_CARD_LIVE_CAPTURE_GUIDE : "",
+          relay.hasConnectedAppClientCapability(PROGRAM_CARD_FIRMWARE_TEXT_CAPABILITY) === true ? PROGRAM_CARD_FIRMWARE_TEXT_GUIDE : "",
+
+          relay.hasConnectedAppClientCapability(PROGRAM_CARD_ACTIONS_CAPABILITY) === true ? `${PROGRAM_CARD_ACTIONS_ON_LINE}${PROGRAM_CARD_ACTIONS_GUIDE}` : "",
+
+          relay.hasConnectedAppClientCapability(PROGRAM_CARD_PICTURES_CAPABILITY) === true
+            ? programCardPicturesGuide(relay.hasConnectedAppClientCapability(PROGRAM_CARD_MODELS_3D_CAPABILITY) === true) : ""]
+          .filter(Boolean)
+          .join(" "),
+      });
+
+      const open = openCards.get(sessionKey);
+
+      const openCard = composeOpenCardFragment(open, Date.now(), { doneSaves: programCardDoneSaves(relay, sessionKey, open), host: "hermes", check: cardFixCheckInTurn,
+        health: programCardHealthOf((card) => relay.programCardHealth?.(card.key, sessionKey), open,
+          (card) => relay.programCardFeedHealth?.(card.cardId, card.key, sessionKey)) });
+      if (openCard) fragments.push({ kind: "program_card_open", text: openCard });
+
+      const changeLine = typeof relay.programCardChangeLine === "function" ? relay.programCardChangeLine(sessionKey) : "";
+      if (changeLine) fragments.push({ kind: "program_card_change", text: changeLine });
+
+      const checkAsk = programCardCheckAskOf(relay, sessionKey, open, Date.now(), { host: "hermes", check: cardFixCheckInTurn,
+        turn: { viewer: viewerTurn, texts: params && typeof params.text === "string" ? [params.text] : [],
+          ticket: queuedOwnership && typeof queuedOwnership.cardCheck === "string" ? queuedOwnership.cardCheck : "" } });
+      if (checkAsk) fragments.push({ kind: "program_card_check_ask", text: checkAsk });
+    }
+    if (promptOwner !== "even-ai") {
+      const draftIndex = typeof relay.programCardDraftIndex === "function" ? relay.programCardDraftIndex(sessionKey) : "";
+      if (draftIndex) fragments.push({ kind: "program_card_drafts", text: draftIndex });
+    }
     let taskIndex = "";
     try {
       const snapshot = glassesLibrary.listTasksForPhone();
@@ -744,10 +985,11 @@ function createHermesLiveUiBridge(opts = {}) {
     };
   }
 
-  function uiState(params) {
+  function uiState(params     ) {
     if (liveuiSwitchedOff()) return toolResultEnvelope(liveuiDisabledResult());
     const sessionKey = normalizeSessionKeyFromParams(params);
-    const channels = handler.snapshotUiState(sessionKey);
+
+    const channels = handler.collectUiState(sessionKey);
     handler.publishCompanionSnapshot(sessionKey);
     try {
       emitLifecycle("ui_state_snapshot", "debug", {
@@ -762,11 +1004,18 @@ function createHermesLiveUiBridge(opts = {}) {
     return { status: "accepted", result: channels.model };
   }
 
-  async function templates(params) {
+  async function templates(params     ) {
     if (liveuiSwitchedOff()) return toolResultEnvelope(liveuiDisabledResult());
     const args = normalizeToolArgs(params);
-    const result = await dispatchLiveuiTemplateOperation(handler, args, async (template, values) => {
-      return withActiveCall(params, ({ sessionKey, signal }) =>
+
+    const result = await dispatchLiveuiTemplateOperation(handler, args, async (template     , values     ) => {
+
+      if (isLiveuiTemplateComposed(template)) {
+        return withActiveCall(params, ({ sessionKey, signal }     ) =>
+          handler.renderStoredTemplate({ template, values, sessionKey, signal, origin: "agent" }),
+        );
+      }
+      return withActiveCall(params, ({ sessionKey, signal }     ) =>
         runLiveuiTemplateRenderLifecycle({
           template,
           values,
@@ -775,26 +1024,48 @@ function createHermesLiveUiBridge(opts = {}) {
           depthBySession,
           nextDepth,
           requireViewedSession: true,
-          renderStoredTemplate: (renderInput) =>
+          origin: "agent",
+          renderStoredTemplate: (renderInput     ) =>
             handler.renderStoredTemplate(renderInput),
         }),
       );
-    });
+    }, { v2: true });
     return toolResultEnvelope(result);
   }
 
-  async function tasks(params) {
+  async function tasks(params     ) {
     if (liveuiSwitchedOff()) return toolResultEnvelope(liveuiDisabledResult());
     const args = normalizeToolArgs(params);
     const agentId = params && typeof params.agentId === "string" ? params.agentId : undefined;
     const sessionKey = normalizeSessionKeyFromParams(params);
     const result = await dispatchLiveuiTaskOperation({
-      createTaskDraft: (input) => handler.createTaskDraft(input, { agentId }),
-      updateTaskDraft: (input) => handler.updateTaskDraft(input, { agentId }),
-      readTask: (taskId) => handler.readTask(taskId),
+      createTaskDraft: (input     ) => handler.createTaskDraft(input, { agentId }),
+      updateTaskDraft: (input     ) => handler.updateTaskDraft(input, { agentId }),
+
+      readTask: (taskId     ) => withTaskRunHealth(handler.readTask(taskId), {
+        row: () => (typeof relay.taskRunRow === "function" ? relay.taskRunRow(taskId) : null),
+        records: () => handler.listTaskRunRecords(taskId),
+      }),
       listTasks: () => handler.listTasks(),
-      findTasks: (query) => handler.findTasks(query),
-      saveUiAsHelper: (input) => handler.saveUiAsHelper(input, { sessionKey, agentId }),
+
+      check: (input     ) => runCardCheck(input, {
+        cards: (query               ) => (typeof relay.programCardCheck === "function" ? relay.programCardCheck(sessionKey, query) : null),
+        rows: () => {
+          if (typeof relay.taskRunRows !== "function") throw new Error("no task rows read");
+          return relay.taskRunRows();
+        },
+        tasks: () => handler.listTasks(),
+      }, Date.now(), { host: "hermes", check: cardFixCheckInTurn }),
+      findTasks: (query     ) => handler.findTasks(query),
+      saveUiAsHelper: (input     ) => handler.saveUiAsHelper(input, { sessionKey, agentId }),
+
+      feedCard: (input     ) => typeof relay.feedProgramCard === "function"
+        ? relay.feedProgramCard({ sessionKey, values: input.values })
+        : { status: "rejected", code: "no_feed_run" },
+
+      listVoiceTaskSchedules: () => handler.listVoiceTaskSchedules(),
+      scheduleTask: (input     ) => handler.scheduleTask(input, { agentId, sessionKey }),
+      lessenTaskSchedule: (action     , input     ) => handler.lessenTaskSchedule(action, input),
     }, args);
     return toolResultEnvelope(result);
   }
@@ -851,8 +1122,10 @@ function createHermesLiveUiBridge(opts = {}) {
       [LINK_LIVEUI_METHODS.uiState]: uiState,
       [LINK_LIVEUI_METHODS.templates]: templates,
       [LINK_LIVEUI_METHODS.tasks]: tasks,
+      [LINK_LIVEUI_METHODS.compose]: compose,
     },
     render,
+    compose,
     abort,
     prompt,
     promptAck,
@@ -866,6 +1139,8 @@ function createHermesLiveUiBridge(opts = {}) {
       unsubscribeAppState();
       unsubscribeAgentTurn();
       unsubscribeDriver();
+      unsubscribeOpenCards();
+      openCards.clear();
     },
     _debugState() {
       return {
@@ -876,4 +1151,4 @@ function createHermesLiveUiBridge(opts = {}) {
   };
 }
 
-module.exports = { DEFAULT_LIVEUI_CONFIG, LIVEUI_TOOL_NAME, LIVEUI_TOOLSET, LINK_LIVEUI_METHODS, normalizeHermesLiveUiSessionKey, buildHermesLiveUiToolDescriptor, buildHermesLiveUiStateToolDescriptor, buildHermesLiveUiTemplateToolDescriptor, buildHermesLiveUiTaskToolDescriptor, LIVEUI_STATE_TOOL_NAME, buildHermesLiveUiHelloPayload, createHermesLiveUiBridge, mergeLiveConfig };
+module.exports = { LIVEUI_TOOLSET, LINK_LIVEUI_METHODS, LIVEUI_STATE_TOOL_NAME, HERMES_SURFACE_DECISION_MAX_WAIT_MS, PROGRAM_CARD_ASK_ARGUMENTS_EXAMPLE, PROGRAM_CARD_DIRECTIONS_SHAPE_FOR_HERMES, PROGRAM_CARD_SITES_SHAPE_FOR_HERMES, PROGRAM_CARD_ASK_SHAPE_FOR_HERMES, PROGRAM_CARD_NOTES_RULE_FOR_HERMES, PROGRAM_CARD_HINT_FOR_HERMES, PROGRAM_CARD_JEV_HINT_FOR_HERMES, DEFAULT_LIVEUI_CONFIG, mergeLiveConfig, normalizeHermesLiveUiSessionKey, buildHermesLiveUiStateToolDescriptor, buildHermesLiveUiTemplateToolDescriptor, buildHermesLiveUiTaskToolDescriptor, buildHermesLiveUiComposeToolDescriptor, buildHermesLiveUiHelloPayload, createHermesLiveUiBridge };

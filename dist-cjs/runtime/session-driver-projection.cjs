@@ -1,4 +1,4 @@
-function projectSessionDriverFields(s = {}) {
+function projectSessionDriverFields(s      = {}) {
   return {
     sessionKey: typeof s.sessionKey === "string" ? s.sessionKey : null,
     state: typeof s.state === "string" ? s.state : "glasses_drive",

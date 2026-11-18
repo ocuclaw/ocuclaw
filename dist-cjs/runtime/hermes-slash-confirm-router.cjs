@@ -1,10 +1,10 @@
 const DEFAULT_CONFIRM_TTL_MS = 300_000;
 
-function clean(value) {
+function clean(value     ) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function createHermesSlashConfirmRouter(deps = {}) {
+function createHermesSlashConfirmRouter(deps      = {}) {
   const hasConnectedClient =
     typeof deps.hasConnectedClient === "function"
       ? deps.hasConnectedClient
@@ -19,7 +19,7 @@ function createHermesSlashConfirmRouter(deps = {}) {
     typeof deps.applyReset === "function" ? deps.applyReset : () => {};
   const emit = typeof deps.emit === "function" ? deps.emit : () => {};
   const now = typeof deps.now === "function" ? deps.now : () => Date.now();
-  async function resolveChoice(confirmId, sessionKey, decision = {}) {
+  async function resolveChoice(confirmId     , sessionKey     , decision      = {}) {
     const choice = clean(decision.choice) || "cancel";
     const reason = clean(decision.reason) || "resolved";
     emit("slash_confirm_resolution", { sessionKey, confirmId, choice, reason });
@@ -29,7 +29,7 @@ function createHermesSlashConfirmRouter(deps = {}) {
         emit("temporary_reply_removed", { sessionKey, confirmId });
       }
       if (result && result.reset === true) applyReset(result);
-    } catch (error) {
+    } catch (error     ) {
 
       emit("slash_confirm_resolution_failed", {
         sessionKey,
@@ -41,7 +41,7 @@ function createHermesSlashConfirmRouter(deps = {}) {
     }
   }
 
-  function present(params = {}) {
+  function present(params      = {}) {
     const confirmId = clean(params.confirmId);
     const sessionKey = clean(params.sessionKey);
     const title = clean(params.title);
@@ -93,7 +93,7 @@ function createHermesSlashConfirmRouter(deps = {}) {
         deadlineSec: Math.max(1, Math.ceil(ttlMs / 1000)),
       },
       expiresAtMs,
-      onDecision: (decision) => resolveChoice(confirmId, sessionKey, decision),
+      onDecision: (decision     ) => resolveChoice(confirmId, sessionKey, decision),
     });
     if (!accepted) {
       emit("slash_confirm_fallback", { sessionKey, confirmId, reason: "presentation_failed" });

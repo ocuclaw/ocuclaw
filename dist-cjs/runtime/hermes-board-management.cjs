@@ -1,10 +1,10 @@
 const BOARD_OPERATIONS = new Set(["board.status", "board.boards", "board.lanes", "board.cards", "board.card", "board.timeline",
   "board.watch", "board.policy", "board.policy.set", "board.create", "board.receipt", "board.verdict",
   "board.comment", "board.tools.enable", "board.decompose", "board.action", "board.maintenance", "board.export",
-  "board.export.part", "board.artifact", "board.artifact.part", "board.watch.rule", "board.watch.rules"]);
+  "board.export.part", "board.artifact", "board.artifact.part", "board.watch.rule", "board.watch.rules", "board.acknowledge"]);
 
 const BOARD_WRITES = new Set(["board.watch", "board.watch.rule", "board.policy.set", "board.create", "board.verdict", "board.comment",
-  "board.tools.enable", "board.decompose", "board.action", "board.export", "board.export.part"]);
+  "board.tools.enable", "board.decompose", "board.action", "board.export", "board.export.part", "board.acknowledge"]);
 
 const TOOLS_STATES = new Set(["on", "off", "unknown"]);
 const TOOLS_SCOPES = new Set(["platform", "profile"]);
@@ -30,7 +30,7 @@ const ARTIFACT_TOKEN = /^[A-Za-z0-9_-]{22}$/;
 const ARTIFACT_NAME_MAX = 120;
 
 const BOARD_UNCERTAIN_WRITES = new Set(["board.create", "board.verdict", "board.comment", "board.tools.enable",
-  "board.decompose", "board.action"]);
+  "board.decompose", "board.action", "board.acknowledge"]);
 
 const COMMENT_MAX = 2000;
 
@@ -48,7 +48,7 @@ const OPERATION_KEY = /^[A-Za-z0-9_-]{16,64}$/;
 const ASSIGNEE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const RECEIPT_STATES = new Set(["pending", "succeeded", "refused", "outcome_unknown"]);
 
-const CARD_ACTIONS = ["make_ready", "reassign", "set_model", "retry", "archive"];
+const CARD_ACTIONS = ["make_ready", "edit", "reassign", "set_model", "retry", "archive"];
 
 const ALL_CARD_ACTIONS = [...CARD_ACTIONS, "reclaim"];
 const RETRY_VIA = new Set(["reclaim", "unblock", "promote"]);
@@ -68,14 +68,14 @@ const RULES_MAX = 200;
 
 const BOARD_CAPABILITY_KEYS = [
   "browse", "passive_moments", "wake", "agent_tools", "create", "comment",
-  "approve", "request_changes", "answer_and_unblock", "make_ready", "reassign", "set_model",
+  "approve", "request_changes", "answer_and_unblock", "make_ready", "edit", "reassign", "set_model",
   "retry", "archive", "dependencies", "watch", "maintenance", "artifact_open",
 ];
 
 const BOARD_CODES = new Set([
   "unsupported", "uncertified", "schema_unsupported", "store_missing", "invalid_target",
   "empty_board", "temporarily_unavailable", "disconnected", "stale_target", "stale_scope",
-  "expired_request", "outcome_unknown", "deferred",
+  "expired_request", "outcome_unknown", "deferred", "edit_unsupported",
 
   "tools_off",
 ]);
@@ -156,6 +156,7 @@ const CREATE_ERRORS                         = {
 };
 
 const ACTION_ERRORS                         = {
+  edit_unsupported: "Editing cards isn't supported by this Hermes.",
   invalid_request: "Hermes couldn't make this change. Check the card and try again.",
   invalid_target: "That card is no longer available.",
   stale_target: "This card changed since you opened it. Look again before changing it.",
@@ -234,7 +235,7 @@ function boardErrorMessage(op        , code        )         {
   if (op === "board.verdict" && Object.hasOwn(VERDICT_ERRORS, code)) return VERDICT_ERRORS[code];
   if (op === "board.comment" && Object.hasOwn(COMMENT_ERRORS, code)) return COMMENT_ERRORS[code];
   if (op === "board.decompose" && Object.hasOwn(DECOMPOSE_ERRORS, code)) return DECOMPOSE_ERRORS[code];
-  if (op === "board.action" && Object.hasOwn(ACTION_ERRORS, code)) return ACTION_ERRORS[code];
+  if ((op === "board.action" || op === "board.acknowledge") && Object.hasOwn(ACTION_ERRORS, code)) return ACTION_ERRORS[code];
   if (BOARD_MAINTENANCE_OPERATIONS.has(op) && Object.hasOwn(MAINTENANCE_ERRORS, code)) return MAINTENANCE_ERRORS[code];
   if (BOARD_ARTIFACT_OPERATIONS.has(op) && Object.hasOwn(ARTIFACT_ERRORS, code)) return ARTIFACT_ERRORS[code];
   if (op === "board.watch" && Object.hasOwn(WATCH_ERRORS, code)) return WATCH_ERRORS[code];
@@ -264,6 +265,13 @@ const onlyKeys = (raw     , keys          ) => Object.keys(raw).every(key => key
 
 function boardRequest(op        , raw     )      {
   if (!BOARD_OPERATIONS.has(op)) return null;
+  if (op === "board.acknowledge") {
+    if (!record(raw) || !onlyKeys(raw, ["slug", "id", "anchor", "key", "unknownTarget"]) ||
+      typeof raw.slug !== "string" || !SLUG.test(raw.slug) || typeof raw.id !== "string" || !CARD_ID.test(raw.id) ||
+      typeof raw.anchor !== "string" || !ANCHOR.test(raw.anchor) || typeof raw.key !== "string" || !OPERATION_KEY.test(raw.key) ||
+      typeof raw.unknownTarget !== "string" || !ATTENTION_HASH.test(raw.unknownTarget)) return null;
+    return { slug: raw.slug, id: raw.id, anchor: raw.anchor, key: raw.key, unknownTarget: raw.unknownTarget };
+  }
   if (op === "board.receipt") {
     return record(raw) && onlyKeys(raw, ["key"]) && typeof raw.key === "string" && OPERATION_KEY.test(raw.key) ? { key: raw.key } : null;
   }
@@ -418,13 +426,28 @@ function decomposeRequest(raw     )      {
 function actionRequest(raw     )      {
   if (typeof raw.action !== "string" || !ALL_CARD_ACTIONS.includes(raw.action)) return null;
   const values = raw.action === "reassign" ? ["assignee"] : raw.action === "set_model" ? ["model", "provider"] :
-    raw.action === "reclaim" ? ["claim"] : [];
+    raw.action === "reclaim" ? ["claim"] : raw.action === "edit" ? ["title", "body", "priority"] : [];
   if (!onlyKeys(raw, ["slug", "anchor", "id", "key", "action", "state", "run", ...values])) return null;
   if (typeof raw.anchor !== "string" || !ANCHOR.test(raw.anchor)) return null;
   if (typeof raw.key !== "string" || !OPERATION_KEY.test(raw.key)) return null;
   if (typeof raw.id !== "string" || !CARD_ID.test(raw.id)) return null;
   if (typeof raw.state !== "string" || !STATUS.test(raw.state) || !count(raw.run)) return null;
   const out      = { slug: raw.slug, anchor: raw.anchor, id: raw.id, key: raw.key, action: raw.action, state: raw.state, run: raw.run };
+  if (raw.action === "edit") {
+    if (!values.some(k => Object.hasOwn(raw, k))) return null;
+    if (Object.hasOwn(raw, "title")) {
+      if (typeof raw.title !== "string" || !raw.title.trim() || raw.title.trim().length > 200 || /[\x00-\x1f\x7f]/.test(raw.title)) return null;
+      out.title = raw.title.trim();
+    }
+    if (Object.hasOwn(raw, "body")) {
+      if (typeof raw.body !== "string" || raw.body.length > 4000 || /[\x00-\x09\x0b-\x1f\x7f]/.test(raw.body)) return null;
+      out.body = raw.body;
+    }
+    if (Object.hasOwn(raw, "priority")) {
+      if (!Number.isSafeInteger(raw.priority) || raw.priority < -10 || raw.priority > 10) return null;
+      out.priority = raw.priority;
+    }
+  }
   if (raw.action === "reassign") {
     if (typeof raw.assignee !== "string" || (raw.assignee !== "" && !ASSIGNEE.test(raw.assignee))) return null;
     out.assignee = raw.assignee;
@@ -451,6 +474,10 @@ function actionReceipt(raw     , out     ) {
     throw new Error("receipt card");
   }
   out.card = { id: card.id, state: card.state };
+  if (raw.operation === "acknowledge") {
+    if (!["interrupted", "completed", "failed"].includes(raw.resolution)) throw new Error("acknowledge resolution");
+    out.resolution = raw.resolution;
+  }
   if (card.assignee !== undefined) {
     if (!text(card.assignee, 64)) throw new Error("receipt assignee");
     out.card.assignee = card.assignee;
@@ -500,10 +527,11 @@ function commentRequest(raw     )      {
 function receipt(raw     , key        ) {
   if (!record(raw) || raw.key !== key || !RECEIPT_STATES.has(raw.state)) throw new Error("receipt");
   if (raw.operation !== "create" && raw.operation !== "decompose" && raw.operation !== "unknown" && raw.operation !== "comment" &&
-    !VERDICTS.has(raw.operation) && !ALL_CARD_ACTIONS.includes(raw.operation)) {
+    raw.operation !== "acknowledge" && !VERDICTS.has(raw.operation) && !ALL_CARD_ACTIONS.includes(raw.operation)) {
     throw new Error("receipt operation");
   }
   const out      = { key: raw.key, operation: raw.operation, state: raw.state };
+  if (raw.state === "succeeded" && raw.operation === "acknowledge") return actionReceipt(raw, out);
   if (raw.state === "succeeded" && ALL_CARD_ACTIONS.includes(raw.operation)) return actionReceipt(raw, out);
 
   if (raw.state === "succeeded" && (VERDICTS.has(raw.operation) || raw.operation === "comment")) {
@@ -559,9 +587,13 @@ function engine(raw     ) {
 }
 
 function capabilities(raw     ) {
-  if (!Array.isArray(raw) || raw.length !== BOARD_CAPABILITY_KEYS.length) throw new Error("capabilities");
-  return raw.map((row     , i        ) => {
-    if (!record(row) || row.key !== BOARD_CAPABILITY_KEYS[i] || typeof row.enabled !== "boolean") throw new Error("capability");
+
+  const legacy = BOARD_CAPABILITY_KEYS.filter(key => key !== "edit");
+  if (!Array.isArray(raw)) throw new Error("capabilities");
+  const keys = raw.length === legacy.length ? legacy : BOARD_CAPABILITY_KEYS;
+  if (raw.length !== keys.length) throw new Error("capabilities");
+  const parsed = raw.map((row     , i        ) => {
+    if (!record(row) || row.key !== keys[i] || typeof row.enabled !== "boolean") throw new Error("capability");
     if (row.enabled) return { key: row.key, enabled: true };
     if (!BOARD_CODES.has(row.code)) throw new Error("code");
     const out      = { key: row.key, enabled: false, code: row.code };
@@ -571,6 +603,9 @@ function capabilities(raw     ) {
     }
     return out;
   });
+  if (keys === legacy) parsed.splice(BOARD_CAPABILITY_KEYS.indexOf("edit"), 0,
+    { key: "edit", enabled: false, code: "edit_unsupported" });
+  return parsed;
 }
 
 function agentTools(raw     ) {
@@ -690,6 +725,10 @@ function cardRow(row     ) {
   if (!validState(row.state)) throw new Error("state");
   if (!Number.isSafeInteger(row.priority) || !count(row.createdAt) || !ATTENTION.has(row.attention)) throw new Error("card fields");
   const out      = { id: row.id, title: row.title, state: row.state, priority: row.priority, createdAt: row.createdAt, attention: row.attention };
+  if (row.outcomeUnknown !== undefined) {
+    if (typeof row.outcomeUnknown !== "boolean" || (row.outcomeUnknown && row.state !== "running")) throw new Error("unknown outcome");
+    out.outcomeUnknown = row.outcomeUnknown;
+  }
   if (text(row.assignee, 64)) out.assignee = row.assignee;
   if (row.runOutcome !== undefined) {
     if (!RUN_OUTCOMES.has(row.runOutcome)) throw new Error("outcome");
@@ -766,6 +805,11 @@ function artifactResult(got     , request     ) {
 
 function cardDetail(raw     , id        ) {
   const out      = cardRow(raw);
+  if (raw.unknownTarget !== undefined || raw.canAcknowledge !== undefined) {
+    if (out.outcomeUnknown !== true || typeof raw.unknownTarget !== "string" || !ATTENTION_HASH.test(raw.unknownTarget) ||
+      typeof raw.canAcknowledge !== "boolean") throw new Error("unknown target");
+    out.unknownTarget = raw.unknownTarget; out.canAcknowledge = raw.canAcknowledge;
+  }
   if (out.id !== id) throw new Error("card id");
   if (prose(raw.brief, 4000)) out.brief = raw.brief;
   if (typeof raw.blockKind === "string" && STATUS.test(raw.blockKind)) out.blockKind = raw.blockKind;
@@ -911,6 +955,11 @@ function boardResult(op        , raw     , request      = {})      {
     }
     return out;
   }
+  if (op === "board.acknowledge") {
+    out.receipt = receipt(raw.receipt, request.key);
+    if (out.receipt.operation !== "acknowledge" || (out.receipt.state === "succeeded" && out.receipt.card?.id !== request.id)) throw new Error("acknowledge receipt");
+    return out;
+  }
   if (op === "board.action") {
 
     out.target = target(raw.target, request.slug);
@@ -1003,6 +1052,10 @@ function boardResult(op        , raw     , request      = {})      {
     out.lanes = lanes(raw.lanes);
     if (!count(raw.needsYou)) throw new Error("needsYou");
     out.needsYou = raw.needsYou;
+    if (raw.unknownCount !== undefined) {
+      if (!count(raw.unknownCount) || raw.unknownCount > raw.needsYou) throw new Error("unknown count");
+      out.unknownCount = raw.unknownCount;
+    }
 
     if (raw.failed !== undefined) {
       if (!count(raw.failed)) throw new Error("failed");
@@ -1019,4 +1072,4 @@ function boardResult(op        , raw     , request      = {})      {
   return out;
 }
 
-module.exports = { BOARD_OPERATIONS, BOARD_READS, BOARD_WRITES, BOARD_UNCERTAIN_WRITES, BOARD_CAPABILITY_KEYS, BOARD_CODES, BOARD_ERRORS, BOARD_MAINTENANCE_OPERATIONS, BOARD_EXPORT_MAX_BYTES, BOARD_EXPORT_PART_BYTES, BOARD_ARTIFACT_OPERATIONS, BOARD_ARTIFACT_MAX_BYTES, boardErrorMessage, boardRequest, boardResult };
+module.exports = { BOARD_OPERATIONS, BOARD_WRITES, BOARD_MAINTENANCE_OPERATIONS, BOARD_EXPORT_MAX_BYTES, BOARD_EXPORT_PART_BYTES, BOARD_ARTIFACT_OPERATIONS, BOARD_ARTIFACT_MAX_BYTES, BOARD_UNCERTAIN_WRITES, BOARD_READS, BOARD_CAPABILITY_KEYS, BOARD_CODES, BOARD_ERRORS, boardErrorMessage, boardRequest, boardResult };

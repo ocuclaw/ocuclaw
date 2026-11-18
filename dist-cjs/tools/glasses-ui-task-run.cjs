@@ -1,5 +1,6 @@
 const { compareRungs } = require("./glasses-ui-delivery-ladder.cjs");
 const { validateSettingValue } = require("./glasses-ui-library.cjs");
+const { TASK_FIT_PROMPT, TASK_UNCHECKED_PROMPT } = require("./glasses-ui-task-unchecked.cjs");
 
 const LIVEUI_TASK_RUN_STATES = Object.freeze({
   starting: "starting",
@@ -16,9 +17,29 @@ const LIVEUI_TASK_RUN_END_REASONS = Object.freeze([
   "no_ui",
   "render_failed",
   "launch_failed",
+
+  "fed",
 ]);
 
-function projectLiveuiTaskRunForPhone(run) {
+function feedFromParams(feed     ) {
+  if (!feed || typeof feed !== "object") return null;
+  const cardId = typeof feed.cardId === "string" ? feed.cardId : "";
+  const keys = Array.isArray(feed.keys) ? feed.keys.filter((key     ) => typeof key === "string" && key) : [];
+  if (!cardId || keys.length === 0) return null;
+  const cardName = typeof feed.cardName === "string" && feed.cardName.trim() ? feed.cardName.trim() : cardId;
+  return { cardId, cardName, keys, ...(typeof feed.bindingDigest === "string" && /^sha256:[a-f0-9]{64}$/.test(feed.bindingDigest)
+    && Array.isArray(feed.inputs) ? { bindingDigest: feed.bindingDigest, inputs: feed.inputs,
+      ...(feed.presentationKind === "surface" ? { presentationKind: "surface" } : {}) } : {}) };
+}
+
+function taskFeedRunMessage(feed     ) {
+  if (feed.presentationKind === "surface") return `This Task has an approved reusable LiveUI presentation: ${JSON.stringify(feed.cardName)}, templateId ${JSON.stringify(feed.cardId)}. Gather the Task's data, then call manage_liveui_tasks with operation "feed_card" and values containing every key in this schema, using null for unavailable data: ${JSON.stringify(feed.inputs)}. ${TASK_FIT_PROMPT} ${TASK_UNCHECKED_PROMPT} That keeps the result for reopening. After successful delivery, render the same templateId with the values feed_card returns (fitted to the card) with manage_liveui_templates operation "render"; do not regenerate a layout. Also provide ordinary output so failures/offline display remain readable.`;
+  if (feed.bindingDigest) return `This run updates the saved glasses card ${JSON.stringify(feed.cardName)}. Do not render a new surface or rewrite its program. Call manage_liveui_tasks with operation "feed_card" and values containing every key in this schema, using null for unavailable data: ${JSON.stringify(feed.inputs)}. ${TASK_FIT_PROMPT} ${TASK_UNCHECKED_PROMPT} Then give the result in ordinary output too, so it remains available when the card is closed.`;
+  const values = feed.keys.map((key     ) => `"${key}": "..."`).join(", ");
+  return `This run feeds the glasses card "${feed.cardName}", which is open on the glasses now. Do not render a LiveUI surface. When you have the result, call manage_liveui_tasks with operation "feed_card" and values {${values}} (each a short line of text), then answer in one short sentence.`;
+}
+
+function projectLiveuiTaskRunForPhone(run     ) {
   if (!run || typeof run !== "object") return null;
   const taskId = typeof run.taskId === "string" ? run.taskId : "";
   const runId = typeof run.runId === "string" ? run.runId : "";
@@ -32,7 +53,7 @@ function projectLiveuiTaskRunForPhone(run) {
   };
 }
 
-function rejected(taskId, code) {
+function rejected(taskId     , code     ) {
   return {
     itemType: "task",
     itemId: typeof taskId === "string" ? taskId : "",
@@ -41,14 +62,14 @@ function rejected(taskId, code) {
   };
 }
 
-function copyExecutor(value) {
+function copyExecutor(value     ) {
   return {
     host: value.host,
     agentId: value.agentId,
   };
 }
 
-function approvedVersionFromLoad(loaded) {
+function approvedVersionFromLoad(loaded     ) {
   if (
     !loaded ||
     loaded.status !== "accepted" ||
@@ -69,7 +90,7 @@ function approvedVersionFromLoad(loaded) {
   return version;
 }
 
-function taskRunStartMessage(version, settingValues = {}) {
+function taskRunStartMessage(version     , settingValues      = {}) {
   if (!version || !Array.isArray(version.settings) || version.settings.length === 0) {
     return version.request;
   }
@@ -82,7 +103,7 @@ function taskRunStartMessage(version, settingValues = {}) {
       ? contractEntry.label
       : contractEntry.key;
     const hasValue = Object.prototype.hasOwnProperty.call(source, contractEntry.key);
-    const validation = hasValue
+    const validation      = hasValue
       ? validateSettingValue(contractEntry, source[contractEntry.key])
       : null;
     let rendered;
@@ -100,11 +121,11 @@ function taskRunStartMessage(version, settingValues = {}) {
   return lines.join("\n");
 }
 
-function normalizeSessionKey(value) {
+function normalizeSessionKey(value     ) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function createLiveuiTaskRunController(opts = {}) {
+function createLiveuiTaskRunController(opts      = {}) {
   if (typeof opts.loadTask !== "function") {
     throw new Error("LiveUI Task Run requires loadTask");
   }
@@ -136,11 +157,11 @@ function createLiveuiTaskRunController(opts = {}) {
     ? opts.resolveTemplateHint
     : () => null;
 
-  let launchClaim = null;
-  let activeRun = null;
-  let launchResolution = null;
+  let launchClaim      = null;
+  let activeRun      = null;
+  let launchResolution      = null;
 
-  function publicRun(run) {
+  function publicRun(run     ) {
     if (!run) return null;
     return {
       runId: run.runId,
@@ -152,7 +173,7 @@ function createLiveuiTaskRunController(opts = {}) {
       startedAt: run.startedAt,
       state: run.state,
       toolNames: [...run.toolNames],
-      approvals: run.approvals.map((approval) => ({
+      approvals: run.approvals.map((approval     ) => ({
         toolName: approval.toolName,
         outcome: approval.outcome,
       })),
@@ -161,18 +182,20 @@ function createLiveuiTaskRunController(opts = {}) {
       ...(Number.isSafeInteger(run.firstRenderAt)
         ? { firstRenderAt: run.firstRenderAt }
         : {}),
+      ...(run.feed ? { feed: { ...run.feed, keys: [...run.feed.keys] }, fedCount: run.fedCount } : {}),
+      ...(typeof run.by === "string" ? { by: run.by } : {}),
       ...(Number.isSafeInteger(run.endedAt) ? { endedAt: run.endedAt } : {}),
       ...(typeof run.endedReason === "string" ? { endedReason: run.endedReason } : {}),
     };
   }
 
-  function settleLaunch(result) {
+  function settleLaunch(result     ) {
     const pending = launchResolution;
     launchResolution = null;
     if (pending) pending.resolve(result);
   }
 
-  function bestEffortAbort(sessionKey) {
+  function bestEffortAbort(sessionKey     ) {
     const key = normalizeSessionKey(sessionKey);
     if (!key) return;
     try {
@@ -182,7 +205,7 @@ function createLiveuiTaskRunController(opts = {}) {
     }
   }
 
-  function endRun(reason, options = {}) {
+  function endRun(reason     , options      = {}) {
     const run = activeRun;
     if (!run || run.state === LIVEUI_TASK_RUN_STATES.ended) return null;
     run.state = LIVEUI_TASK_RUN_STATES.ended;
@@ -201,12 +224,12 @@ function createLiveuiTaskRunController(opts = {}) {
     return ended;
   }
 
-  function failClaim(taskId, code) {
+  function failClaim(taskId     , code     ) {
     launchClaim = null;
     return rejected(taskId, code);
   }
 
-  async function launchTask(params = {}) {
+  async function launchTask(params      = {}) {
     const taskId = typeof params.taskId === "string" ? params.taskId : "";
     const clientId = typeof params.clientId === "string" ? params.clientId : "";
     if (params.origin !== "glasses" || !clientId) {
@@ -245,6 +268,10 @@ function createLiveuiTaskRunController(opts = {}) {
     if (!["isolated", "current_session"].includes(version.context)) {
       return rejected(taskId, "task_not_ready");
     }
+    const feed = feedFromParams(params.feed === undefined && typeof opts.resolvePresentationFeed === "function"
+      ? opts.resolvePresentationFeed({ taskId, clientId, version }) : params.feed);
+    if (params.feed !== undefined && !feed) return rejected(taskId, "card_not_bound");
+    if (feed) firstMessage += `\n\n${taskFeedRunMessage(feed)}`;
 
     const claim = { taskId, clientId, cancelled: false };
     launchClaim = claim;
@@ -312,7 +339,7 @@ function createLiveuiTaskRunController(opts = {}) {
       return failClaim(taskId, claim.cancelled ? "task_cancelled" : "executor_unavailable");
     }
 
-    const run = {
+    const run      = {
       runId: newRunId(),
       taskId,
       versionId: version.versionId,
@@ -325,6 +352,9 @@ function createLiveuiTaskRunController(opts = {}) {
       approvals: [],
       surfaceIds: [],
       delivery: "none",
+      ...(feed ? { feed, fedCount: 0 } : {}),
+
+      ...(feed && ["card", "open", "agent"].includes(params.by) ? { by: params.by } : {}),
     };
     activeRun = run;
     launchClaim = null;
@@ -342,7 +372,7 @@ function createLiveuiTaskRunController(opts = {}) {
         sessionKey: sessionKey || undefined,
         text: firstMessage,
         executor: copyExecutor(executor),
-        onSessionResolved(resolvedSessionKey) {
+        onSessionResolved(resolvedSessionKey     ) {
           const resolved = normalizeSessionKey(resolvedSessionKey);
           if (resolved && activeRun === run && !run.sessionKey) run.sessionKey = resolved;
         },
@@ -359,7 +389,7 @@ function createLiveuiTaskRunController(opts = {}) {
     return resultPromise;
   }
 
-  function observeFirstRender(params = {}) {
+  function observeFirstRender(params      = {}) {
     const run = activeRun;
     const sessionKey = normalizeSessionKey(params.sessionKey);
     if (
@@ -376,7 +406,7 @@ function createLiveuiTaskRunController(opts = {}) {
     return true;
   }
 
-  function observeSurfaceRender(params = {}) {
+  function observeSurfaceRender(params      = {}) {
     const run = activeRun;
     const sessionKey = normalizeSessionKey(params.sessionKey);
     const surfaceId = typeof params.surfaceId === "string" ? params.surfaceId.trim() : "";
@@ -385,7 +415,7 @@ function createLiveuiTaskRunController(opts = {}) {
     return true;
   }
 
-  function observeToolUse(params = {}) {
+  function observeToolUse(params      = {}) {
     const run = activeRun;
     const sessionKey = normalizeSessionKey(params.sessionKey);
     const toolName = typeof params.toolName === "string" ? params.toolName.trim() : "";
@@ -394,7 +424,7 @@ function createLiveuiTaskRunController(opts = {}) {
     return true;
   }
 
-  function observeApproval(params = {}) {
+  function observeApproval(params      = {}) {
     const run = activeRun;
     const sessionKey = normalizeSessionKey(params.sessionKey);
     const toolName = typeof params.toolName === "string" ? params.toolName.trim() : "";
@@ -404,7 +434,7 @@ function createLiveuiTaskRunController(opts = {}) {
     return true;
   }
 
-  function observeSurfaceDelivery(params = {}) {
+  function observeSurfaceDelivery(params      = {}) {
     const run = activeRun;
     const sessionKey = normalizeSessionKey(params.sessionKey);
     const surfaceId = typeof params.surfaceId === "string" ? params.surfaceId.trim() : "";
@@ -421,7 +451,7 @@ function createLiveuiTaskRunController(opts = {}) {
     return true;
   }
 
-  function observeRenderAttempt(params) {
+  function observeRenderAttempt(params     ) {
     const run = activeRun;
     const sessionKey = normalizeSessionKey(
       params && typeof params === "object" ? params.sessionKey : params,
@@ -440,8 +470,34 @@ function createLiveuiTaskRunController(opts = {}) {
     return true;
   }
 
-  function observeTurnIdle(sessionKey) {
+  function observeFeed(params      = {}) {
     const run = activeRun;
+    const sessionKey = normalizeSessionKey(params.sessionKey);
+    if (!run || !run.feed || !sessionKey || sessionKey !== run.sessionKey) return false;
+    run.fedCount += 1;
+    if (run.state === LIVEUI_TASK_RUN_STATES.starting) {
+      run.state = LIVEUI_TASK_RUN_STATES.running;
+      run.firstRenderAt = now();
+      settleLaunch({ itemType: "task", itemId: run.taskId, status: "accepted" });
+    }
+    return true;
+  }
+
+  function observeTurnIdle(sessionKey     , options      = {}) {
+    const run = activeRun;
+
+    if (
+      run &&
+      run.feed &&
+      run.state !== LIVEUI_TASK_RUN_STATES.ended &&
+      normalizeSessionKey(sessionKey) === run.sessionKey &&
+      !run.renderAttempted
+    ) {
+      if (run.fedCount > 0) endRun("fed");
+      else if (options && options.failed === true) endRun("launch_failed", { code: "task_launch_failed" });
+      else endRun("no_ui", { code: "no_data" });
+      return true;
+    }
     if (
       !run ||
       run.state !== LIVEUI_TASK_RUN_STATES.starting ||
@@ -449,11 +505,16 @@ function createLiveuiTaskRunController(opts = {}) {
     ) return false;
 
     if (run.renderAttempted) return true;
+
+    if (options && options.failed === true) {
+      endRun("launch_failed", { code: "task_launch_failed" });
+      return true;
+    }
     endRun("no_ui", { code: "no_ui" });
     return true;
   }
 
-  function observeRenderFailure(sessionKey) {
+  function observeRenderFailure(sessionKey     ) {
     const run = activeRun;
     if (
       !run ||
@@ -464,7 +525,7 @@ function createLiveuiTaskRunController(opts = {}) {
     return true;
   }
 
-  function observeSurfaceRenderFailure(params = {}) {
+  function observeSurfaceRenderFailure(params      = {}) {
     const run = activeRun;
     if (!run || normalizeSessionKey(params.sessionKey) !== run.sessionKey ||
         !run.surfaceIds.includes(params.surfaceId)) return false;
@@ -472,7 +533,7 @@ function createLiveuiTaskRunController(opts = {}) {
     return true;
   }
 
-  function observeSurfaceOutcome(params = {}) {
+  function observeSurfaceOutcome(params      = {}) {
     const run = activeRun;
     if (!run || normalizeSessionKey(params.sessionKey) !== run.sessionKey) return false;
     const result = params && params.outcome && typeof params.outcome.result === "string"
@@ -483,7 +544,7 @@ function createLiveuiTaskRunController(opts = {}) {
     return true;
   }
 
-  function observeSessionEnd(params = {}) {
+  function observeSessionEnd(params      = {}) {
     const run = activeRun;
     const sessionKey = normalizeSessionKey(params.sessionKey);
     if (!run || (sessionKey && sessionKey !== run.sessionKey)) return false;
@@ -495,7 +556,7 @@ function createLiveuiTaskRunController(opts = {}) {
     return true;
   }
 
-  function cancelTaskLaunch(params = {}) {
+  function cancelTaskLaunch(params      = {}) {
     const run = activeRun;
     const taskId = typeof params.taskId === "string" ? params.taskId : "";
     const clientId = typeof params.clientId === "string" ? params.clientId : "";
@@ -520,6 +581,7 @@ function createLiveuiTaskRunController(opts = {}) {
     cancelTaskLaunch,
     observeRenderAttempt,
     observeFirstRender,
+    observeFeed,
     observeSurfaceRender,
     observeSurfaceDelivery,
     observeToolUse,
@@ -539,4 +601,4 @@ function createLiveuiTaskRunController(opts = {}) {
   };
 }
 
-module.exports = { LIVEUI_TASK_RUN_STATES, LIVEUI_TASK_RUN_END_REASONS, taskRunStartMessage, projectLiveuiTaskRunForPhone, createLiveuiTaskRunController };
+module.exports = { LIVEUI_TASK_RUN_STATES, LIVEUI_TASK_RUN_END_REASONS, taskFeedRunMessage, projectLiveuiTaskRunForPhone, taskRunStartMessage, createLiveuiTaskRunController };

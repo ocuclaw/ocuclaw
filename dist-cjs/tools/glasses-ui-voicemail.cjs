@@ -7,7 +7,7 @@ const VOICEMAIL_MAX_ENTRIES_PER_INJECTION = 8;
 const VOICEMAIL_PENDING_CAP_PER_SESSION = 32;
 const DELIVERED_KEY_CAP = 256;
 
-const RESULT_ENUM = new Set(["selected", "back"]);
+const RESULT_ENUM = new Set(["selected", "back", "action"]);
 
 const REAP_REASON_ENUM = new Set(["drain_session", "drain_all", "exit", "pop_back"]);
 
@@ -117,6 +117,8 @@ function createGlassesVoicemail(deps = {}) {
       via: record && record.error === "no_dispatch_lane" ? "wake_unavailable" : "wake_failed",
       staleAfterMs: null,
       surfaceLive: true,
+
+      ...(record && record.liveuiV2 === true ? { liveuiV2: true } : {}),
     };
   }
 
@@ -173,6 +175,8 @@ function createGlassesVoicemail(deps = {}) {
           "this voicemail is their only delivery, so treat the refs as the wearer's parked answer; " +
           "re-confirm before acting if stale)",
       );
+    } else if (entry.liveuiV2) {
+      parts.push("(composed surface: read the parked tap with get_glasses_ui_state)");
     } else {
       parts.push(
         entry.surfaceLive
@@ -335,4 +339,4 @@ function createGlassesVoicemail(deps = {}) {
   return { buildInjection, previewInjection, ackInjection, pendingSessionCount };
 }
 
-module.exports = { createGlassesVoicemail, DEFAULT_VOICEMAIL_TTL_MS, VOICEMAIL_MAX_ENTRIES_PER_INJECTION, VOICEMAIL_PENDING_CAP_PER_SESSION };
+module.exports = { DEFAULT_VOICEMAIL_TTL_MS, VOICEMAIL_MAX_ENTRIES_PER_INJECTION, VOICEMAIL_PENDING_CAP_PER_SESSION, createGlassesVoicemail };

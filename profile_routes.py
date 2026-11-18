@@ -433,6 +433,109 @@ def read_multiplex_enabled() -> Optional[bool]:
         return None
 
 
+#: Upstream's standalone reason for a host with one profile, as v0.23.0 writes
+#: it into ``gateway_state.json`` (``hermes_cli/gateway_multiplex_mode.py``
+#: ``SINGLE_PROFILE_REASON``). Held as text, not imported, so the bundle's
+#: Hermes import surface does not grow for one comparison: if upstream rewords
+#: it, this only stops matching and the "+" falls back to "run setup".
+SINGLE_PROFILE_REASON = "only one profile exists (nothing to multiplex)"
+_FALSE_WORDS = frozenset({"false", "no", "off", "0"})
+
+
+def _single_profile_reason() -> str:
+    return SINGLE_PROFILE_REASON
+
+
+def read_standalone_reason(default_home: Optional[Path]) -> Optional[str]:
+    """Why the LIVE default gateway serves only itself, or None.
+
+    Hermes 0.23 records ``multiplex_standalone_reason`` in the default home's
+    ``gateway_state.json`` when its boot guard keeps it standalone. The record
+    is validated the way :func:`read_served_profiles` validates it (owner home,
+    PID liveness); a stopped, failed, foreign or dead record says nothing.
+    """
+    if default_home is None:
+        return None
+    try:
+        from .profiles_report import _read_json, record_pid_is_live
+
+        record, status = _read_json(Path(default_home) / GATEWAY_STATE_FILENAME)
+        if status != "ok" or record is None:
+            return None
+        owner = record.get("hermes_home")
+        if isinstance(owner, str) and not _same_path(owner, default_home):
+            return None
+        if record.get("gateway_state") in (None, "stopped", "startup_failed"):
+            return None
+        if record_pid_is_live(record) is not True:
+            return None
+        reason = record.get("multiplex_standalone_reason")
+    except Exception:  # noqa: BLE001 - unreadable is "no reason known"
+        return None
+    return reason if isinstance(reason, str) and reason else None
+
+
+def _auto_migration_opted_out(default_home: Path) -> bool:
+    """``gateway.auto_multiplex_migration: false`` in the default config.
+
+    Read raw (Hermes's own reader takes a path and mutates no environment),
+    never through ``auto_migration_opted_out``, which swaps ``HERMES_HOME``
+    for the whole process while it reads. Unreadable counts as opted out.
+    """
+    from .profiles_report import read_profile_config
+
+    if not (Path(default_home) / "config.yaml").exists():
+        return False  # no config: Hermes's default, which is on
+    config, readable = read_profile_config(Path(default_home))
+    if not readable:
+        return True
+    gateway = config.get("gateway")
+    value = gateway.get("auto_multiplex_migration") if isinstance(gateway, dict) else None
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in _FALSE_WORDS
+    return value is False or value == 0
+
+
+def create_switches_on_in_place(default_home: Optional[Path] = None) -> bool:
+    """Will creating a profile turn multiple agents on, with no restart?
+
+    Hermes 0.23 boots a host with one profile standalone, and when a second
+    profile appears its reconcile watcher switches the running gateway to
+    multiplexing in place (``_multiplex_for_added_profile``, about 30 s). That
+    is how Hermes Desktop's New Agent works on such a host, so OcuClaw's "+"
+    may create there too, instead of sending the wearer to setup.
+
+    True only when every fact holds, each one probed: this gateway reads as
+    standalone (not merely unknown), its live record says it is standalone
+    ONLY because the host has one profile, the engine carries the in-place
+    switch, and the operator has not turned the automatic switch off. Any
+    other standalone reason (a secondary that owns a gateway, a duplicate
+    credential) still needs setup's guided migration.
+    """
+    if running_under_secondary_scope():
+        return False
+    if read_multiplex_enabled() is not False:
+        return False
+    home = resolve_default_home() if default_home is None else default_home
+    if home is None:
+        return False
+    if read_standalone_reason(home) != _single_profile_reason():
+        return False
+    try:
+        from gateway.run_profile_reconcile import GatewayProfileReconcileMixin
+
+        if not callable(getattr(GatewayProfileReconcileMixin, "_multiplex_for_added_profile", None)):
+            return False
+    except Exception:  # noqa: BLE001 - no in-place switch on this engine
+        return False
+    try:
+        return not _auto_migration_opted_out(home)
+    except Exception:  # noqa: BLE001 - unreadable config fails closed
+        return False
+
+
 def enumerate_profile_homes(
     *, capabilities: Optional[EngineCapabilities] = None
 ) -> Optional[Dict[str, Path]]:

@@ -2,9 +2,9 @@ const fs = require("node:fs");
 
 const path = require("node:path");
 const { LIVEUI_LIBRARY_ITEM_TYPES, canonicalSerialize, createLiveuiLibrary, isValidLiveuiLibraryItemId, liveuiLibraryDigest, resolveLiveuiLibraryRoot, validateSettingValue: validatePersistedSettingValue } = require("./glasses-ui-library.cjs");
-const { abstractSurfaceToTemplate } = require("./glasses-ui-save-ui.cjs");
+const { abstractComposedSurfaceToTemplate, abstractSurfaceToTemplate } = require("./glasses-ui-save-ui.cjs");
 
-function validateSettingValue(contractEntry, value) {
+function validateSettingValue(contractEntry     , value     ) {
   return validatePersistedSettingValue(contractEntry, value);
 }
 
@@ -12,6 +12,15 @@ const LIVEUI_TASK_LIBRARY_SCHEMA_VERSION =
   LIVEUI_LIBRARY_ITEM_TYPES.task.schemaVersion;
 const LIVEUI_TASK_LIBRARY_DIRNAME = "tasks-v1";
 const LIVEUI_TASK_TOOL_NAME = "manage_liveui_tasks";
+
+const LIVEUI_TASK_SCHEDULE_OPERATIONS = Object.freeze([
+  "list_schedules",
+  "schedule_task",
+  "pause_schedule",
+  "stop_schedule",
+  "quiet_schedule",
+  "move_schedule",
+]);
 const LIVEUI_TASK_AMBIGUITY_HINT =
   "Several Tasks match. Ask the user which one in your chat reply; do not render anything until they answer.";
 
@@ -22,10 +31,16 @@ const LIVEUI_TASK_TOOL_DESCRIPTION = [
   "Drafts are phone-only and cannot run until the phone owner approves.",
   "Never replace a pending Draft without asking the user; use replacePendingDraft only after they confirm.",
   "Always pass the digest you read as expectedDigest.",
+  "update_draft on a scheduled Task leaves its When alone: the Task keeps its schedule once the phone owner approves the Draft, so do not schedule it again.",
   "Omit fields unused by the operation; if the tool transport requires every field, use null, never dummy strings or values. For preferredTemplateId use {\"unchanged\":true} to omit it: null on create_draft/update_draft explicitly clears the hint. create_draft uses taskId/name/request and optional description/icon/executor/context/settings/preferredTemplateId; update_draft additionally uses expectedDigest/replacePendingDraft; read uses taskId; list uses no fields; find_tasks uses query; save_ui_as_helper uses taskId/expectedDigest and optional templateId/name.",
+  "read also answers health when the host keeps run facts for the Task: where its newest run stands (health.run: state, reason, times), its next run, the kept runs the glasses or a card started, never the host's scheduled runs (health.runs), and, when the newest run failed, was skipped or missed, could not be read, or the Task is not on the host's schedule, health.next with the cause and who can fix it. When the user asks why a Task did not run or what went wrong, read it and say that cause; do not guess.",
+  "check is the read for what is not working, and changes nothing: with no fields it lists every saved glasses card and every Task that is not working now, each with its cause and who can fix it (check.cards, check.tasks, check.next); with savedCard (a saved card's name or id) it checks that one card, which need not be open; with taskId it reads that Task as read does. When the user asks why a card or Task is not working, or whether everything works, check and say the cause it gives; do not guess. It judges a card's MCP reads, Jev questions and model uses and a Task's newest run, not a card's own script or feeds; check.next says what it could not judge, so never report more than it does.",
   "preferredTemplateId is an optional visual hint (a saved Template id). On an approved Task, changing it, the name, or the description creates a pending Draft for phone-owner approval before discovery or execution can use it.",
   "save_ui_as_helper turns the surface currently on the glasses into a hidden reusable helper Template (typed slots, no run content) and sets it as the Task's Preferred Template; use it only when the user asks to save this UI alongside a Task Draft.",
-  "When the user asks in ordinary conversation for a job that sounds like a saved Task, call find_tasks first; exactly one match → reuse its request, settings and their current settingValues (and preferredTemplate when present) as helpers and do the work in THIS conversation with your own tools; several matches → ask the user which Task they mean IN YOUR CHAT REPLY and stop; do NOT call render_glasses_ui or paint any picker or surface until the user answers; none → proceed normally; never tell the user a Task \"ran\" — discovery is reuse, not a Task Run.",
+  "Scheduled Tasks (Hermes, only while the app has them on; on scheduled_tasks_off, say so and do not retry): list_schedules shows each Task's When. schedule_task makes a Task that runs on its own: pass starter {key, slots} with only time/recurrence slots and no name for an OcuClaw starter (ocuclaw:glasses-brief, ocuclaw:day-wrap, ocuclaw:glance-reminder) and the glasses ask the user to confirm; the wearer's own words (request plus name), a reminder's text slot, or any other starter become a Draft for the phone. when is {type:\"daily\",time:\"HH:MM\",days:[\"mon\",...],timeZone} or {type:\"once\",at:\"YYYY-MM-DDTHH:MM\",timeZone} or {type:\"interval\",everyMinutes,timeZone}. Doing less needs no approval: pause_schedule, stop_schedule (no more runs; the Task stays), quiet_schedule (no pop-up) use taskId; move_schedule uses taskId and the new when. Never say a Task was made until the result says so. schedule_task's optional monitorUrl: a web page to check before each scheduled run; the run (and its model call) happens only when the page's visible text changed. Use for alerts about a page (price, stock, status). Hermes, or OpenClaw while it watches pages (on task_monitor_unsupported do not retry with monitorUrl; on OpenClaw the When must repeat); never on a reminder.",
+  "feed_card uses values only, and works only inside a Task run whose first message says it feeds a glasses card: pass every key that message names, each in its declared type (null when unavailable), then do what that message says next. Its reply holds the values as kept and what was fixed to fit.",
+  "card on create_draft or update_draft proposes that the Task fills a glasses card: {cardId:\"feed\", values:[\"Temp (C)\",\"Sky\"]} names up to 6 short things the card shows. Use it only when the user asks to show a Task on a card. It rides the Draft, and the phone owner approves it in Review with the Draft; say it waits for their approval. To link an approved Task, call update_draft with only taskId, expectedDigest and card. On program_cards_off, say cards are off on the phone and do not retry.",
+  "When the user asks in ordinary conversation for a job that matches a Task listed in your Task index, or names a saved Task, call find_tasks first; exactly one match → reuse its request, settings and their current settingValues (and preferredTemplate when present) as helpers and do the work in THIS conversation with your own tools; several matches → ask the user which Task they mean IN YOUR CHAT REPLY and stop; do NOT paint any picker or surface until the user answers; none → proceed normally; with no Task index in your context, or no listed Task that fits, skip find_tasks and do the job with your own tools; never tell the user a Task \"ran\" — discovery is reuse, not a Task Run.",
 ].join("\n");
 
 const executorSchema = {
@@ -59,7 +74,7 @@ const settingSchema = {
   additionalProperties: false,
 };
 
-function nullableTaskToolOptionals(schema) {
+function nullableTaskToolOptionals(schema     )      {
   if (schema.type === "array") {
     return { ...schema, items: nullableTaskToolOptionals(schema.items) };
   }
@@ -82,10 +97,20 @@ const liveuiTaskToolParametersSchema = nullableTaskToolOptionals({
   properties: {
     operation: {
       type: "string",
-      enum: ["create_draft", "update_draft", "read", "list", "find_tasks", "save_ui_as_helper"],
+      enum: [
+        "create_draft", "update_draft", "read", "list", "find_tasks", "save_ui_as_helper",
+
+        "feed_card",
+
+        "check",
+
+        ...LIVEUI_TASK_SCHEDULE_OPERATIONS,
+      ],
     },
     query: { type: "string" },
     taskId: { type: "string" },
+
+    savedCard: { type: "string" },
     templateId: { type: "string" },
     name: { type: "string" },
     description: { type: "string" },
@@ -108,6 +133,42 @@ const liveuiTaskToolParametersSchema = nullableTaskToolOptionals({
     },
     expectedDigest: { type: "string" },
     replacePendingDraft: { type: "boolean" },
+
+    starter: {
+      type: "object",
+      required: ["key"],
+      properties: {
+        key: { type: "string" },
+        slots: { type: "object", properties: {}, additionalProperties: { type: "string" } },
+      },
+    },
+    when: {
+      type: "object",
+      required: ["type"],
+      properties: {
+        type: { type: "string" },
+        time: { type: "string" },
+        days: { type: "array", items: { type: "string" } },
+        at: { type: "string" },
+        everyMinutes: { type: "integer" },
+        timeZone: { type: "string" },
+      },
+    },
+    kind: { type: "string" },
+
+    monitorUrl: { type: "string", maxLength: 490 },
+
+    values: { type: "object", properties: {}, additionalProperties: true },
+
+    card: {
+      type: "object",
+      required: ["values"],
+      properties: {
+        cardId: { type: "string", enum: ["feed"] },
+        values: { type: "array", minItems: 1, maxItems: 6, items: { type: "string", maxLength: 40 } },
+      },
+      additionalProperties: false,
+    },
   },
   additionalProperties: false,
 });
@@ -158,20 +219,20 @@ const LIVEUI_TASK_ALL_TOOLS_NOTICE =
 const LIVEUI_TASK_UNKNOWN_APPROVAL_BEHAVIOUR =
   "Tool approvals follow this Agent's current settings.";
 
-function rejected(code, message) {
+function rejected(code     , message     ) {
   return { status: "rejected", code, message };
 }
 
-function hasOwn(value, key) {
+function hasOwn(value     , key     ) {
   return Object.prototype.hasOwnProperty.call(value, key);
 }
 
-function unknownKey(value, allowed) {
+function unknownKey(value     , allowed     ) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   return Object.keys(value).find((key) => !allowed.has(key)) || null;
 }
 
-function plainDataCopy(value, state = { keys: 0 }, depth = 0) {
+function plainDataCopy(value     , state      = { keys: 0 }, depth = 0)      {
   if (
     value === null ||
     typeof value === "string" ||
@@ -203,7 +264,7 @@ function plainDataCopy(value, state = { keys: 0 }, depth = 0) {
   return output;
 }
 
-function validateExecutor(input) {
+function validateExecutor(input     ) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     return rejected("task_executor_invalid", "executor must contain host and agentId");
   }
@@ -224,7 +285,7 @@ function validateExecutor(input) {
   };
 }
 
-function validateSetting(input, index) {
+function validateSetting(input     , index     ) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     return rejected("task_setting_invalid", `settings[${index}] must be an object`);
   }
@@ -297,7 +358,7 @@ function validateSetting(input, index) {
     }
     if (
       input.options.some(
-        (option) =>
+        (option     ) =>
           typeof option !== "string" || option.length > 64,
       )
     ) {
@@ -312,34 +373,34 @@ function validateSetting(input, index) {
       `settings[${index}].options is only valid for enum settings`,
     );
   }
-  const setting = { key: input.key, type: input.type };
+  const setting      = { key: input.key, type: input.type };
   for (const key of ["label", "required", "maxLength", "min", "max", "options"]) {
     if (input[key] !== undefined) setting[key] = input[key];
   }
   return { status: "accepted", setting };
 }
 
-function validateSettings(input) {
+function validateSettings(input     ) {
   if (!Array.isArray(input) || input.length > 16) {
     return rejected("task_settings_invalid", "settings must contain at most 16 entries");
   }
-  const settings = [];
+  const settings      = [];
   for (let index = 0; index < input.length; index += 1) {
-    const validation = validateSetting(input[index], index);
+    const validation      = validateSetting(input[index], index);
     if (validation.status !== "accepted") return validation;
     settings.push(validation.setting);
   }
-  if (new Set(settings.map((setting) => setting.key)).size !== settings.length) {
+  if (new Set(settings.map((setting     ) => setting.key)).size !== settings.length) {
     return rejected("task_setting_key_duplicate", "setting keys must be unique");
   }
   return { status: "accepted", settings };
 }
 
-function validateFields(input, mode) {
+function validateFields(input     , mode     ) {
   let fields;
   try {
     fields = plainDataCopy(input);
-  } catch (err) {
+  } catch (err     ) {
     return rejected("task_not_static_data", err && err.message ? err.message : String(err));
   }
   if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
@@ -381,7 +442,7 @@ function validateFields(input, mode) {
   )) return rejected("task_request_invalid", "request must be 1-4000 characters");
 
   if (hasOwn(fields, "executor")) {
-    const executor = validateExecutor(fields.executor);
+    const executor      = validateExecutor(fields.executor);
     if (executor.status !== "accepted") return executor;
     fields.executor = executor.executor;
   }
@@ -389,7 +450,7 @@ function validateFields(input, mode) {
     return rejected("task_context_invalid", "context must be isolated or current_session");
   }
   if (hasOwn(fields, "settings")) {
-    const settings = validateSettings(fields.settings);
+    const settings      = validateSettings(fields.settings);
     if (settings.status !== "accepted") return settings;
     fields.settings = settings.settings;
   }
@@ -405,20 +466,20 @@ function validateFields(input, mode) {
   return { status: "accepted", fields };
 }
 
-function recordWithinBound(digestInput) {
+function recordWithinBound(digestInput     ) {
   const record = { ...digestInput, digest: liveuiLibraryDigest(digestInput) };
   return new TextEncoder().encode(canonicalSerialize(record)).byteLength <= TASK_MAX_BYTES;
 }
 
-function taskRecordPath(libraryRoot, taskId) {
+function taskRecordPath(libraryRoot     , taskId     ) {
   return path.join(libraryRoot, LIVEUI_TASK_LIBRARY_DIRNAME, `${taskId}.json`);
 }
 
-function normalizeAgentId(value) {
+function normalizeAgentId(value     ) {
   return typeof value === "string" && value.trim() ? value.trim() : "default";
 }
 
-function requireExpectedDigest(input) {
+function requireExpectedDigest(input     ) {
   if (!input || !hasOwn(input, "expectedDigest")) {
     return rejected("task_base_required", "expectedDigest is required for every Task edit");
   }
@@ -428,19 +489,19 @@ function requireExpectedDigest(input) {
   return { status: "accepted", expectedDigest: input.expectedDigest };
 }
 
-function normalizeTaskMatchText(value) {
+function normalizeTaskMatchText(value     ) {
   return typeof value === "string"
     ? value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ")
     : "";
 }
 
-function taskMatchTokens(value) {
+function taskMatchTokens(value     ) {
   const normalized = normalizeTaskMatchText(value);
   if (!normalized) return new Set();
   return new Set(normalized.split(" ").filter((token) => !TASK_MATCH_STOP_WORDS.has(token)));
 }
 
-function taskTokenScore(queryTokens, documentTokens) {
+function taskTokenScore(queryTokens     , documentTokens     ) {
   let shared = 0;
   for (const token of queryTokens) {
     if (documentTokens.has(token)) shared += 1;
@@ -449,17 +510,17 @@ function taskTokenScore(queryTokens, documentTokens) {
   return { shared, score: union > 0 ? shared / union : 0 };
 }
 
-function approvalSetting(setting) {
-  const projected = { key: setting.key, type: setting.type };
+function approvalSetting(setting     ) {
+  const projected      = { key: setting.key, type: setting.type };
   for (const key of ["label", "required", "maxLength", "min", "max", "options"]) {
     if (setting[key] !== undefined) {
-      projected[key] = key === "options" ? setting.options.map((option) => option) : setting[key];
+      projected[key] = key === "options" ? setting.options.map((option     ) => option) : setting[key];
     }
   }
   return projected;
 }
 
-function taskVersionMetadata(record, version) {
+function taskVersionMetadata(record     , version     ) {
   return {
     name: version && typeof version.name === "string"
       ? version.name
@@ -480,10 +541,10 @@ function taskVersionMetadata(record, version) {
   };
 }
 
-function approvalVersion(record, version, includeApprovedAtMs) {
+function approvalVersion(record     , version     , includeApprovedAtMs     ) {
   if (!version) return undefined;
   const metadata = taskVersionMetadata(record, version);
-  const projected = {
+  const projected      = {
     versionId: version.versionId,
     name: metadata.name,
     description: metadata.description,
@@ -494,7 +555,7 @@ function approvalVersion(record, version, includeApprovedAtMs) {
       agentId: version.executor.agentId,
     },
     context: version.context,
-    settings: version.settings.map((setting) => approvalSetting(setting)),
+    settings: version.settings.map((setting     ) => approvalSetting(setting)),
   };
   if (includeApprovedAtMs && Number.isSafeInteger(version.approvedAtMs)) {
     projected.approvedAtMs = version.approvedAtMs;
@@ -502,8 +563,8 @@ function approvalVersion(record, version, includeApprovedAtMs) {
   return projected;
 }
 
-function projectedSettingValues(record) {
-  const projected = {};
+function projectedSettingValues(record     ) {
+  const projected      = {};
   const approved = record && record.versions && record.versions.approved;
   const source = record && record.settingValues;
   if (
@@ -522,17 +583,17 @@ function projectedSettingValues(record) {
   for (const contractEntry of approved.settings) {
     const descriptor = descriptors[contractEntry.key];
     if (!descriptor || !hasOwn(descriptor, "value")) continue;
-    const validation = validateSettingValue(contractEntry, descriptor.value);
+    const validation      = validateSettingValue(contractEntry, descriptor.value);
     if (validation.status === "accepted") projected[contractEntry.key] = validation.value;
   }
   return projected;
 }
 
-function prunedSettingValues(settingValues, approved) {
+function prunedSettingValues(settingValues     , approved     ) {
   if (settingValues === undefined) return undefined;
-  const pruned = {};
+  const pruned      = {};
   if (!approved || !Array.isArray(approved.settings)) return pruned;
-  const contracts = new Map(approved.settings.map((entry) => [entry.key, entry]));
+  const contracts = new Map(approved.settings.map((entry     ) => [entry.key, entry]));
   for (const [key, value] of Object.entries(settingValues)) {
     const contractEntry = contracts.get(key);
     if (!contractEntry) continue;
@@ -541,7 +602,7 @@ function prunedSettingValues(settingValues, approved) {
   return pruned;
 }
 
-function projectTaskForApproval(record, options = {}) {
+function projectTaskForApproval(record     , options      = {}) {
   const reviewedVersion = record.versions.pending || record.versions.approved;
   const reviewedMetadata = taskVersionMetadata(record, reviewedVersion);
   const preferredTemplate = typeof options.resolveTemplateHint === "function" &&
@@ -550,13 +611,11 @@ function projectTaskForApproval(record, options = {}) {
     : null;
   const preferredTemplateName = reviewedMetadata.preferredTemplateName ||
     (preferredTemplate && preferredTemplate.name);
-  const projected = {
+  const projected      = {
     taskId: record.taskId,
-    name: record.name,
+    name: reviewedMetadata.name,
     digest: record.digest,
-    description: typeof record.cosmetic.description === "string"
-      ? record.cosmetic.description
-      : null,
+    description: reviewedMetadata.description,
     icon: typeof record.cosmetic.icon === "string" ? record.cosmetic.icon : null,
     settingValues: projectedSettingValues(record),
     hasPrevious: !!record.versions.previous,
@@ -586,7 +645,7 @@ function projectTaskForApproval(record, options = {}) {
   return projected;
 }
 
-function createLiveuiTaskLibrary(opts = {}) {
+function createLiveuiTaskLibrary(opts      = {}) {
   const libraryDir = resolveLiveuiLibraryRoot(opts.libraryDir);
   const host = opts.host;
   if (!["openclaw", "hermes"].includes(host)) {
@@ -613,7 +672,7 @@ function createLiveuiTaskLibrary(opts = {}) {
     : () => null;
   const rejectNameClash = typeof opts.rejectNameClash === "function"
     ? opts.rejectNameClash
-    : (clash) => rejected(
+    : (clash     ) => rejected(
       "library_name_clash",
       `Visible name clashes with ${clash && clash.name ? clash.name : "another item"}`,
     );
@@ -629,6 +688,10 @@ function createLiveuiTaskLibrary(opts = {}) {
   const currentSurfaceSpecForSession = typeof opts.currentSurfaceSpecForSession === "function"
     ? opts.currentSurfaceSpecForSession
     : () => null;
+
+  const currentComposedSurfaceForSession = typeof opts.currentComposedSurfaceForSession === "function"
+    ? opts.currentComposedSurfaceForSession
+    : () => null;
   const saveHelperTemplate = typeof opts.saveHelperTemplate === "function"
     ? opts.saveHelperTemplate
     : () => rejected("save_ui_unavailable", "helper Template persistence is unavailable");
@@ -639,7 +702,7 @@ function createLiveuiTaskLibrary(opts = {}) {
     ? opts.rollbackHelperTemplate
     : () => undefined;
 
-  function resolvePreferredTemplate(templateId) {
+  function resolvePreferredTemplate(templateId     ) {
     if (!isValidLiveuiLibraryItemId(templateId)) return null;
     try {
       const resolved = resolveTemplateHint(templateId);
@@ -651,7 +714,7 @@ function createLiveuiTaskLibrary(opts = {}) {
     }
   }
 
-  function applyPreferredTemplate(record, templateId) {
+  function applyPreferredTemplate(record     , templateId     ) {
     if (templateId !== null && !isValidLiveuiLibraryItemId(templateId)) {
       return rejected("template_id_invalid", "preferredTemplateId must be a valid Template id or null");
     }
@@ -671,14 +734,14 @@ function createLiveuiTaskLibrary(opts = {}) {
     };
   }
 
-  function retainedPreferredTemplateId(record) {
+  function retainedPreferredTemplateId(record     ) {
     return typeof record.preferredTemplateId === "string" &&
       resolvePreferredTemplate(record.preferredTemplateId)
       ? record.preferredTemplateId
       : null;
   }
 
-  function exists(taskId) {
+  function exists(taskId     ) {
     try {
       return fs.existsSync(taskRecordPath(libraryDir, taskId));
     } catch (_) {
@@ -686,7 +749,7 @@ function createLiveuiTaskLibrary(opts = {}) {
     }
   }
 
-  function read(taskId) {
+  function read(taskId     ) {
     if (!isValidLiveuiLibraryItemId(taskId)) {
       return rejected("task_id_invalid", "taskId is invalid");
     }
@@ -696,8 +759,8 @@ function createLiveuiTaskLibrary(opts = {}) {
     return { status: "accepted", task: loaded.record };
   }
 
-  function loadForOwnerWrite(taskId, options) {
-    const base = requireExpectedDigest(options);
+  function loadForOwnerWrite(taskId     , options     ) {
+    const base      = requireExpectedDigest(options);
     if (base.status !== "accepted") return base;
     if (!isValidLiveuiLibraryItemId(taskId)) {
       return rejected("task_id_invalid", "taskId is invalid");
@@ -717,12 +780,12 @@ function createLiveuiTaskLibrary(opts = {}) {
   }
 
   function saveOwnerWrite(
-    taskId,
-    current,
-    versions,
-    expectedDigest,
-    settingValues = current.settingValues,
-    metadata = null,
+    taskId     ,
+    current     ,
+    versions     ,
+    expectedDigest     ,
+    settingValues      = current.settingValues,
+    metadata      = null,
   ) {
     const effectiveMetadata = metadata || {
       name: current.name,
@@ -731,7 +794,7 @@ function createLiveuiTaskLibrary(opts = {}) {
         : "",
       preferredTemplateId: retainedPreferredTemplateId(current),
     };
-    const baseInput = {
+    const baseInput      = {
       schemaVersion: current.schemaVersion,
       itemType: current.itemType,
       taskId: current.taskId,
@@ -744,7 +807,7 @@ function createLiveuiTaskLibrary(opts = {}) {
       nextVersionNumber: current.nextVersionNumber,
     };
     if (settingValues !== undefined) baseInput.settingValues = settingValues;
-    const preferred = applyPreferredTemplate(
+    const preferred      = applyPreferredTemplate(
       baseInput,
       effectiveMetadata.preferredTemplateId,
     );
@@ -758,13 +821,13 @@ function createLiveuiTaskLibrary(opts = {}) {
     return { status: "saved", task: saved.record };
   }
 
-  function findTasks(query) {
+  function findTasks(query     ) {
     const normalizedQuery = normalizeTaskMatchText(query);
     if (!normalizedQuery) {
       return rejected("task_query_invalid", "query must contain searchable text");
     }
     const queryTokens = taskMatchTokens(normalizedQuery);
-    const matches = [];
+    const matches      = [];
     const listed = listItemsForDiscovery();
     for (const row of listed.items) {
       if (!row || row.itemType !== "task") continue;
@@ -794,7 +857,7 @@ function createLiveuiTaskLibrary(opts = {}) {
         name: metadata.name,
         description: metadata.description,
         request: approved.request,
-        settings: approved.settings.map((setting) => approvalSetting(setting)),
+        settings: approved.settings.map((setting     ) => approvalSetting(setting)),
         settingValues: projectedSettingValues(record),
         context: approved.context,
         preferredTemplate: (() => {
@@ -807,7 +870,7 @@ function createLiveuiTaskLibrary(opts = {}) {
         score,
       });
     }
-    matches.sort((left, right) => {
+    matches.sort((left     , right     ) => {
       if (left.match !== right.match) return left.match === "exact_name" ? -1 : 1;
       if (left.score !== right.score) return right.score - left.score;
       return left.taskId < right.taskId ? -1 : left.taskId > right.taskId ? 1 : 0;
@@ -822,16 +885,16 @@ function createLiveuiTaskLibrary(opts = {}) {
     };
   }
 
-  const controller = {
+  const controller      = {
     libraryDir,
-    createDraft(input, context = {}) {
-      const validation = validateFields(input, "create");
+    createDraft(input     , context      = {}) {
+      const validation      = validateFields(input, "create");
       if (validation.status !== "accepted") return validation;
       const fields = validation.fields;
       if (exists(fields.taskId)) {
         return rejected("task_exists", `task already exists: ${fields.taskId}`);
       }
-      const defaults = resolveTaskDefaults();
+      const defaults      = resolveTaskDefaults();
       const executor = fields.executor || {
         host,
         agentId: normalizeAgentId(
@@ -872,7 +935,7 @@ function createLiveuiTaskLibrary(opts = {}) {
         },
         nextVersionNumber: 2,
       };
-      const preferred = applyPreferredTemplate(
+      const preferred      = applyPreferredTemplate(
         baseInput,
         hasOwn(fields, "preferredTemplateId") ? fields.preferredTemplateId : null,
       );
@@ -888,11 +951,11 @@ function createLiveuiTaskLibrary(opts = {}) {
       if (saved.status !== "saved") return saved;
       return { status: "saved", task: saved.record };
     },
-    updateDraft(input, context = {}) {
+    updateDraft(input     , context      = {}) {
       if (!input || !hasOwn(input, "expectedDigest")) {
         return rejected("task_base_required", "expectedDigest is required for every Task edit");
       }
-      const validation = validateFields(input, "owner");
+      const validation      = validateFields(input, "owner");
       if (validation.status !== "accepted") return validation;
       const fields = validation.fields;
       if (typeof fields.expectedDigest !== "string" || !fields.expectedDigest) {
@@ -996,14 +1059,16 @@ function createLiveuiTaskLibrary(opts = {}) {
         if (clash) return rejectNameClash(clash);
       }
 
-      const baseInput = {
+      const retainLegacyMetadata = [current.versions.approved, current.versions.previous]
+        .some((version) => version && APPROVAL_METADATA_KEYS.some((key) => !hasOwn(version, key)));
+      const baseInput      = {
         schemaVersion: LIVEUI_TASK_LIBRARY_SCHEMA_VERSION,
         itemType: "task",
         taskId: current.taskId,
-        name: hasOwn(fields, "name") ? fields.name : current.name,
+        name: !retainLegacyMetadata && hasOwn(fields, "name") ? fields.name : current.name,
         cosmetic: {
           ...current.cosmetic,
-          ...(hasOwn(fields, "description") ? { description: fields.description } : {}),
+          ...(!retainLegacyMetadata && hasOwn(fields, "description") ? { description: fields.description } : {}),
           ...(hasOwn(fields, "icon") ? { icon: fields.icon } : {}),
         },
         versions: { ...current.versions },
@@ -1028,10 +1093,10 @@ function createLiveuiTaskLibrary(opts = {}) {
           baseInput.nextVersionNumber = current.nextVersionNumber + 1;
         }
       }
-      const requestedPreferredTemplateId = hasOwn(fields, "preferredTemplateId")
+      const requestedPreferredTemplateId = !retainLegacyMetadata && hasOwn(fields, "preferredTemplateId")
         ? candidateApproval.preferredTemplateId
         : retainedPreferredTemplateId(current);
-      const preferred = applyPreferredTemplate(baseInput, requestedPreferredTemplateId);
+      const preferred      = applyPreferredTemplate(baseInput, requestedPreferredTemplateId);
       if (preferred.status !== "accepted") return preferred;
       if (!approvalChanged && !cosmeticSupplied && preferred.unchanged) {
         return { status: "unchanged", task: current };
@@ -1046,8 +1111,8 @@ function createLiveuiTaskLibrary(opts = {}) {
       if (saved.status !== "saved") return saved;
       return { status: "saved", task: saved.record };
     },
-    updateTaskContext(taskId, context) {
-      const validation = validateFields({ taskId, context }, "update");
+    updateTaskContext(taskId     , context     ) {
+      const validation      = validateFields({ taskId, context }, "update");
       if (validation.status !== "accepted") return validation;
       const loaded = read(taskId);
       if (loaded.status !== "accepted") return loaded;
@@ -1064,10 +1129,10 @@ function createLiveuiTaskLibrary(opts = {}) {
         replacePendingDraft: true,
       }, { authoredBy: "phone", baseApproved: true });
     },
-    updateTaskExecutor(taskId, executorInput) {
-      const executor = validateExecutor(executorInput);
+    updateTaskExecutor(taskId     , executorInput     ) {
+      const executor      = validateExecutor(executorInput);
       if (executor.status !== "accepted") return executor;
-      const loaded = read(taskId);
+      const loaded      = read(taskId);
       if (loaded.status !== "accepted") return loaded;
       const current = loaded.task;
       const base = current.versions.approved;
@@ -1082,7 +1147,7 @@ function createLiveuiTaskLibrary(opts = {}) {
         replacePendingDraft: true,
       }, { authoredBy: "phone", baseApproved: true });
     },
-    updateTaskSettingValues(taskId, valuesInput, options = {}) {
+    updateTaskSettingValues(taskId     , valuesInput     , options      = {}) {
       let values;
       try {
         values = plainDataCopy(valuesInput);
@@ -1111,17 +1176,17 @@ function createLiveuiTaskLibrary(opts = {}) {
           invalid: patchKeys.map((key) => ({ key, code: "setting_value_invalid" })),
         };
       }
-      const loaded = loadForOwnerWrite(taskId, options);
+      const loaded      = loadForOwnerWrite(taskId, options);
       if (loaded.status !== "accepted") return loaded;
       const current = loaded.record;
       const approved = current.versions.approved;
       if (!approved) {
         return rejected("task_not_approved", "Task Setting values require an approved version");
       }
-      const contracts = new Map(approved.settings.map((entry) => [entry.key, entry]));
+      const contracts = new Map(approved.settings.map((entry     ) => [entry.key, entry]));
       const unknownSettingKey = patchKeys.find((key) => !contracts.has(key));
       if (unknownSettingKey) {
-        const response = {
+        const response      = {
           status: "rejected",
           code: "setting_unknown",
           message: `unknown Task Setting: ${unknownSettingKey}`,
@@ -1129,10 +1194,10 @@ function createLiveuiTaskLibrary(opts = {}) {
         response.key = unknownSettingKey;
         return response;
       }
-      const invalid = [];
+      const invalid      = [];
       for (const key of patchKeys) {
         if (values[key] === null) continue;
-        const validation = validateSettingValue(contracts.get(key), values[key]);
+        const validation      = validateSettingValue(contracts.get(key), values[key]);
         if (validation.status !== "accepted") {
           invalid.push({ key, code: "setting_value_invalid" });
         }
@@ -1140,7 +1205,7 @@ function createLiveuiTaskLibrary(opts = {}) {
       if (invalid.length > 0) {
         return { status: "rejected", code: "setting_value_invalid", invalid };
       }
-      const nextValues = { ...(current.settingValues || {}) };
+      const nextValues      = { ...(current.settingValues || {}) };
       for (const key of patchKeys) {
         if (values[key] === null) delete nextValues[key];
         else nextValues[key] = values[key];
@@ -1156,14 +1221,14 @@ function createLiveuiTaskLibrary(opts = {}) {
         nextValues,
       );
     },
-    approveTask(taskId, options = {}) {
-      const loaded = loadForOwnerWrite(taskId, options);
+    approveTask(taskId     , options      = {}) {
+      const loaded      = loadForOwnerWrite(taskId, options);
       if (loaded.status !== "accepted") return loaded;
       const current = loaded.record;
       if (!current.versions.pending) {
         return rejected("task_no_pending", "Task has no pending Draft to approve");
       }
-      const clash = findVisibleNameClash(taskId, current.name, { approving: true });
+      const clash = findVisibleNameClash(taskId, taskVersionMetadata(current, current.versions.pending).name, { approving: true });
       if (clash) return rejectNameClash(clash);
       const nowValue = typeof options.now === "function"
         ? options.now()
@@ -1175,7 +1240,7 @@ function createLiveuiTaskLibrary(opts = {}) {
       }
 
       const pending = current.versions.pending;
-      const defaults = resolveTaskDefaults();
+      const defaults      = resolveTaskDefaults();
       const inheritedContext = pending.context
         ? null
         : defaults.defaultContext || "isolated";
@@ -1191,7 +1256,7 @@ function createLiveuiTaskLibrary(opts = {}) {
         ...(inheritedExecutor ? { executor: inheritedExecutor } : {}),
         approvedAtMs: nowValue,
       };
-      const versions = { approved };
+      const versions      = { approved };
       if (current.versions.approved) versions.previous = current.versions.approved;
       return saveOwnerWrite(
         taskId,
@@ -1202,14 +1267,14 @@ function createLiveuiTaskLibrary(opts = {}) {
         taskVersionMetadata(current, approved),
       );
     },
-    rejectTask(taskId, options = {}) {
-      const loaded = loadForOwnerWrite(taskId, options);
+    rejectTask(taskId     , options      = {}) {
+      const loaded      = loadForOwnerWrite(taskId, options);
       if (loaded.status !== "accepted") return loaded;
       const current = loaded.record;
       if (!current.versions.pending) {
         return rejected("task_no_pending", "Task has no pending Draft to reject");
       }
-      const versions = {};
+      const versions      = {};
       if (current.versions.approved) versions.approved = current.versions.approved;
       if (current.versions.previous) versions.previous = current.versions.previous;
       if (Object.keys(versions).length === 0) {
@@ -1232,14 +1297,14 @@ function createLiveuiTaskLibrary(opts = {}) {
           : null,
       );
     },
-    undoTaskUpdate(taskId, options = {}) {
-      const loaded = loadForOwnerWrite(taskId, options);
+    undoTaskUpdate(taskId     , options      = {}) {
+      const loaded      = loadForOwnerWrite(taskId, options);
       if (loaded.status !== "accepted") return loaded;
       const current = loaded.record;
       if (!current.versions.previous) {
         return rejected("task_undo_unavailable", "Task has no previous approved version");
       }
-      const versions = { approved: current.versions.previous };
+      const versions      = { approved: current.versions.previous };
       if (current.versions.pending) versions.pending = current.versions.pending;
       return saveOwnerWrite(
         taskId,
@@ -1250,17 +1315,60 @@ function createLiveuiTaskLibrary(opts = {}) {
         taskVersionMetadata(current, current.versions.previous),
       );
     },
-    updateTaskCosmetic(taskId, options = {}) {
-      const input = { taskId };
+
+    createDraftFromApproved(taskId     , options      = {}) {
+      const loaded      = loadForOwnerWrite(taskId, options);
+      if (loaded.status !== "accepted") return loaded;
+      const current = loaded.record;
+      const approved = current.versions.approved;
+      if (!approved) return rejected("task_not_approved", "Task has no approved version");
+      if (current.versions.pending) {
+        return rejected(
+          "task_draft_pending",
+          "A pending Draft already exists. Ask the user before replacing it, then pass replacePendingDraft: true.",
+        );
+      }
+      const { approvedAtMs: _approvedAtMs, ...base } = approved;
+      const versions      = {
+        ...current.versions,
+        pending: {
+          ...base,
+          versionId: `v${current.nextVersionNumber}`,
+          authoredBy: options.authoredBy === "agent" ? "agent" : "phone",
+        },
+      };
+      const baseInput      = {
+        schemaVersion: current.schemaVersion,
+        itemType: current.itemType,
+        taskId: current.taskId,
+        name: current.name,
+        cosmetic: { ...current.cosmetic },
+        versions,
+        nextVersionNumber: current.nextVersionNumber + 1,
+      };
+      if (current.settingValues !== undefined) baseInput.settingValues = current.settingValues;
+      const preferred      = applyPreferredTemplate(baseInput, retainedPreferredTemplateId(current));
+      if (preferred.status !== "accepted") return preferred;
+      if (!recordWithinBound(preferred.record)) {
+        return rejected("task_too_large", `task exceeds ${TASK_MAX_BYTES} canonical bytes`);
+      }
+      const saved = library.saveItem("task", taskId, preferred.record, {
+        expectedDigest: loaded.expectedDigest,
+      });
+      if (saved.status !== "saved") return saved;
+      return { status: "saved", task: saved.record };
+    },
+    updateTaskCosmetic(taskId     , options      = {}) {
+      const input      = { taskId };
       for (const key of OWNER_COSMETIC_KEYS) {
         if (hasOwn(options, key)) input[key] = options[key];
       }
-      const validation = validateFields(input, "update");
+      const validation      = validateFields(input, "update");
       if (validation.status !== "accepted") return validation;
       if (!OWNER_COSMETIC_KEYS.some((key) => hasOwn(validation.fields, key))) {
         return rejected("task_update_empty", "cosmetic update did not change the Task");
       }
-      const loaded = loadForOwnerWrite(taskId, options);
+      const loaded      = loadForOwnerWrite(taskId, options);
       if (loaded.status !== "accepted") return loaded;
       const current = loaded.record;
       if (hasOwn(validation.fields, "name")) {
@@ -1268,7 +1376,7 @@ function createLiveuiTaskLibrary(opts = {}) {
         if (clash) return rejectNameClash(clash);
       }
       const versions = Object.fromEntries(
-        Object.entries(current.versions).map(([slot, version]) => [
+        Object.entries(current.versions).map(([slot, version]     ) => [
           slot,
           {
             ...version,
@@ -1281,7 +1389,7 @@ function createLiveuiTaskLibrary(opts = {}) {
           },
         ]),
       );
-      const baseInput = {
+      const baseInput      = {
         schemaVersion: current.schemaVersion,
         itemType: current.itemType,
         taskId: current.taskId,
@@ -1304,7 +1412,7 @@ function createLiveuiTaskLibrary(opts = {}) {
       if (hasOwn(validation.fields, "icon") && !validation.fields.icon) {
         delete baseInput.cosmetic.icon;
       }
-      const preferred = applyPreferredTemplate(
+      const preferred      = applyPreferredTemplate(
         baseInput,
         retainedPreferredTemplateId(current),
       );
@@ -1319,8 +1427,8 @@ function createLiveuiTaskLibrary(opts = {}) {
       if (saved.status !== "saved") return saved;
       return { status: "saved", task: saved.record };
     },
-    setTaskPreferredTemplate(taskId, templateId, options = {}) {
-      const loaded = loadForOwnerWrite(taskId, options);
+    setTaskPreferredTemplate(taskId     , templateId     , options      = {}) {
+      const loaded      = loadForOwnerWrite(taskId, options);
       if (loaded.status !== "accepted") return loaded;
       const current = loaded.record;
       const resolvedTemplate = templateId === null ? null : resolvePreferredTemplate(templateId);
@@ -1328,7 +1436,7 @@ function createLiveuiTaskLibrary(opts = {}) {
         return rejected("template_not_found", `template not found: ${templateId}`);
       }
       const versions = Object.fromEntries(
-        Object.entries(current.versions).map(([slot, version]) => [
+        Object.entries(current.versions).map(([slot, version]     ) => [
           slot,
           {
             ...version,
@@ -1337,7 +1445,7 @@ function createLiveuiTaskLibrary(opts = {}) {
           },
         ]),
       );
-      const preferred = applyPreferredTemplate({ ...current, versions }, templateId);
+      const preferred      = applyPreferredTemplate({ ...current, versions }, templateId);
       if (preferred.status !== "accepted") return preferred;
       const digestInput = preferred.record;
       const currentInput = { ...current };
@@ -1354,7 +1462,7 @@ function createLiveuiTaskLibrary(opts = {}) {
       if (saved.status !== "saved") return saved;
       return { status: "saved", task: saved.record };
     },
-    saveUiAsHelper(input, context = {}) {
+    saveUiAsHelper(input     , context      = {}) {
       const extra = unknownKey(input, SAVE_UI_KEYS);
       if (extra) return rejected("task_field_unknown", `unknown save_ui_as_helper field: ${extra}`);
       if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -1383,20 +1491,49 @@ function createLiveuiTaskLibrary(opts = {}) {
         return rejected("template_id_invalid", "templateId is invalid");
       }
       const name = input.name === undefined ? `${current.name} UI` : input.name;
-      const spec = currentSurfaceSpecForSession(context.sessionKey);
-      if (!spec) {
-        return rejected("save_ui_no_current_surface", "no current LiveUI surface for this session");
-      }
-      let abstraction;
-      try {
-        abstraction = abstractSurfaceToTemplate(spec, { templateId, name });
-      } catch (err) {
-        return rejected(
-          err && err.code === "save_ui_unsupported_kind"
-            ? err.code
-            : "save_ui_unsupported_kind",
-          err && err.message ? err.message : "current surface cannot be saved as a Template",
-        );
+      let abstraction     ;
+      const composed = currentComposedSurfaceForSession(context.sessionKey);
+      if (composed && composed.spec) {
+
+        const sources = composed.pictureSources;
+
+        const data = composed.data && typeof composed.data === "object" && !Array.isArray(composed.data)
+          ? composed.data
+          : null;
+        const out = abstractComposedSurfaceToTemplate(data ? { ...composed.spec, data } : composed.spec, {
+          ...(Array.isArray(composed.inputs) ? { inputs: composed.inputs } : {}),
+
+          ...(sources && typeof sources === "object" && !Array.isArray(sources) ? { pictureSources: sources } : {}),
+        });
+        if (!out.ok) return rejected(out.code, out.message);
+        abstraction = {
+          template: {
+            schemaVersion: 2,
+            templateId,
+            name,
+            vocab: out.vocab,
+            body: { surface: out.surface },
+            inputs: out.inputs,
+          },
+          slotValues: out.values,
+          keys: out.inputs.map((i     ) => i.key),
+        };
+      } else {
+        const spec = currentSurfaceSpecForSession(context.sessionKey);
+        if (!spec) {
+          return rejected("save_ui_no_current_surface", "no current LiveUI surface for this session");
+        }
+        try {
+          abstraction = abstractSurfaceToTemplate(spec, { templateId, name });
+        } catch (err     ) {
+          return rejected(
+            err && err.code === "save_ui_unsupported_kind"
+              ? err.code
+              : "save_ui_unsupported_kind",
+            err && err.message ? err.message : "current surface cannot be saved as a Template",
+          );
+        }
+        abstraction.keys = abstraction.template.slots.map((slot     ) => slot.key);
       }
 
       const templateSaved = saveHelperTemplate(
@@ -1438,7 +1575,7 @@ function createLiveuiTaskLibrary(opts = {}) {
           templateId,
           hidden: true,
           preferredTemplateId: templateId,
-          slots: abstraction.template.slots.map((slot) => slot.key),
+          slots: abstraction.keys,
           ...(abstraction.note === undefined ? {} : { note: abstraction.note }),
         };
       } catch (err) {
@@ -1446,12 +1583,12 @@ function createLiveuiTaskLibrary(opts = {}) {
         throw err;
       }
     },
-    deleteTask(taskId, options = {}) {
-      const loaded = loadForOwnerWrite(taskId, options);
+    deleteTask(taskId     , options      = {}) {
+      const loaded      = loadForOwnerWrite(taskId, options);
       const invalidRow = loaded.status === "accepted"
         ? null
         : library.listItems().items.find(
-          (row) =>
+          (row     ) =>
             row &&
             row.status === "invalid" &&
             row.itemType === "task" &&
@@ -1486,21 +1623,21 @@ function createLiveuiTaskLibrary(opts = {}) {
       const listed = library.listItems();
       return {
         status: "accepted",
-        tasks: listed.items.filter((row) => row.itemType === "task"),
+        tasks: listed.items.filter((row     ) => row.itemType === "task"),
       };
     },
-    listItems(options = {}) {
+    listItems(options      = {}) {
       return library.listItems(options);
     },
   };
   return controller;
 }
 
-async function dispatchLiveuiTaskOperation(handler, args) {
+async function dispatchLiveuiTaskOperation(handler     , args     ) {
 
   try {
     args = plainDataCopy(args);
-  } catch (err) {
+  } catch (err     ) {
     return rejected("task_not_static_data", err && err.message ? err.message : String(err));
   }
   const operation = args && typeof args.operation === "string" ? args.operation : "";
@@ -1534,15 +1671,67 @@ async function dispatchLiveuiTaskOperation(handler, args) {
   }
   if (operation === "read") return handler.readTask(args.taskId);
   if (operation === "list") return handler.listTasks();
+  if (operation === "check") {
+    const oneTask = typeof args.taskId === "string" && args.taskId !== "";
+
+    if (oneTask && args.savedCard !== undefined) {
+      return rejected("check_invalid", "check takes savedCard or taskId, not both: check the card and read the Task in two calls");
+    }
+
+    if (oneTask) return handler.readTask(args.taskId);
+    if (typeof handler.check !== "function") return rejected("check_unavailable", "check is not available here");
+    return handler.check({ savedCard: args.savedCard });
+  }
   if (operation === "find_tasks") return handler.findTasks(args.query);
+  if (operation === "feed_card") {
+    if (typeof handler.feedCard !== "function") return rejected("no_feed_run", "feed_card is not available here");
+    return handler.feedCard({ values: args.values });
+  }
   if (operation === "save_ui_as_helper") {
     const { operation: _operation, ...input } = args;
     return handler.saveUiAsHelper(input);
   }
+  if (LIVEUI_TASK_SCHEDULE_OPERATIONS.includes(operation)) {
+    return dispatchLiveuiTaskScheduleOperation(handler, operation, args);
+  }
   return rejected(
     "task_operation_invalid",
-    "operation must be create_draft, update_draft, read, list, find_tasks, or save_ui_as_helper",
+    `operation must be create_draft, update_draft, read, list, find_tasks, save_ui_as_helper, feed_card, check, or ${LIVEUI_TASK_SCHEDULE_OPERATIONS.join(", ")}`,
   );
 }
 
-module.exports = { LIVEUI_TASK_LIBRARY_SCHEMA_VERSION, LIVEUI_TASK_LIBRARY_DIRNAME, LIVEUI_TASK_TOOL_NAME, LIVEUI_TASK_TOOL_DESCRIPTION, LIVEUI_TASK_ALL_TOOLS_NOTICE, LIVEUI_TASK_UNKNOWN_APPROVAL_BEHAVIOUR, liveuiTaskToolParametersSchema, validateSettingValue, projectTaskForApproval, createLiveuiTaskLibrary, dispatchLiveuiTaskOperation };
+function withoutNulls(value     ) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const out = Object.create(null);
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry !== null) out[key] = entry;
+  }
+  return out;
+}
+
+function dispatchLiveuiTaskScheduleOperation(handler     , operation     , args     ) {
+  if (typeof handler.listVoiceTaskSchedules !== "function") {
+    return rejected("scheduled_tasks_off", "Scheduled Tasks are not available on this host. Do not retry.");
+  }
+  if (operation === "list_schedules") return handler.listVoiceTaskSchedules();
+  if (operation === "schedule_task") {
+    const starter = withoutNulls(args.starter);
+    if (starter && hasOwn(starter, "slots")) starter.slots = withoutNulls(starter.slots);
+    return handler.scheduleTask({
+      ...(hasOwn(args, "taskId") ? { taskId: args.taskId } : {}),
+      ...(hasOwn(args, "name") ? { name: args.name } : {}),
+      ...(hasOwn(args, "request") ? { request: args.request } : {}),
+      ...(hasOwn(args, "kind") ? { kind: args.kind } : {}),
+      ...(hasOwn(args, "monitorUrl") ? { monitorUrl: args.monitorUrl } : {}),
+      ...(starter ? { starter: { ...starter } } : {}),
+      when: withoutNulls(args.when),
+    });
+  }
+  const action = operation.replace(/_schedule$/, "");
+  return handler.lessenTaskSchedule(action, {
+    taskId: args.taskId,
+    ...(operation === "move_schedule" ? { when: withoutNulls(args.when) } : {}),
+  });
+}
+
+module.exports = { validateSettingValue, LIVEUI_TASK_LIBRARY_SCHEMA_VERSION, LIVEUI_TASK_LIBRARY_DIRNAME, LIVEUI_TASK_TOOL_NAME, LIVEUI_TASK_SCHEDULE_OPERATIONS, LIVEUI_TASK_TOOL_DESCRIPTION, liveuiTaskToolParametersSchema, LIVEUI_TASK_ALL_TOOLS_NOTICE, LIVEUI_TASK_UNKNOWN_APPROVAL_BEHAVIOUR, validateExecutor, projectTaskForApproval, createLiveuiTaskLibrary, dispatchLiveuiTaskOperation };

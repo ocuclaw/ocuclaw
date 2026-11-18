@@ -13,6 +13,7 @@ from .saved_rpc import OPERATIONS as SAVED_OPERATIONS, capabilities as saved_cap
 from .tools_management import OPERATIONS as TOOLS_OPERATIONS, tools_capabilities, handle_tools
 from .connections_management import OPERATIONS as CONNECTION_OPERATIONS, capabilities as connection_capabilities, handle_connections
 from .enrollment_management import OPERATIONS as AGENT_OPERATIONS, capabilities as agent_capabilities, handle_agents
+from .handoffs_management import OPERATIONS as HANDOFF_OPERATIONS, capabilities as handoff_capabilities, handle_handoffs
 from .management_summary import overview_summary
 
 
@@ -70,6 +71,9 @@ def read_management(rpc: Any, params: Any) -> dict:
     learning_operation = identity["operation"] in LEARNING_OPERATIONS
     from .board_management import OPERATIONS as BOARD_OPERATIONS
     board_operation = identity["operation"] in BOARD_OPERATIONS
+    # #5029: the Task scheduler in the relay child; the phone path never admits these.
+    from .task_schedule_management import OPERATIONS as TASK_SCHEDULE_OPERATIONS
+    task_schedule_operation = identity["operation"] in TASK_SCHEDULE_OPERATIONS
     agent_operation = identity["operation"] in AGENT_OPERATIONS
     allowed = set(identity) | ({"memory"} if identity["operation"] in MEMORY_OPERATIONS else set()) | ({"jobs"} if job_operation else set()) | ({"approvals"} if approval_operation else set())
     allowed |= {"agents"} if agent_operation else set()
@@ -80,15 +84,17 @@ def read_management(rpc: Any, params: Any) -> dict:
     allowed |= {"saved"} if identity["operation"] in SAVED_OPERATIONS else set()
     allowed |= {"tools"} if identity["operation"] in TOOLS_OPERATIONS else set()
     allowed |= {"connections"} if identity["operation"] in CONNECTION_OPERATIONS else set()
+    allowed |= {"handoffs"} if identity["operation"] in HANDOFF_OPERATIONS else set()
     allowed |= {"learning"} if learning_operation else set()
     allowed |= {"board"} if board_operation else set()
+    allowed |= {"taskSchedule"} if task_schedule_operation else set()
     if set(p) - allowed or any(not identity[key] for key in identity):
         return fail("invalid_request", "A request identity and explicit profile scope are required.")
     if any(p[key] != identity[key] for key in identity):
         return fail("invalid_request", "Request identity is invalid.")
     if identity["scope"] not in ("profile", "gateway"):
         return fail("invalid_scope", "Choose profile or shared gateway scope.")
-    if identity["operation"] not in ("capabilities", "overview", *MEMORY_OPERATIONS, *SKILLS_OPERATIONS, *HEALTH_OPERATIONS, *SAVED_OPERATIONS, *TOOLS_OPERATIONS, *CONNECTION_OPERATIONS, *AGENT_OPERATIONS) and not job_operation and not approval_operation and not automation_operation and not permission_operation and not learning_operation and not board_operation:
+    if identity["operation"] not in ("capabilities", "overview", *MEMORY_OPERATIONS, *SKILLS_OPERATIONS, *HEALTH_OPERATIONS, *SAVED_OPERATIONS, *TOOLS_OPERATIONS, *CONNECTION_OPERATIONS, *AGENT_OPERATIONS, *HANDOFF_OPERATIONS) and not job_operation and not approval_operation and not automation_operation and not permission_operation and not learning_operation and not board_operation and not task_schedule_operation:
         return fail("unsupported", "This operation is not supported by the connected Hermes adapter.", "unsupported")
     if identity["operation"] == "overview" and identity["scope"] != "profile":
         return fail("invalid_scope", "Overview requires a selected profile.")
@@ -129,6 +135,8 @@ def read_management(rpc: Any, params: Any) -> dict:
         return handle_tools(rpc, identity, p.get("tools"))
     if identity["operation"] in CONNECTION_OPERATIONS:
         return handle_connections(rpc, identity, p.get("connections"))
+    if identity["operation"] in HANDOFF_OPERATIONS:
+        return handle_handoffs(rpc, identity, p.get("handoffs"))
     if job_operation:
         from .jobs_management import handle_jobs
         return handle_jobs(identity, p.get("jobs"), rpc=rpc)
@@ -151,6 +159,9 @@ def read_management(rpc: Any, params: Any) -> dict:
     if board_operation:
         from .board_management import handle_board
         return handle_board(identity, p.get("board"), rpc)
+    if task_schedule_operation:
+        from .task_schedule_management import handle_task_schedule
+        return handle_task_schedule(identity, p.get("taskSchedule"), rpc)
     capabilities = [
         {"operation": "capabilities", "scope": "gateway", "supported": True, "applyTiming": "read_only"},
         {"operation": "overview", "scope": "profile", "supported": True, "applyTiming": "read_only"},
@@ -162,6 +173,7 @@ def read_management(rpc: Any, params: Any) -> dict:
     result["capabilities"].extend(tools_capabilities())
     result["capabilities"].extend(connection_capabilities())
     result["capabilities"].extend(agent_capabilities())
+    result["capabilities"].extend(handoff_capabilities())
     from .jobs_management import jobs_capabilities
     result["capabilities"].extend(jobs_capabilities(identity["profileId"]))
     from .approvals_management import approvals_capabilities
@@ -174,6 +186,8 @@ def read_management(rpc: Any, params: Any) -> dict:
     result["capabilities"].extend(permissions_capabilities())
     from .board_management import generic_capabilities as board_generic_capabilities
     result["capabilities"].extend(board_generic_capabilities())
+    # taskSchedule.* rows are deliberately absent: the phone can never call
+    # those ops, and its capability list is bounded.
     if identity["operation"] == "overview":
         overview = {
             "profileName": _text(profile.get("displayName")) or identity["profileId"],

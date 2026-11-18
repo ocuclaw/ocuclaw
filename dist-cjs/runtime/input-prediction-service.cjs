@@ -1,13 +1,10 @@
-const { INPUT_PREDICTION_CANDIDATE_SCHEMAS, INPUT_PREDICTION_UNSUPPORTED_SCHEMA_REASON, INPUT_PREDICTION_LIMITS, INPUT_PREDICTION_METHODS, INPUT_PREDICTION_PER_WORD_RETIRED_REASON, INPUT_PREDICTION_PROMPT_VERSION, INPUT_PREDICTION_PROTOCOL_VERSION, INPUT_PREDICTION_PURPOSE, INPUT_PREDICTION_TEST_EXAMPLE, findForbiddenKey, isCandidateUnderSchema, modelAllowResult, normalizeCandidateSchema, normalizeJevContext, normalizePredictionRequest, normalizeUsage, predictionResult, predictionTelemetry } = require("./input-prediction-shared.cjs");
+const { INPUT_PREDICTION_CANDIDATE_SCHEMAS, INPUT_PREDICTION_UNSUPPORTED_SCHEMA_REASON, INPUT_PREDICTION_LIMITS, INPUT_PREDICTION_METHODS, INPUT_PREDICTION_PER_WORD_RETIRED_REASON, INPUT_PREDICTION_PROTOCOL_VERSION, INPUT_PREDICTION_PURPOSE, INPUT_PREDICTION_TEST_EXAMPLE, findForbiddenKey, modelAllowResult, normalizeCandidateSchema, normalizePredictionRequest, normalizeUsage, predictionResult, predictionTelemetry } = require("./input-prediction-shared.cjs");
 const { SILENT_INPUT_OPEN_LIMITS, SILENT_INPUT_OPEN_PROMPT_VERSION, classifyOpenReplyError, OPEN_REPLY_MODEL_UNREACHABLE_REASON, normalizeOpenRequest, openReplyResult, openReplyTelemetry } = require("./silent-input-open-reply.cjs");
 
 const INPUT_PREDICTION_SERVICE_DEFAULTS = Object.freeze({
   maxConcurrent: 4,
   minIntervalMs: INPUT_PREDICTION_LIMITS.minIntervalMs,
   timeoutMs: INPUT_PREDICTION_LIMITS.timeoutMs,
-
-  cacheTtlMs: 60_000,
-  cacheMaxEntries: 256,
 });
 
 const INPUT_PREDICTION_DEBUG_CATEGORY = "silentInput.prediction";
@@ -18,6 +15,7 @@ const INPUT_PREDICTION_TEST_JOBS = Object.freeze(["ranking", "replies"]);
 
 const INPUT_PREDICTION_TEST_REASON_CODES = Object.freeze([
   "ok",
+
   "no_key",
   "key_rejected",
   "model_unusable",
@@ -43,7 +41,7 @@ const OPEN_ACTIVE_TOTAL = 2;
 
 const OPEN_MIN_INTERVAL_MS = 750;
 
-function normalizeRoute(raw) {
+function normalizeRoute(raw     ) {
   if (!raw || typeof raw !== "object") return null;
   const provider = typeof raw.provider === "string" ? raw.provider.trim() : "";
   const model = typeof raw.model === "string" ? raw.model.trim() : "";
@@ -53,7 +51,7 @@ function normalizeRoute(raw) {
 
 const KEY_SEP = String.fromCharCode(31);
 
-function shortHash(text) {
+function shortHash(text     ) {
   const s = typeof text === "string" ? text : "";
   let h = 0x811c9dc5;
   for (let i = 0; i < s.length; i += 1) {
@@ -63,16 +61,16 @@ function shortHash(text) {
   return h.toString(36);
 }
 
-function cleanString(value) {
+function cleanString(value     ) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function nonNegativeInt(value, fallback) {
+function nonNegativeInt(value     , fallback     ) {
   const n = Number(value);
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
 }
 
-function createInputPredictionService(opts) {
+function createInputPredictionService(opts     ) {
   const o = opts && typeof opts === "object" ? opts : {};
   const bridge = o.gatewayBridge;
   if (!bridge || typeof bridge.request !== "function") {
@@ -84,28 +82,15 @@ function createInputPredictionService(opts) {
   const emitDebug = typeof o.emitDebug === "function" ? o.emitDebug : () => {};
   const logger = o.logger && typeof o.logger.warn === "function" ? o.logger : { warn() {} };
   const resolveIdentity = typeof o.resolveIdentity === "function" ? o.resolveIdentity : () => ({});
-
-  const jevAnswer = o.jevRanker && typeof o.jevRanker.answer === "function" ? o.jevRanker : null;
-
-  const jevRoute = {
-    provider: (jevAnswer && cleanString(jevAnswer.provider)) || "typesafe",
-    model: (jevAnswer && cleanString(jevAnswer.model)) || "",
-  };
-
-  const typesafeKeyPresent = jevAnswer !== null || o.typesafeKeyPresent === true;
   const limits = {
     maxConcurrent: nonNegativeInt(o.maxConcurrent, INPUT_PREDICTION_SERVICE_DEFAULTS.maxConcurrent) || 1,
     minIntervalMs: nonNegativeInt(o.minIntervalMs, INPUT_PREDICTION_SERVICE_DEFAULTS.minIntervalMs),
     timeoutMs: nonNegativeInt(o.timeoutMs, INPUT_PREDICTION_SERVICE_DEFAULTS.timeoutMs) || INPUT_PREDICTION_SERVICE_DEFAULTS.timeoutMs,
-    cacheTtlMs: nonNegativeInt(o.cacheTtlMs, INPUT_PREDICTION_SERVICE_DEFAULTS.cacheTtlMs),
-    cacheMaxEntries: nonNegativeInt(o.cacheMaxEntries, INPUT_PREDICTION_SERVICE_DEFAULTS.cacheMaxEntries),
   };
 
   const clients = new Map();
 
   const lanes = new Map();
-
-  const cache = new Map();
 
   const openCalls = new Map();
 
@@ -119,7 +104,6 @@ function createInputPredictionService(opts) {
   let policyRevision = "";
   const stats = {
     requests: 0,
-    cacheHits: 0,
     rateLimited: 0,
     superseded: 0,
     timeouts: 0,
@@ -132,15 +116,11 @@ function createInputPredictionService(opts) {
   const openTimeoutMs = nonNegativeInt(o.openTimeoutMs, SILENT_INPUT_OPEN_LIMITS.timeoutMs)
     || SILENT_INPUT_OPEN_LIMITS.timeoutMs;
 
-  function laneKey(clientId, editorEpoch) {
-    return `${clientId}|${editorEpoch}`;
-  }
-
-  function openPrefix(clientId) {
+  function openPrefix(clientId     ) {
     return `${clientId}${KEY_SEP}`;
   }
 
-  function openMemoKey(clientId, identity, req, editorEpoch) {
+  function openMemoKey(clientId     , identity     , req     , editorEpoch     ) {
     return [
       openPrefix(clientId),
       identity.connectionId,
@@ -149,29 +129,18 @@ function createInputPredictionService(opts) {
       req.modelChoice,
       policyRevision,
       SILENT_INPUT_OPEN_PROMPT_VERSION,
+
+      req.locale,
       String(editorEpoch),
       shortHash(req.replyingTo),
     ].join(KEY_SEP);
   }
 
-  function openWordsMarker(clientId, editorEpoch) {
-    const prefix = openPrefix(clientId);
-    let rev = 0;
-    let count = 0;
-    for (const [key, entry] of openCalls) {
-      if (!key.startsWith(prefix)) continue;
-      if (entry.editorEpoch !== editorEpoch) continue;
-      rev += entry.wordsRevision || 0;
-      count += entry.words ? entry.words.length : 0;
-    }
-    return `${rev}:${count}`;
-  }
-
-  function identityFor(clientId) {
-    let identity = {};
+  function identityFor(clientId     ) {
+    let identity      = {};
     try {
       identity = resolveIdentity(clientId) || {};
-    } catch (err) {
+    } catch (err     ) {
       logger.warn(`[input-prediction] identity resolve failed: ${err && err.message ? err.message : err}`);
     }
 
@@ -186,7 +155,7 @@ function createInputPredictionService(opts) {
     };
   }
 
-  function identityFields(identity) {
+  function identityFields(identity     ) {
     return { agentId: identity.agentId || "", profileId: identity.profileId || "", sessionKey: identity.sessionKey || "" };
   }
 
@@ -199,9 +168,9 @@ function createInputPredictionService(opts) {
 
   const OPEN_REPLY_UNSUPPORTED_REASON = "this host does not write whole replies";
 
-  const NO_TYPESAFE_KEY_REASON = "this host has no TypeSafe key";
+  const RANKING_RETIRED_REASON = "this host no longer ranks words; suggestions come from the phone";
 
-  function testReasonCode(status, reason) {
+  function testReasonCode(status     , reason     ) {
     if (status === "ready") return "ok";
     if (status === "invalid-output") return "model_unusable";
     if (status === "busy") return "busy";
@@ -214,115 +183,37 @@ function createInputPredictionService(opts) {
     }
     if (status === "unavailable") {
       if (text === NO_SESSION_REASON || text === SESSION_MISMATCH_REASON) return "no_session";
-      if (text === NO_TYPESAFE_KEY_REASON) return "no_key";
-      if (text === "jev:http_401" || text === "jev:http_403") return "key_rejected";
     }
 
     return "error";
   }
 
-  function phoneSessionMismatch(p, identity) {
+  function phoneSessionMismatch(p     , identity     ) {
     const phoneSession = cleanString(p.sessionKey);
     return phoneSession !== "" && phoneSession !== identity.sessionKey;
   }
 
-  function cacheKey(clientId, identity, req, payload) {
-
-    const jev = jevAnswer ? normalizeJevContext(payload) : null;
-
-    const editorEpoch = nonNegativeInt(payload && payload.editorEpoch, 0);
-
-    const schema = normalizeCandidateSchema(payload);
-    return [
-      clientId,
-      identity.connectionId,
-
-      identity.agentId,
-      identity.profileId,
-      req.modelChoice,
-      policyRevision,
-      INPUT_PREDICTION_PROMPT_VERSION,
-      req.locale,
-      req.spellingMode,
-      String(req.ways),
-      req.contextSuffix,
-      req.pattern,
-      String(editorEpoch),
-      openWordsMarker(clientId, editorEpoch),
-    ]
-      .concat(jev ? ["jev", jev.replyingTo] : [])
-      .concat(schema.ok && schema.named ? ["schema", schema.schema] : []).join("\u001f");
-  }
-
-  function schemaEcho(payload) {
+  function schemaEcho(payload     ) {
     const schema = normalizeCandidateSchema(payload);
     return schema.ok && schema.named ? { candidateSchema: schema.schema } : {};
   }
 
-  function sanitizeUnderSchema(result, schema) {
-    const candidates = Array.isArray(result.candidates) ? result.candidates : [];
-    result.candidates = candidates.filter((word) => isCandidateUnderSchema(word, schema));
-    if (Array.isArray(result.rankedWords)) {
-      const scores = Array.isArray(result.rankedScores) ? result.rankedScores : [];
-      const words = [];
-      const kept = [];
-      for (let i = 0; i < result.rankedWords.length; i += 1) {
-        if (!isCandidateUnderSchema(result.rankedWords[i], schema)) continue;
-        words.push(result.rankedWords[i]);
-        kept.push(scores[i]);
-      }
-      result.rankedWords = words;
-      if (Array.isArray(result.rankedScores)) result.rankedScores = kept;
-    }
-    return result;
-  }
-
-  function noteIdentity(clientId, identity) {
+  function noteIdentity(clientId     , identity     ) {
     const identityKey = [identity.connectionId, identity.agentId, identity.profileId].join("\u001f");
     const state = clients.get(clientId) || { lastCallAtMs: 0 };
     const previous = state.identityKey;
     state.identityKey = identityKey;
     clients.set(clientId, state);
     if (previous === undefined || previous === identityKey) return;
-    let dropped = 0;
-    for (const [key, entry] of Array.from(cache.entries())) {
-      if (entry.clientId === clientId) {
-        cache.delete(key);
-        dropped += 1;
-      }
-    }
-
     const openDropped = dropOpenCalls(clientId);
     try {
-      emitDebug(INPUT_PREDICTION_DEBUG_CATEGORY, "prediction_cache_cleared", { clientId, reason: "identity_changed", dropped, openDropped });
+      emitDebug(INPUT_PREDICTION_DEBUG_CATEGORY, "prediction_cache_cleared", { clientId, reason: "identity_changed", openDropped });
     } catch {
 
     }
   }
 
-  function cacheGet(key) {
-    const entry = cache.get(key);
-    if (!entry) return null;
-    if (entry.expiresAtMs <= now()) {
-      cache.delete(key);
-      return null;
-    }
-
-    cache.delete(key);
-    cache.set(key, entry);
-    return entry.result;
-  }
-
-  function cacheSet(key, clientId, result) {
-    if (limits.cacheMaxEntries === 0 || limits.cacheTtlMs === 0) return;
-    cache.set(key, { result, expiresAtMs: now() + limits.cacheTtlMs, clientId });
-    while (cache.size > limits.cacheMaxEntries) {
-      const oldest = cache.keys().next().value;
-      cache.delete(oldest);
-    }
-  }
-
-  function echoFields(payload, req) {
+  function echoFields(payload     , req     ) {
     return {
       requestId: req.requestId,
       editorEpoch: nonNegativeInt(payload.editorEpoch, 0),
@@ -333,7 +224,7 @@ function createInputPredictionService(opts) {
     };
   }
 
-  function telemetry(event, result, extra) {
+  function telemetry(event     , result     , extra     ) {
     try {
       emitDebug(INPUT_PREDICTION_DEBUG_CATEGORY, event, predictionTelemetry(result, extra));
     } catch {
@@ -341,7 +232,7 @@ function createInputPredictionService(opts) {
     }
   }
 
-  async function capabilities(clientId) {
+  async function capabilities(clientId     ) {
     let identity = identityFor(clientId);
     let caps = await fetchCapabilities(clientId, identity);
 
@@ -354,7 +245,7 @@ function createInputPredictionService(opts) {
     return caps;
   }
 
-  async function fetchCapabilities(clientId, identity) {
+  async function fetchCapabilities(clientId     , identity     ) {
     let caps;
     try {
       caps = await bridge.request(INPUT_PREDICTION_METHODS.capabilities, {
@@ -364,7 +255,7 @@ function createInputPredictionService(opts) {
         profileId: identity.profileId || undefined,
         purpose: INPUT_PREDICTION_PURPOSE,
       });
-    } catch (err) {
+    } catch (err     ) {
       caps = {
         protocolVersion: INPUT_PREDICTION_PROTOCOL_VERSION,
         supported: false,
@@ -382,14 +273,11 @@ function createInputPredictionService(opts) {
     if (nextRevision && nextRevision !== policyRevision) {
 
       policyRevision = nextRevision;
-      cache.clear();
       openCalls.clear();
     }
 
-    const ranking = jevAnswer !== null;
-
     const writesReplies = c.openReply === true;
-    const supported = ranking || writesReplies;
+    const supported = writesReplies;
 
     openReplyByClient.set(clientId, writesReplies);
     const openRoute = normalizeRoute(c.openReplyRoute)
@@ -397,14 +285,12 @@ function createInputPredictionService(opts) {
     if (openRoute) openReplyRouteByClient.set(clientId, openRoute);
     return {
       protocolVersion: INPUT_PREDICTION_PROTOCOL_VERSION,
-
       supported,
       unsupportedReason: supported
         ? undefined
         : (cleanString(c.unsupportedReason) || NOTHING_TO_OFFER_REASON),
       structuredOutput: c.structuredOutput === true,
-
-      abort: ranking ? true : c.abort === true,
+      abort: c.abort === true,
       policyRevision: cleanString(c.policyRevision),
       limits: {
         ...INPUT_PREDICTION_LIMITS,
@@ -413,28 +299,21 @@ function createInputPredictionService(opts) {
         timeoutMs: limits.timeoutMs,
       },
 
-      jevRanker: ranking,
-
-      typesafeKeyPresent,
-
       candidateSchemas: INPUT_PREDICTION_CANDIDATE_SCHEMAS.slice(),
 
       openReply: c.openReply === true,
 
       openReplyRoute: normalizeRoute(c.openReplyRoute),
-
-      models: ranking ? [] : (Array.isArray(c.models) ? c.models : []),
+      models: Array.isArray(c.models) ? c.models : [],
 
       replyModels: Array.isArray(c.models) ? c.models : [],
-      connectionDefault: ranking
-        ? { provider: jevRoute.provider, model: jevRoute.model }
-        : (c.connectionDefault && typeof c.connectionDefault === "object" ? c.connectionDefault : null),
+      connectionDefault: c.connectionDefault && typeof c.connectionDefault === "object" ? c.connectionDefault : null,
       host: c.host && typeof c.host === "object" ? c.host : { kind: bridge.kind || "" },
       ...identityFields(identity),
     };
   }
 
-  function makeJob(clientId, payload, req, identity, resolve, kind = "request", routeOverride = "") {
+  function makeJob(clientId     , payload     , req     , identity     , resolve     ) {
     return {
       clientId,
       payload,
@@ -442,11 +321,6 @@ function createInputPredictionService(opts) {
       identity,
       resolve,
 
-      kind,
-
-      route: routeOverride === "jev" || routeOverride === "bridge" ? routeOverride : (jevAnswer ? "jev" : "bridge"),
-
-      abort: null,
       laneKey: "",
       settled: false,
       cancelled: false,
@@ -455,21 +329,11 @@ function createInputPredictionService(opts) {
     };
   }
 
-  function stopBackend(job) {
-    if (job.route === "jev") {
-      if (job.abort) {
-        try {
-          job.abort.abort();
-        } catch (_) {
-
-        }
-      }
-      return null;
-    }
+  function stopBackend(job     ) {
     return bridge.request(INPUT_PREDICTION_METHODS.cancel, { requestId: job.req.requestId, clientId: job.clientId });
   }
 
-  function releaseLane(job) {
+  function releaseLane(job     ) {
     const lk = job.laneKey;
     const lane = lanes.get(lk);
     if (!lane || lane.active !== job) return;
@@ -488,7 +352,7 @@ function createInputPredictionService(opts) {
     }
   }
 
-  function settle(job, result) {
+  function settle(job     , result     ) {
     if (job.settled) return;
     job.settled = true;
     if (job.timer) {
@@ -498,7 +362,7 @@ function createInputPredictionService(opts) {
     job.resolve(result);
   }
 
-  async function dispatch(job) {
+  async function dispatch(job     ) {
     const { clientId, req, identity } = job;
     const echo = echoFields(job.payload, req);
     if (job.settled) {
@@ -508,18 +372,6 @@ function createInputPredictionService(opts) {
     if (job.cancelled) {
 
       settle(job, predictionResult("cancelled", { ...echo, reason: "cancelled before dispatch" }));
-      releaseLane(job);
-      return;
-    }
-    const key = job.kind === "test" ? null : cacheKey(clientId, identity, req, job.payload);
-    const cached = key ? cacheGet(key) : null;
-
-    if (cached) {
-      stats.cacheHits += 1;
-
-      const hit = predictionResult("ready", { ...cached, ...echo, cached: true, usage: null });
-      telemetry("prediction_cache_hit", hit, { clientId });
-      settle(job, hit);
       releaseLane(job);
       return;
     }
@@ -551,66 +403,28 @@ function createInputPredictionService(opts) {
     }, req.timeoutMs);
     try {
 
-      const params = job.kind === "test"
-        ? {
-            requestId: req.requestId,
-            modelChoice: req.modelChoice,
-            purpose: INPUT_PREDICTION_PURPOSE,
-            timeoutMs: req.timeoutMs,
-          }
-        : { ...req };
-
-      if (job.route === "jev") job.abort = new AbortController();
-      const raw = job.route === "jev"
-        ? await jevAnswer.answer(
-          req,
-
-          job.kind === "test"
-            ? {}
-            : {
-              ...normalizeJevContext(job.payload),
-              openWords: openWordsFor(clientId, job.payload && job.payload.editorEpoch),
-
-              candidateSchema: normalizeCandidateSchema(job.payload).schema,
-            },
-          { signal: job.abort.signal, perGroup: job.kind === "test" ? 1 : 0 },
-        )
-        : await bridge.request(job.kind === "test" ? INPUT_PREDICTION_METHODS.test : INPUT_PREDICTION_METHODS.request, {
-          ...params,
-          clientId,
-          connectionId: identity.connectionId,
-          agentId: identity.agentId || undefined,
-          profileId: identity.profileId || undefined,
-        });
+      const raw = await bridge.request(INPUT_PREDICTION_METHODS.test, {
+        requestId: req.requestId,
+        modelChoice: req.modelChoice,
+        purpose: INPUT_PREDICTION_PURPOSE,
+        timeoutMs: req.timeoutMs,
+        clientId,
+        connectionId: identity.connectionId,
+        agentId: identity.agentId || undefined,
+        profileId: identity.profileId || undefined,
+      });
       const r = raw && typeof raw === "object" ? raw : {};
 
       const result = predictionResult(r.status, { ...r, ...echo, usage: normalizeUsage(r.usage) });
-
-      if (job.kind !== "test") sanitizeUnderSchema(result, normalizeCandidateSchema(job.payload).schema);
       if (job.cancelled && result.status === "ready") {
 
         result.status = "cancelled";
         result.candidates = [];
-
-        delete result.rankedWords;
-        delete result.rankedScores;
         result.reason = "cancelled before result";
-      }
-      if (result.status === "ready" && key) {
-        cacheSet(key, clientId, {
-          candidates: result.candidates.slice(),
-
-          rankedWords: Array.isArray(result.rankedWords) ? result.rankedWords.slice() : undefined,
-          rankedScores: Array.isArray(result.rankedScores) ? result.rankedScores.slice() : undefined,
-          provider: result.provider,
-          model: result.model,
-          usage: result.usage,
-          elapsedMs: result.elapsedMs,
-        });
       }
       telemetry("prediction_result", result, { clientId, e2eMs: now() - startedAt });
       settle(job, result);
-    } catch (err) {
+    } catch (err     ) {
       const failure = predictionResult("error", {
         ...echo,
         elapsedMs: now() - startedAt,
@@ -624,13 +438,13 @@ function createInputPredictionService(opts) {
     }
   }
 
-  function request(clientId, payload) {
+  function request(clientId     , payload     ) {
     const identity = identityFor(clientId);
     const tag = identityFields(identity);
-    return requestFor(clientId, payload, identity).then((result) => ({ ...result, ...tag }));
+    return requestFor(clientId, payload, identity).then((result     ) => ({ ...result, ...tag }));
   }
 
-  function requestFor(clientId, payload, identity) {
+  function requestFor(clientId     , payload     , identity     ) {
     stats.requests += 1;
     const p = payload && typeof payload === "object" ? payload : {};
     const requestIdIn = cleanString(p.requestId);
@@ -681,31 +495,17 @@ function createInputPredictionService(opts) {
       return Promise.resolve(refused);
     }
 
-    if (!jevAnswer) {
-      const retired = predictionResult("unavailable", { ...baseEcho, reason: PER_WORD_RETIRED_REASON });
-      telemetry("prediction_retired", retired, { clientId });
-      return Promise.resolve(retired);
-    }
-    const req = normalized.value;
-    noteIdentity(clientId, identity);
-    const key = cacheKey(clientId, identity, req, p);
-    const cached = cacheGet(key);
-
-    if (cached) {
-      stats.cacheHits += 1;
-      const hit = predictionResult("ready", { ...cached, ...baseEcho, cached: true, usage: null });
-      telemetry("prediction_cache_hit", hit, { clientId });
-      return Promise.resolve(hit);
-    }
-    return enqueue(clientId, p, req, identity, laneKey(clientId, editorEpoch), baseEcho, "request");
+    const retired = predictionResult("unavailable", { ...baseEcho, reason: PER_WORD_RETIRED_REASON });
+    telemetry("prediction_retired", retired, { clientId });
+    return Promise.resolve(retired);
   }
 
-  function enqueue(clientId, p, req, identity, lk, baseEcho, kind, routeOverride = "") {
+  function enqueue(clientId     , p     , req     , identity     , lk     , baseEcho     ) {
     const clientState = clients.get(clientId) || { lastCallAtMs: 0 };
     const sinceLast = now() - clientState.lastCallAtMs;
     const lane = lanes.get(lk) || { active: null, pending: null };
     return new Promise((resolve) => {
-      const job = makeJob(clientId, p, req, identity, resolve, kind, routeOverride);
+      const job = makeJob(clientId, p, req, identity, resolve);
       job.laneKey = lk;
       if (lane.active && lane.active.scheduledTimer) {
 
@@ -752,13 +552,13 @@ function createInputPredictionService(opts) {
     });
   }
 
-  function open(clientId, payload) {
+  function open(clientId     , payload     ) {
     const identity = identityFor(clientId);
     const tag = identityFields(identity);
-    return openFor(clientId, payload, identity).then((result) => ({ ...result, ...tag }));
+    return openFor(clientId, payload, identity).then((result     ) => ({ ...result, ...tag }));
   }
 
-  function openFor(clientId, payload, identity) {
+  function openFor(clientId     , payload     , identity     ) {
     stats.openRequests += 1;
     const p = payload && typeof payload === "object" ? payload : {};
     const requestIdIn = cleanString(p.requestId);
@@ -768,7 +568,7 @@ function createInputPredictionService(opts) {
       editorEpoch,
       settingsRevision: nonNegativeInt(p.settingsRevision, 0),
     };
-    const fail = (status, reason) => {
+    const fail = (status     , reason     ) => {
       const result = openReplyResult(status, { ...baseEcho, reason });
       openTelemetry("open_rejected", result, { clientId });
       return Promise.resolve(result);
@@ -806,7 +606,7 @@ function createInputPredictionService(opts) {
 
       openCalls.delete(key);
       openCalls.set(key, already);
-      return already.promise.then((result) => ({ ...result, ...baseEcho, repeated: true }));
+      return already.promise.then((result     ) => ({ ...result, ...baseEcho, repeated: true }));
     }
 
     const state = clients.get(clientId) || {};
@@ -839,15 +639,14 @@ function createInputPredictionService(opts) {
       if (mine > 0) openActiveByClient.set(clientId, mine);
       else openActiveByClient.delete(clientId);
     };
-    const entry = {
+    const entry      = {
       words: [],
-      wordsRevision: 0,
       editorEpoch,
       createdAtMs: startedAt,
       promise: null,
     };
 
-    const forgetIfNotReady = (result) => {
+    const forgetIfNotReady = (result     ) => {
       if (result && result.status === "ready") return;
       if (openCalls.get(key) === entry) openCalls.delete(key);
     };
@@ -860,7 +659,7 @@ function createInputPredictionService(opts) {
       call = Promise.reject(err);
     }
     entry.promise = call
-      .then((raw) => {
+      .then((raw     ) => {
         const r = raw && typeof raw === "object" ? raw : {};
         const result = openReplyResult(r.status === "ready" ? "ready" : r.status || "error", {
           ...r,
@@ -869,12 +668,11 @@ function createInputPredictionService(opts) {
         });
 
         entry.words = Array.isArray(result.words) ? result.words.slice() : [];
-        entry.wordsRevision += 1;
         openTelemetry("open_result", result, { clientId, e2eMs: now() - startedAt });
         forgetIfNotReady(result);
         return result;
       })
-      .catch((err) => {
+      .catch((err     ) => {
 
         const classified = classifyOpenReplyError(err);
         const failure = openReplyResult(classified.status, {
@@ -886,7 +684,7 @@ function createInputPredictionService(opts) {
         forgetIfNotReady(failure);
         return failure;
       })
-      .then((result) => {
+      .then((result     ) => {
         release();
         return result;
       });
@@ -896,7 +694,7 @@ function createInputPredictionService(opts) {
     return entry.promise;
   }
 
-  function openTelemetry(event, result, extra) {
+  function openTelemetry(event     , result     , extra     ) {
     try {
       emitDebug(INPUT_PREDICTION_DEBUG_CATEGORY, event, openReplyTelemetry(result, extra));
     } catch {
@@ -911,7 +709,7 @@ function createInputPredictionService(opts) {
     }
   }
 
-  function dropOpenCalls(clientId) {
+  function dropOpenCalls(clientId     ) {
     const prefix = openPrefix(clientId);
     let dropped = 0;
     for (const key of Array.from(openCalls.keys())) {
@@ -923,7 +721,7 @@ function createInputPredictionService(opts) {
     return dropped;
   }
 
-  function pruneOpenCalls(clientId) {
+  function pruneOpenCalls(clientId     ) {
     const prefix = openPrefix(clientId);
     const mine = [];
     for (const key of openCalls.keys()) if (key.startsWith(prefix)) mine.push(key);
@@ -935,7 +733,7 @@ function createInputPredictionService(opts) {
     }
   }
 
-  function openWordsFor(clientId, editorEpoch) {
+  function openWordsFor(clientId     , editorEpoch     ) {
 
     const prefix = openPrefix(clientId);
     const epoch = nonNegativeInt(editorEpoch, 0);
@@ -954,14 +752,14 @@ function createInputPredictionService(opts) {
     return words;
   }
 
-  function schedule(job, waitMs) {
+  function schedule(job     , waitMs     ) {
     job.scheduledTimer = setTimer(() => {
       job.scheduledTimer = null;
       dispatch(job);
     }, Math.max(0, waitMs));
   }
 
-  function cancel(clientId, payload) {
+  function cancel(clientId     , payload     ) {
     const p = payload && typeof payload === "object" ? payload : {};
     const requestId = cleanString(p.requestId);
     if (!requestId) return Promise.resolve({ accepted: false, abort: false, reason: "requestId required" });
@@ -984,19 +782,14 @@ function createInputPredictionService(opts) {
           releaseLane(job);
           return Promise.resolve({ accepted: true, abort: true, abortProbe: "not-dispatched", reason: "deferred request dropped before dispatch" });
         }
-        if (lane.active.route === "jev") {
-
-          stopBackend(lane.active);
-          return Promise.resolve({ accepted: true, abort: true, abortProbe: "aborted", reason: "ranking call aborted" });
-        }
         return bridge
           .request(INPUT_PREDICTION_METHODS.cancel, { requestId, clientId })
-          .then((raw) => {
+          .then((raw     ) => {
             const r = raw && typeof raw === "object" ? raw : {};
 
             return { accepted: true, abort: r.abort === true, abortProbe: cleanString(r.abortProbe) || undefined, reason: cleanString(r.reason) || undefined };
           })
-          .catch((err) => ({ accepted: true, abort: false, abortProbe: "unobserved", reason: `result suppressed; upstream cancel failed: ${err && err.message ? err.message : err}` }));
+          .catch((err     ) => ({ accepted: true, abort: false, abortProbe: "unobserved", reason: `result suppressed; upstream cancel failed: ${err && err.message ? err.message : err}` }));
       }
     }
     return Promise.resolve({ accepted: false, abort: false, reason: "no such request for this client" });
@@ -1004,7 +797,7 @@ function createInputPredictionService(opts) {
 
   let testSeq = 0;
 
-  async function test(clientId, payload) {
+  async function test(clientId     , payload     ) {
     const p = payload && typeof payload === "object" ? payload : {};
     const identity = identityFor(clientId);
     const modelChoice = cleanString(p.modelChoice) || "default";
@@ -1012,12 +805,10 @@ function createInputPredictionService(opts) {
     const clientRequestId = typeof p.requestId === "string" && REQUEST_ID_RE.test(p.requestId) ? p.requestId : "";
 
     const asked = cleanString(p.job);
-    const job = INPUT_PREDICTION_TEST_JOBS.includes(asked) ? asked : (jevAnswer ? "ranking" : "replies");
+    const job = INPUT_PREDICTION_TEST_JOBS.includes(asked) ? asked : "replies";
 
-    const jobRoute = job === "ranking" ? "jev" : "bridge";
-
-    const knownRoute = job === "ranking" ? jevRoute : (openReplyRouteByClient.get(clientId) || null);
-    const testShape = (r) => {
+    const knownRoute = job === "ranking" ? null : (openReplyRouteByClient.get(clientId) || null);
+    const testShape = (r     ) => {
       const status = typeof r.status === "string" ? r.status : "error";
       const reason = cleanString(r.reason) || undefined;
       return {
@@ -1046,15 +837,13 @@ function createInputPredictionService(opts) {
       return testShape({ status: "unavailable", reason: SESSION_MISMATCH_REASON });
     }
 
-    if (jobRoute === "jev" && !jevAnswer) {
-      return testShape({ status: "unavailable", reason: NO_TYPESAFE_KEY_REASON });
+    if (job === "ranking") {
+      return testShape({ status: "policy-denied", reason: RANKING_RETIRED_REASON });
     }
     testSeq += 1;
     const requestId = `test-${testSeq}`;
 
-    const testTimeoutMs = jobRoute === "jev"
-      ? limits.timeoutMs
-      : Math.max(limits.timeoutMs, openTimeoutMs + INPUT_PREDICTION_TEST_ROUND_TRIP_MARGIN_MS);
+    const testTimeoutMs = Math.max(limits.timeoutMs, openTimeoutMs + INPUT_PREDICTION_TEST_ROUND_TRIP_MARGIN_MS);
     const normalized = normalizePredictionRequest({
       ...INPUT_PREDICTION_TEST_EXAMPLE,
       requestId,
@@ -1066,16 +855,16 @@ function createInputPredictionService(opts) {
     const testRequest = { ...normalized.value, timeoutMs: testTimeoutMs };
     const baseEcho = { requestId, editorEpoch: 0, draftRevision: 0, settingsRevision: 0, dictionaryRevision: 0 };
     try {
-      const raw = await enqueue(clientId, { requestId }, testRequest, identity, `${clientId}|test`, baseEcho, "test", jobRoute);
+      const raw = await enqueue(clientId, { requestId }, testRequest, identity, `${clientId}|test`, baseEcho);
       const result = testShape(raw && typeof raw === "object" ? raw : {});
       telemetry("prediction_test", result, { clientId });
       return result;
-    } catch (err) {
+    } catch (err     ) {
       return testShape({ status: "error", reason: err && err.message ? String(err.message) : String(err) });
     }
   }
 
-  async function modelAllow(clientId, payload) {
+  async function modelAllow(clientId     , payload     ) {
     const p = payload && typeof payload === "object" ? payload : {};
     const requestId = typeof p.requestId === "string" && REQUEST_ID_RE.test(p.requestId) ? p.requestId : "";
     const modelChoice = cleanString(p.modelChoice).trim();
@@ -1103,7 +892,7 @@ function createInputPredictionService(opts) {
     }
   }
 
-  function onClientDisconnect(clientId) {
+  function onClientDisconnect(clientId     ) {
     for (const [key, lane] of Array.from(lanes.entries())) {
       if (!key.startsWith(`${clientId}|`)) continue;
       if (lane.pending) {
@@ -1124,9 +913,6 @@ function createInputPredictionService(opts) {
       }
       lanes.delete(key);
     }
-    for (const [key, entry] of Array.from(cache.entries())) {
-      if (entry.clientId === clientId) cache.delete(key);
-    }
     dropOpenCalls(clientId);
     openActiveByClient.delete(clientId);
     openReplyByClient.delete(clientId);
@@ -1134,7 +920,6 @@ function createInputPredictionService(opts) {
   }
 
   function clearCache() {
-    cache.clear();
 
     openCalls.clear();
   }
@@ -1145,7 +930,6 @@ function createInputPredictionService(opts) {
       activeCount,
       openActive: openActiveTotal,
       openCalls: openCalls.size,
-      cacheSize: cache.size,
       lanes: lanes.size,
       policyRevision,
       limits: { ...limits },

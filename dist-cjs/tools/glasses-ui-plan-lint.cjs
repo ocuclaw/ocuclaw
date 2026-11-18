@@ -123,6 +123,12 @@ const SYSTEM_STATS_KNOWN_FIELDS = Object.freeze([
   "memUsedPct",
   "cpuPct",
   "loadAvg1",
+  "mem_total_mb",
+  "mem_used_mb",
+  "mem_free_mb",
+  "mem_used_pct",
+  "cpu_pct",
+  "load_avg_1",
 ]);
 
 const IMPLICIT_TEMPLATE_PATHS = Object.freeze(["output"]);
@@ -133,7 +139,7 @@ const SHORT_INTERACTIVE_TIMEOUT_MS = 60_000;
 
 const REPLACE_SUSPICIOUS_STACK_DEPTH = 2;
 
-const REFERENCES_DIR_FROM_MODULE = "../../skills/glasses-ui/references";
+const REFERENCES_DIR_FROM_MODULE = "../../registry";
 
 const HTTP_RECIPE_FIELD_SETS_FILE = "http-recipe-field-sets.json";
 
@@ -757,7 +763,7 @@ function lintGlassesUiPlan(spec, ctx) {
       if (matched) {
         const mappingPath = refresh.targets && refresh.targets.itemsFromPath;
         const mapping = typeof mappingPath === "string"
-          ? (matched.arrayMappings || []).find((candidate) => candidate.path === mappingPath)
+          ? (matched.arrayMappings || []).find((candidate     ) => candidate.path === mappingPath)
           : null;
         if (typeof mappingPath === "string" && !mapping) {
           findings.push(unknownFieldFinding(
@@ -767,7 +773,7 @@ function lintGlassesUiPlan(spec, ctx) {
           ));
         }
         const known = knownPathSet(
-          ((mapping && mapping.knownFields) || matched.knownFields || []).map((f) => f.path),
+          ((mapping && mapping.knownFields) || matched.knownFields || []).map((f     ) => f.path),
         );
         const openPrefixes = (mapping && mapping.openPrefixes) || matched.openPrefixes || [];
         const closed = mapping
@@ -1003,4 +1009,4 @@ function boundMachineProjection(machine) {
   };
 }
 
-module.exports = { PLAN_LINT_CODES, PLAN_LINT_SEVERITIES, PICKABLE_KINDS, ACTUATION_VERBS, ACTUATION_VERB_FORMS, EXPIRY_CONSENT_PATTERNS, EXPIRY_LINKING_PATTERNS, EXPIRY_WEAK_MENTIONS, SYSTEM_STATS_KNOWN_FIELDS, IMPLICIT_TEMPLATE_PATHS, DEFAULT_RECOMMENDED_LABEL_CHARS, SHORT_INTERACTIVE_TIMEOUT_MS, REPLACE_SUSPICIOUS_STACK_DEPTH, REFERENCES_DIR_FROM_MODULE, HTTP_RECIPE_FIELD_SETS_FILE, loadHttpRecipeFieldSets, templateRegistryArtifact, resolveTemplateFacts, finding, collectSpecCopy, findActuationVerb, findActuationVerbInText, findActuationVerbToken, findExpiryConsentPhrase, findExpiryWeakMention, findConsentViolation, resolveLayoutBudgets, KIND_SCOPED_BUDGET_KEYS, BUDGET_PROVENANCE, measureLayoutFacts, extractTemplatePaths, collectRefreshTemplatePaths, matchHttpRecipe, lintGlassesUiPlan, describeTemplate, projectValidateOnlyChannels, MACHINE_PROJECTION_LIST_CAP, capCodeList, isCappedList, CAP_SENTINEL_PATTERN, allowlistWireKind, scrubTemplateRef, scrubLayoutFacts, boundMachineProjection, splitConsentClauses };
+module.exports = { PLAN_LINT_CODES, PLAN_LINT_SEVERITIES, PICKABLE_KINDS, ACTUATION_VERB_FORMS, ACTUATION_VERBS, EXPIRY_LINKING_PATTERNS, EXPIRY_WEAK_MENTIONS, EXPIRY_CONSENT_PATTERNS, SYSTEM_STATS_KNOWN_FIELDS, IMPLICIT_TEMPLATE_PATHS, DEFAULT_RECOMMENDED_LABEL_CHARS, SHORT_INTERACTIVE_TIMEOUT_MS, REPLACE_SUSPICIOUS_STACK_DEPTH, REFERENCES_DIR_FROM_MODULE, HTTP_RECIPE_FIELD_SETS_FILE, loadHttpRecipeFieldSets, templateRegistryArtifact, resolveTemplateFacts, finding, collectSpecCopy, findActuationVerbToken, findActuationVerbInText, findActuationVerb, findExpiryConsentPhrase, findExpiryWeakMention, splitConsentClauses, findConsentViolation, BUDGET_PROVENANCE, KIND_SCOPED_BUDGET_KEYS, resolveLayoutBudgets, measureLayoutFacts, extractTemplatePaths, collectRefreshTemplatePaths, matchHttpRecipe, lintGlassesUiPlan, describeTemplate, projectValidateOnlyChannels, MACHINE_PROJECTION_LIST_CAP, CAP_SENTINEL_PATTERN, isCappedList, capCodeList, allowlistWireKind, scrubTemplateRef, scrubLayoutFacts, boundMachineProjection };

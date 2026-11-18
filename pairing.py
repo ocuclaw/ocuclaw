@@ -12,8 +12,8 @@ WHY IT TALKS TO THE RELAY OVER HTTP
 
 The exchange lives inside the relay runtime — that is where the Noise suite, the
 Relay Credential and the phone's endpoint are. ``hermes`` is a different process.
-A command that built its own exchange host would print a QR for an exchange no
-phone could reach and approve something nobody scanned. So this drives the ONE
+A command that built its own exchange host would print a code for an exchange no
+phone could reach and approve something nobody typed. So this drives the ONE
 real exchange through the relay's authenticated control path.
 
 WHAT IT NEVER DOES
@@ -34,12 +34,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import hmac
 import json
+import logging
 import math
 import os
 import queue
 import re
-import select
-import shutil
+import selectors
 import signal
 import subprocess
 import sys
@@ -50,7 +50,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, Mapping, Optional, TextIO, Tuple
 
-from . import cloudways_qr, relay_credential
+from . import relay_credential, webui_terminal
 
 #: Exit codes, matching the sibling `status`/`doctor` contract in cli.py.
 EXIT_OK = 0
@@ -102,15 +102,12 @@ DEFAULT_WS_PORT = 47801
 
 #: How often the terminal asks the relay what changed, and for how long.
 POLL_INTERVAL_S = 1.0
-#: #3743. Above a pairing code redrawn once the window grew. Shared with the
-#: OpenClaw CLI word for word.
-QR_REDRAW_LEAD_LINE = "The code fits now. In OcuClaw tap Take a photo of the QR code."
-#: A hair over the two-minute exchange lifetime, so an expiry is OBSERVED here
+#: A hair over the five-minute exchange lifetime, so an expiry is OBSERVED here
 #: rather than guessed at by a timeout of our own.
-POLL_DEADLINE_S = 135.0
+POLL_DEADLINE_S = 315.0
 #: After an approval, how long past the code's lifetime the terminal still
 #: waits for the phone to connect back. Capped by :data:`POLL_DEADLINE_S`, so a
-#: two-minute code is watched for 135 seconds in all, as on OpenClaw.
+#: five-minute code is watched for 315 seconds in all, as on OpenClaw.
 CONNECT_BACK_GRACE_S = 15.0
 
 #: How many unreadable answers to tolerate before treating the prompt as refused.
@@ -118,9 +115,109 @@ MAX_PROMPT_RETRIES = 5
 
 PROMPT_TEXT = "Type approve, refuse, or cancel: "
 
+# Word for word pairing-terminal.ts. The owning Node runtime decides whether
+# phone codes are enabled, and owns lookup, sealing and commitment verification.
+PHONE_CODE_COMPUTER = "In OcuClaw tap Pair with your agent, then type the phone code it shows:\n"
+PHONE_CODE_DASHBOARD = "In OcuClaw tap Pair with your agent.\nIt shows a phone code.\nPaste or type the phone code here:\n"
+PHONE_CODE_MANUAL = "For manual pairing, type m.\n"
+PHONE_CODE_SENT = "Sent to your phone.\nCheck the four words on your glasses\nor in OcuClaw. They should match the\nwords that appear here.\n"
+PHONE_CODE_OUTAGE = "Phone codes aren't working right now, so here's manual pairing.\n"
+PHONE_CODE_MISSING = "No phone is waiting with that code. Check the code in OcuClaw. If it ran out, tap Get a new code there.\n"
+PHONE_CODE_PAIRING_TYPED = "That's the pairing code, which goes into the phone. Here, type the 6-digit phone code that OcuClaw shows.\n"
+
+# #5485: the text-only manual block, word for word the relay's own
+# (pairing-bootstrap-presenter.ts `manualPairingBlock`). No terminal draws a QR.
+MANUAL_PAIRING_HEADING = "Manual pairing"
+MANUAL_PAIRING_LEAD = "In OcuClaw tap Pair with your agent > Pair manually, then type:"
+#: A row of an older relay's drawn code: its half-block glyphs.
+_QR_ROW = re.compile("[▀▄█]")
+_ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def expiry_clock(seconds: float) -> str:
+    """``4:59``, ``0:45``: whole seconds left, as minutes and seconds."""
+    total = max(0, int(math.floor(seconds))) if math.isfinite(seconds) else 0
+    return f"{total // 60}:{total % 60:02d}"
+
+
+def manual_pairing_block(address: str, pairing_code: str, expires_in_seconds: Any) -> str:
+    """The manual block every terminal prints. An unknown expiry reads "a few minutes"."""
+    known = (
+        isinstance(expires_in_seconds, (int, float))
+        and not isinstance(expires_in_seconds, bool)
+        and math.isfinite(expires_in_seconds)
+        and expires_in_seconds > 0
+    )
+    expiry = expiry_clock(float(expires_in_seconds)) if known else "a few minutes"
+    return "\n".join(
+        (
+            MANUAL_PAIRING_HEADING,
+            MANUAL_PAIRING_LEAD,
+            f"  Address:      {address}",
+            f"  Pairing code: {pairing_code}",
+            f"Expires in {expiry}.",
+            "",
+        )
+    )
+
+
+def _reply_value(created: Any, key: str) -> Optional[str]:
+    """#5484: the ``create`` reply's own ``address`` or ``pairingCode`` field.
+
+    An older relay sends neither, and the block's lines are read instead. A
+    value with a control character is never printed.
+    """
+    value = created.get(key) if isinstance(created, Mapping) else None
+    if not isinstance(value, str) or not value.isprintable():
+        return None
+    return value.strip() or None
+
+
+def _first_value(lines: Any, label: str) -> Optional[str]:
+    """``value`` from the first ``<label>: value`` line at any indent, colour removed."""
+    prefix = f"{label}:"
+    for line in lines:
+        plain = _ANSI_SGR.sub("", line).strip()
+        if plain.startswith(prefix):
+            value = plain[len(prefix) :].strip()
+            if value:
+                return value
+    return None
+
+
+def manual_pairing_text(block: str, created: Mapping[str, Any]) -> str:
+    """What every terminal prints for a code to type (#5485): text only.
+
+    The address and the code are the reply's ``address`` and ``pairingCode``
+    fields (#5484), or, from an older relay, the block's ``Address:`` and
+    ``Pairing code:`` lines, so an older relay's drawn QR never reaches the
+    screen. A block whose two lines cannot be read keeps its words, with every
+    row of a drawing and any row only colour paints taken out.
+    """
+    lines = str(block or "").splitlines()
+    address = _reply_value(created, "address") or _first_value(lines, "Address")
+    pairing_code = _reply_value(created, "pairingCode") or _first_value(lines, "Pairing code")
+    if address and pairing_code:
+        seconds = created.get("expiresInSeconds") if isinstance(created, Mapping) else None
+        return manual_pairing_block(address, pairing_code, seconds)
+    kept = [
+        line
+        for line in lines
+        if not _QR_ROW.search(line) and not ("\x1b[" in line and not _ANSI_SGR.sub("", line).strip())
+    ]
+    return "\n".join(kept).rstrip("\n") + "\n"
+
+
+# As the OpenClaw terminal: the relay's health probe is 3 s, so 4 s bounds the
+# phone-code status call.
+PHONE_CODE_STATUS_TIMEOUT_SECONDS = 4.0
+# A create with a phone code costs the host a lookup and a delivery, 5 s each
+# at most, so it gets OpenClaw's longer 12 s create wait.
+PHONE_CODE_CREATE_TIMEOUT_SECONDS = 12.0
+
 RESET_WARNING = (
     "Reset immediately invalidates ALL existing app pairings, disconnects "
-    "every paired phone, requires secure QR or Manual re-pairing, and cannot "
+    "every paired phone, requires pairing again with a new phone code, and cannot "
     "restore the prior credential."
 )
 RESET_PROMPT_TEXT = 'Type "reset" to reset the Relay Credential for all devices: '
@@ -147,6 +244,13 @@ EXPIRED_REASON = "expired"
 
 #: Plain-language endings, keyed by the core's secret-free failure reasons.
 _FAILURE_TEXT: Dict[str, str] = {
+    # The phone's handshake key was not the one it committed to with its phone
+    # code. Stopped before any words showed. Word for word the OpenClaw
+    # terminal's ending for this reason (pairing-terminal.ts), so both hosts
+    # say the same thing; it already says to start again.
+    "phone_key_mismatch": (
+        "Pairing stopped. No credential delivery was observed. Start pairing again to retry."
+    ),
     "expired": (
         "The pairing request expired before it finished. Nothing was sent to the "
         "phone."
@@ -407,6 +511,8 @@ def _restart_hermes_gateway(*, timeout_s: Optional[float] = None) -> bool:
     timeout_s = _gateway_restart_timeout_s() if timeout_s is None else timeout_s
     if timeout_s is None:
         return False
+    started = time.monotonic()
+    _trace_restart({"phase": "start", "timeout_s": timeout_s})
     try:
         completed = subprocess.run(
             ["hermes", "gateway", "restart"],
@@ -416,9 +522,94 @@ def _restart_hermes_gateway(*, timeout_s: Optional[float] = None) -> bool:
             timeout=timeout_s,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log_restart_failure(type(exc).__name__, "")
+        _trace_restart({"phase": "error", "error": type(exc).__name__, "duration_s": round(time.monotonic() - started, 3)})
         return False
+    if completed.returncode != 0:
+        _log_restart_failure(f"exit {completed.returncode}", completed.stderr or completed.stdout)
+    else:
+        logging.getLogger(__name__).info("[ocuclaw] hermes gateway restart exited 0")
+    _trace_restart({
+        "phase": "done",
+        "exit": completed.returncode,
+        "duration_s": round(time.monotonic() - started, 3),
+        "stdout": _first_line(getattr(completed, "stdout", b"")),
+        "stderr": _first_line(getattr(completed, "stderr", b"")),
+    })
     return completed.returncode == 0
+
+
+def _first_line(output: Any) -> str:
+    """The first non-empty line of a subprocess's output, cut to 200 chars.
+
+    Hermes's refusals lead with the reason, and the lines after it can name
+    live sessions, so only the first line is kept anywhere.
+    """
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", "replace")
+    return next((line.strip() for line in str(output or "").splitlines() if line.strip()), "")[:200]
+
+
+def _restart_trace_path() -> Optional[str]:
+    """``<HERMES_HOME>/logs/ocuclaw-restart.jsonl``, or None when there is no Hermes home.
+
+    The home is never created here: a test or a host with no Hermes home
+    gets no trace file.
+    """
+    home = os.environ.get("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
+    if not os.path.isdir(home):
+        return None
+    return os.path.join(home, "logs", "ocuclaw-restart.jsonl")
+
+
+def _trace_restart(record: Mapping[str, Any]) -> None:
+    """Append one line about the restart to the Hermes logs, for a run's evidence.
+
+    Chat setup runs the restart from inside whatever process hosts the agent
+    (the Hermes WebUI, a terminal, the gateway) on a timer after its turn.
+    When the restart never takes effect, the plugin log alone cannot say
+    whether the command ran, refused, or is still waiting (cross-os e2e run
+    42556136172 on Linux). The ``start`` line carries the process and the
+    environment markers Hermes reads to choose its restart route; the
+    ``done`` line carries the exit and the first line of each stream.
+    """
+    path = _restart_trace_path()
+    if path is None:
+        return
+    try:
+        import shutil
+
+        line: Dict[str, Any] = {
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+            "pid": os.getpid(),
+            "argv0": sys.argv[0] if sys.argv else "",
+            "hermes_on_path": shutil.which("hermes") is not None,
+            "env": {
+                name: ("set" if os.environ.get(name) else "unset")
+                for name in ("INVOCATION_ID", "_HERMES_GATEWAY", "HERMES_SUPERVISED_CHILD", "HERMES_HOME", "XDG_RUNTIME_DIR")
+            },
+            **record,
+        }
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(line) + "\n")
+    except Exception:  # noqa: BLE001 - evidence only, never the restart's outcome
+        pass
+
+
+def _log_restart_failure(outcome: str, output: Any) -> None:
+    """Name a refused restart in the plugin log, never in a chat.
+
+    Chat setup runs the restart on a timer after its turn, so a refusal was
+    silent and the next turn could only say the plugin was not loaded. Only
+    the first line goes in: Hermes's refusals lead with the reason, and the
+    lines after it can name live sessions.
+    """
+    first = _first_line(output)
+    logging.getLogger(__name__).warning(
+        "[ocuclaw] hermes gateway restart failed (%s)%s", outcome, f": {first}" if first else ""
+    )
 
 
 def _relay_verify_address() -> str:
@@ -675,7 +866,7 @@ def _render_reset_result(
             "  Every phone is disconnected. Pairing your phone now.\n"
             if then_pair
             else "  Every phone is disconnected. Return to /ocuclaw-setup and "
-            "securely re-pair by QR or Manual pairing.\n"
+            "securely re-pair with a phone code.\n"
         )
         return (
             "\n  Relay Credential reset complete. The replacement was atomically "
@@ -856,8 +1047,8 @@ def run_pair_new_key(
 def _read_relay_credential() -> str:
     """Read the managed Relay Credential this host authenticates with.
 
-    Goes through Hermes's own ``.env`` accessor first — the canonical secret
-    source per the adapter's contract — and falls back to the process
+    Goes through Hermes's secret scope only (catalogue rule 11); on a
+    single-profile gateway Hermes itself falls through to the process
     environment, which is how a supervised run receives it.
     """
     return relay_credential.read_relay_credential()
@@ -882,7 +1073,9 @@ def _control_url() -> str:
         if isinstance(extra, dict):
             if str(extra.get("wsBind") or "").strip():
                 bind = str(extra["wsBind"]).strip()
-            if "wsPort" in extra:
+            # #7316: a bool is not a port (`int(True) == 1`); the adapter
+            # binds the default for it, so advertise the default too.
+            if "wsPort" in extra and not isinstance(extra["wsPort"], bool):
                 candidate = int(extra["wsPort"])
                 if 1 <= candidate <= 65535:
                     port = candidate
@@ -999,6 +1192,7 @@ def _render_prompt_block(phone_label: str, phrase: Any, *, unicode: bool = False
         f"{_render_words_box(words, unicode=unicode)}"
         "\n"
         "  If any word differs, type refuse.\n"
+        "  Approving also lets these glasses talk to your agent.\n"
     )
 
 
@@ -1061,8 +1255,7 @@ def _approval_line(
         remaining = deadline - monotonic_fn()
         if remaining <= 0:
             return None
-        ready, _, _ = select.select([fd], [], [], remaining)
-        if not ready:
+        if not _wait_readable(fd, remaining):
             return None
         chunk = os.read(fd, 1)
         if not chunk:
@@ -1070,6 +1263,143 @@ def _approval_line(
         answer.extend(chunk)
         if chunk == b"\n":
             return answer.decode("utf-8", errors="replace")
+
+
+def _finish_despite_interrupt(call: Callable[[], Any]) -> Tuple[Any, bool]:
+    """Run ``call`` to its end, holding a Ctrl-C until it returns.
+
+    Returns its result and whether Ctrl-C was pressed meanwhile, so the caller
+    can undo what the call made. If the call fails after a Ctrl-C, the wearer
+    cancelled: that is raised as KeyboardInterrupt, not the call's own error.
+    Off the main thread no SIGINT can arrive, so the call simply runs. A
+    handler Python did not install (``getsignal`` answers None) cannot be put
+    back, so it is left alone and the call simply runs.
+    """
+    pressed = []
+    previous = signal.getsignal(signal.SIGINT)
+    installed = False
+    if previous is not None:
+        try:
+            signal.signal(signal.SIGINT, lambda *_: pressed.append(True))
+            installed = True
+        except ValueError:
+            pass
+    try:
+        result = call()
+    except Exception as exc:
+        if pressed:
+            raise KeyboardInterrupt from exc
+        raise
+    finally:
+        if installed:
+            signal.signal(signal.SIGINT, previous)
+    return result, bool(pressed)
+
+
+def _phone_code_line(stdin: TextIO, stdout: TextIO, prompt: str = "> ") -> str:
+    """One echoed line, with terminal paste/report escapes kept out of the code.
+
+    Only this phase reads key by key. Restore the terminal before handing back
+    to the existing approval reader. Windows consoles use their native character
+    reader rather than select(), which cannot wait on Windows stdin.
+
+    The prompt is written only once keys are read one at a time, so a code
+    pasted the moment it shows is neither echoed twice nor flushed away.
+    Output processing stays on: the Enter that ends the code starts the next
+    line at the left edge.
+    """
+    fd = None
+    saved = None
+    console = None
+    try:
+        try:
+            fd = stdin.fileno() if stdin.isatty() else None
+        except (AttributeError, OSError, ValueError):
+            fd = None
+        if fd is not None:
+            if os.name == "nt":
+                import msvcrt
+                console = msvcrt
+            else:
+                import termios
+                import tty
+                saved = termios.tcgetattr(fd)
+                tty.setcbreak(fd, termios.TCSANOW)
+        stdout.write(prompt)
+        stdout.flush()
+
+        def read_char(*, escape: bool = False) -> str:
+            if console is not None:
+                if escape:
+                    until = time.monotonic() + 0.03
+                    while not console.kbhit():
+                        if time.monotonic() >= until:
+                            return ""
+                        time.sleep(0.001)
+                return console.getwch()
+            if fd is not None:
+                if escape and not _wait_readable(fd, 0.03):
+                    return ""
+                return os.read(fd, 1).decode("utf-8", errors="replace")
+            return stdin.read(1)
+
+        answer = ""
+        while True:
+            char = read_char()
+            if char in {"", "\x03", "\x04"}:
+                raise EOFError
+            if console is not None and char in {"\x00", "\xe0"}:
+                # An arrow or function key: a prefix, then its scan code. It
+                # cancels, as an arrow does in the OpenClaw terminal, and the
+                # scan code is read so it never lands on the next prompt.
+                read_char()
+                raise EOFError
+            if char == "\x1b":
+                sequence = char
+                while len(sequence) < 32:
+                    char = read_char(escape=True)
+                    if not char:
+                        raise EOFError
+                    sequence += char
+                    if sequence in {"\x1b[200~", "\x1b[201~"} or re.fullmatch(r"\x1b\[\d+;\d+R", sequence):
+                        break
+                    if not re.fullmatch(r"\x1b(?:\[[0-9;]*)?", sequence):
+                        raise EOFError
+                else:
+                    raise EOFError
+                continue
+            if char in {"\n", "\r"}:
+                stdout.write("\n")
+                stdout.flush()
+                return answer
+            if char in {"\x7f", "\b"}:
+                if answer:
+                    answer = answer[:-1]
+                    stdout.write("\b \b")
+            elif char >= " ":
+                if len(answer) >= 256:
+                    return ""
+                answer += char
+                stdout.write(char)
+            stdout.flush()
+    finally:
+        if saved is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def _wait_readable(fd: int, timeout: float) -> bool:
+    """True once ``fd`` has input, False when ``timeout`` runs out.
+
+    A selector, not ``select()``: ``select()`` refuses any fd numbered 1024 or
+    higher (#5121). epoll refuses regular files and ``/dev/null``, which
+    ``select()`` always reports readable, so they stay readable here.
+    """
+    with selectors.DefaultSelector() as waiting:
+        try:
+            waiting.register(fd, selectors.EVENT_READ)
+        except PermissionError:
+            return True
+        return bool(waiting.select(timeout))
 
 
 def _select_cannot_wait_on_stdin() -> bool:
@@ -1180,7 +1510,7 @@ def _outcome_text(
 #: after a phone had joined: the phone was told the same thing and saved
 #: nothing. A local deadline with no host verdict keeps :func:`_expiry_text`,
 #: because then nobody knows what the phone saw.
-WINDOW_ELAPSED_TEXT = "Pairing took longer than the two-minute window."
+WINDOW_ELAPSED_TEXT = "Pairing took longer than the five-minute window."
 
 #: Phases where a host-reported expiry reached a phone that had joined.
 _HOST_WINDOW_PHASES = frozenset({"awaiting-approval", "awaiting-phone-connection"})
@@ -1242,8 +1572,8 @@ def terminal_declares_unicode(
 #: Latin-1 characters ("Ã©"), so the two modes differ by cursor advance: one
 #: column when decoded as UTF-8, two when decoded as single bytes. A character
 #: whose trailing bytes are Latin-1 CONTROLS would advance one column either
-#: way and tell us nothing — which is exactly what the half-block glyphs the QR
-#: is drawn with do, and why they fail silently.
+#: way and tell us nothing — which is exactly what the box-drawing glyphs
+#: around the four words do, and why they fail silently.
 _PROBE_CHAR = "é"
 
 #: How long to wait for the terminal to answer. A terminal that does not
@@ -1279,7 +1609,6 @@ def probe_terminal_unicode(
     pairing block, at a point where there is nothing yet to type.
     """
     try:
-        import select
         import termios
         import tty
     except ImportError:  # pragma: no cover - POSIX-only, as Hermes is
@@ -1299,8 +1628,7 @@ def probe_terminal_unicode(
         stdout.flush()
         reply = ""
         while "R" not in reply:
-            ready, _, _ = select.select([fd], [], [], timeout_s)
-            if not ready:
+            if not _wait_readable(fd, timeout_s):
                 return None
             chunk = os.read(fd, 32)
             if not chunk:
@@ -1341,14 +1669,18 @@ def terminal_supports_unicode(
     environment's claim decide — see :func:`terminal_declares_unicode` for why
     that claim is not trusted first.
 
-    Unknown, either way, reads as no. A false yes prints an unscannable code
-    and says nothing; a false no prints a working manual path and explains
-    itself.
+    Unknown, either way, reads as no. A false yes paints the words' frame as
+    mojibake; a false no only costs plain ASCII corners.
     """
     encoding = getattr(stream, "encoding", None)
     if not _looks_utf8(encoding if isinstance(encoding, str) else None):
         # We could not even emit UTF-8, so what the terminal reads is moot.
         return False
+    if webui_terminal.active(os.environ if environ is None else environ):
+        # The Hermes WebUI's /terminal is xterm.js, which always decodes UTF-8.
+        # Its answer to the probe travels back over HTTP, long after the probe
+        # gave up, and then lands in the input as text (`^[[10;2R`).
+        return True
     if stdin is not None:
         probed = probe_terminal_unicode(stdin, stream)
         if probed is not None:
@@ -1378,82 +1710,6 @@ def terminal_supports_color(
         return False
 
 
-def terminal_columns(fallback: int = 0) -> int:
-    """Usable terminal width, or [fallback] when it cannot be determined.
-
-    ``shutil.get_terminal_size`` already consults ``COLUMNS`` and then the
-    device itself, and substitutes its own default when both fail. That default
-    is a guess, and guessing wide enough to print a QR that then wraps is the
-    one outcome worth avoiding, so a failure here returns [fallback] instead.
-    """
-    try:
-        columns = int(shutil.get_terminal_size().columns)
-    except Exception:  # noqa: BLE001 - an unmeasurable terminal is unknown
-        return fallback
-    return columns if columns > 0 else fallback
-
-
-def _terminal_capabilities(
-    stream: TextIO,
-    environ: Optional[Mapping[str, str]] = None,
-    stdin: Optional[TextIO] = None,
-) -> Dict[str, Any]:
-    """The terminal description sent with a create request.
-
-    ``zoom`` names the keys the host's "zoom out" hint shows (#3743).
-    ``redraw`` promises the host that this CLI draws the code itself once the
-    window is big enough, so the block may say "the code will appear here".
-    Only a half-block code can be redrawn here, so it needs UTF-8, and only
-    with the encoder present is the promise one this side can keep.
-    """
-    caps: Dict[str, Any] = {
-        "unicode": terminal_supports_unicode(stream, environ, stdin),
-        "color": terminal_supports_color(stream, environ),
-        "columns": terminal_columns(),
-        "rows": shutil.get_terminal_size(fallback=(0, 0)).lines,
-        "zoom": cloudways_qr.zoom_key(environ),
-    }
-    if caps["unicode"] and cloudways_qr.encoder_available():
-        caps["redraw"] = True
-    return caps
-
-
-def _pending_pairing_qr(
-    block: str,
-    terminal: Mapping[str, Any],
-    payload_text: str,
-    *,
-    light_terminal: bool,
-    size_fn: Callable[[], Tuple[int, int]],
-    matrix_fn: Callable[[str], Any],
-) -> Optional["cloudways_qr.PendingQr"]:
-    """#3743. The code to redraw, when the host withheld it for size only.
-
-    The host says so by printing the "code will appear here" line, which it
-    does only for a create that declared ``redraw``. Anything else, no redraw.
-    """
-    if not terminal.get("redraw") or not payload_text:
-        return None
-    if cloudways_qr.HINT_BIGGER_LINE not in block:
-        return None
-    try:
-        matrix = matrix_fn(payload_text)
-    except Exception:  # noqa: BLE001 - no encoder: the manual path still works
-        return None
-    if not matrix:
-        return None
-    code = cloudways_qr.render_code(
-        matrix, colour=bool(terminal.get("color")), light_terminal=light_terminal
-    )
-    return cloudways_qr.PendingQr(
-        code=code,
-        fits=False,
-        columns=int(terminal.get("columns") or 0),
-        rows=int(terminal.get("rows") or 0),
-        size_fn=size_fn,
-    )
-
-
 def run_pair(
     address: str,
     *,
@@ -1469,8 +1725,6 @@ def run_pair(
     sleep_fn: Optional[Callable[[float], None]] = None,
     monotonic_fn: Optional[Callable[[], float]] = None,
     outcome_fn: Optional[Callable[[Mapping[str, Any]], None]] = None,
-    terminal_size_fn: Optional[Callable[[], Tuple[int, int]]] = None,
-    qr_matrix_fn: Optional[Callable[[str], Any]] = None,
 ) -> int:
     """Run one interactive pairing session. Returns the process exit code.
 
@@ -1484,6 +1738,9 @@ def run_pair(
     printed, not what is polled, not the exit code. It exists because the exit
     code alone cannot tell "the person here refused the four words" — which is
     the user stopping, not a fault — from "the pairing broke".
+
+    ``light_terminal`` and ``show_payload_text`` are accepted and do nothing
+    (#5485): no terminal draws a QR, and the manual block is text already.
     """
     out = sys.stdout if stdout is None else stdout
     err = sys.stderr if stderr is None else stderr
@@ -1493,8 +1750,6 @@ def run_pair(
     post_fn = _post if post_fn is None else post_fn
     sleep_fn = time.sleep if sleep_fn is None else sleep_fn
     monotonic_fn = time.monotonic if monotonic_fn is None else monotonic_fn
-    terminal_size_fn = cloudways_qr.terminal_size if terminal_size_fn is None else terminal_size_fn
-    qr_matrix_fn = cloudways_qr.qr_matrix if qr_matrix_fn is None else qr_matrix_fn
 
     # #3234c. A caller that takes the ending also owns "what to do next": the
     # ladder offers a fresh code in place, and `hermes ocuclaw pair` needs an
@@ -1555,22 +1810,101 @@ def run_pair(
         return EXIT_PROBLEM
 
     url = control_url_fn()
-    terminal = _terminal_capabilities(out, None, inp)
-
+    # Whether the four words get a box-drawn frame (#3228): the terminal's own
+    # answer first, the environment's claim only if it will not answer.
+    unicode = terminal_supports_unicode(out, None, inp)
+    route_flags = {}
     try:
-        status, created = post_fn(
-            url,
-            {
-                "v": 1,
-                "op": "create",
-                "address": address,
-                "lightTerminal": light_terminal,
-                # The host renders the block, but only this side can see the
-                # terminal it will be printed on (#2505).
-                "terminal": terminal,
-            },
-            credential=credential,
-        )
+        from .adapter import _setup_raw_config
+        from .custom_route import configured_phone_address
+
+        config, _readable = _setup_raw_config()
+        extra = config.get("platforms", {}).get("ocuclaw", {}).get("extra", {})
+        if configured_phone_address(extra) is not None:
+            route_flags["customRoute"] = True
+    except Exception:  # noqa: BLE001 - the gateway still fences the address
+        pass
+
+    def create(phone_code: Optional[str] = None):
+        # #5485: the block is text only, so this terminal's size and colours
+        # no longer change what the host sends back.
+        payload = {"v": 1, "op": "create", "address": address}
+        if phone_code is None:
+            # Without a code the request is today's, byte for byte.
+            return post_fn(url, payload, credential=credential)
+        payload.update(route_flags)
+        payload["phoneCode"] = phone_code
+        return post_fn(url, payload, credential=credential,
+                       timeout=PHONE_CODE_CREATE_TIMEOUT_SECONDS)
+
+    created = None
+    try:
+        # The owning runtime decides, not this process: a separate CLI may
+        # have a different environment from the gateway. A refused, failed or
+        # old control endpoint means off, which keeps today's bytes. Like
+        # today's create, an interrupt here is not caught: off stays today's.
+        try:
+            status, availability = post_fn(url,
+                {"v": 1, "op": "phone-code-status", "address": address, **route_flags},
+                credential=credential, timeout=PHONE_CODE_STATUS_TIMEOUT_SECONDS)
+        except Exception:  # noqa: BLE001 - any failed status call means off
+            status, availability = 0, {}
+        if status == 200 and availability.get("available") is True:
+            # Word for word the OpenClaw terminal (pairing-terminal.ts).
+            from .terminal_output import styled
+
+            out.write(styled("\nPair your phone\n", out, role="heading"))
+            out.write(PHONE_CODE_DASHBOARD if webui_terminal.active(os.environ) else PHONE_CODE_COMPUTER)
+            out.write(PHONE_CODE_MANUAL)
+            try:
+                tries = 3
+                while tries:
+                    try:
+                        phone_code = _phone_code_line(inp, out)
+                    except (KeyboardInterrupt, EOFError):
+                        out.write("\n")
+                        raise
+                    if not phone_code.strip():
+                        continue
+                    if phone_code.strip().lower() == "m":
+                        break
+                    # The host may create an exchange and hand its note to the
+                    # phone before it answers, so a Ctrl-C waits for the answer
+                    # and then cancels what it made, as OpenClaw does. A live
+                    # exchange would refuse the next pairing for five minutes.
+                    (status, reply), interrupted = _finish_despite_interrupt(
+                        lambda: create(phone_code))
+                    if interrupted:
+                        secret = reply.get("controlSecret") if status == 200 else None
+                        if isinstance(secret, str) and secret:
+                            try:
+                                post_fn(url, {"v": 1, "op": "cancel"}, credential=credential,
+                                        control_secret=secret)
+                            except ControlError:
+                                pass  # the exchange expires at the host
+                        raise KeyboardInterrupt
+                    if status == 200 and reply.get("reason") == "pairing_code_typed":
+                        out.write(PHONE_CODE_PAIRING_TYPED)
+                        continue
+                    if status == 200 and reply.get("reason") in {"malformed", "no_code", "spent"}:
+                        out.write(PHONE_CODE_MISSING)
+                        tries -= 1
+                        if tries:
+                            out.write(f"{tries} {'try' if tries == 1 else 'tries'} left.\n")
+                        continue
+                    created = reply
+                    break
+            except (KeyboardInterrupt, EOFError):
+                # Cancelled while asking: no exchange was kept. A code is only
+                # sent to the host after Enter, and an exchange an interrupted
+                # create made was cancelled above.
+                out.write("\nPairing cancelled. Start pairing again to retry.\n")
+                report_outcome("failed", {"reason": "cancelled"})
+                return EXIT_PROBLEM
+        elif status == 200 and availability.get("reason") == "unavailable":
+            out.write(PHONE_CODE_OUTAGE)
+        if created is None:
+            status, created = create()
     except ControlError as exc:
         err.write(f"{exc}\n")
         return EXIT_PROBLEM
@@ -1588,42 +1922,23 @@ def run_pair(
 
     control_secret = str(created.get("controlSecret") or "")
     block = str(created.get("bootstrapBlock") or "")
-    if not control_secret or not block:
+    sent = created.get("delivery") == "sent"
+    if not control_secret or (not block and not sent):
         err.write("The relay returned an unusable pairing request.\n")
         return EXIT_PROBLEM
 
     # The Q15 local-human-only view: the printed block carries the canonical
     # private address and the short-lived pairing code, and nothing secret.
-    out.write(block)
-    if show_payload_text:
-        # The exact text the code encodes. For a terminal that cannot render
-        # block characters at all — a screen reader, a pipe, a log — the QR is
-        # an empty rectangle and this is the only way to hand it over. It is the
-        # same four public fields the QR carries and nothing more, so printing
-        # it discloses exactly what holding the code up to a camera would.
-        payload_text = str(created.get("payloadText") or "")
-        if payload_text:
-            out.write(f"  Code contents: {payload_text}\n\n")
+    # #5485: every terminal prints the text-only manual block, built from the
+    # reply's fields, so an older relay's drawn QR never reaches the screen.
+    if sent:
+        out.write(PHONE_CODE_SENT)
+        out.write("Waiting for the phone. Ctrl-C cancels.\n")
+    else:
+        if created.get("delivery") == "unavailable":
+            out.write(PHONE_CODE_OUTAGE)
+        out.write(manual_pairing_text(block, created))
     out.flush()
-
-    # #3743. The host withheld the code for size and promised it would appear
-    # once the window grows: while the phone is awaited, measure the window
-    # every half second and draw it the first time it fits. Once.
-    pending_code = _pending_pairing_qr(
-        block,
-        terminal,
-        str(created.get("payloadText") or ""),
-        light_terminal=light_terminal,
-        size_fn=terminal_size_fn,
-        matrix_fn=qr_matrix_fn,
-    )
-
-    def redraw_code(waiting: "cloudways_qr.PendingQr") -> None:
-        try:
-            out.write(f"\n{QR_REDRAW_LEAD_LINE}\n{waiting.code}\n")
-            out.flush()
-        except Exception:  # noqa: BLE001 - a closed stream never fails a pairing
-            pass
 
     lifetime = created.get("expiresInSeconds")
     lifetime = float(lifetime) if isinstance(lifetime, (int, float)) and not isinstance(lifetime, bool) else POLL_DEADLINE_S
@@ -1634,7 +1949,7 @@ def run_pair(
     # Once approved, the terminal keeps watching a little past the code's own
     # lifetime, so the host's verdict on the phone's connection is OBSERVED
     # rather than cut off at the same instant it lands. Same total bound as the
-    # OpenClaw ladder: 135 seconds from the start for a two-minute code.
+    # OpenClaw ladder: 315 seconds from the start for a five-minute code.
     connect_back_deadline = started + min(POLL_DEADLINE_S, lifetime + CONNECT_BACK_GRACE_S)
     prompt_shown = False
     decided = False
@@ -1691,7 +2006,7 @@ def run_pair(
                     _render_prompt_block(
                         prompt.get("phoneLabel"),
                         prompt.get("safetyPhrase"),
-                        unicode=bool(terminal.get("unicode")),
+                        unicode=unicode,
                     )
                 )
                 prompt_shown = True
@@ -1758,9 +2073,4 @@ def run_pair(
             # "credential delivered; pairing unconfirmed".
             continue
 
-        if pending_code is not None and phase == "waiting-for-phone" and not prompt_shown:
-            pending_code = cloudways_qr.sleep_watching(
-                POLL_INTERVAL_S, pending_code, sleep_fn=sleep_fn, draw_fn=redraw_code
-            )
-        else:
-            sleep_fn(POLL_INTERVAL_S)
+        sleep_fn(POLL_INTERVAL_S)

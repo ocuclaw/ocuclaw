@@ -35,7 +35,7 @@ function isTerminalOutcome(outcome) {
   return !!(outcome && typeof outcome.result === "string" && TERMINAL_RESULTS.has(outcome.result));
 }
 
-function isSettlementOutcome(outcome) {
+function isSettlementOutcome(outcome     ) {
   return !!(outcome && typeof outcome.result === "string" && SETTLEMENT_RESULTS.has(outcome.result));
 }
 
@@ -90,15 +90,15 @@ function createSurfaceStore(deps = {}) {
   const stackBySession = new Map();
 
   const generationBySession = new Map();
-  let stageHolder = null;
-  let pendingStageGrant = null;
+  let stageHolder      = null;
+  let pendingStageGrant      = null;
 
-  function generationFor(rawSessionKey) {
+  function generationFor(rawSessionKey     ) {
     const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
     return generationBySession.get(sessionKey) || 1;
   }
 
-  function advanceGeneration(rawSessionKey) {
+  function advanceGeneration(rawSessionKey     ) {
     const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
     generationBySession.set(sessionKey, generationFor(sessionKey) + 1);
   }
@@ -113,7 +113,7 @@ function createSurfaceStore(deps = {}) {
     }
   }
 
-  function planStageGrant(rawSessionKey, opts = {}) {
+  function planStageGrant(rawSessionKey     , opts      = {}) {
     const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
     const graceMs = Number.isFinite(opts.graceMs)
       ? Math.max(0, Math.floor(opts.graceMs))
@@ -178,7 +178,7 @@ function createSurfaceStore(deps = {}) {
     };
   }
 
-  function commitStageGrant(rawSessionKey, plan) {
+  function commitStageGrant(rawSessionKey     , plan     ) {
     const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
     if (!plan || plan.ok !== true) return false;
     if (stageHolder && stageHolder.sessionKey === sessionKey && plan.action === "retain") {
@@ -217,7 +217,7 @@ function createSurfaceStore(deps = {}) {
     return true;
   }
 
-  function bindStageSurface(rawSessionKey, surfaceId) {
+  function bindStageSurface(rawSessionKey     , surfaceId     ) {
     const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
     if (!stageHolder || stageHolder.sessionKey !== sessionKey) return false;
     stageHolder.surfaceId = surfaceId;
@@ -236,7 +236,7 @@ function createSurfaceStore(deps = {}) {
     return true;
   }
 
-  function clearStageForSession(rawSessionKey) {
+  function clearStageForSession(rawSessionKey     ) {
     const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
     if (!stageHolder || stageHolder.sessionKey !== sessionKey) return false;
     stageHolder = null;
@@ -254,7 +254,7 @@ function createSurfaceStore(deps = {}) {
     return count;
   }
 
-  function stageState(rawSessionKey, opts = {}) {
+  function stageState(rawSessionKey     , opts      = {}) {
     const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
     const graceMs = Number.isFinite(opts.graceMs)
       ? Math.max(0, Math.floor(opts.graceMs))
@@ -399,7 +399,7 @@ function createSurfaceStore(deps = {}) {
     };
   }
 
-  function clearSendAndReceiptEvidence(entry) {
+  function clearSendAndReceiptEvidence(entry     ) {
     entry.lastAttemptedSend = null;
     entry.sendAttempts.clear();
     entry.lastPaintedAt = null;
@@ -407,7 +407,7 @@ function createSurfaceStore(deps = {}) {
     entry.deliveryEvidence.clientReceiptAtMs = null;
   }
 
-  function stampAuthoredAndValidated(entry) {
+  function stampAuthoredAndValidated(entry     ) {
     const atMs = now();
     if (entry.deliveryEvidence.authoredAtMs === null) {
       entry.deliveryEvidence.authoredAtMs = atMs;
@@ -461,7 +461,7 @@ function createSurfaceStore(deps = {}) {
     });
   }
 
-  function settleSupersededDeclaration(entry) {
+  function settleSupersededDeclaration(entry     ) {
     if (entry?.settleOnSupersede !== true || !entry.pending) return;
     const pending = entry.pending;
     entry.pending = null;
@@ -474,7 +474,7 @@ function createSurfaceStore(deps = {}) {
     return { ...outcome, surfaceUuid: entry.uuid };
   }
 
-  function deliveryForRecord(entry, record) {
+  function deliveryForRecord(entry     , record     ) {
     const parkedForMs = Math.max(0, now() - record.queuedAtMs);
     const delivered = {
       ...record.outcome,
@@ -508,7 +508,9 @@ function createSurfaceStore(deps = {}) {
     } else {
       entry.state = "visible_awaiting_agent";
 
-      entry.awaitingAgentResponse = !!(outcome && outcome.result !== "window_expired");
+      entry.awaitingAgentResponse = !!(
+        outcome && outcome.result !== "window_expired" && outcome.result !== "shown"
+      );
       entry.terminationCause = null;
     }
     pending(decorateDelivery(entry, outcome));
@@ -567,7 +569,7 @@ function createSurfaceStore(deps = {}) {
     return n;
   }
 
-  function markAgentRunEnded(rawSessionKey, ended = true) {
+  function markAgentRunEnded(rawSessionKey     , ended = true) {
     const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
     for (const entry of bySurface.values()) {
       if (entry.sessionKey === sessionKey) entry.agentRunEnded = ended;
@@ -656,7 +658,7 @@ function createSurfaceStore(deps = {}) {
     syncStageBusySince();
   }
 
-  function breadcrumbFor(rawSessionKey, depth = undefined) {
+  function breadcrumbFor(rawSessionKey     , depth      = undefined) {
     const s = stackBySession.get(normalizeGlassesSessionKey(rawSessionKey));
     if (!s || s.length === 0) return null;
     const levels = Number.isFinite(depth) && depth > 0 ? s.slice(0, depth) : s;
@@ -691,7 +693,7 @@ function createSurfaceStore(deps = {}) {
     return list ? list.map((r) => ({ ...r, events: [...r.events] })) : [];
   }
 
-  function deadLetterEventCount(rawSessionKey) {
+  function deadLetterEventCount(rawSessionKey     ) {
     const list = deadLetterBySession.get(normalizeGlassesSessionKey(rawSessionKey));
     if (!list) return 0;
     let total = 0;
@@ -750,7 +752,7 @@ function createSurfaceStore(deps = {}) {
       delivered = {
         mode: "log",
         surfaceUuid: entry.uuid,
-        events: records.map((record) => deliveryForRecord(entry, record)),
+        events: records.map((record     ) => deliveryForRecord(entry, record)),
       };
     } else if (entry.events.length) {
       delivered = deliveryForRecord(entry, entry.events[entry.events.length - 1]);
@@ -785,7 +787,7 @@ function createSurfaceStore(deps = {}) {
     return entry ? entry.sessionKey : null;
   }
 
-  function surfaceFactsFor(surfaceId) {
+  function surfaceFactsFor(surfaceId     ) {
     const entry = bySurface.get(surfaceId);
     if (!entry) return null;
     return {
@@ -805,14 +807,14 @@ function createSurfaceStore(deps = {}) {
     };
   }
 
-  function recordContent(surfaceId, frame) {
+  function recordContent(surfaceId     , frame     ) {
     const entry = bySurface.get(surfaceId);
     if (!entry || !frame || typeof frame !== "object") return null;
     const isRender = frame.__render === true;
     const source = isRender && frame.__spec && typeof frame.__spec === "object"
       ? frame.__spec
       : frame;
-    const next = isRender || !entry.lastContent
+    const next      = isRender || !entry.lastContent
       ? { kind: source.kind || entry.kind || null }
       : { ...entry.lastContent };
 
@@ -828,7 +830,7 @@ function createSurfaceStore(deps = {}) {
     return JSON.parse(JSON.stringify(next));
   }
 
-  function recordSpec(surfaceId, normalizedSpec) {
+  function recordSpec(surfaceId     , normalizedSpec     ) {
     const entry = bySurface.get(surfaceId);
     if (!entry || !normalizedSpec || typeof normalizedSpec !== "object" ||
         Array.isArray(normalizedSpec)) return null;
@@ -836,7 +838,7 @@ function createSurfaceStore(deps = {}) {
     return JSON.parse(JSON.stringify(entry.recordedSpec));
   }
 
-  function currentSurfaceSpecForSession(rawSessionKey) {
+  function currentSurfaceSpecForSession(rawSessionKey     ) {
     const surfaceId = topSurfaceId(rawSessionKey);
     const entry = surfaceId ? bySurface.get(surfaceId) : null;
     return entry && entry.recordedSpec
@@ -844,14 +846,14 @@ function createSurfaceStore(deps = {}) {
       : null;
   }
 
-  function recordPreloadedChildren(surfaceId, children, recordedChildren = children) {
+  function recordPreloadedChildren(surfaceId     , children     , recordedChildren      = children) {
     const entry = bySurface.get(surfaceId);
     if (!entry) return;
     const slots = Array.isArray(children) ? children : [];
 
     entry.preloadedChildGenerations = entry.preloadedChildGenerations
-      .map((generation) => generation.filter((child) => slots[child.itemIndex]))
-      .filter((generation) => generation.length);
+      .map((generation     ) => generation.filter((child     ) => slots[child.itemIndex]))
+      .filter((generation     ) => generation.length);
     const generation = slots.flatMap((child, itemIndex) =>
       child && typeof child.surfaceId === "string"
         ? [{ childId: child.surfaceId, itemIndex, spec: JSON.parse(JSON.stringify(recordedChildren[itemIndex])) }]
@@ -864,7 +866,7 @@ function createSurfaceStore(deps = {}) {
     }
   }
 
-  function stackSurfaceIds(rawSessionKey) {
+  function stackSurfaceIds(rawSessionKey     ) {
     const s = stackBySession.get(normalizeGlassesSessionKey(rawSessionKey));
     return s ? [...s] : [];
   }
@@ -916,7 +918,7 @@ function createSurfaceStore(deps = {}) {
     return { mode: "replace", surfaceId: top, depth };
   }
 
-  function adoptClientPush(rawSessionKey, childId, meta = {}) {
+  function adoptClientPush(rawSessionKey     , childId     , meta      = {}) {
     const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
     const stack = stackFor(sessionKey);
     const top = stack[stack.length - 1] || null;
@@ -929,10 +931,10 @@ function createSurfaceStore(deps = {}) {
     if (!top || (typeof meta.parentId === "string" && meta.parentId && meta.parentId !== top)) {
       return { ok: false, code: "parent_not_top", top };
     }
-    const parentEntry = bySurface.get(top);
+    const parentEntry      = bySurface.get(top);
     const itemIndex = Number.isInteger(meta.itemIndex) && meta.itemIndex >= 0 ? meta.itemIndex : null;
     const sentChild = parentEntry && parentEntry.preloadedChildGenerations
-      .flat().find((child) => child.childId === childId && child.itemIndex === itemIndex);
+      .flat().find((child     ) => child.childId === childId && child.itemIndex === itemIndex);
     if (!sentChild) return { ok: false, code: "child_generation_unavailable", top };
     const childSpec = sentChild.spec;
     const kind =
@@ -943,7 +945,7 @@ function createSurfaceStore(deps = {}) {
           : null;
     pauseCron(top);
     stack.push(childId);
-    const entry = makeEntry(sessionKey, kind);
+    const entry      = makeEntry(sessionKey, kind);
     entry.clientPushed = { parentId: top, itemIndex };
 
     entry.state = "visible_awaiting_agent";
@@ -959,11 +961,11 @@ function createSurfaceStore(deps = {}) {
     return { ok: true, mode: "adopted", parentId: top, itemIndex, kind };
   }
 
-  function adoptedChildFor(rawSessionKey) {
+  function adoptedChildFor(rawSessionKey     ) {
     const sessionKey = normalizeGlassesSessionKey(rawSessionKey);
     const stack = stackFor(sessionKey);
     const top = stack[stack.length - 1] || null;
-    const entry = top ? bySurface.get(top) : null;
+    const entry      = top ? bySurface.get(top) : null;
     if (!entry || !entry.clientPushed) return null;
     return { childId: top, parentId: entry.clientPushed.parentId, itemIndex: entry.clientPushed.itemIndex };
   }
@@ -1012,7 +1014,7 @@ function createSurfaceStore(deps = {}) {
 
   let sendSeq = 0;
 
-  function recordSendAttempt(surfaceId, opts) {
+  function recordSendAttempt(surfaceId     , opts     ) {
     const entry = bySurface.get(surfaceId);
     if (!entry) return null;
     const mode = opts && opts.mode === "update" ? "update" : "render";
@@ -1040,7 +1042,7 @@ function createSurfaceStore(deps = {}) {
     return { ...entry.lastAttemptedSend };
   }
 
-  function recordClientReceipt(surfaceId, receipt) {
+  function recordClientReceipt(surfaceId     , receipt     ) {
     const entry = bySurface.get(surfaceId);
     if (!entry) return { ok: false, reason: "unknown_surface" };
     const latestAttempt = entry.lastAttemptedSend;
@@ -1082,7 +1084,7 @@ function createSurfaceStore(deps = {}) {
     return { ok: true, surfaceUuid: entry.uuid, seq, atMs, superseded };
   }
 
-  function recordClientFailureEvidence(surfaceId, report) {
+  function recordClientFailureEvidence(surfaceId     , report     ) {
     const entry = bySurface.get(surfaceId);
     if (!entry) return { ok: false, reason: "unknown_surface" };
     const latestAttempt = entry.lastAttemptedSend;
@@ -1111,7 +1113,7 @@ function createSurfaceStore(deps = {}) {
         : "unknown";
     const atMs = now();
     if (report?.deduplicate === true && entry.clientFailures?.recent.some(
-      (item) => item.clientId === clientId && item.seq === seq && item.code === code,
+      (item     ) => item.clientId === clientId && item.seq === seq && item.code === code,
     )) {
       return { ok: true, surfaceUuid: entry.uuid, seq, code, clientId,
         total: entry.clientFailures.total, duplicate: true };
@@ -1134,13 +1136,13 @@ function createSurfaceStore(deps = {}) {
     return { ok: true, surfaceUuid: entry.uuid, seq, code, clientId, total: failures.total };
   }
 
-  function clientFailuresOf(surfaceId) {
+  function clientFailuresOf(surfaceId     ) {
     const entry = bySurface.get(surfaceId);
     if (!entry || !entry.clientFailures) return null;
     const failures = entry.clientFailures;
     return {
       total: failures.total,
-      clients: Array.from(failures.byClient.entries()).map(([clientId, info]) => ({
+      clients: Array.from(failures.byClient.entries()).map(([clientId, info]     ) => ({
         clientId,
         count: info.count,
         lastCode: info.lastCode,
@@ -1150,7 +1152,7 @@ function createSurfaceStore(deps = {}) {
     };
   }
 
-  function validateTerminalClientReport(surfaceId, report, allowedCodes) {
+  function validateTerminalClientReport(surfaceId     , report     , allowedCodes     ) {
     const entry = bySurface.get(surfaceId);
     if (!entry) return { ok: false, reason: "unknown_surface" };
     if (!allowedCodes.includes(report?.code)) return { ok: false, reason: "invalid_code" };
@@ -1166,15 +1168,15 @@ function createSurfaceStore(deps = {}) {
     return { ok: true, surfaceUuid: entry.uuid };
   }
 
-  function validateClientRenderError(surfaceId, report) {
+  function validateClientRenderError(surfaceId     , report     ) {
     return validateTerminalClientReport(surfaceId, report, RENDER_FAILURE_CODES);
   }
 
-  function validateClientRenderDrop(surfaceId, report) {
+  function validateClientRenderDrop(surfaceId     , report     ) {
     return validateTerminalClientReport(surfaceId, report, RENDER_DROP_CODES);
   }
 
-  function hasClientReceipt(surfaceUuid, seq) {
+  function hasClientReceipt(surfaceUuid     , seq     ) {
     for (const entry of bySurface.values()) {
       if (entry.uuid !== surfaceUuid) continue;
       const attempt = entry.sendAttempts.get(seq);
@@ -1183,7 +1185,7 @@ function createSurfaceStore(deps = {}) {
     return false;
   }
 
-  function deliveryEvidenceOf(surfaceId) {
+  function deliveryEvidenceOf(surfaceId     ) {
     const entry = bySurface.get(surfaceId);
     if (!entry) return null;
     return {
@@ -1194,7 +1196,7 @@ function createSurfaceStore(deps = {}) {
     };
   }
 
-  function lastRenderSendOf(surfaceId) {
+  function lastRenderSendOf(surfaceId     ) {
     const entry = bySurface.get(surfaceId);
     if (!entry) return null;
     for (const attempt of entry.sendAttempts.values()) {
@@ -1206,10 +1208,10 @@ function createSurfaceStore(deps = {}) {
   return {
     storeId,
     register, resolve, hasSurface, isPending, drainSession, drainAll, settlePending,
-    isCurrentDeclaration: (surfaceId, declarationId) =>
+    isCurrentDeclaration: (surfaceId     , declarationId     ) =>
       typeof declarationId === "string" && bySurface.get(surfaceId)?.declarationId === declarationId,
-    isWearerInitiated: (surfaceId) => bySurface.get(surfaceId)?.wearerInitiated === true,
-    hasAgentRunEnded: (surfaceId) => bySurface.get(surfaceId)?.agentRunEnded === true,
+    isWearerInitiated: (surfaceId     ) => bySurface.get(surfaceId)?.wearerInitiated === true,
+    hasAgentRunEnded: (surfaceId     ) => bySurface.get(surfaceId)?.agentRunEnded === true,
     markAgentRunEnded,
     stateOf, queueEvent, isExitLatched, onReattached,
     applyRender, recordPreloadedChildren, adoptClientPush, adoptedChildFor, popBack, exit, topSurfaceId, stackDepth, stackSurfaceIds, sessionKeys, sessionForSurface,
@@ -1226,4 +1228,4 @@ function createSurfaceStore(deps = {}) {
 
 const createPendingRenderMap = createSurfaceStore;
 
-module.exports = { createPendingRenderMap, createSurfaceStore, isTerminalOutcome, isSettlementOutcome, GLASS_EVENT_ORIGINS, normalizeGlassesSessionKey, SETTLEMENT_OUTCOME_RESULTS, TERMINAL_OUTCOME_RESULTS, SURFACE_REAP_REASONS, SURFACE_EVICTION_REASONS, DEAD_LETTER_REASONS, RECEIPT_REJECTION_REASONS, RENDER_FAILURE_CODES, RENDER_DROP_CODES };
+module.exports = { TERMINAL_OUTCOME_RESULTS, SETTLEMENT_OUTCOME_RESULTS, SURFACE_REAP_REASONS, SURFACE_EVICTION_REASONS, DEAD_LETTER_REASONS, isTerminalOutcome, isSettlementOutcome, RECEIPT_REJECTION_REASONS, RENDER_FAILURE_CODES, RENDER_DROP_CODES, GLASS_EVENT_ORIGINS, normalizeGlassesSessionKey, createSurfaceStore, createPendingRenderMap };

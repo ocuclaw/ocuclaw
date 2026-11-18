@@ -1,9 +1,11 @@
-const HEALTH_READS = new Set(["health.snapshot", "health.usage", "diagnostics.status"]);
+const { hermesAuxUsageTasks } = require("./hermes-aux-usage.cjs");
+
+const HEALTH_READS =new Set(["health.snapshot", "health.usage", "diagnostics.status"]);
 const HEALTH_OPERATIONS = new Set([...HEALTH_READS, "diagnostics.start", "diagnostics.cancel"]);
-const token = (v) => typeof v === "string" && /^[A-Za-z0-9_-]{16,128}$/.test(v);
-const number = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
-const id = (v) => typeof v === "string" && /^[A-Za-z0-9_.:/@+ -]{1,160}$/.test(v);
-const actions = {
+const token = (v     ) => typeof v === "string" && /^[A-Za-z0-9_-]{16,128}$/.test(v);
+const number = (v     ) => typeof v === "number" && Number.isFinite(v) && v >= 0;
+const id = (v     ) => typeof v === "string" && /^[A-Za-z0-9_.:/@+ -]{1,160}$/.test(v);
+const actions      = {
   advisories: "Review native security advisories with the host administrator.",
   mcp: "Review configured MCP package versions and native advisories.",
   python: "Check the Hermes interpreter and environment on the host.",
@@ -22,7 +24,7 @@ const actions = {
   service: "Review native gateway service status on the host.",
   native_check: "Review native diagnostic details on the host.",
 };
-function healthRequest(op, value) {
+function healthRequest(op     , value     ) {
   const p = value ?? {};
   const keys = op === "health.snapshot" ? [] : op === "health.usage" ? ["periodDays"] :
     op === "diagnostics.status" ? ["operationId"] : ["operationId", "producedAt", "expiresAt", ...(op === "diagnostics.start" ? ["kind"] : [])];
@@ -34,9 +36,9 @@ function healthRequest(op, value) {
   if (op === "diagnostics.start" && !["doctor", "security"].includes(p.kind)) return undefined;
   return Object.fromEntries(keys.map(key => [key, p[key]]));
 }
-function healthResult(raw) {
+function healthResult(raw     ) {
   if (!raw || typeof raw !== "object") throw new Error("Invalid health result");
-  const result = {};
+  const result      = {};
   if (raw.snapshot) {
     const row = raw.snapshot;
     if (!number(row.observedAt) || row.source !== "native_gateway" || row.gateway !== "responding" || row.provider !== "unknown") throw new Error("Invalid snapshot");
@@ -46,8 +48,8 @@ function healthResult(raw) {
   if (raw.usage) {
     const row = raw.usage;
     if (!number(row.observedAt) || row.source !== "native_session_accounting" || row.window !== "session_start" || ![7, 30, 90].includes(row.periodDays) || !Array.isArray(row.models)) throw new Error("Invalid usage");
-    const accounting = (r) => {
-      const out = {};
+    const accounting = (r     ) => {
+      const out      = {};
       for (const key of ["input", "output", "records", "actualRecords", "estimatedRecords"]) {
         if (!number(r?.[key])) throw new Error("Invalid accounting");
         out[key] = r[key];
@@ -61,12 +63,15 @@ function healthResult(raw) {
     };
     result.usage = {observedAt: row.observedAt, source: row.source, window: row.window, periodDays: row.periodDays,
       auxiliary: row.auxiliary === "available" ? "available" : "unknown", truncated: row.truncated === true,
-      totals: accounting(row.totals), models: row.models.slice(0, 100).map((r) => ({...accounting(r), model: id(r.model) ? r.model : "redacted-model"}))};
+      totals: accounting(row.totals), models: row.models.slice(0, 100).map((r     ) => ({...accounting(r), model: id(r.model) ? r.model : "redacted-model"}))};
+
+    const tasks = hermesAuxUsageTasks(row.tasks);
+    if (tasks !== undefined) result.usage.tasks = tasks;
   }
   if (raw.receipt) {
     const row = raw.receipt;
     if (!token(row.operationId) || !["not_found", "reserved", "running", "completed", "partial", "cancelled", "unknown", "native_failed", "permission_denied", "timeout"].includes(row.state)) throw new Error("Invalid receipt");
-    const receipt = {operationId: row.operationId, state: row.state, findings: []};
+    const receipt      = {operationId: row.operationId, state: row.state, findings: []};
     for (const key of ["startedAt", "updatedAt", "deadlineSeconds", "checks"]) if (number(row[key])) receipt[key] = row[key];
     if (["doctor", "security", "unknown"].includes(row.kind)) receipt.kind = row.kind;
     if ([...Object.keys(actions), "starting", "admitted", "native_checks", "component_discovery", "advisory_lookup", "finished", "gateway_changed", "cancel_unconfirmed", "result_unavailable"].includes(row.phase)) receipt.phase = row.phase;
@@ -86,4 +91,4 @@ function healthResult(raw) {
   return result;
 }
 
-module.exports = { HEALTH_OPERATIONS, HEALTH_READS, healthRequest, healthResult };
+module.exports = { HEALTH_READS, HEALTH_OPERATIONS, healthRequest, healthResult };

@@ -1,6 +1,6 @@
 # Reset relay credential — all devices
 
-**Guide version:** 2026-09-29 (1.3.26-hermes)
+**Guide version:** 2026-10-28 (1.3.27-hermes)
 
 Use this branch only when the user explicitly asks to reset the Relay
 Credential or suspects a paired phone is lost or compromised. This is an
@@ -19,8 +19,8 @@ marker on first bootstrap after upgrade without changing their credential.
 Before asking for confirmation, say exactly:
 
 > Reset immediately invalidates ALL existing app pairings, disconnects every
-> paired phone, requires secure QR or Manual re-pairing, and cannot restore the
-> prior credential.
+> paired phone, requires pairing again with a new phone code, and cannot restore
+> the prior credential.
 
 Explain that the next command is the only mutation: it requires confirmation
 in an interactive terminal on the Hermes host, generates and atomically stores
@@ -39,7 +39,7 @@ presenter, or non-interactive path. Before persistence it also requires a
 bounded Hermes service restart lifecycle. An unmanaged foreground gateway is a
 secret-free refusal: install and start the Hermes gateway service, then retry.
 
-Managed/NixOS Hermes profiles are outside the beta platform scope under the
+Managed/NixOS Hermes profiles are outside the supported platform scope under the
 [managed-mode ruling clarification](https://github.com/OcuClawhub/even&#99;law/issues/1321#issuecomment-5312718733).
 OcuClaw does not generate, prompt for, or bypass-write a secret there. A
 deployment-provided readable `OCUCLAW_RELAY_TOKEN` remains established and may
@@ -68,10 +68,11 @@ either credential.
 On success every phone is disconnected. Run `hermes ocuclaw doctor` and
 continue only when the route is currently verified. With the phone ready, call
 `{"operation":"pair_phone"}` so the supported Hermes TUI/Desktop panel obtains the
-verified address and advances from QR to the four-word local decision without
-passing either through the model.
+verified address and advances from the phone code to the four-word local decision
+without passing either through the model.
 
-QR and Manual are credential-free initiations of the same encrypted exchange.
+The phone code and manual pairing are credential-free initiations of the same
+encrypted exchange.
 Completion criterion: the intended phone completes an authenticated app hello;
 no other phone is described as paired. Then resume the Setup Assistant at the
 phone-origin/G2 completion journey. The separate-terminal

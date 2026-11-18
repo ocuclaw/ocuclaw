@@ -10,7 +10,7 @@ function genRunId() {
 
 const HIDDEN_AGENT_FALLBACK_BEFORE = [2026, 8, 0];
 
-function hostAllowsHiddenAgentFallback(hostVersion) {
+function hostAllowsHiddenAgentFallback(hostVersion     ) {
   if (typeof hostVersion !== "string") return false;
   const match = hostVersion.trim().match(/^(\d{4})\.(\d+)\.(\d+)/);
   if (!match) return false;
@@ -117,4 +117,4 @@ function registerSessionTitleDistiller(api, service) {
   });
 }
 
-module.exports = { registerSessionTitleDistiller, hostAllowsHiddenAgentFallback };
+module.exports = { hostAllowsHiddenAgentFallback, registerSessionTitleDistiller };

@@ -527,4 +527,4 @@ function createSessionDriverWatch(opts = {}) {
   };
 }
 
-module.exports = { DRIVER_STATES, buildSessionDriverSnapshot, sessionDriverSnapshotsEqual, createSessionDriverWatch };
+module.exports = { DRIVER_STATES, DEFAULT_LIVENESS_MS, buildSessionDriverSnapshot, sessionDriverSnapshotsEqual, createSessionDriverWatch };

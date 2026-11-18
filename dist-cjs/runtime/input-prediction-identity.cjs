@@ -1,8 +1,8 @@
-function clean(value) {
+function clean(value     ) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function resolveInputPredictionIdentity(lookups) {
+function resolveInputPredictionIdentity(lookups     ) {
   const l = lookups && typeof lookups === "object" ? lookups : {};
   const sessionKey = clean(l.clientSessionKey);
   const out = { sessionKey, agentId: "", profileId: "" };

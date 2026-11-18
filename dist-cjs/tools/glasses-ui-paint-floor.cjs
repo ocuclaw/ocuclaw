@@ -1,5 +1,73 @@
 const DEFAULT_PAINT_FLOOR_MS = 250;
 
+function cleanPatchItems(items     ) {
+  return items
+    .map((i     ) => {
+      if (typeof i === "string") return i;
+      if (i && typeof i === "object" && typeof i.label === "string") {
+        const o      = { label: i.label };
+        if (typeof i.body === "string") o.body = i.body;
+        if (typeof i.checked === "boolean") o.checked = i.checked;
+        return o;
+      }
+      return null;
+    })
+    .filter((i     ) => i !== null);
+}
+
+const labelOf = (item     ) => (typeof item === "string" ? item : item.label);
+
+function applyFieldPatchToSpec(spec     , patch     ) {
+  if (!spec || typeof spec !== "object" || Array.isArray(spec)) return spec;
+  if (!patch || typeof patch !== "object") return { ...spec };
+  const next      = { ...spec };
+  const title = typeof patch.title === "string" ? patch.title : undefined;
+  const body = typeof patch.body === "string" ? patch.body : undefined;
+  const items = Array.isArray(patch.items) ? cleanPatchItems(patch.items) : undefined;
+  if (spec.kind === "paged_text_surface") return next;
+  if (title !== undefined) next.title = title;
+  const current = Array.isArray(spec.items) ? spec.items : [];
+  switch (spec.kind) {
+    case "text_surface":
+      if (body !== undefined) next.body = body;
+      break;
+    case "list_surface":
+      if (items !== undefined) next.items = items.map(labelOf);
+      break;
+    case "list_with_details_surface":
+      if (items !== undefined) {
+        next.items = items.map((item     , i        ) => {
+          const existing = current[i];
+          const rowBody = typeof item === "object" && item.body !== undefined
+            ? item.body
+            : body !== undefined
+              ? body
+              : existing && typeof existing === "object" ? existing.body : undefined;
+          return rowBody === undefined ? { label: labelOf(item) } : { label: labelOf(item), body: rowBody };
+        });
+      } else if (body !== undefined) {
+        next.items = current.map((item     ) => ({ ...item, body }));
+      }
+      break;
+    case "checklist_surface":
+      if (items !== undefined) {
+        next.items = items.map((item     , i        ) => {
+          const existing = current[i];
+          const checked = typeof item === "object" && item.checked !== undefined
+            ? item.checked
+            : existing && typeof existing === "object" ? existing.checked : undefined;
+          return checked === undefined ? { label: labelOf(item) } : { label: labelOf(item), checked };
+        });
+      }
+      break;
+    default:
+
+      if (body !== undefined) next.body = body;
+      if (items !== undefined) next.items = items;
+  }
+  return next;
+}
+
 function createPaintFloorCoalescer(deps) {
   const paintFloorMs = Number.isFinite(deps.paintFloorMs) ? deps.paintFloorMs : DEFAULT_PAINT_FLOOR_MS;
   const send = deps.send;
@@ -28,6 +96,17 @@ function createPaintFloorCoalescer(deps) {
     if (isMarkerOnly(incoming) && isRenderSentinel(base)) {
       return { ...base, __marker: incoming.marker };
     }
+    if (isRenderSentinel(base) && incoming && typeof incoming === "object" && !isRenderSentinel(incoming)) {
+
+      const next      = { ...base, __spec: applyFieldPatchToSpec(base.__spec, incoming) };
+      if (incoming.__recordedSpec && typeof incoming.__recordedSpec === "object") {
+        next.__recordedSpec = incoming.__recordedSpec;
+      } else if (base.__recordedSpec !== undefined) {
+        next.__recordedSpec = applyFieldPatchToSpec(base.__recordedSpec, incoming);
+      }
+      if (incoming.marker !== undefined) next.__marker = incoming.marker;
+      return next;
+    }
     if (isRenderSentinel(base) !== isRenderSentinel(incoming)) {
 
       const next = incoming && typeof incoming === "object" ? { ...incoming } : {};
@@ -40,6 +119,10 @@ function createPaintFloorCoalescer(deps) {
     const merged = base ? { ...base } : {};
     if (incoming && typeof incoming === "object") {
       for (const k of Object.keys(incoming)) merged[k] = incoming[k];
+    }
+
+    if (isRenderSentinel(merged) && (base?.__origin === "agent" || incoming?.__origin === "agent")) {
+      merged.__origin = "agent";
     }
     return merged;
   }
@@ -88,12 +171,24 @@ function createPaintFloorCoalescer(deps) {
     bySurface.delete(surfaceId);
   }
 
-  function hasPending(surfaceId) {
+  function hasPending(surfaceId     ) {
     const st = bySurface.get(surfaceId);
     return !!(st && st.pendingPatch);
   }
 
-  return { enqueue, dispose, hasPending, _bySurface: bySurface };
+  function predictFieldPatch(surfaceId     , phoneSpec     , patch     ) {
+    const st = bySurface.get(surfaceId);
+    const pending = st ? st.pendingPatch : null;
+    if (isRenderSentinel(pending)) return applyFieldPatchToSpec(pending.__spec, patch);
+    return applyFieldPatchToSpec(phoneSpec, pending ? mergePatch(pending, patch) : patch);
+  }
+
+  function pendingRenderOf(surfaceId     ) {
+    const st = bySurface.get(surfaceId);
+    return st && isRenderSentinel(st.pendingPatch) ? st.pendingPatch : null;
+  }
+
+  return { enqueue, dispose, hasPending, predictFieldPatch, pendingRenderOf, _bySurface: bySurface };
 }
 
-module.exports = { createPaintFloorCoalescer, DEFAULT_PAINT_FLOOR_MS };
+module.exports = { DEFAULT_PAINT_FLOOR_MS, applyFieldPatchToSpec, createPaintFloorCoalescer };

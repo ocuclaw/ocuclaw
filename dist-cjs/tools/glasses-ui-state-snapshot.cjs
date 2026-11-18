@@ -1,8 +1,8 @@
 const { DELIVERY_RUNG_PHRASING, DELIVERY_RUNGS, assertHonestFieldName } = require("./glasses-ui-delivery-ladder.cjs");
 const { MACHINE_PROJECTION_LIST_CAP, allowlistWireKind, capCodeList, resolveLayoutBudgets } = require("./glasses-ui-plan-lint.cjs");
 
-const UI_STATE_SCHEMA_ID = "glasses-ui/state-snapshot@7";
-const UI_STATE_SCHEMA_VERSION = 7;
+const UI_STATE_SCHEMA_ID = "glasses-ui/state-snapshot@8";
+const UI_STATE_SCHEMA_VERSION = 8;
 
 const UI_STATE_RESULT = "ui_state";
 
@@ -62,7 +62,7 @@ const LIVEUI_HOST_CAPABILITY_HOOKS = Object.freeze([
   Object.freeze({ capability: "clientCapabilityRead", hook: "relay.hasClientCapability" }),
 ]);
 
-function readHookPath(port, path) {
+function readHookPath(port     , path     ) {
   const parts = String(path).split(".");
   let cursor = port;
   for (const part of parts) {
@@ -72,8 +72,8 @@ function readHookPath(port, path) {
   return cursor;
 }
 
-function buildHostCapabilityManifest(port) {
-  const capabilities = {};
+function buildHostCapabilityManifest(port     ) {
+  const capabilities      = {};
   for (const row of LIVEUI_HOST_CAPABILITY_HOOKS) {
     capabilities[row.capability] = typeof readHookPath(port, row.hook) === "function";
   }
@@ -103,6 +103,31 @@ const UI_STATE_MODEL_FIELDS = Object.freeze([
   "readingProfile",
   "hostCapabilities",
 ]);
+
+const UI_STATE_MODEL_V2_FIELDS = Object.freeze(["state", "outcomes"]);
+
+const UI_STATE_V2_BLOCK_FIELDS = Object.freeze([
+  "surface", "rev", "age_ms", "derived", "timers", "focus", "fallback", "report",
+  "result", "action", "row", "selected_index", "removed", "later_rev",
+  "mode", "status", "remaining_ms", "elapsed_ms", "held_ms", "length_ms", "text_bytes", "present",
+]);
+
+function attachLiveUiV2Read(model     , read     ) {
+  if (!read || typeof read !== "object") return model;
+  for (const name of [...UI_STATE_MODEL_V2_FIELDS, ...UI_STATE_V2_BLOCK_FIELDS]) {
+    assertHonestFieldName(name, "ui-state model channel V2 block");
+    if (UI_STATE_STRUCTURAL_EXCLUSIONS.includes(name)) {
+      throw new Error(`ui-state model channel V2 block: field "${name}" is structurally excluded`);
+    }
+  }
+  return {
+    ...model,
+    ...projectByEnumeration(UI_STATE_MODEL_V2_FIELDS, {
+      state: read.state === undefined ? null : read.state,
+      outcomes: Array.isArray(read.outcomes) ? read.outcomes : [],
+    }),
+  };
+}
 
 const UI_STATE_MACHINE_FIELDS = Object.freeze([
   "result",
@@ -208,8 +233,8 @@ const UI_STATE_COMPANION_EXCLUSIONS = Object.freeze([
   "authorization",
 ]);
 
-function projectByEnumeration(fields, facts) {
-  const out = {};
+function projectByEnumeration(fields     , facts     ) {
+  const out      = {};
   for (const field of fields) {
     if (facts && Object.prototype.hasOwnProperty.call(facts, field)) {
       const value = facts[field];
@@ -219,7 +244,7 @@ function projectByEnumeration(fields, facts) {
   return out;
 }
 
-function collectKeys(value, sink, depth) {
+function collectKeys(value     , sink     , depth     ) {
   if (depth > 12 || value === null || typeof value !== "object") return;
   if (Array.isArray(value)) {
     for (const item of value) collectKeys(item, sink, depth + 1);
@@ -231,7 +256,7 @@ function collectKeys(value, sink, depth) {
   }
 }
 
-function assertUiStateExclusions(envelope, context) {
+function assertUiStateExclusions(envelope     , context     ) {
   const keys = new Set();
   collectKeys(envelope, keys, 0);
   for (const excluded of UI_STATE_STRUCTURAL_EXCLUSIONS) {
@@ -247,7 +272,7 @@ function assertUiStateExclusions(envelope, context) {
   return true;
 }
 
-function assertCompanionSnapshotExclusions(envelope, context) {
+function assertCompanionSnapshotExclusions(envelope     , context     ) {
   const keys = new Set();
   collectKeys(envelope, keys, 0);
   for (const excluded of UI_STATE_COMPANION_EXCLUSIONS) {
@@ -261,7 +286,7 @@ function assertCompanionSnapshotExclusions(envelope, context) {
   return true;
 }
 
-function assertUiStateFieldNamesHonest(envelope, context) {
+function assertUiStateFieldNamesHonest(envelope     , context     ) {
   const keys = new Set();
   collectKeys(envelope, keys, 0);
   for (const key of keys) {
@@ -270,7 +295,7 @@ function assertUiStateFieldNamesHonest(envelope, context) {
   return true;
 }
 
-function deriveRenderContext(signals) {
+function deriveRenderContext(signals     ) {
   const s = signals || {};
   const presence =
     s.linkPresence === undefined || s.linkPresence === null
@@ -296,7 +321,7 @@ function deriveRenderContext(signals) {
   return { linkPresence: presence, glassesPresence, backpressure, agentTurn };
 }
 
-function deriveReadingProfile(kind, opts) {
+function deriveReadingProfile(kind     , opts     ) {
   const wireKind = allowlistWireKind(kind);
   if (!wireKind) {
     return {
@@ -317,7 +342,7 @@ function deriveReadingProfile(kind, opts) {
   };
 }
 
-function projectDelivery(deliveryState, receiptPresent) {
+function projectDelivery(deliveryState     , receiptPresent     ) {
   if (!deliveryState) {
     return {
       rung: null,
@@ -342,7 +367,7 @@ function projectDelivery(deliveryState, receiptPresent) {
   };
 }
 
-function projectUiStateChannels(facts) {
+function projectUiStateChannels(facts     ) {
   const f = facts || {};
   const active = f.active || null;
   const shared = {
@@ -439,7 +464,7 @@ function projectUiStateChannels(facts) {
   const modelStack = {
     depth: f.stackDepth || 0,
     entries: capCodeList(
-      rawStack.map((e) => ({
+      rawStack.map((e     ) => ({
         surfaceUuid: e.surfaceUuid,
         kind: allowlistWireKind(e.kind),
         titleChars: typeof e.title === "string" ? e.title.length : 0,
@@ -450,7 +475,7 @@ function projectUiStateChannels(facts) {
   const companionStack = {
     depth: f.stackDepth || 0,
     entries: capCodeList(
-      rawStack.map((e) => ({
+      rawStack.map((e     ) => ({
         surfaceUuid: e.surfaceUuid,
         kind: allowlistWireKind(e.kind),
         title: typeof e.title === "string" ? e.title : null,
@@ -500,7 +525,7 @@ function projectUiStateChannels(facts) {
   return { model, machine, dev, companion };
 }
 
-function emptyUiStateFacts(sessionKey, extra) {
+function emptyUiStateFacts(sessionKey     , extra     ) {
   const e = extra || {};
   return {
     sessionKey: sessionKey || null,
@@ -543,4 +568,4 @@ const UI_STATE_UNSENT_RUNG = DELIVERY_RUNGS.AUTHORED;
 
 const UI_STATE_RUNG_PHRASING = DELIVERY_RUNG_PHRASING;
 
-module.exports = { UI_STATE_SCHEMA_ID, UI_STATE_SCHEMA_VERSION, UI_STATE_RESULT, LINK_PRESENCE_STATES, BACKPRESSURE_STATES, AGENT_TURN_STATES, SURFACE_MARKER_STATES, LIVEUI_HOST_CAPABILITY_HOOKS, buildHostCapabilityManifest, UI_STATE_MODEL_FIELDS, UI_STATE_MACHINE_FIELDS, UI_STATE_COMPANION_FIELDS, UI_STATE_DEV_FIELDS, UI_STATE_STRUCTURAL_EXCLUSIONS, UI_STATE_COMPANION_EXCLUSIONS, projectByEnumeration, assertUiStateExclusions, assertCompanionSnapshotExclusions, assertUiStateFieldNamesHonest, deriveRenderContext, deriveReadingProfile, projectDelivery, projectUiStateChannels, emptyUiStateFacts, UI_STATE_UNSENT_RUNG, UI_STATE_RUNG_PHRASING };
+module.exports = { UI_STATE_SCHEMA_ID, UI_STATE_SCHEMA_VERSION, UI_STATE_RESULT, LINK_PRESENCE_STATES, GLASSES_PRESENCE_STATES, BACKPRESSURE_STATES, AGENT_TURN_STATES, SURFACE_MARKER_STATES, STAGE_ROLES, LIVEUI_HOST_CAPABILITY_HOOKS, buildHostCapabilityManifest, UI_STATE_MODEL_FIELDS, UI_STATE_MODEL_V2_FIELDS, attachLiveUiV2Read, UI_STATE_MACHINE_FIELDS, UI_STATE_COMPANION_FIELDS, UI_STATE_DEV_FIELDS, UI_STATE_STRUCTURAL_EXCLUSIONS, UI_STATE_COMPANION_EXCLUSIONS, projectByEnumeration, assertUiStateExclusions, assertCompanionSnapshotExclusions, assertUiStateFieldNamesHonest, deriveRenderContext, deriveReadingProfile, projectDelivery, projectUiStateChannels, emptyUiStateFacts, UI_STATE_UNSENT_RUNG, UI_STATE_RUNG_PHRASING };

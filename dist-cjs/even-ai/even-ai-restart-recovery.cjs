@@ -1,7 +1,5 @@
 const { randomUUID } = require("node:crypto");
-
 const fs = require("node:fs");
-
 const path = require("node:path");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
 const { scopeOpenClawSessionKey } = require("../gateway/gateway-bridge.cjs");
@@ -22,13 +20,13 @@ const DEFAULT_VERIFY_DELAY_MS = 1500;
 const MAX_RESEND_ATTEMPTS = 3;
 const LIVE_PENDING_STATES = Object.freeze(["queued", "running", "accepted", "staged"]);
 
-function trimString(value) {
+function trimString(value     ) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function cloneSendOptions(sendOptions) {
+function cloneSendOptions(sendOptions     ) {
   if (!sendOptions || typeof sendOptions !== "object") return {};
-  const out = {};
+  const out      = {};
   const prompt = sendOptions.prompt;
   if (prompt && typeof prompt === "object" && typeof prompt.content === "string") {
     out.prompt = {
@@ -42,7 +40,7 @@ function cloneSendOptions(sendOptions) {
   return out;
 }
 
-function normalizeEntry(raw) {
+function normalizeEntry(raw     ) {
   if (!raw || typeof raw !== "object") return null;
   const runId = trimString(raw.runId);
   const sessionKey = trimString(raw.sessionKey);
@@ -62,7 +60,7 @@ function normalizeEntry(raw) {
   };
 }
 
-function createEvenAiSendJournal(opts = {}) {
+function createEvenAiSendJournal(opts      = {}) {
   const logger = normalizeLogger(opts.logger);
   const now = typeof opts.now === "function" ? opts.now : () => Date.now();
   const maxEntries =
@@ -86,7 +84,7 @@ function createEvenAiSendJournal(opts = {}) {
           if (entry) entries.set(entry.runId, entry);
         }
       }
-    } catch (err) {
+    } catch (err     ) {
       if (!err || err.code !== "ENOENT") {
         logger.warn(`[evenai] send journal unreadable, starting empty: ${err && err.message}`);
       }
@@ -109,7 +107,7 @@ function createEvenAiSendJournal(opts = {}) {
         { mode: 0o600, flag: "wx" },
       );
       fs.renameSync(temporary, filePath);
-    } catch (err) {
+    } catch (err     ) {
 
       logger.warn(`[evenai] send journal write failed: ${err && err.message}`);
     } finally {
@@ -128,7 +126,7 @@ function createEvenAiSendJournal(opts = {}) {
         .sort((a, b) => a.acceptedAtMs - b.acceptedAtMs);
     },
 
-    record(raw) {
+    record(raw     ) {
       const entry = normalizeEntry({ acceptedAtMs: now(), ...raw });
       if (!entry) return false;
       entries.delete(entry.runId);
@@ -140,7 +138,7 @@ function createEvenAiSendJournal(opts = {}) {
       return true;
     },
 
-    complete(runId) {
+    complete(runId     ) {
       const key = trimString(runId);
       if (!key || !entries.has(key)) return false;
       entries.delete(key);
@@ -148,7 +146,7 @@ function createEvenAiSendJournal(opts = {}) {
       return true;
     },
 
-    has(runId) {
+    has(runId     ) {
       return entries.has(trimString(runId));
     },
 
@@ -158,7 +156,7 @@ function createEvenAiSendJournal(opts = {}) {
   };
 }
 
-function messageText(message) {
+function messageText(message     ) {
   if (!message) return "";
   const content = message.content;
   if (typeof content === "string") return content;
@@ -169,13 +167,13 @@ function messageText(message) {
     .join("");
 }
 
-function messageIdempotencyKey(message) {
+function messageIdempotencyKey(message     ) {
   if (!message || typeof message !== "object") return "";
   const meta = message.__openclaw && typeof message.__openclaw === "object" ? message.__openclaw : {};
   return trimString(message.idempotencyKey) || trimString(meta.idempotencyKey);
 }
 
-function messageTimestampMs(message) {
+function messageTimestampMs(message     ) {
   if (!message || typeof message !== "object") return null;
   const value = Number(message.timestamp);
   return Number.isFinite(value) ? value : null;
@@ -184,14 +182,14 @@ function messageTimestampMs(message) {
 const HOST_RESUME_PROMPT_PREFIX =
   "[System] Your previous turn was interrupted by a gateway restart";
 
-function historyStampsKeys(messages) {
-  return messages.some((message) => message && message.role === "user" && messageIdempotencyKey(message));
+function historyStampsKeys(messages     ) {
+  return messages.some((message     ) => message && message.role === "user" && messageIdempotencyKey(message));
 }
 
-function evenAiHostResumedOldestEntry(oldestEntry, history) {
+function evenAiHostResumedOldestEntry(oldestEntry     , history     ) {
   const messages = history && Array.isArray(history.messages) ? history.messages : [];
   if (!oldestEntry || historyStampsKeys(messages)) return false;
-  return messages.some((message) => {
+  return messages.some((message     ) => {
     if (!message || message.role !== "user") return false;
     if (!messageText(message).trimStart().startsWith(HOST_RESUME_PROMPT_PREFIX)) return false;
     const ts = messageTimestampMs(message);
@@ -199,7 +197,7 @@ function evenAiHostResumedOldestEntry(oldestEntry, history) {
   });
 }
 
-function classifyEvenAiJournalEntry(entry, history) {
+function classifyEvenAiJournalEntry(entry     , history     ) {
   const messages = history && Array.isArray(history.messages) ? history.messages : [];
   const prefix = `${entry.runId}:`;
   for (const message of messages) {
@@ -229,7 +227,7 @@ function classifyEvenAiJournalEntry(entry, history) {
   return "lost";
 }
 
-function isEvenAiRecoverySessionBusy(history) {
+function isEvenAiRecoverySessionBusy(history     ) {
   const info = history && history.sessionInfo;
   if (!info || typeof info !== "object") return false;
   const status = trimString(info.status).toLowerCase();
@@ -238,7 +236,7 @@ function isEvenAiRecoverySessionBusy(history) {
   return info.abortedLastRun === true && status !== "failed" && status !== "killed";
 }
 
-function findEntryUserRowIndex(entry, messages) {
+function findEntryUserRowIndex(entry     , messages     ) {
   const prefix = `${entry.runId}:`;
   const stamped = historyStampsKeys(messages);
   const wanted = entry.text.trim();
@@ -257,7 +255,7 @@ function findEntryUserRowIndex(entry, messages) {
   return -1;
 }
 
-function isEvenAiEntryStrandedUnanswered(entry, history) {
+function isEvenAiEntryStrandedUnanswered(entry     , history     ) {
   if (isEvenAiRecoverySessionBusy(history)) return false;
   const messages = history && Array.isArray(history.messages) ? history.messages : [];
   const index = findEntryUserRowIndex(entry, messages);
@@ -275,11 +273,11 @@ function isEvenAiEntryStrandedUnanswered(entry, history) {
   return true;
 }
 
-function sleep(ms, setTimeoutFn) {
+function sleep(ms     , setTimeoutFn     ) {
   return new Promise((resolve) => setTimeoutFn(resolve, ms));
 }
 
-function createEvenAiRestartRecovery(opts = {}) {
+function createEvenAiRestartRecovery(opts      = {}) {
   const journal = opts.journal;
   const gatewayBridge = opts.gatewayBridge;
   if (!journal || typeof journal.record !== "function") {
@@ -309,21 +307,21 @@ function createEvenAiRestartRecovery(opts = {}) {
   const dispatchUserSend =
     typeof opts.dispatchGatewayUserSend === "function"
       ? opts.dispatchGatewayUserSend
-      : (_sessionKey, send) => send();
+      : (_sessionKey     , send     ) => send();
   const beginPromptTurnOwnership =
     typeof opts.beginPromptTurnOwnership === "function" ? opts.beginPromptTurnOwnership : () => null;
   const cancelPromptTurnOwnership =
     typeof opts.cancelPromptTurnOwnership === "function" ? opts.cancelPromptTurnOwnership : () => {};
 
   let recoveryStarted = false;
-  let recoveryPromise = null;
+  let recoveryPromise      = null;
   let closed = false;
 
-  const offMessage = gatewayBridge.on("message", (data) => {
+  const offMessage = gatewayBridge.on("message", (data     ) => {
     if (data && typeof data.role === "string" && data.role !== "assistant") return;
     journal.complete(data && data.runId);
   });
-  const offActivity = gatewayBridge.on("activity", (data) => {
+  const offActivity = gatewayBridge.on("activity", (data     ) => {
     const phase = trimString(data && data.phase).toLowerCase();
 
     if (phase === "error") journal.complete(data && data.runId);
@@ -336,14 +334,14 @@ function createEvenAiRestartRecovery(opts = {}) {
     });
   });
 
-  async function readHistory(gatewaySessionKey) {
+  async function readHistory(gatewaySessionKey     ) {
     return gatewayBridge.request("chat.history", {
       sessionKey: gatewaySessionKey,
       limit: HISTORY_LIMIT,
     });
   }
 
-  async function readSettledHistory(gatewaySessionKey) {
+  async function readSettledHistory(gatewaySessionKey     ) {
     const deadline = now() + settleTimeoutMs;
     let history = await readHistory(gatewaySessionKey);
     while (!closed && isEvenAiRecoverySessionBusy(history) && now() < deadline) {
@@ -353,11 +351,11 @@ function createEvenAiRestartRecovery(opts = {}) {
     return history;
   }
 
-  async function resend(entry) {
+  async function resend(entry     ) {
     const sendOptions = cloneSendOptions(entry.sendOptions);
-    let ticket = null;
+    let ticket      = null;
 
-    const ack = await dispatchUserSend(entry.sessionKey, () => {
+    const ack      = await dispatchUserSend(entry.sessionKey, () => {
       ticket = beginPromptTurnOwnership(entry.sessionKey, {
         owner: "even-ai",
         lane: "turn-scoped",
@@ -390,7 +388,7 @@ function createEvenAiRestartRecovery(opts = {}) {
     return replacement;
   }
 
-  async function resendAndConfirm(gatewaySessionKey, entry) {
+  async function resendAndConfirm(gatewaySessionKey     , entry     ) {
     let current = entry;
     for (let attempt = 1; attempt <= MAX_RESEND_ATTEMPTS; attempt += 1) {
       current = await resend(current);
@@ -411,8 +409,8 @@ function createEvenAiRestartRecovery(opts = {}) {
   }
 
   async function recover() {
-    const candidates = journal.previousEntries().filter((entry) => journal.has(entry.runId));
-    const summary = { candidates: candidates.length, resent: 0, reached: 0, pending: 0, stale: 0, failed: 0 };
+    const candidates = journal.previousEntries().filter((entry     ) => journal.has(entry.runId));
+    const summary      = { candidates: candidates.length, resent: 0, reached: 0, pending: 0, stale: 0, failed: 0 };
     if (candidates.length === 0) return summary;
 
     const bySession = new Map();
@@ -437,7 +435,7 @@ function createEvenAiRestartRecovery(opts = {}) {
       let history;
       try {
         history = await readSettledHistory(gatewaySessionKey);
-      } catch (err) {
+      } catch (err     ) {
 
         summary.failed += sessionEntries.length;
         emitDebug("evenai", "restart_recovery_history_failed", "warn", { sessionKey: gatewaySessionKey }, () => ({
@@ -449,7 +447,7 @@ function createEvenAiRestartRecovery(opts = {}) {
       const hostResumedOldest = evenAiHostResumedOldestEntry(sessionEntries[0], history);
       for (const entry of sessionEntries) {
         if (closed) break;
-        let verdict =
+        let verdict      =
           hostResumedOldest && entry === sessionEntries[0]
             ? "reached"
             : classifyEvenAiJournalEntry(entry, history);
@@ -473,7 +471,7 @@ function createEvenAiRestartRecovery(opts = {}) {
             ageMs: now() - entry.acceptedAtMs,
             textChars: entry.text.length,
           }));
-        } catch (err) {
+        } catch (err     ) {
           summary.failed += 1;
           emitDebug("evenai", "restart_recovery_resend_failed", "warn", { sessionKey: gatewaySessionKey, runId: entry.runId }, () => ({
             message: err && err.message ? err.message : String(err),
@@ -489,10 +487,10 @@ function createEvenAiRestartRecovery(opts = {}) {
 
   return {
 
-    recordAcceptedSend(params = {}) {
+    recordAcceptedSend(params      = {}) {
       try {
         return journal.record(params);
-      } catch (err) {
+      } catch (err     ) {
         logger.warn(`[evenai] send journal record failed: ${err && err.message}`);
         return false;
       }
@@ -511,4 +509,4 @@ function createEvenAiRestartRecovery(opts = {}) {
   };
 }
 
-module.exports = { classifyEvenAiJournalEntry, createEvenAiRestartRecovery, createEvenAiSendJournal, evenAiHostResumedOldestEntry, isEvenAiEntryStrandedUnanswered, isEvenAiRecoverySessionBusy };
+module.exports = { createEvenAiSendJournal, evenAiHostResumedOldestEntry, classifyEvenAiJournalEntry, isEvenAiRecoverySessionBusy, isEvenAiEntryStrandedUnanswered, createEvenAiRestartRecovery };

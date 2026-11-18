@@ -1,18 +1,21 @@
+const { modelInputKey, modelInputsFromCatalogRows } = require("../domain/model-input-kinds.cjs");
+
 const ABORT_SETTLE_GRACE_MS = 750;
 
 const { INPUT_PREDICTION_LIMITS, INPUT_PREDICTION_METHODS, INPUT_PREDICTION_MODEL_CHOICE_RE, INPUT_PREDICTION_MODEL_LIST_CAP, INPUT_PREDICTION_PER_WORD_RETIRED_REASON, INPUT_PREDICTION_PROTOCOL_VERSION, INPUT_PREDICTION_PURPOSE, modelAllowResult, normalizeUsage, policyRevisionOf, predictionResult, replyModelSpeedFacts } = require("../runtime/input-prediction-shared.cjs");
 const { SILENT_INPUT_OPEN_LIMITS, SILENT_INPUT_OPEN_TEST_EXAMPLE, SILENT_INPUT_OPEN_TEST_LIMITS, buildOpenReplyMessages, normalizeOpenRequest, openReplyResult, classifyOpenReplyError, openReplyFailureClass, parseOpenReplyText } = require("../runtime/silent-input-open-reply.cjs");
+const { configuredAgentRows } = require("./openclaw-agent-roster.cjs");
 
 const DEFAULT_CHOICE = "default";
 
-function configuredOpenReplyRoute(config, identity = {}) {
+function configuredOpenReplyRoute(config     , identity      = {}) {
   const agents = config && config.agents || {};
-  const list = Array.isArray(agents.list) ? agents.list : [];
+  const list = configuredAgentRows(config);
   const id = typeof identity.agentId === "string" ? identity.agentId.trim().toLowerCase() : "";
   const agent = id
-    ? list.find((entry) => typeof entry.id === "string" && entry.id.trim().toLowerCase() === id)
-    : list.find((entry) => entry.default === true) || list[0];
-  const primary = (value) => typeof value === "string" ? value.trim()
+    ? list.find((entry     ) => typeof entry.id === "string" && entry.id.trim().toLowerCase() === id)
+    : list.find((entry     ) => entry.default === true) || list[0];
+  const primary = (value     ) => typeof value === "string" ? value.trim()
     : value && typeof value.primary === "string" ? value.primary.trim() : "";
   const defaults = agents.defaults || {};
   let ref = primary(agent && agent.model) || primary(defaults.model);
@@ -20,7 +23,7 @@ function configuredOpenReplyRoute(config, identity = {}) {
   if (ref.includes("@")) ref = ref.slice(0, ref.lastIndexOf("@")).trim();
   if (!ref.includes("/")) {
     const aliases = defaults.models && typeof defaults.models === "object" ? defaults.models : {};
-    const match = Object.entries(aliases).find(([, entry]) =>
+    const match = Object.entries(aliases).find(([, entry]     ) =>
       typeof entry?.alias === "string" && entry.alias.trim().toLowerCase() === ref.toLowerCase());
     if (!ref || !match) return null;
     ref = match[0];
@@ -31,12 +34,12 @@ function configuredOpenReplyRoute(config, identity = {}) {
   return slash > 0 && provider && model ? { provider, model } : null;
 }
 
-function canonicalModelRef(raw, aliases) {
+function canonicalModelRef(raw     , aliases     ) {
   let ref = typeof raw === "string" ? raw.trim() : "";
   if (ref.includes("@")) ref = ref.slice(0, ref.lastIndexOf("@")).trim();
   if (!ref) return "";
   if (!ref.includes("/")) {
-    const match = Object.entries(aliases).find(([, entry]) =>
+    const match = Object.entries(aliases).find(([, entry]     ) =>
       typeof entry?.alias === "string" && entry.alias.trim().toLowerCase() === ref.toLowerCase());
     if (!match) return "";
     ref = match[0].trim();
@@ -48,31 +51,31 @@ function canonicalModelRef(raw, aliases) {
   return out && INPUT_PREDICTION_MODEL_CHOICE_RE.test(out) ? out : "";
 }
 
-function configuredReplyModels(config, identity = {}) {
+function configuredReplyModels(config     , identity      = {}) {
   const agents = config && config.agents || {};
   const defaults = agents.defaults || {};
   const aliases = defaults.models && typeof defaults.models === "object" && !Array.isArray(defaults.models)
     ? defaults.models : {};
-  const out = [];
-  const seen = new Set();
-  const add = (raw) => {
+  const out      = [];
+  const seen      = new Set();
+  const add = (raw     ) => {
     const ref = canonicalModelRef(raw, aliases);
     if (ref && !seen.has(ref)) {
       seen.add(ref);
       out.push(ref);
     }
   };
-  const addRoute = (value) => {
+  const addRoute = (value     ) => {
     if (typeof value === "string") return add(value);
     if (!value || typeof value !== "object") return;
     add(value.primary);
     if (Array.isArray(value.fallbacks)) for (const entry of value.fallbacks) add(entry);
   };
-  const list = Array.isArray(agents.list) ? agents.list : [];
+  const list = configuredAgentRows(config);
   const id = typeof identity.agentId === "string" ? identity.agentId.trim().toLowerCase() : "";
   const agent = id
-    ? list.find((entry) => entry && typeof entry.id === "string" && entry.id.trim().toLowerCase() === id)
-    : list.find((entry) => entry && entry.default === true) || list[0];
+    ? list.find((entry     ) => entry && typeof entry.id === "string" && entry.id.trim().toLowerCase() === id)
+    : list.find((entry     ) => entry && entry.default === true) || list[0];
   if (agent) addRoute(agent.model);
   addRoute(defaults.model);
   for (const key of Object.keys(aliases)) add(key);
@@ -91,34 +94,34 @@ function configuredReplyModels(config, identity = {}) {
   return out;
 }
 
-function isSeparateAgentRuntime(entry) {
+function isSeparateAgentRuntime(entry     ) {
   const runtime = entry && typeof entry === "object" ? entry.agentRuntime : null;
   const id = runtime && typeof runtime === "object" && typeof runtime.id === "string"
     ? runtime.id.trim().toLowerCase() : "";
   return Boolean(id) && !["auto", "default", "openclaw", "pi"].includes(id);
 }
 
-function runtimeOnlyModelMatcher(config, identity = {}) {
+function runtimeOnlyModelMatcher(config     , identity      = {}) {
   const agents = config && config.agents || {};
   const defaults = agents.defaults || {};
   const aliases = defaults.models && typeof defaults.models === "object" && !Array.isArray(defaults.models)
     ? defaults.models : {};
   const explicit = new Set();
   const wholeProviders = new Set();
-  const add = (raw) => {
+  const add = (raw     ) => {
     const ref = canonicalModelRef(raw, aliases);
     if (ref) explicit.add(ref);
   };
-  const fromMap = (map) => {
+  const fromMap = (map     ) => {
     if (!map || typeof map !== "object" || Array.isArray(map)) return;
     for (const [key, entry] of Object.entries(map)) if (isSeparateAgentRuntime(entry)) add(key);
   };
   fromMap(aliases);
-  const list = Array.isArray(agents.list) ? agents.list : [];
+  const list = configuredAgentRows(config);
   const id = typeof identity.agentId === "string" ? identity.agentId.trim().toLowerCase() : "";
   const agent = id
-    ? list.find((entry) => entry && typeof entry.id === "string" && entry.id.trim().toLowerCase() === id)
-    : list.find((entry) => entry && entry.default === true) || list[0];
+    ? list.find((entry     ) => entry && typeof entry.id === "string" && entry.id.trim().toLowerCase() === id)
+    : list.find((entry     ) => entry && entry.default === true) || list[0];
   if (agent) fromMap(agent.models);
   const providers = config && config.models && config.models.providers;
   if (providers && typeof providers === "object" && !Array.isArray(providers)) {
@@ -135,14 +138,14 @@ function runtimeOnlyModelMatcher(config, identity = {}) {
       }
     }
   }
-  return (raw) => {
+  return (raw     ) => {
     const ref = canonicalModelRef(raw, aliases);
     if (!ref) return false;
     return explicit.has(ref) || wholeProviders.has(ref.slice(0, ref.indexOf("/")));
   };
 }
 
-function configuredModelOutputCost(config, ref) {
+function configuredModelOutputCost(config     , ref     , field                     = "output") {
   const slash = typeof ref === "string" ? ref.indexOf("/") : -1;
   if (slash <= 0) return null;
   const provider = ref.slice(0, slash).trim().toLowerCase();
@@ -155,7 +158,7 @@ function configuredModelOutputCost(config, ref) {
     const models = block && Array.isArray(block.models) ? block.models : [];
     for (const entry of models) {
       if (!entry || typeof entry !== "object" || typeof entry.id !== "string" || entry.id.trim() !== model) continue;
-      const out = entry.cost && typeof entry.cost === "object" ? entry.cost.output : undefined;
+      const out = entry.cost && typeof entry.cost === "object" ? entry.cost[field] : undefined;
       if (typeof out === "number" && Number.isFinite(out) && out >= 0) return out;
     }
   }
@@ -163,7 +166,7 @@ function configuredModelOutputCost(config, ref) {
 }
 
 function nodeFs() {
-  const runtime = globalThis;
+  const runtime      = globalThis;
   const proc = runtime.process;
   try {
     if (!proc || typeof proc.getBuiltinModule !== "function") return { fs: null, path: null, entry: "" };
@@ -173,19 +176,32 @@ function nodeFs() {
   }
 }
 
-function bundledCatalogOutputCosts(hostRoot) {
+function bundledCatalogOutputCosts(hostRoot     , field                     = "output") {
   const costs = new Map();
+  for (const { provider, block } of bundledProviderCatalogs(hostRoot)) {
+    for (const entry of block.models) {
+      if (!entry || typeof entry.id !== "string") continue;
+      const out = entry.cost && typeof entry.cost === "object" ? entry.cost[field] : undefined;
+      const ref = `${provider.trim().toLowerCase()}/${entry.id.trim()}`.toLowerCase();
+      if (typeof out === "number" && Number.isFinite(out) && out >= 0 && !costs.has(ref)) costs.set(ref, out);
+    }
+  }
+  return costs;
+}
+
+function bundledProviderCatalogs(hostRoot     ) {
+  const out        = [];
   const { fs, path } = nodeFs();
   const dir = fs && typeof hostRoot === "string" && hostRoot ? path.join(hostRoot, "dist", "extensions") : "";
-  if (!dir) return costs;
-  let names = [];
+  if (!dir) return out;
+  let names      = [];
   try {
     names = fs.readdirSync(dir);
   } catch {
-    return costs;
+    return out;
   }
   for (const name of names) {
-    let manifest = null;
+    let manifest      = null;
     try {
       manifest = JSON.parse(fs.readFileSync(path.join(dir, name, "openclaw.plugin.json"), "utf8"));
     } catch {
@@ -194,16 +210,51 @@ function bundledCatalogOutputCosts(hostRoot) {
     const providers = manifest && manifest.modelCatalog && manifest.modelCatalog.providers;
     if (!providers || typeof providers !== "object" || Array.isArray(providers)) continue;
     for (const provider of Object.keys(providers)) {
-      const models = providers[provider] && Array.isArray(providers[provider].models) ? providers[provider].models : [];
-      for (const entry of models) {
-        if (!entry || typeof entry.id !== "string") continue;
-        const out = entry.cost && typeof entry.cost === "object" ? entry.cost.output : undefined;
-        const ref = `${provider.trim().toLowerCase()}/${entry.id.trim()}`.toLowerCase();
-        if (typeof out === "number" && Number.isFinite(out) && out >= 0 && !costs.has(ref)) costs.set(ref, out);
-      }
+      const raw = providers[provider];
+      out.push({ provider, block: { raw, models: raw && Array.isArray(raw.models) ? raw.models : [] } });
     }
   }
-  return costs;
+  return out;
+}
+
+function bundledCatalogModelInputs(hostRoot     ) {
+  const rows        = [];
+  for (const { provider, block } of bundledProviderCatalogs(hostRoot)) {
+    for (const entry of block.models) if (entry && typeof entry === "object") rows.push({ provider, id: entry.id, input: entry.input });
+  }
+  return modelInputsFromCatalogRows(rows);
+}
+
+const BUNDLED_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+function bundledDefaultUtilityModels(hostRoot     ) {
+  const models = new Map();
+  for (const { provider, block } of bundledProviderCatalogs(hostRoot)) {
+    const key = provider.trim().toLowerCase();
+    const raw = block.raw && typeof block.raw === "object" ? block.raw.defaultUtilityModel : undefined;
+    const id = typeof raw === "string" ? raw.trim() : "";
+    if (key && BUNDLED_MODEL_ID_RE.test(id) && !models.has(key)) models.set(key, id);
+  }
+  return models;
+}
+
+function createBundledUtilityModelLookup() {
+  let bundled      = null;
+  return (provider     ) => {
+    if (typeof provider !== "string" || !provider.trim()) return null;
+    if (!bundled) bundled = bundledDefaultUtilityModels(findOpenclawPackageRoot());
+    return bundled.get(provider.trim().toLowerCase()) || null;
+  };
+}
+
+function createBundledModelInputLookup(opts      = {}) {
+  const o = opts && typeof opts === "object" ? opts : {};
+  let bundled      = null;
+  return (provider     , modelId     ) => {
+    if (!bundled) bundled = bundledCatalogModelInputs(typeof o.hostRoot === "string" ? o.hostRoot : findOpenclawPackageRoot());
+    const kinds = bundled.get(modelInputKey(provider, modelId));
+    return kinds ? kinds.slice() : null;
+  };
 }
 
 function findOpenclawPackageRoot() {
@@ -229,26 +280,36 @@ function findOpenclawPackageRoot() {
   return "";
 }
 
-function createReplyModelPriceLookup(opts = {}) {
+function createReplyModelPriceLookup(opts      = {}) {
   const o = opts && typeof opts === "object" ? opts : {};
-  let bundled = null;
+  const field = o.field === "input" ? "input" : "output";
+  let bundled      = null;
   const bundledCosts = () => {
     if (bundled) return bundled;
     const root = typeof o.hostRoot === "string" ? o.hostRoot : findOpenclawPackageRoot();
-    bundled = bundledCatalogOutputCosts(root);
+    bundled = bundledCatalogOutputCosts(root, field);
     return bundled;
   };
-  return (ref) => {
+  return (ref     ) => {
     if (typeof ref !== "string" || !ref.includes("/")) return null;
     const config = typeof o.getConfig === "function" ? o.getConfig() : o.config;
-    const own = configuredModelOutputCost(config, ref);
+    const own = configuredModelOutputCost(config, ref, field);
     if (own !== null) return own;
     const hit = bundledCosts().get(ref.trim().toLowerCase());
     return typeof hit === "number" ? hit : null;
   };
 }
 
-function probeLlmCompleteOptions(fn) {
+function createModelTokenPriceLookup(opts      = {}) {
+  const input = createReplyModelPriceLookup({ ...opts, field: "input" });
+  const output = createReplyModelPriceLookup({ ...opts, field: "output" });
+  return (ref     ) => {
+    const i = input(ref), o = output(ref);
+    return i === null || o === null ? null : { input: i, output: o };
+  };
+}
+
+function probeLlmCompleteOptions(fn     ) {
   if (typeof fn !== "function") {
     return { schema: false, signal: false, timeoutMs: false, probe: "unavailable" };
   }
@@ -270,11 +331,11 @@ function probeLlmCompleteOptions(fn) {
   };
 }
 
-function resolvePolicy(policy) {
+function resolvePolicy(policy     ) {
   const raw = typeof policy === "function" ? policy() : policy;
   const obj = raw && typeof raw === "object" ? raw : {};
   const allowedModels = Array.isArray(obj.allowedModels)
-    ? obj.allowedModels.filter((m) => typeof m === "string" && m.trim()).map((m) => m.trim())
+    ? obj.allowedModels.filter((m     ) => typeof m === "string" && m.trim()).map((m     ) => m.trim())
     : [];
   return {
     allowModelOverride: obj.allowModelOverride === true,
@@ -285,7 +346,7 @@ function resolvePolicy(policy) {
   };
 }
 
-function resolveOptionSupport(optionSupport, llmComplete) {
+function resolveOptionSupport(optionSupport     , llmComplete     ) {
   const raw = typeof optionSupport === "function" ? optionSupport() : optionSupport;
   if (raw && typeof raw === "object") {
     return {
@@ -298,22 +359,22 @@ function resolveOptionSupport(optionSupport, llmComplete) {
   return probeLlmCompleteOptions(llmComplete);
 }
 
-function policyAllows(policy, ref, configured) {
+function policyAllows(policy     , ref     , configured     ) {
   if (!policy.allowModelOverride) return false;
   if (policy.allowedModels.includes(ref)) return true;
 
   return policy.anyModel === true && configured.includes(ref);
 }
 
-function modelsFromPolicy(policy, configured = [], chatRef = "", isRuntimeOnly = () => false, facts = {}) {
+function modelsFromPolicy(policy     , configured      = [], chatRef      = "", isRuntimeOnly      = () => false, facts      = {}) {
   const usable = typeof facts.usable === "function" ? facts.usable : () => null;
   const speed = typeof facts.speed === "function" ? facts.speed : () => ({});
-  const first = { id: DEFAULT_CHOICE, label: chatRef || "Chat model", provider: "", model: "", isDefault: true, allowed: true, current: true };
+  const first      = { id: DEFAULT_CHOICE, label: chatRef || "Chat model", provider: "", model: "", isDefault: true, allowed: true, current: true };
   if (chatRef && isRuntimeOnly(chatRef)) first.callable = false;
   if (chatRef) Object.assign(first, speed(chatRef));
-  const models = [first];
+  const models      = [first];
   const seen = new Set([DEFAULT_CHOICE]);
-  const push = (ref, listedByPolicy) => {
+  const push = (ref     , listedByPolicy     ) => {
     if (models.length >= INPUT_PREDICTION_MODEL_LIST_CAP) return;
     if (!ref || ref === "*" || seen.has(ref) || !INPUT_PREDICTION_MODEL_CHOICE_RE.test(ref)) return;
     if (isRuntimeOnly(ref)) return;
@@ -330,7 +391,7 @@ function modelsFromPolicy(policy, configured = [], chatRef = "", isRuntimeOnly =
   return models;
 }
 
-function createOpenclawInputPredictionAdapter(opts) {
+function createOpenclawInputPredictionAdapter(opts     ) {
   const o = opts && typeof opts === "object" ? opts : {};
   const llmComplete = typeof o.llmComplete === "function" ? o.llmComplete : null;
   const now = typeof o.now === "function" ? o.now : () => Date.now();
@@ -338,20 +399,20 @@ function createOpenclawInputPredictionAdapter(opts) {
   const active = new Map();
 
   const lastResolvedByIdentity = new Map();
-  const identityKey = (agentId, profileId) =>
+  const identityKey = (agentId     , profileId     ) =>
     `${typeof agentId === "string" ? agentId.trim() : ""}\u001f${typeof profileId === "string" ? profileId.trim() : ""}`;
-  const activeKey = (clientId, requestId) => `${clientId || ""}|${requestId}`;
+  const activeKey = (clientId     , requestId     ) => `${clientId || ""}|${requestId}`;
 
   let abortEvidence = "unobserved";
   const abortGraceMs = Number.isFinite(o.abortSettleGraceMs) ? Number(o.abortSettleGraceMs) : ABORT_SETTLE_GRACE_MS;
   const setTimer = typeof o.setTimeoutFn === "function" ? o.setTimeoutFn : setTimeout;
   const clearTimer = typeof o.clearTimeoutFn === "function" ? o.clearTimeoutFn : clearTimeout;
 
-  function abortSupported(support) {
+  function abortSupported(support     ) {
     return support.signal === true || abortEvidence === "observed";
   }
 
-  function configuredRoute(identity) {
+  function configuredRoute(identity     ) {
     const raw = typeof o.completionRoute === "function" ? o.completionRoute(identity) : o.completionRoute;
     if (raw && typeof raw === "object") {
       const provider = typeof raw.provider === "string" ? raw.provider.trim() : "";
@@ -361,18 +422,18 @@ function createOpenclawInputPredictionAdapter(opts) {
     return null;
   }
 
-  function configuredModels(identity) {
+  function configuredModels(identity     ) {
     try {
       const raw = typeof o.configuredModels === "function" ? o.configuredModels(identity || {}) : o.configuredModels;
-      return Array.isArray(raw) ? raw.filter((ref) => typeof ref === "string" && INPUT_PREDICTION_MODEL_CHOICE_RE.test(ref)) : [];
+      return Array.isArray(raw) ? raw.filter((ref     ) => typeof ref === "string" && INPUT_PREDICTION_MODEL_CHOICE_RE.test(ref)) : [];
     } catch {
       return [];
     }
   }
 
-  function runtimeOnlyMatcher(identity) {
+  function runtimeOnlyMatcher(identity     ) {
     if (typeof o.runtimeOnlyModel !== "function") return () => false;
-    return (ref) => {
+    return (ref     ) => {
       try {
         return o.runtimeOnlyModel(ref, identity || {}) === true;
       } catch {
@@ -386,7 +447,7 @@ function createOpenclawInputPredictionAdapter(opts) {
   const authTtlMs = Number.isFinite(o.authTtlMs) ? Number(o.authTtlMs) : 30000;
   const authTimeoutMs = Number.isFinite(o.authTimeoutMs) ? Number(o.authTimeoutMs) : 2500;
 
-  function lookupProviderAuth(provider) {
+  function lookupProviderAuth(provider     ) {
     if (typeof o.providerAuth !== "function") return Promise.resolve(null);
     const pending = authInflight.get(provider);
     if (pending) return pending;
@@ -394,9 +455,9 @@ function createOpenclawInputPredictionAdapter(opts) {
       const timer = setTimer(() => resolve(null), authTimeoutMs);
       Promise.resolve()
         .then(() => o.providerAuth(provider))
-        .then((value) => resolve(value === true ? true : value === false ? false : null), () => resolve(null))
+        .then((value     ) => resolve(value === true ? true : value === false ? false : null), () => resolve(null))
         .finally(() => clearTimer(timer));
-    }).then((usable) => {
+    }).then((usable     ) => {
       authByProvider.set(provider, { usable, at: now() });
       authInflight.delete(provider);
       return usable;
@@ -405,7 +466,7 @@ function createOpenclawInputPredictionAdapter(opts) {
     return run;
   }
 
-  async function refreshProviderAuth(identity) {
+  async function refreshProviderAuth(identity     ) {
     if (typeof o.providerAuth !== "function") return;
     const policy = resolvePolicy(o.policy);
     const refs = [...configuredModels(identity), ...(policy.allowModelOverride ? policy.allowedModels : [])];
@@ -414,15 +475,15 @@ function createOpenclawInputPredictionAdapter(opts) {
       const slash = typeof ref === "string" ? ref.indexOf("/") : -1;
       if (slash > 0) providers.add(ref.slice(0, slash).trim().toLowerCase());
     }
-    const stale = [...providers].filter((provider) => {
+    const stale = [...providers].filter((provider     ) => {
       const hit = authByProvider.get(provider);
       return !hit || now() - hit.at >= authTtlMs;
     });
-    await Promise.all(stale.map((provider) => lookupProviderAuth(provider)));
+    await Promise.all(stale.map((provider     ) => lookupProviderAuth(provider)));
   }
 
-  function modelFacts(identity) {
-    const exempt = (ref) => {
+  function modelFacts(identity     ) {
+    const exempt = (ref     ) => {
       if (typeof o.authExemptModel !== "function") return false;
       try {
         return o.authExemptModel(ref, identity || {}) === true;
@@ -431,12 +492,12 @@ function createOpenclawInputPredictionAdapter(opts) {
       }
     };
     return {
-      usable: (ref, provider) => {
+      usable: (ref     , provider     ) => {
         if (!provider || exempt(ref)) return null;
         const hit = authByProvider.get(String(provider).trim().toLowerCase());
         return hit ? hit.usable : null;
       },
-      speed: (ref) => {
+      speed: (ref     ) => {
         let cost = null;
         if (typeof o.modelPrice === "function") {
           try {
@@ -451,14 +512,14 @@ function createOpenclawInputPredictionAdapter(opts) {
     };
   }
 
-  function chatModelRef(identity) {
+  function chatModelRef(identity     ) {
     const route = configuredRoute(identity);
     if (route) return `${route.provider}/${route.model}`;
     const last = lastResolvedByIdentity.get(identityKey(identity && identity.agentId, identity && identity.profileId));
     return last && last.provider && last.model ? `${last.provider}/${last.model}` : "";
   }
 
-  function observeAbort(promise, controller) {
+  function observeAbort(promise     , controller     ) {
     if (abortEvidence === "observed" || !promise || typeof promise.then !== "function") return;
     let settled = false;
     const timer = setTimer(() => {
@@ -470,7 +531,7 @@ function createOpenclawInputPredictionAdapter(opts) {
       clearTimer(timer);
       if (abortEvidence !== "observed") abortEvidence = "ignored";
     };
-    const onRejected = (err) => {
+    const onRejected = (err     ) => {
       if (settled) return;
       settled = true;
       clearTimer(timer);
@@ -481,13 +542,13 @@ function createOpenclawInputPredictionAdapter(opts) {
     promise.then(onResolved, onRejected);
   }
 
-  function capabilities(params = null) {
+  function capabilities(params      = null) {
     const p = params && typeof params === "object" ? params : {};
     const lastResolved = lastResolvedByIdentity.get(identityKey(p.agentId, p.profileId)) || null;
     const policy = resolvePolicy(o.policy);
     const support = resolveOptionSupport(o.optionSupport, llmComplete);
     const supported = Boolean(llmComplete);
-    const out = {
+    const out      = {
       protocolVersion: INPUT_PREDICTION_PROTOCOL_VERSION,
       supported,
       structuredOutput: supported && support.schema === true,
@@ -515,7 +576,7 @@ function createOpenclawInputPredictionAdapter(opts) {
     return out;
   }
 
-  function authorizeModelChoice(modelChoice, identity = {}) {
+  function authorizeModelChoice(modelChoice     , identity      = {}) {
     if (!modelChoice || modelChoice === DEFAULT_CHOICE) return { ok: true, model: null };
     const policy = resolvePolicy(o.policy);
     if (!policyAllows(policy, modelChoice, policy.anyModel ? configuredModels(identity) : [])) {
@@ -524,7 +585,7 @@ function createOpenclawInputPredictionAdapter(opts) {
     return { ok: true, model: modelChoice };
   }
 
-  async function runCompletion(req, spec) {
+  async function runCompletion(req     , spec     ) {
     const messagesOf = spec.messages;
     const maxTokens = spec.maxTokens;
     const result = spec.result;
@@ -546,10 +607,10 @@ function createOpenclawInputPredictionAdapter(opts) {
     }
     const support = resolveOptionSupport(o.optionSupport, llmComplete);
     const controller = typeof AbortController === "function" ? new AbortController() : null;
-    const entry = { clientId: req.clientId, requestId: req.requestId, controller, cancelled: false, completion: null };
+    const entry      = { clientId: req.clientId, requestId: req.requestId, controller, cancelled: false, completion: null };
     const entryKey = req.requestId ? activeKey(req.clientId, req.requestId) : "";
     if (entryKey) active.set(entryKey, entry);
-    const params = {
+    const params      = {
       messages: messagesOf(req),
       maxTokens,
       temperature: 0,
@@ -562,7 +623,7 @@ function createOpenclawInputPredictionAdapter(opts) {
 
     let timer = null;
     let timedOut = false;
-    let completion = null;
+    let completion      = null;
     const timeout = new Promise((resolve) => {
       timer = setTimer(() => {
         timedOut = true;
@@ -617,7 +678,7 @@ function createOpenclawInputPredictionAdapter(opts) {
     }
   }
 
-  async function request(params) {
+  async function request(params     ) {
     const p = params && typeof params === "object" ? params : {};
     return predictionResult("unavailable", {
 
@@ -626,7 +687,7 @@ function createOpenclawInputPredictionAdapter(opts) {
     });
   }
 
-  async function open(params, ask = SILENT_INPUT_OPEN_LIMITS) {
+  async function open(params     , ask      = SILENT_INPUT_OPEN_LIMITS) {
     const normalized = normalizeOpenRequest(params);
     if (!normalized.ok) {
       return openReplyResult(normalized.status, {
@@ -636,12 +697,13 @@ function createOpenclawInputPredictionAdapter(opts) {
     }
     return runCompletion(normalized.value, {
 
-      messages: (req) => buildOpenReplyMessages(req, ask),
+      messages: (req     ) => buildOpenReplyMessages(req, ask),
       maxTokens: ask.maxTokens,
       result: openReplyResult,
       classify: classifyOpenReplyError,
-      readText(text, base) {
-        const parsed = parseOpenReplyText(text, ask);
+      readText(text     , base     ) {
+
+        const parsed = parseOpenReplyText(text, ask, normalized.value?.locale);
         if (!parsed) {
           return openReplyResult("invalid-output", { ...base, reason: "output is not a JSON object" });
         }
@@ -662,7 +724,7 @@ function createOpenclawInputPredictionAdapter(opts) {
     });
   }
 
-  function cancel(params) {
+  function cancel(params     ) {
     const requestId = params && typeof params.requestId === "string" ? params.requestId : "";
     const clientId = params && typeof params.clientId === "string" ? params.clientId : "";
     const entry = requestId ? active.get(activeKey(clientId, requestId)) : null;
@@ -684,7 +746,7 @@ function createOpenclawInputPredictionAdapter(opts) {
     return { accepted: true, abort: abortSupported(support) };
   }
 
-  async function test(params) {
+  async function test(params     ) {
     const p = params && typeof params === "object" ? params : {};
 
     const requestId = typeof p.requestId === "string" ? p.requestId : `test-${now()}`;
@@ -700,7 +762,7 @@ function createOpenclawInputPredictionAdapter(opts) {
         reason: "host runtime.llm.complete unavailable",
       };
     }
-    const result = await open({
+    const result      = await open({
       ...SILENT_INPUT_OPEN_TEST_EXAMPLE,
       requestId,
       clientId: typeof p.clientId === "string" ? p.clientId : "",
@@ -725,7 +787,7 @@ function createOpenclawInputPredictionAdapter(opts) {
     };
   }
 
-  async function capabilitiesFresh(params = null) {
+  async function capabilitiesFresh(params      = null) {
     const p = params && typeof params === "object" ? params : {};
     try {
       await refreshProviderAuth(p);
@@ -735,7 +797,7 @@ function createOpenclawInputPredictionAdapter(opts) {
     return capabilities(params);
   }
 
-  function handle(method, params) {
+  function handle(method     , params     ) {
     switch (method) {
       case INPUT_PREDICTION_METHODS.capabilities:
         return capabilitiesFresh(params);
@@ -754,14 +816,14 @@ function createOpenclawInputPredictionAdapter(opts) {
     }
   }
 
-  async function modelAllow(params) {
+  async function modelAllow(params     ) {
     const p = params && typeof params === "object" ? params : {};
     const requestId = typeof p.requestId === "string" ? p.requestId : "";
     const choice = typeof p.modelChoice === "string" ? p.modelChoice.trim() : "";
     if (!choice || choice === DEFAULT_CHOICE || !INPUT_PREDICTION_MODEL_CHOICE_RE.test(choice)) {
       return modelAllowResult(requestId, "policy-denied");
     }
-    const listed = (await capabilitiesFresh(p)).models.find((entry) => entry.id === choice);
+    const listed = (await capabilitiesFresh(p)).models.find((entry     ) => entry.id === choice);
     if (!listed || listed.allowed !== false) return modelAllowResult(requestId, "policy-denied");
     const log = o.logger && typeof o.logger.info === "function" ? o.logger : null;
     if (typeof o.allowModel !== "function") {
@@ -783,8 +845,8 @@ function createOpenclawInputPredictionAdapter(opts) {
   return { handle, capabilities, capabilitiesFresh, request, open, cancel, test, modelAllow, activeCount: () => active.size, abortEvidence: () => abortEvidence };
 }
 
-function isInputPredictionMethod(method) {
+function isInputPredictionMethod(method     ) {
   return typeof method === "string" && method.startsWith("input.prediction.");
 }
 
-module.exports = { ABORT_SETTLE_GRACE_MS, configuredOpenReplyRoute, configuredReplyModels, runtimeOnlyModelMatcher, configuredModelOutputCost, bundledCatalogOutputCosts, createReplyModelPriceLookup, probeLlmCompleteOptions, createOpenclawInputPredictionAdapter, isInputPredictionMethod };
+module.exports = { ABORT_SETTLE_GRACE_MS, configuredOpenReplyRoute, configuredReplyModels, runtimeOnlyModelMatcher, configuredModelOutputCost, bundledCatalogOutputCosts, bundledCatalogModelInputs, bundledDefaultUtilityModels, createBundledUtilityModelLookup, createBundledModelInputLookup, createReplyModelPriceLookup, createModelTokenPriceLookup, probeLlmCompleteOptions, createOpenclawInputPredictionAdapter, isInputPredictionMethod };

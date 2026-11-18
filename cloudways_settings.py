@@ -1,6 +1,6 @@
 """Step 2 of the Cloudways ladder: the settings, through sanctioned doors only.
 
-Three settings, two different doors, and the difference is not cosmetic:
+Glasses settings and the live-reasoning default use two sanctioned doors:
 
 * **The wearer admin allow-list** (`platforms.ocuclaw.extra.allow_admin_from`)
   is a PLATFORM setting. Hermes gives a platform plugin no API that writes
@@ -13,10 +13,14 @@ Three settings, two different doors, and the difference is not cosmetic:
   **reply streaming** (`display.platforms.ocuclaw.streaming`) are both HERMES
   CORE display keys, read per-turn (0.21.5), never at gateway start. Neither
   can move to env seeding, so the ladder runs the user's own `hermes config
-  set` line as a subprocess for each — the exact line shown in the consent —
+  set` line as a subprocess for each — the exact line `--details` shows —
   and confirms it with `hermes config get`. `display.streaming` (no
   `platforms.<name>` segment) is a DIFFERENT, CLI-only key and must never be
   written here; top-level `streaming.enabled` must NEVER be written either.
+* **Live reasoning** (`plugins.stream_reasoning_deltas`) is gateway-wide. On
+  a host with reasoning hooks, setup enables it through the Hermes CLI only
+  when unset. Explicit values survive reruns; an unreadable value blocks the
+  step before any write. The pending marker covers its gateway restart too.
 
 Three rules this module exists to keep:
 
@@ -34,6 +38,14 @@ Three rules this module exists to keep:
 "Already correct" is judged on the EFFECTIVE value, not on where it lives: a
 hand-edited `config.yaml` that already lists the wearer is correct, and the
 ladder leaves it alone rather than adding an env name that would shadow it.
+
+**One question, and it is about the glasses, not about settings.** Tool
+progress and streaming are what OcuClaw needs to work as designed, so the step
+applies them without asking. The allow-list is the one real choice: it lets
+the glasses continue a chat started in Hermes Desktop or the terminal
+("Continue here"), and it turns slash-command gating on for the platform. So
+the step asks only that, in plain words, and only while it is not already on.
+A no skips that one setting and setup carries on; a rerun asks again.
 """
 from __future__ import annotations
 
@@ -69,6 +81,29 @@ TOOL_PROGRESS_VALUE = "off"
 STREAMING_KEY = "display.platforms.ocuclaw.streaming"
 STREAMING_VALUE = "true"
 
+# Fresh setup enables live reasoning only when no value has been saved.
+# This is gateway-wide, unlike the reply-streaming display key above.
+REASONING_KEY = "plugins.stream_reasoning_deltas"
+REASONING_DEFAULT_MESSAGE = (
+    "Live reasoning will be enabled for this Hermes gateway. "
+    "This lets OcuClaw show reasoning steps as they arrive."
+)
+
+#: Shared chats (Matty, 2026-11-06): with one conversation on the glasses and
+#: Desktop, a message sent while a reply is still running must wait its turn,
+#: not cut that reply off (Hermes's default, `interrupt`). Hermes has no
+#: per-chat setting for gateway turns, so this is the Hermes-wide display key,
+#: and setup writes it only when shared chats is on and nobody chose a mode.
+#: `hermes config get` cannot tell "unset" from the default here (it answers
+#: `interrupt` either way), so "unset" is read from `config.yaml` itself.
+BUSY_INPUT_MODE_KEY = "display.busy_input_mode"
+BUSY_INPUT_MODE_VALUE = "queue"
+BUSY_QUEUE_DEFAULT_MESSAGE = (
+    "Shared chats are on, so a message sent while a reply is still coming will "
+    "wait its turn instead of cutting that reply off. This applies to all of "
+    "this Hermes."
+)
+
 #: `display.interface tui` is deliberately NOT here. The ladder pairs in its
 #: own terminal, so it never needs the TUI selected (evidence: #3098 / PR
 #: #3118). Writing it would change a setting the user did not need changed.
@@ -85,7 +120,9 @@ CONFIG_CMD_TIMEOUT_S = 30.0
 
 DETAIL_ALREADY_CORRECT = "already-correct"
 DETAIL_WRITTEN = "written"
-DETAIL_CONSENT_DECLINED = "consent-declined"
+#: The person said no to Continue here. Not a stop: whatever else was needed
+#: was still written (status done), or nothing else was needed (skipped).
+DETAIL_CONTINUE_HERE_DECLINED = "continue-here-declined"
 DETAIL_READ_BACK_MISMATCH = "read-back-mismatch"
 DETAIL_ENV_WRITE_FAILED = "env-write-failed"
 DETAIL_PENDING_MARKER_FAILED = "pending-marker-failed"
@@ -94,7 +131,7 @@ JOURNAL_DETAILS = frozenset(
     {
         DETAIL_ALREADY_CORRECT,
         DETAIL_WRITTEN,
-        DETAIL_CONSENT_DECLINED,
+        DETAIL_CONTINUE_HERE_DECLINED,
         DETAIL_READ_BACK_MISMATCH,
         DETAIL_ENV_WRITE_FAILED,
         DETAIL_PENDING_MARKER_FAILED,
@@ -108,31 +145,30 @@ ALREADY_CORRECT_MESSAGE = (
     "Settings already applied."
 )
 
+#: The step's one question (Matty, 2026-10-03). Continue here (#2509) lets the
+#: glasses carry on a chat started in Hermes Desktop or the terminal, which is
+#: the whole of what the allow-list is for, so that is what the question
+#: names. Tool progress and streaming are not asked about: they are applied.
+#: It is asked only while Continue here is off, and the default is No.
+CONTINUE_HERE_QUESTION = "Continue your Desktop and terminal chats on your glasses?"
+CONTINUE_HERE_PROMPT = f"{CONTINUE_HERE_QUESTION} Type yes or no: "
+
+#: A no skips Continue here alone; setup carries on. The way back is a real
+#: one: a rerun finds Continue here still off and asks again, once the restart
+#: that no was part of has happened (see `_declined_before_the_restart`).
+CONTINUE_HERE_DECLINED_MESSAGE = (
+    "Not turned on. To turn it on later, run the same setup command again."
+)
+
+#: The step's last line whenever it wrote something.
+APPLIED_MESSAGE = "Glasses settings applied."
+
+#: `--details` only (#3244): the technical block, every key that changes, its
+#: value and the exact command. The default run shows none of it.
 CONSENT_HEADER = "  These settings will change on this host, and nothing else:"
 
-#: The default consent (#3244): what each setting DOES, in the user's words,
-#: and an offer of the exact keys for anybody who wants them. `--details`
-#: prints :data:`CONSENT_HEADER` and the technical block instead. Both ask the
-#: same question, take the same answer and write the same two settings.
-#:
-#: The header counts what is actually changing. A rerun that found one setting
-#: already correct must not claim two are about to change.
-SHORT_CONSENT_HEADER_TWO = "  Setup will make these changes:"
-SHORT_CONSENT_HEADER_ONE = "  Setup will make this change:"
-SHORT_ALLOW_ADMIN_LINE = (
-    '    Enable "Continue here" for your glasses wearer,\n'
-    "    so you can pick up a Desktop or terminal chat on your glasses."
-)
-SHORT_TOOL_PROGRESS_LINE = (
-    "    Keep tool-progress messages out of the conversation.\n"
-    "    Tool activity will still appear in the UI."
-)
-SHORT_STREAMING_LINE = (
-    "    Turn on reply streaming for the glasses.\n"
-    "    Without it the glasses show only \"typing\" for the whole reply,\n"
-    "    then the whole reply at once."
-)
-SHORT_DETAILS_HINT = "  Exact settings: add --details when running setup."
+#: Under the allow-list in the `--details` block while it is still a question.
+CONTINUE_HERE_ON_YES_NOTE = "      only if you answer yes below."
 
 ENV_DOOR_NOTE = (
     f"      written to the Hermes env file as {ALLOW_ADMIN_FROM_ENV}; the gateway "
@@ -157,7 +193,7 @@ PENDING_MARKER_FAILED_MESSAGE = (
 
 
 def tool_progress_command_line() -> str:
-    """The EXACT line the consent shows — and the argv that is executed.
+    """The EXACT line `--details` shows — and the argv that is executed.
 
     One source for both, so the promise and the action can never drift apart.
     """
@@ -174,7 +210,7 @@ def tool_progress_read_command_line() -> str:
 
 
 def streaming_command_line() -> str:
-    """The EXACT line the consent shows — and the argv that is executed.
+    """The EXACT line `--details` shows — and the argv that is executed.
 
     Mirrors :func:`tool_progress_command_line`: one source for both the
     promise and the action.
@@ -230,6 +266,18 @@ def read_platform_extra() -> Mapping[str, Any]:
     block = platforms.get("ocuclaw") if isinstance(platforms, Mapping) else None
     extra = block.get("extra") if isinstance(block, Mapping) else None
     return extra if isinstance(extra, Mapping) else {}
+
+
+def read_saved_busy_input_mode() -> Tuple[Optional[str], bool]:
+    """`display.busy_input_mode` as `config.yaml` has it, and whether it read.
+
+    A READ, never a write. Unset is ``(None, True)``; an unreadable file is
+    ``(None, False)``.
+    """
+    config, readable = health.setup_raw_config()
+    if not readable:
+        return None, False
+    return health.busy_input_mode_setting(config), True
 
 
 # -- reading what is there now ------------------------------------------------
@@ -327,7 +375,7 @@ def _parse_on(text: str) -> Optional[bool]:
 # -- the subprocess door ------------------------------------------------------
 
 
-def _hermes(ctx: Any, *args: str) -> Tuple[Optional[int], str, str]:
+def _hermes(ctx: Any, *args: str, timeout_s: float = CONFIG_CMD_TIMEOUT_S) -> Tuple[Optional[int], str, str]:
     """Run one `hermes` verb through the INJECTED runner, in this CLI process.
 
     ``HERMES_HOME`` is pinned to the home the ladder resolved, the same way
@@ -346,7 +394,7 @@ def _hermes(ctx: Any, *args: str) -> Tuple[Optional[int], str, str]:
             argv,
             capture_output=True,
             text=True,
-            timeout=CONFIG_CMD_TIMEOUT_S,
+            timeout=timeout_s,
             check=False,
             env=env,
         )
@@ -408,6 +456,43 @@ def read_streaming(ctx: Any) -> Optional[bool]:
     return None if word is None else _parse_on(word)
 
 
+def _reasoning_hooks_available() -> bool:
+    from .adapter import _probe_optional_hook_support
+
+    stream_hooks, _interim = _probe_optional_hook_support()
+    return stream_hooks
+
+
+def _reasoning_default_needed(ctx: Any) -> Optional[bool]:
+    """Only a known absent key earns a default; a failed read never does."""
+    if not _reasoning_hooks_available():
+        return False
+    code, out, err = _hermes(ctx, "config", "get", REASONING_KEY)
+    if code == 0:
+        return False  # Preserve every explicit value, including false.
+    if code == 1 and f"Config key not set: {REASONING_KEY}" in (out + err):
+        return True
+    return None
+
+
+def _busy_queue_default_needed() -> bool:
+    """Shared chats will be live, and nobody has chosen what a mid-reply message does.
+
+    Shared chats are on unless the host turned them off, but they share
+    nothing before Hermes 0.23 or without Continue here. The caller drops the
+    write when Continue here is declined, so this assumes it will be on. Any
+    saved mode, including `interrupt`, is a choice and is kept. An unreadable
+    `config.yaml` earns no write.
+    """
+    if not health.shared_chats_requested(read_platform_extra()):
+        return False
+    parsed = health.parse_version(str(health.hermes_version() or ""))
+    if parsed is None or parsed < health.SHARED_CHATS_MIN_HERMES:
+        return False
+    saved, readable = read_saved_busy_input_mode()
+    return readable and saved is None
+
+
 # -- the step -----------------------------------------------------------------
 
 
@@ -417,60 +502,117 @@ class _Plan:
     current_ids: List[str] = field(default_factory=list)
     tool_progress: bool = False  # True: the display key still needs setting
     streaming: bool = False  # True: the streaming key still needs turning on
+    reasoning: bool = False  # True: live reasoning has never been configured
+    busy_queue: bool = False  # True: shared chats on, busy mode never chosen
 
     @property
     def empty(self) -> bool:
-        return self.admin_ids is None and not self.tool_progress and not self.streaming
+        return (
+            self.admin_ids is None
+            and not self.tool_progress
+            and not self.streaming
+            and not self.reasoning
+            and not self.busy_queue
+        )
 
 
-def _consent_lines(plan: _Plan, *, details: bool = False) -> List[str]:
-    """What the user is asked to say yes to. Same question either way (#3244)."""
-    if not details:
-        return _short_consent_lines(plan)
+def _details_lines(plan: _Plan) -> List[str]:
+    """`--details`: every key that changes, its value and the exact command.
+
+    Same question, same answer and the same writes as the default run (#3244);
+    only the words differ.
+    """
     lines = [CONSENT_HEADER]
     if plan.admin_ids is not None:
         lines.append(f"    {ALLOW_ADMIN_FROM_KEY} = {admin_ids_text(plan.admin_ids)}")
         # The current list, so nobody has to guess whose admin is being kept.
-        # This is a privilege key: the consent shows what it is now, not only
+        # This is a privilege key: the block shows what it is now, not only
         # what it becomes.
         lines.append(f"      it is {admin_ids_text(plan.current_ids)} today.")
         lines.append(ENV_DOOR_NOTE)
         lines.append(ENV_OVERRIDE_NOTE)
+        lines.append(CONTINUE_HERE_ON_YES_NOTE)
     if plan.tool_progress:
         lines.append(f"    {TOOL_PROGRESS_KEY} = {TOOL_PROGRESS_VALUE}")
         lines.append(f"      set by running: {tool_progress_command_line()}")
     if plan.streaming:
         lines.append(f"    {STREAMING_KEY} = {STREAMING_VALUE}")
         lines.append(f"      set by running: {streaming_command_line()}")
+    if plan.reasoning:
+        lines.append(f"    {REASONING_KEY} = true (gateway-wide; unset values only)")
+        lines.append(f"      set by running: hermes config set {REASONING_KEY} true")
+    if plan.busy_queue:
+        lines.append(
+            f"    {BUSY_INPUT_MODE_KEY} = {BUSY_INPUT_MODE_VALUE} "
+            "(all of this Hermes; shared chats on and no mode chosen)"
+        )
+        lines.append(
+            f"      set by running: hermes config set {BUSY_INPUT_MODE_KEY} {BUSY_INPUT_MODE_VALUE}"
+        )
     return lines
 
 
-def _short_consent_lines(plan: _Plan) -> List[str]:
-    """The default: what the two settings do, and where to find the keys."""
-    wanted = [
-        line
-        for line, needed in (
-            (SHORT_ALLOW_ADMIN_LINE, plan.admin_ids is not None),
-            (SHORT_TOOL_PROGRESS_LINE, plan.tool_progress),
-            (SHORT_STREAMING_LINE, plan.streaming),
+def _ask_continue_here(ctx: Any, plan: _Plan, details: bool) -> bool:
+    """The step's one question. True on yes; never a stop.
+
+    The default run asks the question alone. Under `--yes` there is no prompt
+    to read, so the question is said as a line first: "answered yes" must say
+    what it answered.
+    """
+    from . import cloudways_setup as ladder
+
+    if details:
+        lines = _details_lines(plan)
+    elif bool(getattr(ctx.options, "assume_yes", False)):
+        lines = [f"  {CONTINUE_HERE_QUESTION}"]
+    else:
+        lines = []
+    # `y` is what a person types at a prompt, and this is their own host. Step
+    # 6 publishes a route and keeps the whole word; this does not.
+    return bool(
+        ctx.ask(
+            lines,
+            question=CONTINUE_HERE_PROMPT,
+            answers=ladder.SHORT_YES_CONSENT_ANSWERS,
         )
-        if needed
-    ]
-    header = SHORT_CONSENT_HEADER_TWO if len(wanted) > 1 else SHORT_CONSENT_HEADER_ONE
-    lines = [header, ""]
-    for line in wanted:
-        lines.extend((line, ""))
-    return [*lines, SHORT_DETAILS_HINT, ""]
+    )
+
+
+def _declined_before_the_restart(ctx: Any) -> bool:
+    """Was Continue here answered no in this setup, with its restart still owed?
+
+    Step 2 stamps the restart marker only when it writes, and a yes writes the
+    allow-list. So a marker still standing while Continue here is off means
+    the last step 2 heard a no and wrote the other settings, and step 3 has
+    not yet seen the gateway start that clears it. The run that carries on
+    after that restart must not ask the same person the same question again.
+    `--yes` still answers yes.
+    """
+    if bool(getattr(ctx.options, "assume_yes", False)):
+        return False
+    home = getattr(getattr(ctx, "layout", None), "hermes_home", None)
+    try:
+        _written_at, status = cloudways_restart_step.read_pending_marker(home)
+    except Exception:  # noqa: BLE001 - unsure: ask, which is the safe side
+        return False
+    return status == cloudways_restart_step.MARKER_OK
 
 
 def apply_settings(ctx: Any) -> Any:
-    """Step 2. One consent, sanctioned doors, and every write read back.
+    """Step 2. One question, sanctioned doors, and every write read back.
+
+    Tool progress, reply streaming and unset live reasoning are applied without
+    asking. Continue here is
+    asked about while it is off; a no skips it alone, says how to turn it on
+    later, and the step carries on with the rest.
 
     ``ctx.state["settings_changed"]`` is set on every path that reaches a
     verdict: it is this run's answer to "did anything change that the gateway
     has not picked up yet", which step 3 (#3103) reads to decide whether a
     restart is pending. It is scratch shared within ONE run and is never
-    persisted — see the rerun note in the module's PR.
+    persisted — see the rerun note in the module's PR. A no to Continue here
+    also sets ``ctx.state["continue_here_declined"]``, which the ladder reads
+    before it names Continue here in its last line.
 
     The same fact is made durable by the ladder's pending marker
     (`cloudways_restart_step.mark_restart_pending`), stamped BEFORE the first
@@ -492,6 +634,16 @@ def apply_settings(ctx: Any) -> Any:
         plan.admin_ids = desired_admin_ids(current_ids)
     plan.tool_progress = read_tool_progress(ctx) is not True
     plan.streaming = read_streaming(ctx) is not True
+    reasoning_default = _reasoning_default_needed(ctx)
+    if reasoning_default is None:
+        ctx.say("  The live-reasoning setting could not be read. Nothing was changed; run setup again after fixing the config read.")
+        ctx.state["settings_changed"] = False
+        return ladder.StepRecord(
+            "settings", ladder.STATUS_FAILED, DETAIL_READ_BACK_MISMATCH,
+            exit_code=ladder.SETUP_EXIT_PROBLEM,
+        )
+    plan.reasoning = reasoning_default
+    plan.busy_queue = _busy_queue_default_needed()
 
     if plan.empty:
         ctx.say(f"  {ALREADY_CORRECT_MESSAGE}")
@@ -503,21 +655,29 @@ def apply_settings(ctx: Any) -> Any:
         ctx.state["settings_changed"] = False
         return ladder.StepRecord("settings", ladder.STATUS_SKIPPED, DETAIL_ALREADY_CORRECT)
 
-    # Two settings on the user's own host, and `y` is what a person types at a
-    # prompt. Step 6 publishes a route and keeps the whole word; this does not.
-    if not ctx.ask(
-        _consent_lines(plan, details=bool(getattr(ctx.options, "details", False))),
-        question="Apply these changes? Type yes or y; anything else stops: ",
-        answers=ladder.SHORT_YES_CONSENT_ANSWERS,
-    ):
-        # The ladder's own resume wording, so every declined step reads alike.
-        ctx.say(f"  {ladder.RESUME_MESSAGE}")
+    details = bool(getattr(ctx.options, "details", False))
+    declined = False
+    # Asked BEFORE anything is written, so a Ctrl-C at the question still
+    # leaves the host exactly as it was.
+    if plan.admin_ids is not None:
+        if _declined_before_the_restart(ctx) or not _ask_continue_here(ctx, plan, details):
+            declined = True
+            plan.admin_ids = None
+            # No Continue here, so nothing is shared and queue mode is not owed.
+            plan.busy_queue = False
+            ctx.say(f"  {CONTINUE_HERE_DECLINED_MESSAGE}")
+            # Read at the end of the run: a restart owed for the other two
+            # settings must not be announced as Continue here switching on.
+            ctx.state["continue_here_declined"] = True
+    elif details:
+        for line in _details_lines(plan):
+            ctx.say(line)
+
+    if plan.empty:
+        # Continue here was the only thing left, and the answer was no.
         ctx.state["settings_changed"] = False
         return ladder.StepRecord(
-            "settings",
-            ladder.STATUS_DECLINED,
-            DETAIL_CONSENT_DECLINED,
-            exit_code=ladder.SETUP_EXIT_STOPPED,
+            "settings", ladder.STATUS_SKIPPED, DETAIL_CONTINUE_HERE_DECLINED
         )
 
     # BEFORE the first byte is written, and this order is load-bearing (#3149
@@ -546,6 +706,30 @@ def apply_settings(ctx: Any) -> Any:
     # Every return below this line leaves the stamp standing on purpose: a write
     # that failed or did not read back may still have put bytes on disk.
     changed = False
+
+    if plan.reasoning:
+        # Recheck immediately before writing so a choice saved during the
+        # Continue here question wins over the default.
+        needed = _reasoning_default_needed(ctx)
+        if needed is None:
+            ctx.say("  The live-reasoning setting could not be read. Run setup again after fixing the config read.")
+            ctx.state["settings_changed"] = changed
+            return ladder.StepRecord(
+                "settings", ladder.STATUS_FAILED, DETAIL_READ_BACK_MISMATCH,
+                exit_code=ladder.SETUP_EXIT_PROBLEM,
+            )
+        if needed:
+            ctx.say(f"  {REASONING_DEFAULT_MESSAGE}")
+            _hermes(ctx, "config", "set", REASONING_KEY, "true")
+            code, out, _err = _hermes(ctx, "config", "get", REASONING_KEY)
+            if code != 0 or _parse_on(out.strip()) is not True:
+                ctx.say(f"  {REASONING_KEY} did not read back as true. Setup has not finished; run the same command again.")
+                ctx.state["settings_changed"] = changed
+                return ladder.StepRecord(
+                    "settings", ladder.STATUS_FAILED, DETAIL_READ_BACK_MISMATCH,
+                    exit_code=ladder.SETUP_EXIT_PROBLEM,
+                )
+            changed = True
 
     if plan.admin_ids is not None:
         wanted = admin_ids_text(plan.admin_ids)
@@ -640,30 +824,55 @@ def apply_settings(ctx: Any) -> Any:
                 f"`{streaming_read_command_line()}` reads back {word}."
             )
 
+    # Rechecked here, like live reasoning: a mode saved while the Continue here
+    # question was open wins over the default.
+    if plan.busy_queue and _busy_queue_default_needed():
+        ctx.say(f"  {BUSY_QUEUE_DEFAULT_MESSAGE}")
+        _hermes(ctx, "config", "set", BUSY_INPUT_MODE_KEY, BUSY_INPUT_MODE_VALUE)
+        code, out, _err = _hermes(ctx, "config", "get", BUSY_INPUT_MODE_KEY)
+        if code != 0 or out.strip().lower() != BUSY_INPUT_MODE_VALUE:
+            ctx.say(
+                f"  {BUSY_INPUT_MODE_KEY} did not read back as {BUSY_INPUT_MODE_VALUE}. "
+                "Setup has not finished; run the same command again."
+            )
+            ctx.state["settings_changed"] = changed
+            return ladder.StepRecord(
+                "settings", ladder.STATUS_FAILED, DETAIL_READ_BACK_MISMATCH,
+                exit_code=ladder.SETUP_EXIT_PROBLEM,
+            )
+        changed = True
+
     ctx.state["settings_changed"] = changed
-    ctx.say("  Settings applied.")
-    return ladder.StepRecord("settings", ladder.STATUS_DONE, DETAIL_WRITTEN)
+    ctx.say(f"  {APPLIED_MESSAGE}")
+    return ladder.StepRecord(
+        "settings",
+        ladder.STATUS_DONE,
+        DETAIL_CONTINUE_HERE_DECLINED if declined else DETAIL_WRITTEN,
+    )
 
 
 __all__ = [
     "ALLOW_ADMIN_FROM_ENV",
     "ALLOW_ADMIN_FROM_KEY",
     "ALREADY_CORRECT_MESSAGE",
+    "BUSY_INPUT_MODE_KEY",
+    "BUSY_INPUT_MODE_VALUE",
+    "BUSY_QUEUE_DEFAULT_MESSAGE",
+    "APPLIED_MESSAGE",
+    "CONSENT_HEADER",
+    "CONTINUE_HERE_DECLINED_MESSAGE",
+    "CONTINUE_HERE_ON_YES_NOTE",
+    "CONTINUE_HERE_PROMPT",
+    "CONTINUE_HERE_QUESTION",
     "ENV_OVERRIDE_NOTE",
     "DETAIL_ALREADY_CORRECT",
-    "DETAIL_CONSENT_DECLINED",
+    "DETAIL_CONTINUE_HERE_DECLINED",
     "DETAIL_ENV_WRITE_FAILED",
     "DETAIL_PENDING_MARKER_FAILED",
     "DETAIL_READ_BACK_MISMATCH",
     "DETAIL_WRITTEN",
     "JOURNAL_DETAILS",
     "PENDING_MARKER_FAILED_MESSAGE",
-    "SHORT_ALLOW_ADMIN_LINE",
-    "SHORT_CONSENT_HEADER_ONE",
-    "SHORT_CONSENT_HEADER_TWO",
-    "SHORT_DETAILS_HINT",
-    "SHORT_STREAMING_LINE",
-    "SHORT_TOOL_PROGRESS_LINE",
     "STREAMING_KEY",
     "STREAMING_VALUE",
     "TOOL_PROGRESS_KEY",
@@ -676,6 +885,7 @@ __all__ = [
     "env_seed_admin_ids",
     "read_env_name",
     "read_platform_extra",
+    "read_saved_busy_input_mode",
     "read_streaming",
     "read_streaming_word",
     "read_tool_progress",

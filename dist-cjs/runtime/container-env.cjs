@@ -35,4 +35,4 @@ function composeContainerLoopbackNotice(wsBind, wsPort) {
   );
 }
 
-module.exports = { isContainerEnvironment, isLoopbackBindAddress, composeContainerLoopbackNotice };
+module.exports = { isLoopbackBindAddress, isContainerEnvironment, composeContainerLoopbackNotice };

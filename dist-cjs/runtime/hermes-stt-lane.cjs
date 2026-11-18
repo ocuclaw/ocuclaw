@@ -5,7 +5,14 @@ const { discardLinkSpillFileAsync, writeLinkSpillFile } = require("./link-attach
 const LINK_STT_METHODS = Object.freeze({
   capabilitiesList: "stt.capabilities.list",
   transcribe: "stt.transcribe",
+
+  streamOpen: "stt.stream.open",
+  streamCancel: "stt.stream.cancel",
+  streamPartial: "stt.stream.partial",
 });
+
+const LINK_STT_STREAM_OPEN_TIMEOUT_MS = 5_000;
+const LINK_STT_STREAM_CANCEL_TIMEOUT_MS = 5_000;
 
 const LINK_STT_CAPABILITIES_TIMEOUT_MS = 10_000;
 
@@ -24,12 +31,12 @@ const LINK_DOWN_MESSAGES = Object.freeze([
   "control link not ready",
 ]);
 
-function isLinkDownError(err) {
+function isLinkDownError(err     ) {
   const message = err && err.message ? String(err.message) : "";
   return LINK_DOWN_MESSAGES.includes(message);
 }
 
-function normalizeSttCapabilitiesErrorCode(err) {
+function normalizeSttCapabilitiesErrorCode(err     ) {
   const code = err ? err.code : undefined;
   if (code === RPC_METHOD_NOT_FOUND_CODE) return "method_not_found";
 
@@ -63,18 +70,18 @@ const STT_TRANSCRIBE_ERROR_CODES = Object.freeze({
 const OFFLINE_TRANSCRIBE_MESSAGE =
   "no live Hermes link: speech-to-text is unavailable on this host";
 
-function cleanIdentifier(raw) {
+function cleanIdentifier(raw     ) {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
   return trimmed || null;
 }
 
-function cleanFreeText(raw) {
+function cleanFreeText(raw     ) {
   if (typeof raw !== "string") return null;
   return raw.trim() || null;
 }
 
-function offlineSttTranscribeResult(provider) {
+function offlineSttTranscribeResult(provider     ) {
   return {
     success: false,
     provider: cleanIdentifier(provider),
@@ -85,7 +92,7 @@ function offlineSttTranscribeResult(provider) {
   };
 }
 
-function transcribeFailure(provider, code, message) {
+function transcribeFailure(provider     , code     , message     ) {
   return {
     success: false,
     provider: cleanIdentifier(provider),
@@ -93,7 +100,7 @@ function transcribeFailure(provider, code, message) {
   };
 }
 
-function classifySttProviderError(message) {
+function classifySttProviderError(message     ) {
   const text = typeof message === "string" ? message.toLowerCase() : "";
 
   if (
@@ -151,7 +158,7 @@ function classifySttProviderError(message) {
   return STT_TRANSCRIBE_ERROR_CODES.transcribeFailed;
 }
 
-function normalizeEnvelopeError(raw) {
+function normalizeEnvelopeError(raw     ) {
   if (typeof raw === "string" && raw.trim()) {
     return {
       code: classifySttProviderError(raw),
@@ -176,11 +183,11 @@ function normalizeEnvelopeError(raw) {
   };
 }
 
-function createHermesSttLane(deps = {}) {
+function createHermesSttLane(deps      = {}) {
   const link = deps && deps.link ? deps.link : null;
   const logger = deps && deps.logger ? deps.logger : null;
 
-  function warn(message) {
+  function warn(message     ) {
     if (logger && typeof logger.warn === "function") logger.warn(message);
   }
 
@@ -200,14 +207,18 @@ function createHermesSttLane(deps = {}) {
         { timeoutMs: LINK_STT_CAPABILITIES_TIMEOUT_MS },
       ),
     ).then(
-      (result) => ({
+      (result     ) => ({
 
         status: STT_CAPABILITIES_STATUS.ok,
         uploadProtocolVersion: 1,
+
+        ...(result && result.streamProtocolVersion === 1
+          ? { streamProtocolVersion: 1 }
+          : {}),
         providers:
           result && Array.isArray(result.providers) ? result.providers : [],
       }),
-      (err) => {
+      (err     ) => {
         if (isLinkDownError(err)) return offlineSttCapabilitiesSnapshot();
         const code = normalizeSttCapabilitiesErrorCode(err);
         warn(
@@ -228,7 +239,7 @@ function createHermesSttLane(deps = {}) {
     );
   }
 
-  async function transcribe(request = {}) {
+  async function transcribe(request      = {}) {
     const req = request && typeof request === "object" ? request : {};
     const provider = cleanIdentifier(req.provider);
     const audio = req.audio && typeof req.audio === "object" ? req.audio : null;
@@ -258,7 +269,7 @@ function createHermesSttLane(deps = {}) {
       spillPath = await writeLinkSpillFile(content, {
         prefix: STT_SPILL_FILE_PREFIX,
       });
-    } catch (err) {
+    } catch (err     ) {
       const message = err && err.message ? String(err.message) : "spill failed";
       warn(`[hermes-stt] could not stage transcribe audio: ${message}`);
       return transcribeFailure(
@@ -271,17 +282,19 @@ function createHermesSttLane(deps = {}) {
     return transcribeStaged(req, spillPath, audio);
   }
 
-  async function transcribeStaged(req, spillPath, audio = {
+  async function transcribeStaged(req     , spillPath     , audio      = {
     format: "wav", sampleRateHz: 16000, channels: 1,
-  }) {
+  }, options      = {}) {
+
+    const streamId = options && cleanIdentifier(options.streamId);
     const provider = cleanIdentifier(req.provider);
 
-    const audioParams = {};
+    const audioParams      = {};
     for (const field of ["format", "sampleRateHz", "channels"]) {
       if (audio && audio[field] !== undefined) audioParams[field] = audio[field];
     }
     audioParams.path = spillPath;
-    const params = {
+    const params      = {
       provider,
       model: cleanIdentifier(req.model),
       language: cleanIdentifier(req.language),
@@ -289,12 +302,14 @@ function createHermesSttLane(deps = {}) {
       audio: audioParams,
     };
 
+    if (streamId) params.streamId = streamId;
+
     return Promise.resolve().then(() =>
       link.request(LINK_STT_METHODS.transcribe, params, {
         timeoutMs: LINK_STT_TRANSCRIBE_TIMEOUT_MS,
       }),
     ).then(
-      async (result) => {
+      async (result     ) => {
 
         await discardLinkSpillFileAsync(spillPath);
         const envelope = result && typeof result === "object" ? result : {};
@@ -313,7 +328,7 @@ function createHermesSttLane(deps = {}) {
           error: normalizeEnvelopeError(envelope.error),
         };
       },
-      async (err) => {
+      async (err     ) => {
         await discardLinkSpillFileAsync(spillPath);
         if (isLinkDownError(err)) return offlineSttTranscribeResult(provider);
         const code = normalizeSttCapabilitiesErrorCode(err);
@@ -327,10 +342,58 @@ function createHermesSttLane(deps = {}) {
     );
   }
 
+  function openStream(request      = {}) {
+    const req = request && typeof request === "object" ? request : {};
+    const streamId = cleanIdentifier(req.streamId);
+    const provider = cleanIdentifier(req.provider);
+    if (linkIsDown() || !streamId || !provider || typeof req.path !== "string" || !req.path) {
+      return Promise.resolve(false);
+    }
+    const params = {
+      streamId,
+      path: req.path,
+      provider,
+      model: cleanIdentifier(req.model),
+      language: cleanIdentifier(req.language),
+      prompt: cleanFreeText(req.prompt),
+    };
+    return Promise.resolve().then(() =>
+      link.request(LINK_STT_METHODS.streamOpen, params, {
+        timeoutMs: LINK_STT_STREAM_OPEN_TIMEOUT_MS,
+      }),
+    ).then(
+      (result     ) => {
+        if (result && result.opened === true) return true;
+        const reason = result && typeof result.reason === "string" ? result.reason : "refused";
+        if (logger && typeof logger.info === "function") {
+          logger.info(`[hermes-stt] live words not opened (${reason}); batch only`);
+        }
+        return false;
+      },
+      (err     ) => {
+        if (!isLinkDownError(err)) {
+          warn(`[hermes-stt] ${LINK_STT_METHODS.streamOpen} failed (${normalizeSttCapabilitiesErrorCode(err)})`);
+          void cancelStream(streamId);
+        }
+        return false;
+      },
+    );
+  }
+
+  function cancelStream(rawStreamId     ) {
+    const streamId = cleanIdentifier(rawStreamId);
+    if (linkIsDown() || !streamId) return Promise.resolve(false);
+    return Promise.resolve().then(() =>
+      link.request(LINK_STT_METHODS.streamCancel, { streamId }, {
+        timeoutMs: LINK_STT_STREAM_CANCEL_TIMEOUT_MS,
+      }),
+    ).then((result     ) => !!(result && result.cancelled === true), () => false);
+  }
+
   const upload = createHermesSttUpload({
-    isReady: () => !linkIsDown(), transcribeStaged, logger,
+    isReady: () => !linkIsDown(), transcribeStaged, openStream, cancelStream, logger,
   });
-  return { getCapabilities, transcribe, upload };
+  return { getCapabilities, transcribe, upload, openStream, cancelStream };
 }
 
-module.exports = { LINK_STT_METHODS, LINK_STT_CAPABILITIES_TIMEOUT_MS, LINK_STT_TRANSCRIBE_TIMEOUT_MS, STT_SPILL_FILE_PREFIX, STT_CAPABILITIES_STATUS, STT_TRANSCRIBE_ERROR_CODES, normalizeSttCapabilitiesErrorCode, offlineSttCapabilitiesSnapshot, offlineSttTranscribeResult, createHermesSttLane };
+module.exports = { LINK_STT_METHODS, LINK_STT_STREAM_OPEN_TIMEOUT_MS, LINK_STT_STREAM_CANCEL_TIMEOUT_MS, LINK_STT_CAPABILITIES_TIMEOUT_MS, LINK_STT_TRANSCRIBE_TIMEOUT_MS, STT_SPILL_FILE_PREFIX, STT_CAPABILITIES_STATUS, normalizeSttCapabilitiesErrorCode, offlineSttCapabilitiesSnapshot, STT_TRANSCRIBE_ERROR_CODES, offlineSttTranscribeResult, classifySttProviderError, createHermesSttLane };

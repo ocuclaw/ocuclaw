@@ -116,8 +116,8 @@ NATIVE_BUILDS = (
 # so the exact-build table above almost never holds for real users. When no audited
 # build matches, the reads are still served if BOTH hold:
 #   1. the running Hermes reports a version inside the plugin's supported range
-#      (health.SUPPORTED_HERMES_MIN <= v < health.SUPPORTED_HERMES_MAX_EXCLUSIVE),
-#      read the way the rest of the plugin reads it; and
+#      (health.hermes_version_supported: at or above health.SUPPORTED_HERMES_MIN, with
+#      no ceiling), read the way the rest of the plugin reads it; and
 #   2. a structural probe of exactly the surface this module uses passes
 #      (_probe_reads below). Diagnostics additionally need _probe_diagnostics.
 # The probe only observes: it never patches Hermes and never writes into a Hermes home.
@@ -205,14 +205,16 @@ def _version_outside_range():
 
     ``parse_version`` keeps the leading digits of each part, so a main label such as
     ``0.21.4``, ``0.21.4+12.gabc1234`` or ``0.21.5.dev3`` counts as its release line, and
-    ``0.22.0.dev0`` counts as 0.22.0: the next line is not the supported one. A missing or
+    ``0.24.0.dev0`` counts as 0.24.0. That gate has a floor and no ceiling: a newer line
+    than OcuClaw has tested passes it and is left to the structural probe. A missing or
     placeholder label (``0.0.0``) cannot be placed in the range, so it is refused.
     """
-    from .health import SUPPORTED_HERMES_MAX_EXCLUSIVE, SUPPORTED_HERMES_MIN, hermes_version, parse_version
-    parsed = parse_version(hermes_version())
+    from .health import hermes_version, hermes_version_supported, parse_version
+    version = hermes_version()
+    parsed = parse_version(version)
     if parsed is None or parsed == (0, 0, 0):
         return "hermes_version_unknown"
-    if not SUPPORTED_HERMES_MIN <= parsed < SUPPORTED_HERMES_MAX_EXCLUSIVE:
+    if not hermes_version_supported(version):
         return "hermes_version_outside_supported_range"
     return None
 
@@ -395,11 +397,24 @@ cost is never replaced by estimated cost or reported as a billed zero.
         for key, coverage in (("estimated", "estimatedRecords"), ("actual", "actualRecords")):
             totals[key] = sum(row[key] or 0 for row in result) if totals[coverage] else None
         result.sort(key=lambda row: row["input"] + row["output"], reverse=True)
-        return {"observedAt": now * 1000, "source": "native_session_accounting", "periodDays": days,
+        body = {"observedAt": now * 1000, "source": "native_session_accounting", "periodDays": days,
                 "window": "session_start", "auxiliary": auxiliary, "totals": totals,
                 "models": result[:100], "truncated": len(result) > 100}
     finally:
         db.close()
+    # OcuClaw's own background calls (#5046): counted by the plugin's
+    # post_auxiliary_call observer, because Hermes' ledger above records aux
+    # usage only inside an agent turn. Separate from the totals; absent when
+    # the host has no aux hooks.
+    try:
+        from .aux_usage import usage_tasks
+
+        tasks = usage_tasks(home, days)
+    except Exception:
+        tasks = None
+    if tasks is not None:
+        body["tasks"] = tasks
+    return body
 
 
 def snapshot(home):

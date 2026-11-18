@@ -1,3 +1,5 @@
+const { voiceDiagnosticPriority } = require("./voice-attempt-summary.cjs");
+
 const DEFAULT_DEBUG_CATEGORIES = Object.freeze([
   "relay.transport",
   "relay.protocol",
@@ -57,6 +59,14 @@ const DEFAULT_DEBUG_CATEGORIES = Object.freeze([
   "activity.status",
 
   "thinking.stream",
+
+  "token.usage",
+
+  "token.aux",
+
+  "firecrawl.web",
+
+  "card.studio",
 ]);
 
 const DEBUG_CATEGORY_ALIASES = Object.freeze({
@@ -122,7 +132,7 @@ function clampInt(value, min, max, fallback) {
   return rounded;
 }
 
-function createNoisyPolicyFilter(options = {}) {
+function createNoisyPolicyFilter(options      = {}) {
   const noisyPolicies = {
     ...DEFAULT_NOISY_CATEGORY_POLICIES,
     ...(options.noisyPolicies || {}),
@@ -212,6 +222,30 @@ function createDebugStore(opts) {
   let ringWrite = 0;
   let ringSize = 0;
   let seq = 0;
+  const coverageSince = new Map();
+  const summaries = new Map();
+  let summaryBytes = 0;
+  const summaryLoss      = { dropped: 0, fromMs: null, toMs: null };
+  const summaryKey = (event     ) => {
+    const id = event.event === "voice_attempt_summary" ? event.data?.attemptId
+      : event.event === "even_ai_test_summary" ? event.data?.testId
+      : ["soniox_temp_key_failed", "cartesia_access_token_failed"].includes(event.event) ? event.data?.voiceSessionId : null;
+    return typeof id === "string" && /^[a-zA-Z0-9_-]{1,80}$/.test(id) ? `${event.cat}:${event.event}:${event.data?.clientId || "relay"}:${id}` : null;
+  };
+  const summaryPriority = (event     ) => voiceDiagnosticPriority(event) || (event.severity === "warn" ? 3 : 2);
+  function removeSummary(key     , lost     ) {
+    const old = summaries.get(key);
+    if (!old) return;
+    summaries.delete(key);
+    summaryBytes -= old.bytes;
+    ring[old.index] = undefined;
+    ringSize--;
+    if (lost) {
+      summaryLoss.dropped = Math.min(2147483647, summaryLoss.dropped + 1);
+      summaryLoss.fromMs = Math.min(summaryLoss.fromMs ?? old.event.ts, old.event.ts);
+      summaryLoss.toMs = Math.max(summaryLoss.toMs ?? old.event.ts, old.event.ts);
+    }
+  }
 
   function pruneExpired(nowMs) {
     for (const [cat, expiresAt] of enabledUntil) {
@@ -291,6 +325,7 @@ function createDebugStore(opts) {
       ttlMs = Math.min(Math.floor(rawTtl), maxTtlMs);
       expiresAtMs = nowMs + ttlMs;
       for (const cat of enable) {
+        if (!isEnabled(cat, nowMs)) coverageSince.set(cat, nowMs);
         enabledUntil.set(cat, expiresAtMs);
       }
     }
@@ -335,10 +370,25 @@ function createDebugStore(opts) {
   }
 
   function append(event) {
+    const key = summaryKey(event);
+    if (key) removeSummary(key, false);
+
+    const protectedIndexes = new Set([...summaries.values()].map(row => row.index));
+    while (protectedIndexes.has(ringWrite) && protectedIndexes.size < capacity) ringWrite = (ringWrite + 1) % capacity;
+    const replacing = ring[ringWrite] !== undefined;
     ring[ringWrite] = event;
+    if (key) {
+      const bytes = new TextEncoder().encode(JSON.stringify(event)).length;
+      summaries.set(key, { event, index: ringWrite, bytes });
+      summaryBytes += bytes;
+    }
     ringWrite = (ringWrite + 1) % capacity;
-    if (ringSize < capacity) {
+    if (!replacing) {
       ringSize += 1;
+    }
+    while (summaries.size > Math.min(32, capacity - 1) || summaryBytes > 32768) {
+      const oldest = [...summaries].sort((a, b) => summaryPriority(a[1].event) - summaryPriority(b[1].event) || a[1].event.seq - b[1].event.seq)[0];
+      removeSummary(oldest[0], true);
     }
   }
 
@@ -391,13 +441,7 @@ function createDebugStore(opts) {
   }
 
   function getAllEvents() {
-    if (ringSize === 0) return [];
-    const out = [];
-    const oldest = (ringWrite - ringSize + capacity) % capacity;
-    for (let i = 0; i < ringSize; i += 1) {
-      out.push(ring[(oldest + i) % capacity]);
-    }
-    return out;
+    return ring.filter(Boolean).sort((a, b) => a.seq - b.seq);
   }
 
   function formatEventForDump(evt) {
@@ -535,6 +579,7 @@ function createDebugStore(opts) {
       categories: categoriesFilter,
       limit: limit === null ? undefined : limit,
       totalMatched: filtered.length,
+      voiceSummaryRetention: { version: 1, maxSummaries: 32, maxBytes: 32768, retained: summaries.size, bytes: summaryBytes, ...summaryLoss },
       returned: formattedEvents.length,
       dropped: Math.max(0, filtered.length - formattedEvents.length),
       enabled: getEnabledCategories(nowMs),
@@ -558,6 +603,10 @@ function createDebugStore(opts) {
     dump,
     emit,
     isEnabled,
+    captureCoverage(category     , sinceMs     ) {
+      return Number.isFinite(sinceMs) && isEnabled(category, nowFn()) && coverageSince.has(category) && coverageSince.get(category) <= sinceMs
+        ? "complete" : "incomplete";
+    },
     getSnapshot,
     getEnabledCategories,
     getKnownCategories() {
@@ -573,4 +622,4 @@ function createDebugStore(opts) {
   };
 }
 
-module.exports = { createDebugStore, createNoisyPolicyFilter, DEFAULT_DEBUG_CATEGORIES, DEFAULT_NOISY_CATEGORY_POLICIES };
+module.exports = { createNoisyPolicyFilter, createDebugStore, DEFAULT_DEBUG_CATEGORIES, DEFAULT_NOISY_CATEGORY_POLICIES };

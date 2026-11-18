@@ -1,14 +1,14 @@
 const CUSTOM_SYSTEM_PROMPT_MAX_CODE_POINTS = 4_000;
 
-function normalizeCustomSystemPrompt(value) {
+function normalizeCustomSystemPrompt(value         ) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function countUnicodeCodePoints(value) {
+function countUnicodeCodePoints(value         ) {
   return Array.from(typeof value === "string" ? value : "").length;
 }
 
-function normalizeAndValidateCustomSystemPrompt(value) {
+function normalizeAndValidateCustomSystemPrompt(value         ) {
   const normalized = normalizeCustomSystemPrompt(value);
   const codePointCount = countUnicodeCodePoints(normalized);
   if (codePointCount > CUSTOM_SYSTEM_PROMPT_MAX_CODE_POINTS) {

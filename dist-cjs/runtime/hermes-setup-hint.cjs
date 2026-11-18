@@ -1,23 +1,23 @@
 const LINK_SETUP_HINT_METHOD = "setup.hint";
 const SETUP_HINT_AWAITING_FIRST_REPLY = "awaiting-first-reply";
 
-function normalizeSetupHintPhase(value) {
+function normalizeSetupHintPhase(value     ) {
   return value === SETUP_HINT_AWAITING_FIRST_REPLY
     ? SETUP_HINT_AWAITING_FIRST_REPLY
     : null;
 }
 
-function createHermesSetupHint({ getRelay, logger } = {}) {
-  let phase = null;
+function createHermesSetupHint({ getRelay, logger }      = {}) {
+  let phase      = null;
 
-  function warn(err) {
+  function warn(err     ) {
     if (!logger || typeof logger.warn !== "function") return;
     logger.warn(
       `[hermes-setup-hint] publish failed: ${err && err.message ? err.message : err}`,
     );
   }
 
-  function setPhase(value) {
+  function setPhase(value     ) {
     const next = normalizeSetupHintPhase(value);
 
     if (next === phase) return { phase };
@@ -34,9 +34,9 @@ function createHermesSetupHint({ getRelay, logger } = {}) {
     return { phase };
   }
 
-  const methods = {};
+  const methods      = {};
 
-  methods[LINK_SETUP_HINT_METHOD] = (params) =>
+  methods[LINK_SETUP_HINT_METHOD] = (params     ) =>
     setPhase(params && typeof params === "object" ? params.phase : null);
 
   return {

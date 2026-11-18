@@ -1,22 +1,51 @@
+const { Buffer } = require("node:buffer");
+const { scrubSecretShapes } = require("../domain/debug-bundle-redaction.cjs");
 const { createHash } = require("node:crypto");
-const { buildRateLimitInfoFromSnapshot, selectProviderUsageSnapshot } = require("./provider-usage-select.cjs");
-const { stripAllTaggedSpans } = require("../domain/tagged-span-strip.cjs");
+const { normalizeAgentAppearance } = require("../domain/agent-appearance.cjs");
+const { buildRateLimitInfoFromSnapshot, normalizeProviderId, selectProviderUsageSnapshot } = require("./provider-usage-select.cjs");
+const { stripDisplayMarkup } = require("../domain/tagged-span-strip.cjs");
+const { progressNoteInActionVoice, splitBoldHeading } = require("../domain/activity-prose.cjs");
+const { serverIdOf } = require("../domain/conversation-state.cjs");
+const { projectOpenClawConversationHistory } = require("../domain/openclaw-conversation-history.cjs");
+const { programCardPictureSurfaceId } = require("../domain/program-card-pictures.cjs");
+const { modelInputKey, modelInputsFromCatalogRows } = require("../domain/model-input-kinds.cjs");
+const { speckFeelings } = require("../domain/speck-marker.cjs");
 const { parseTaggedSpans } = require("../domain/tagged-span-parser.cjs");
 const { EMOJI_TAG_FAMILY_CONFIG } = require("../domain/neural-emoji-reactor-tag-config.cjs");
 const { PACE_TAG_FAMILY_CONFIG } = require("../domain/neural-pace-modulator-tag-config.cjs");
 const { applyMarkdownWithSpans } = require("../domain/streaming-span-markdown.cjs");
+const { createUiRecordFamily, splitUiRecordSpans, stripNoteRecords, stripReplyMarkup } = require("../domain/ui-record-family.cjs");
+const { createLiveUiSurfaceRevisions, fillLiveUiInputs, isLiveUiSurfaceOrigin } = require("../tools/liveui-compiler/surface-revisions.cjs");
+const { replyPictureFallbackRecords } = require("../domain/reply-picture-fallback.cjs");
+const { validateLiveUiInputs } = require("../tools/liveui-compiler/template-inputs.cjs");
+const { liveUiSpecDataKeys } = require("../tools/liveui-compiler/stored-surface.cjs");
+const { createLiveUiSurfaceSender } = require("../tools/liveui-compiler/surface-sender.cjs");
+const { createLiveUiSurfaceState, isLiveUiParkedResult, liveUiRowNames, sanitizeLiveUiStateReport } = require("../tools/liveui-compiler/surface-state.cjs");
+const { isWakeRefToken, isWakeRowRefToken } = require("../tools/glasses-ui-wake.cjs");
+const { createLiveUiPictureService, createPictureResolver } = require("../tools/liveui-pictures/picture-service.cjs");
+const { createPictureModels } = require("../tools/liveui-models/model-picture.cjs");
+const { createLiveUiVideoService, LIVEUI_SUBTITLES_PATH } = require("../tools/liveui-video/video-service.cjs");
 const { createSessionContextService } = require("./session-context-service.cjs");
 const { isTitleDistillerRun } = require("./session-title-distiller-helpers.cjs");
 const { normalizeLogger } = require("../domain/logger-adapter.cjs");
 const { reasoningCeilingForModel } = require("./capability-snapshot.cjs");
 const { getActiveBackendKind } = require("../gateway/backend-contract.cjs");
+const { resolveInputPredictionIdentity } = require("./input-prediction-identity.cjs");
 const { relaySessionKeyFor } = require("./openclaw-session-key.cjs");
+const { parseHermesPublicKey } = require("./hermes-session-keys.cjs");
+const { runtimeOnlyModelMatcher } = require("../gateway/input-prediction-openclaw.cjs");
+const { sanitizeConnectReason } = require("../gateway/sanitize-connect-reason.cjs");
+const { codexAppServerApprovalCommand, formatWaiting, formatWaitingExplanation, normalizeWaitingPayload, waitingExplainInput } = require("./downstream-codec-approval.cjs");
+const { createRunSignalTracker } = require("./run-signals.cjs");
+const { MODEL_SITES_FENCE_KIND, modelSitesGuideLine } = require("../tools/liveui-model-sites/model-sites-guide.cjs");
 
 const DEFAULT_MODEL_PROVIDER = "anthropic";
 const DEFAULT_MODEL_ID = "claude-opus-4-6";
 const POOL_OUTCOME_FRESHNESS_MS = 10 * 60 * 1000;
 const THINKING_FINALIZE_RETENTION_MS = 5 * 60 * 1000;
 const LEDGER_COMMIT_HISTORY_GRACE_MS = 1_000;
+
+const LEDGER_COMMIT_STALL_MS = 500;
 const AGENT_PROGRESS_NOTES_DEFAULT = "conversation";
 
 const AGENT_PROGRESS_NOTES_LEGACY_STATUS = "status";
@@ -30,7 +59,7 @@ function normalizeAgentProgressNotes(value) {
   return AGENT_PROGRESS_NOTES_DEFAULT;
 }
 
-function normalizeOriginAtMs(value) {
+function normalizeOriginAtMs(value     ) {
   return typeof value === "number" && Number.isFinite(value) && value > 0
     ? value
     : null;
@@ -44,7 +73,7 @@ function isNarrationCommit(data) {
   return kind === "narration";
 }
 
-function isToolProgressCommit(data) {
+function isToolProgressCommit(data     ) {
   const kind =
     data && typeof data.messageKind === "string"
       ? data.messageKind.trim().toLowerCase()
@@ -76,7 +105,7 @@ function isTerminalActivityBoundary(state, phase, origin) {
   );
 }
 
-function classifyRunOutcomeFrame(activity, phase, origin) {
+function classifyRunOutcomeFrame(activity     , phase     , origin     ) {
   const failoverPending = !!activity && activity.failoverPending === true;
   const normalizedPhase = typeof phase === "string" ? phase.trim().toLowerCase() : "";
 
@@ -89,7 +118,7 @@ function classifyRunOutcomeFrame(activity, phase, origin) {
 }
 
 const CANCELLED_RUN_CODES = new Set(["interrupted", "cancelled"]);
-function isCancelledRunFrame(activity) {
+function isCancelledRunFrame(activity     ) {
   if (!activity || typeof activity !== "object") return false;
   if (activity.aborted === true) return true;
   return typeof activity.code === "string" && CANCELLED_RUN_CODES.has(activity.code.trim().toLowerCase());
@@ -100,7 +129,7 @@ const CANCELLED_CLOSE_DROPPED_FIELDS = [
   "message", "error", "reason", "rateLimitInfo",
 ];
 
-function quietCancelledRunClose(activity) {
+function quietCancelledRunClose(activity     ) {
   if (!activity || typeof activity !== "object" || Array.isArray(activity)) return activity;
   const phase = typeof activity.phase === "string" ? activity.phase.trim().toLowerCase() : "";
   if (phase !== "error" || activity.failoverPending === true || !isCancelledRunFrame(activity)) {
@@ -134,34 +163,17 @@ function modelRefKey(provider, model) {
   return `${provider}/${model}`;
 }
 
-function normalizeProviderId(rawProvider) {
-  const normalized = String(rawProvider || "").trim().toLowerCase();
-  if (normalized === "z.ai" || normalized === "z-ai") {
-    return "zai";
-  }
-  if (normalized === "opencode-zen") {
-    return "opencode";
-  }
-  if (normalized === "qwen") {
-    return "qwen-portal";
-  }
-  if (normalized === "kimi-code") {
-    return "kimi-coding";
-  }
-  return normalized;
-}
-
-function parseModelRef(raw, defaultProvider) {
+function parseModelRef(raw, defaultProvider, normalizeProvider = normalizeProviderId) {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
   if (!trimmed) return null;
   const slash = trimmed.indexOf("/");
   if (slash === -1) {
-    const provider = normalizeProviderId(defaultProvider);
+    const provider = normalizeProvider(defaultProvider);
     if (!provider) return null;
     return { provider, model: trimmed };
   }
-  const provider = normalizeProviderId(trimmed.slice(0, slash));
+  const provider = normalizeProvider(trimmed.slice(0, slash));
   const model = trimmed.slice(slash + 1).trim();
   if (!provider || !model) return null;
   return { provider, model };
@@ -193,7 +205,7 @@ function buildModelAliasIndex(config) {
   return aliasIndex;
 }
 
-function resolveModelRefFromString(raw, aliasIndex) {
+function resolveModelRefFromString(raw, aliasIndex, normalizeProvider = normalizeProviderId) {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
   if (!trimmed) return null;
@@ -203,10 +215,14 @@ function resolveModelRefFromString(raw, aliasIndex) {
       return aliasMatch;
     }
   }
-  return parseModelRef(trimmed, DEFAULT_MODEL_PROVIDER);
+  return parseModelRef(trimmed, DEFAULT_MODEL_PROVIDER, normalizeProvider);
 }
 
-function resolveConfiguredDefaultModelRef(config, aliasIndex) {
+function resolveConfiguredDefaultModelRef(
+  config,
+  aliasIndex,
+  normalizeProvider = normalizeProviderId,
+) {
   const modelConfig =
     config && config.agents && config.agents.defaults
       ? config.agents.defaults.model
@@ -230,7 +246,7 @@ function resolveConfiguredDefaultModelRef(config, aliasIndex) {
       }
       return { provider: DEFAULT_MODEL_PROVIDER, model: rawModel };
     }
-    const parsed = resolveModelRefFromString(rawModel, aliasIndex);
+    const parsed = resolveModelRefFromString(rawModel, aliasIndex, normalizeProvider);
     if (parsed) {
       return parsed;
     }
@@ -238,7 +254,38 @@ function resolveConfiguredDefaultModelRef(config, aliasIndex) {
   return { provider: DEFAULT_MODEL_PROVIDER, model: DEFAULT_MODEL_ID };
 }
 
-function resolveConfiguredModelRefs(config) {
+function configuredAgentRows(config) {
+  const agentsConfig = config && config.agents && typeof config.agents === "object"
+    ? config.agents
+    : {};
+  const rows = [];
+  for (const agent of Array.isArray(agentsConfig.list) ? agentsConfig.list : []) {
+    if (!agent || typeof agent !== "object") continue;
+    rows.push({ id: typeof agent.id === "string" ? agent.id.trim() : "", agent });
+  }
+  const entries = agentsConfig.entries;
+  if (entries && typeof entries === "object" && !Array.isArray(entries)) {
+    for (const [id, agent] of Object.entries(entries)) {
+      if (!agent || typeof agent !== "object") continue;
+      rows.push({ id: id.trim(), agent });
+    }
+  }
+  return rows;
+}
+
+function agentIdsWithOwnModel(configSnapshot) {
+  const ids = new Set        ();
+  for (const { id, agent } of configuredAgentRows(extractConfigObject(configSnapshot))) {
+    const model = agent.model;
+    const primary = typeof model === "string"
+      ? model
+      : model && typeof model === "object" ? model.primary : "";
+    if (id && typeof primary === "string" && primary.trim()) ids.add(id);
+  }
+  return ids;
+}
+
+function resolveConfiguredModelRefs(config, normalizeProvider = normalizeProviderId) {
   const aliasIndex = buildModelAliasIndex(config || {});
   const refs = [];
   const seen = new Set();
@@ -251,7 +298,7 @@ function resolveConfiguredModelRefs(config) {
     refs.push(ref);
   }
 
-  addRef(resolveConfiguredDefaultModelRef(config || {}, aliasIndex));
+  addRef(resolveConfiguredDefaultModelRef(config || {}, aliasIndex, normalizeProvider));
 
   const modelConfig =
     config && config.agents && config.agents.defaults
@@ -269,7 +316,7 @@ function resolveConfiguredModelRefs(config) {
       ? modelConfig.fallbacks
       : [];
   for (const raw of modelFallbacks) {
-    const parsed = resolveModelRefFromString(String(raw || ""), aliasIndex);
+    const parsed = resolveModelRefFromString(String(raw || ""), aliasIndex, normalizeProvider);
     addRef(parsed);
   }
 
@@ -280,7 +327,7 @@ function resolveConfiguredModelRefs(config) {
       ? imageModelConfig.primary.trim()
       : "";
   if (imagePrimary) {
-    const parsed = resolveModelRefFromString(imagePrimary, aliasIndex);
+    const parsed = resolveModelRefFromString(imagePrimary, aliasIndex, normalizeProvider);
     addRef(parsed);
   }
 
@@ -291,7 +338,7 @@ function resolveConfiguredModelRefs(config) {
       ? imageModelConfig.fallbacks
       : [];
   for (const raw of imageFallbacks) {
-    const parsed = resolveModelRefFromString(String(raw || ""), aliasIndex);
+    const parsed = resolveModelRefFromString(String(raw || ""), aliasIndex, normalizeProvider);
     addRef(parsed);
   }
 
@@ -305,8 +352,25 @@ function resolveConfiguredModelRefs(config) {
       ? config.agents.defaults.models
       : {};
   for (const rawKey of Object.keys(modelEntries)) {
-    const parsed = parseModelRef(String(rawKey || ""), DEFAULT_MODEL_PROVIDER);
+    const parsed = parseModelRef(String(rawKey || ""), DEFAULT_MODEL_PROVIDER, normalizeProvider);
     addRef(parsed);
+  }
+
+  for (const { agent } of configuredAgentRows(config)) {
+    const agentModel = agent && typeof agent === "object" ? agent.model : undefined;
+    if (typeof agentModel === "string") {
+      addRef(resolveModelRefFromString(agentModel, aliasIndex, normalizeProvider));
+      continue;
+    }
+    if (!agentModel || typeof agentModel !== "object") continue;
+    if (typeof agentModel.primary === "string") {
+      addRef(resolveModelRefFromString(agentModel.primary, aliasIndex, normalizeProvider));
+    }
+    if (Array.isArray(agentModel.fallbacks)) {
+      for (const raw of agentModel.fallbacks) {
+        addRef(resolveModelRefFromString(String(raw || ""), aliasIndex, normalizeProvider));
+      }
+    }
   }
 
   return refs;
@@ -325,7 +389,11 @@ function extractConfigObject(configSnapshot) {
   return {};
 }
 
-function mapConfiguredCatalogRows(modelsCatalogRows, configSnapshot) {
+function mapConfiguredCatalogRows(
+  modelsCatalogRows,
+  configSnapshot,
+  normalizeProvider = normalizeProviderId,
+) {
   const byKey = new Map();
   const providers = new Set();
   for (const row of modelsCatalogRows) {
@@ -334,14 +402,16 @@ function mapConfiguredCatalogRows(modelsCatalogRows, configSnapshot) {
   }
   const catalogUnavailable = modelsCatalogRows.length === 0;
   const config = extractConfigObject(configSnapshot);
-  const configuredRefs = resolveConfiguredModelRefs(config);
+  const configuredRefs = resolveConfiguredModelRefs(config, normalizeProvider);
+  const runtimeOnly = runtimeOnlyModelMatcher(config);
   const out = [];
   for (const ref of configuredRefs) {
     const key = modelRefKey(ref.provider, ref.model);
     const row = byKey.get(key);
     if (row) {
       out.push(row);
-    } else if (catalogUnavailable || providers.has(ref.provider)) {
+    } else if (!runtimeOnly(key) && (catalogUnavailable || providers.has(ref.provider))) {
+
       const reasoningCeiling = reasoningCeilingForModel(ref.provider, ref.model);
       const configuredRow = {
         provider: ref.provider,
@@ -355,13 +425,21 @@ function mapConfiguredCatalogRows(modelsCatalogRows, configSnapshot) {
   return out;
 }
 
-function mapHermesConfiguredCatalogRows(rows, configSnapshot) {
-  const config = extractConfigObject(configSnapshot);
+const hermesProviderId = (raw         ) => String(raw || "").trim();
+
+function mapHermesConfiguredCatalogRows(rows     , configSnapshot     ) {
+
+  const available = Array.isArray(rows) ? rows : [];
+  const config      = extractConfigObject(configSnapshot);
   const model = config.agents?.defaults?.model;
-  if (model?.primary) return mapConfiguredCatalogRows(rows, configSnapshot);
+  if (model?.primary) {
+    const configured = mapConfiguredCatalogRows(available, configSnapshot, hermesProviderId);
+    const keys = new Set(configured.map(row => modelRefKey(row.provider, row.id)));
+    return [...configured, ...available.filter(row => !keys.has(modelRefKey(row.provider, row.id)))];
+  }
   const fallbacks = model?.fallbacks || [];
-  if (!fallbacks.length) return [];
-  return mapConfiguredCatalogRows(rows, {
+  if (!fallbacks.length) return available;
+  return mapHermesConfiguredCatalogRows(available, {
     config: {
       ...config,
       agents: {
@@ -408,6 +486,14 @@ function normalizeSkillsCatalogRows(rows) {
   const seen = new Set();
   for (const row of rows) {
     if (!row || typeof row !== "object" || row.eligible !== true) continue;
+
+    if (
+      row.disabled === true ||
+      row.blockedByAllowlist === true ||
+      row.blockedByAgentFilter === true
+    ) {
+      continue;
+    }
     const name = typeof row.name === "string" ? row.name.trim() : "";
     if (!name) continue;
     const key = name.toLowerCase();
@@ -653,6 +739,8 @@ function isMethodNotFoundError(err, message) {
   );
 }
 
+const AGENT_DESCRIPTION_MAX_CHARS = 500;
+
 function normalizeAgentsCatalogRows(rows) {
   if (!Array.isArray(rows)) return [];
   const out = [];
@@ -681,12 +769,26 @@ function normalizeAgentsCatalogRows(rows) {
       typeof model.primary === "string" && model.primary.trim()
         ? model.primary.trim()
         : null;
-    out.push({ id, name, emoji, primaryModel });
+
+    const avatar = typeof identity.avatar === "string" &&
+      /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/]+=*$/.test(identity.avatar) &&
+      identity.avatar.length <= 175000 ? identity.avatar : null;
+    const appearance = emoji ? null : normalizeAgentAppearance(identity.appearance);
+
+    const description = typeof row.description === "string" && row.description.trim()
+      ? row.description.trim().slice(0, AGENT_DESCRIPTION_MAX_CHARS)
+      : "";
+    out.push({ id, name, emoji, primaryModel, ...(avatar ? { avatarDataUri: avatar } : {}),
+      ...(appearance ? { appearance } : {}),
+      ...(description ? { description } : {}),
+      ...(description && row.descriptionAuto === true ? { descriptionAuto: true } : {}) });
   }
   return out;
 }
 
 const WORKSPACE_IDENTITY_FILENAME = "IDENTITY.md";
+
+const AGENT_BOOTSTRAP_RUN_START_PROBE_DELAY_MS = 3000;
 
 const UPSTREAM_DEFAULT_IDENTITY_NAME = "Assistant";
 
@@ -874,12 +976,819 @@ function createUpstreamRuntime(opts = {}) {
   const emitDebug = typeof opts.emitDebug === "function" ? opts.emitDebug : () => {};
   const operationRegistry = opts.operationRegistry || null;
 
-  const runtimeOpts = opts;
+  const runtimeOpts      = opts;
   const noteRunOutcomeFrame =
     typeof runtimeOpts.noteRunOutcomeFrame === "function" ? runtimeOpts.noteRunOutcomeFrame : null;
+
+  const noteCardBuildRunSignal =
+    typeof runtimeOpts.noteCardBuildRunSignal === "function" ? runtimeOpts.noteCardBuildRunSignal : null;
+
+  const noteCardBuildReasoning =
+    typeof runtimeOpts.noteCardBuildReasoning === "function" ? runtimeOpts.noteCardBuildReasoning : null;
+  const noteCardBuildAgentNote =
+    typeof runtimeOpts.noteCardBuildAgentNote === "function" ? runtimeOpts.noteCardBuildAgentNote : null;
+
+  const noteCardBuildFinalReply =
+    typeof runtimeOpts.noteCardBuildFinalReply === "function" ? runtimeOpts.noteCardBuildFinalReply : null;
+
+  const noteCardBuildLateReply =
+    typeof runtimeOpts.noteCardBuildLateReply === "function" ? runtimeOpts.noteCardBuildLateReply : null;
+
+  const noteCardBuildOffSessionActivity =
+    typeof runtimeOpts.noteCardBuildOffSessionActivity === "function" ? runtimeOpts.noteCardBuildOffSessionActivity : null;
   const now = typeof opts.now === "function" ? opts.now : () => Date.now();
 
-  function normalizeGatewaySessionEvent(data) {
+  const approvalExplainer =
+    runtimeOpts.approvalExplainer && typeof runtimeOpts.approvalExplainer.explain === "function"
+      ? runtimeOpts.approvalExplainer
+      : null;
+
+  const approvalsAwaitingExplanation      = new Set();
+
+  const liveUiV2Trace = (event        , data     ) =>
+    emitDebug("glasses.lifecycle", event, "debug", { sessionKey: data && data.sessionKey }, () => data);
+
+  let liveUiV2Sender      = null;
+
+  const liveUiV2State = createLiveUiSurfaceState({
+    nowMs: runtimeOpts.liveUiV2FloorClock && typeof runtimeOpts.liveUiV2FloorClock.nowMs === "function"
+      ? runtimeOpts.liveUiV2FloorClock.nowMs
+      : undefined,
+    trace: liveUiV2Trace,
+
+    authoredState: (sessionKey        , surfaceId        ) =>
+      typeof liveUiV2Surfaces.modelState === "function" ? liveUiV2Surfaces.modelState(sessionKey, surfaceId) : null,
+    onShown: (sessionKey        , surfaceId        , name        , value                 ) => {
+      if (typeof liveUiV2Surfaces.noteModelShownState === "function") {
+        liveUiV2Surfaces.noteModelShownState(sessionKey, surfaceId, name, value);
+      }
+    },
+
+    rowRefs: (sessionKey        , surfaceId        ) => {
+      const surface = typeof liveUiV2Surfaces.getSurface === "function" ? liveUiV2Surfaces.getSurface(sessionKey, surfaceId) : null;
+      return surface ? liveUiRowNames(surface.spec) : null;
+    },
+  });
+
+  const liveUiPictureContext      = runtimeOpts.liveUiPictureContext || null;
+  const liveUiWearerRuns = new Set        ();
+
+  const liveUiModelSiteRuns = new Map                ();
+  const liveUiComposeReach = new Map                ();
+  function rememberLiveUiRun(store                                   , runId        , reach         ) {
+    if (store instanceof Map) store.set(runId, reach || "hosts");
+    else store.add(runId);
+
+    if (store.size > 256) {
+      const oldest = store.keys().next().value;
+      if (oldest !== undefined) store.delete(oldest);
+    }
+  }
+
+  const LIVEUI_MEDIA_CONTINUATION_TOOLS = new Set(["image_generate", "video_generate", "music_generate"]);
+  const LIVEUI_MEDIA_CONTINUATION_MS = 15 * 60 * 1000;
+  const liveUiMediaContinuations = new Map                ();
+  function noteLiveUiMediaContinuation(data     )       {
+    if (!data || typeof data.runId !== "string" || !data.runId || typeof data.sessionKey !== "string") return;
+    const session = liveUiV2Key(data.sessionKey);
+    if (typeof data.tool === "string" && LIVEUI_MEDIA_CONTINUATION_TOOLS.has(data.tool)) {
+      if (liveUiWearerRuns.has(data.runId)) {
+        liveUiMediaContinuations.set(`${session}\u0000${data.tool}`, now() + LIVEUI_MEDIA_CONTINUATION_MS);
+        if (liveUiMediaContinuations.size > 64) {
+          const oldest = liveUiMediaContinuations.keys().next().value;
+          if (oldest !== undefined) liveUiMediaContinuations.delete(oldest);
+        }
+      }
+      return;
+    }
+    if (data.origin !== "lifecycle" || data.phase !== "start" || liveUiWearerRuns.has(data.runId)) return;
+    const tool = data.runId.slice(0, Math.max(0, data.runId.indexOf(":")));
+    if (!LIVEUI_MEDIA_CONTINUATION_TOOLS.has(tool)) return;
+    const key = `${session}\u0000${tool}`;
+    const until = liveUiMediaContinuations.get(key);
+    if (until === undefined) return;
+    liveUiMediaContinuations.delete(key);
+    if (now() <= until) rememberLiveUiRun(liveUiWearerRuns, data.runId);
+  }
+
+  function liveUiWearerRunOpen(key        )          {
+    return [...upstreamRunPipeline.values()].some(
+      (entry     ) => entry && entry.sessionKey && liveUiV2Key(entry.sessionKey) === key && liveUiWearerRuns.has(entry.runId),
+    );
+  }
+
+  let liveUiRunlessReplyKey                = null;
+  function liveUiPictureReach(runId     , sessionKey         )                     {
+    const id = typeof runId === "string" ? runId : "";
+    const runlessReply = !id && typeof sessionKey === "string" && sessionKey === liveUiRunlessReplyKey;
+    const reach = runlessReply
+      ? (liveUiWearerRunOpen(sessionKey) ? "wearer" : "hosts")
+      : id && (liveUiWearerRuns.has(id) ? "wearer" : liveUiComposeReach.get(id) || "hosts");
+    if (reach !== "wearer") return "hosts";
+    const open = liveUiPictureContext && typeof liveUiPictureContext.wearerReachOpen === "function"
+      ? liveUiPictureContext.wearerReachOpen() !== false : true;
+    return open ? "wearer" : "hosts";
+  }
+
+  const liveUiVideo = liveUiPictureContext
+    ? (runtimeOpts.liveUiVideoService || createLiveUiVideoService({
+      trace: liveUiV2Trace,
+      speed: () => typeof liveUiPictureContext.videoSpeed !== "function" || liveUiPictureContext.videoSpeed() !== false,
+      size: () => (typeof liveUiPictureContext.videoSize === "function" ? liveUiPictureContext.videoSize() : null),
+
+      onTitle: () => {
+        if (typeof liveUiV2Surfaces.refreshPictureTitles === "function") liveUiV2Surfaces.refreshPictureTitles();
+      },
+
+      onMetadata: () => {
+        if (liveUiPictures && typeof liveUiPictures.refreshVideoMetadata === "function") liveUiPictures.refreshVideoMetadata();
+      },
+
+      onToolsNeeded: (need) => {
+        const server = getServer();
+        if (server) server.broadcast(JSON.stringify({ type: "ocuclaw.liveui.video_tools", missing: need.missing, update: need.update }));
+      },
+    }))
+    : null;
+  const liveUiPictureModels = createPictureModels();
+
+  const isProgramCardPictureKey = (key     ) => typeof key === "string" && key.startsWith("card:");
+  const liveUiPictures      = liveUiPictureContext
+    ? createLiveUiPictureService({
+      video: liveUiVideo,
+      videoHostCheck: () => (typeof liveUiPictureContext.hostCheck === "function" ? liveUiPictureContext.hostCheck() : null),
+      async resolve(src        , reach     , ctx     ) {
+
+        const scope = isProgramCardPictureKey(ctx.sessionKey)
+          ? { roots: [], filesAllowed: false }
+          : typeof liveUiPictureContext.fileScope === "function"
+            ? await liveUiPictureContext.fileScope(ctx.sessionKey)
+            : { roots: [], filesAllowed: false };
+        return createPictureResolver({
+          httpEnabled: () => typeof liveUiPictureContext.httpEnabled === "function" && liveUiPictureContext.httpEnabled() === true,
+          hostCheck: () => (typeof liveUiPictureContext.hostCheck === "function" ? liveUiPictureContext.hostCheck() : null),
+          roots: () => (scope && Array.isArray(scope.roots) ? scope.roots : []),
+          filesAllowed: () => !!(scope && scope.filesAllowed),
+          video: liveUiVideo,
+          trace: liveUiV2Trace,
+
+          models: liveUiPictureModels,
+          modelSites: runtimeOpts.modelSites || null,
+
+          ...(typeof runtimeOpts.liveUiPictureFetch === "function" ? { fetch: runtimeOpts.liveUiPictureFetch } : {}),
+        })(src, reach, ctx);
+      },
+      sendToClient(clientId        , frame     ) {
+        const server = getServer();
+        if (server && typeof server.unicast === "function") server.unicast(clientId, JSON.stringify(frame));
+      },
+      dropLine(sessionKey        , text        ) {
+
+        if (isProgramCardPictureKey(sessionKey)) return;
+        if (typeof liveUiV2Surfaces.noteDropLine === "function") liveUiV2Surfaces.noteDropLine(sessionKey, text);
+      },
+      trace: liveUiV2Trace,
+
+      ...(runtimeOpts.liveUiPictureClock || {}),
+      ...(runtimeOpts.liveUiPictureLimits ? { limits: runtimeOpts.liveUiPictureLimits } : {}),
+    })
+    : null;
+  function notePictureRevision(revision     ) {
+    if (!liveUiPictures || !revision || typeof revision.sessionKey !== "string") return;
+    const { sessionKey, surfaceId } = revision;
+    if (revision.withdrawn) {
+      liveUiPictures.noteSurfaceGone(sessionKey, surfaceId);
+    } else {
+      liveUiPictures.noteSurface(sessionKey, surfaceId, {
+        reach: liveUiPictureReach(revision.runId, sessionKey),
+        modelSitesAllowed: liveUiModelSiteRuns.get(revision.runId) === liveUiV2Key(sessionKey),
+        sources: Array.isArray(revision.pictures) ? revision.pictures : [],
+      });
+
+      if (!revision.streaming && revision.replaces) liveUiPictures.noteSurfaceGone(sessionKey, revision.replaces);
+    }
+
+    if (revision.streaming) liveUiPictures.noteRecordActivity(sessionKey);
+    else liveUiPictures.noteSettled(sessionKey);
+  }
+
+  const PROGRAM_CARD_PICTURE_SURFACES_PER_CLIENT = 8;
+  const programCardPictureSurfaces = new Map
+
+   ();
+  function sendProgramCardPictureFailed(clientId        , surfaceId        , id        , code        , large = false) {
+    const server = getServer();
+    if (!server || typeof server.unicast !== "function") return;
+    server.unicast(clientId, JSON.stringify({
+      type: "liveui_picture", surfaceId, id, status: "failed", code, ...(large ? { large: true } : {}),
+    }));
+  }
+  function closeProgramCardPictureSurface(surfaceId        , reason        ) {
+    const entry = programCardPictureSurfaces.get(surfaceId);
+    if (!entry) return;
+    programCardPictureSurfaces.delete(surfaceId);
+    if (liveUiPictures) liveUiV2Step("card_pictures_closed", entry.key, () => liveUiPictures.noteSurfaceGone(entry.key, surfaceId));
+    liveUiV2Trace("program_card_pictures_closed", { sessionKey: entry.sessionKey, surfaceId, reason });
+  }
+
+  function openProgramCardPictures(clientId     , clientSession     , admitted     ) {
+    if (typeof clientId !== "string" || !clientId || !admitted || admitted.op !== "open" || typeof admitted.sub !== "string") return;
+    const surfaceId = programCardPictureSurfaceId(admitted.sub);
+    const sessionKey = typeof clientSession === "string" && clientSession ? clientSession : "main";
+    const key = `card:${liveUiV2Key(sessionKey)}`;
+    const existing = programCardPictureSurfaces.get(surfaceId);
+    if (existing && existing.clientId !== clientId) {
+      liveUiV2Trace("program_card_pictures_ignored", { sessionKey, surfaceId, reason: "other_client" });
+      return;
+    }
+    const accepted = (Array.isArray(admitted.pictures) ? admitted.pictures : []).filter(
+      (p     ) => p && typeof p.id === "string" && typeof p.src === "string",
+    );
+    const refused = new Map                ();
+    for (const r of Array.isArray(admitted.refused) ? admitted.refused : []) {
+      if (r && typeof r.id === "string") refused.set(r.id, typeof r.code === "string" ? r.code : "picture_source_refused");
+    }
+
+    if (!liveUiPictures) for (const p of accepted) refused.set(p.id, "picture_source_refused");
+    const fetched = liveUiPictures ? accepted : [];
+
+    if (existing && existing.key !== key && liveUiPictures) {
+      liveUiV2Step("card_pictures_moved", existing.key, () => liveUiPictures.noteSurfaceGone(existing.key, surfaceId));
+    }
+    programCardPictureSurfaces.delete(surfaceId);
+
+    const mine = [...programCardPictureSurfaces.entries()].filter(([, entry]) => entry.clientId === clientId);
+    while (mine.length >= PROGRAM_CARD_PICTURE_SURFACES_PER_CLIENT) {
+      closeProgramCardPictureSurface((mine.shift()       )[0], "evicted");
+    }
+    const card = typeof admitted.card === "string" ? admitted.card.slice(0, 64) : "";
+    programCardPictureSurfaces.set(surfaceId, { clientId, sessionKey, key, card, refused });
+    if (liveUiPictures) {
+
+      const reach = liveUiPictureContext && typeof liveUiPictureContext.wearerReachOpen === "function"
+        && liveUiPictureContext.wearerReachOpen() === false ? "hosts" : "wearer";
+      liveUiV2Step("card_pictures_opened", key, () => liveUiPictures.noteSurface(key, surfaceId, {
+        reach,
+        modelSitesAllowed: false,
+        sources: fetched.map((p     ) => ({ id: p.id, src: p.src, componentId: typeof p.name === "string" ? p.name : p.id, eager: true })),
+      }));
+    }
+
+    for (const [id, code] of refused) sendProgramCardPictureFailed(clientId, surfaceId, id, code);
+    liveUiV2Trace("program_card_pictures_opened", {
+      sessionKey, surfaceId, card, pictures: fetched.length, refused: refused.size, ...(existing ? { replaced: true } : {}),
+    });
+  }
+  const liveUiV2Surfaces =
+    runtimeOpts.liveUiV2Surfaces ||
+    createLiveUiSurfaceRevisions({
+      trace: liveUiV2Trace,
+
+      decidedFrame: (sessionKey        , runId               ) =>
+        runId && typeof runtimeOpts.liveUiV2DecidedFrame === "function"
+          ? runtimeOpts.liveUiV2DecidedFrame(sessionKey, runId) || null
+          : null,
+
+      decidedIcon: (sessionKey        , runId               ) =>
+        runId && typeof runtimeOpts.liveUiV2DecidedIcon === "function"
+          ? runtimeOpts.liveUiV2DecidedIcon(sessionKey, runId) || null
+          : null,
+
+      askedWords: (sessionKey        , runId               ) =>
+        runId && typeof runtimeOpts.liveUiV2AskedWords === "function"
+          ? runtimeOpts.liveUiV2AskedWords(sessionKey, runId) || null
+          : null,
+
+      pictureTitle: (src        ) => (liveUiVideo ? liveUiVideo.titleFor(src) : null),
+
+      pictureFallback: replyPictureFallbackRecords,
+      onSurfaceEnded: (sessionKey        , surfaceId        ) => {
+        if (liveUiPictures) liveUiV2Step("pictures_ended", sessionKey, () => liveUiPictures.noteSurfaceGone(sessionKey, surfaceId));
+      },
+      onRevision: (revision     ) => {
+        if (typeof runtimeOpts.onLiveUiRevision === "function") runtimeOpts.onLiveUiRevision(revision);
+        if (revision && typeof revision.sessionKey === "string" && typeof revision.surfaceId === "string") {
+          liveUiV2State.noteSurface(revision.sessionKey, revision.surfaceId);
+        }
+        liveUiV2Step("pictures", revision && revision.sessionKey, () => notePictureRevision(revision));
+        if (!liveUiV2Sender) return;
+        try {
+          liveUiV2Sender.onRevision(revision);
+        } catch (err) {
+          emitDebug("glasses.lifecycle", "liveui_v2_send_error", "warn", { sessionKey: revision && revision.sessionKey }, () => ({
+            surfaceId: revision && revision.surfaceId,
+            specRev: revision && revision.specRev,
+            error: err && (err       ).message ? (err       ).message : String(err),
+          }));
+        }
+      },
+    });
+  liveUiV2Sender = createLiveUiSurfaceSender({
+    surfaces: liveUiV2Surfaces,
+    getServer: () => getServer(),
+
+    sessionContext:
+      typeof runtimeOpts.liveUiV2SessionContext === "function" ? runtimeOpts.liveUiV2SessionContext : undefined,
+    isUnderBackpressure:
+      typeof runtimeOpts.isGlassesUnderBackpressure === "function" ? runtimeOpts.isGlassesUnderBackpressure : undefined,
+    trace: liveUiV2Trace,
+
+    seedFor: (surfaceId        ) => {
+      const hit = liveUiV2State.cached(surfaceId);
+      return hit ? { ...hit.report } : null;
+    },
+
+    ...(runtimeOpts.liveUiV2FloorClock || {}),
+  });
+  const liveUiV2Key = (sessionKey     ) => relaySessionKeyFor(sessionKey) || sessionKey;
+
+  function liveUiV2Step(step        , sessionKey     , fn            ) {
+    try {
+      fn();
+    } catch (err) {
+      emitDebug("glasses.lifecycle", "liveui_v2_engine_error", "warn", { sessionKey }, () => ({
+        step,
+        error: err && (err       ).message ? (err       ).message : String(err),
+      }));
+    }
+  }
+
+  const liveUiV2CompactionCounts = new Map();
+
+  const liveUiV2CompactionsNoted = new Set();
+
+  let composeCallCounter = 0;
+  function composeLiveUiV2Records(sessionKey     , input      = {}) {
+    const key = liveUiV2Key(sessionKey);
+    const text = input && typeof input.records === "string" ? input.records : "";
+
+    const inputKeys =
+      input && Array.isArray(input.inputKeys)
+        ? input.inputKeys.filter((name     ) => typeof name === "string")
+        : input && Array.isArray(input.inputs)
+          ? input.inputs.map((entry     ) => entry && entry.key).filter((name     ) => typeof name === "string")
+          : null;
+    const check = inputKeys ? liveUiV2Surfaces.checkText(key, text, { inputs: inputKeys }) : liveUiV2Surfaces.checkText(key, text);
+
+    const values = input && input.values && typeof input.values === "object" && !Array.isArray(input.values) ? input.values : null;
+    const validateOnly = Boolean(input && input.validateOnly === true);
+    emitDebug("glasses.lifecycle", "liveui_v2_compose_call", "debug", { sessionKey: key }, () => ({
+      callId: input && typeof input.callId === "string" ? input.callId : null,
+      validateOnly,
+      ok: check.ok,
+      mode: check.mode,
+      placed: check.placed.length,
+      notes: check.notes.length,
+      reason: check.reason,
+    }));
+    if (validateOnly) return { ...check, painted: false, surfaceId: null, specRev: null };
+    composeCallCounter += 1;
+    const callId = input && typeof input.callId === "string" && input.callId ? input.callId : `n${composeCallCounter}`;
+    const runId = `compose:${callId}`;
+
+    rememberLiveUiRun(liveUiComposeReach, runId, liveUiWearerRunOpen(key) ? "wearer" : "hosts");
+    if (!check.ok) {
+
+      const refreshing = input && Array.isArray(input.inputs) && input.inputs.length > 0;
+      if (check.mode === "text" && !refreshing && liveUiV2Engine("noteUnframed")) {
+        liveUiV2Step("compose_unframed", key, () => liveUiV2Surfaces.noteUnframed(key, { runId, text }));
+      }
+      return { ...check, painted: false, surfaceId: null, specRev: null };
+    }
+
+    let seed      = null;
+    if (check.mode === "new" && input && Array.isArray(input.inputs) && input.inputs.length > 0) {
+      const valid = validateLiveUiInputs(input.inputs);
+      let filled = valid.ok && values ? fillLiveUiInputs(valid.inputs, values) : null;
+      if (valid.ok && (!filled || !filled.ok)) filled = fillLiveUiInputs(valid.inputs, null);
+      if (valid.ok && filled && filled.ok) {
+        seed = { inputs: valid.inputs, data: filled.data, loading: filled.loading, origin: "agent", passive: false };
+      }
+    } else if (
+      check.mode === "patch" &&
+      check.target &&
+      input &&
+      Array.isArray(input.inputs) &&
+      input.inputs.length > 0
+    ) {
+
+      const meta = liveUiV2Engine("surfaceMeta") ? (liveUiV2Surfaces       ).surfaceMeta(key, check.target) : null;
+      const byKey = new Map(input.inputs.map((entry     ) => [entry && entry.key, entry]));
+      const held = meta && Array.isArray(meta.inputs) ? meta.inputs : [];
+      const heldKeys = new Set(held.map((entry     ) => entry.key));
+      const merged = [
+        ...held.map((entry     ) => byKey.get(entry.key) || entry),
+        ...input.inputs.filter((entry     ) => !heldKeys.has(entry && entry.key)),
+      ];
+      const set = setLiveUiV2Inputs(sessionKey, check.target, merged, values);
+      if (values && (!set || set.ok !== true)) {
+
+        setLiveUiV2Inputs(sessionKey, check.target, merged, null);
+      }
+    }
+    let revision      = null;
+    liveUiV2Step("compose", key, () => {
+
+      revision = liveUiV2Surfaces.commitText(key, { runId, text, viaTool: true, ...(seed ? { seed } : {}) });
+    });
+    return {
+      ...check,
+      painted: !!(revision && !revision.withdrawn),
+
+      surfaceId: revision ? revision.surfaceId : check.mode === "patch" ? check.target : null,
+      specRev: revision ? revision.specRev : null,
+    };
+  }
+
+  function liveUiV2Engine(name        )      {
+    return liveUiV2Surfaces && typeof (liveUiV2Surfaces       )[name] === "function" ? liveUiV2Surfaces : null;
+  }
+
+  function prefetchLiveUiV2Picture(sessionKey     , surfaceId     , src     , componentId     ) {
+    if (!liveUiPictures || typeof liveUiPictures.prefetch !== "function" || typeof surfaceId !== "string" || typeof src !== "string") {
+      return Promise.resolve({ ok: true });
+    }
+    const key = liveUiV2Key(sessionKey);
+    return liveUiPictures.prefetch(key, surfaceId, { src, componentId: typeof componentId === "string" ? componentId : "" }, "hosts");
+  }
+
+  function writeLiveUiV2Data(sessionKey     , surfaceId     , patch     ) {
+    const engine = liveUiV2Engine("writeData");
+    if (!engine || typeof surfaceId !== "string") return { ok: false, reason: "surface_gone" };
+    let result      = { ok: false, reason: "surface_gone" };
+    liveUiV2Step("write_data", sessionKey, () => {
+      result = engine.writeData(liveUiV2Key(sessionKey), surfaceId, patch, { cause: "tick" });
+    });
+    return result;
+  }
+
+  function setLiveUiV2Inputs(sessionKey     , surfaceId     , inputs     , values     ) {
+    const engine = liveUiV2Engine("setInputs");
+    if (!engine || typeof surfaceId !== "string") return { ok: false, reason: "surface_gone" };
+    let result      = { ok: false, reason: "surface_gone" };
+    liveUiV2Step("set_inputs", sessionKey, () => {
+      result = engine.setInputs(liveUiV2Key(sessionKey), surfaceId, inputs, values || undefined);
+    });
+    return result;
+  }
+
+  function isLiveUiV2SurfaceLive(sessionKey     , surfaceId     ) {
+    const engine = liveUiV2Engine("isLive");
+    return !!engine && typeof surfaceId === "string" && engine.isLive(liveUiV2Key(sessionKey), surfaceId) === true;
+  }
+
+  function liveUiV2TopSurface(sessionKey     , opts      = null) {
+    const key = liveUiV2Key(sessionKey);
+    const keys = opts && Array.isArray(opts.refreshKeys) ? opts.refreshKeys : null;
+    const target = keys && liveUiV2Engine("refreshTarget") ? liveUiV2Surfaces.refreshTarget(key, keys) : undefined;
+    const surfaceId = target === undefined ? liveUiV2Surfaces.patchTarget(key) : target ? target.surfaceId : null;
+    if (!surfaceId) return null;
+    const snapshot = liveUiV2Surfaces.getSurface(key, surfaceId);
+    const meta = liveUiV2Engine("surfaceMeta") ? (liveUiV2Surfaces       ).surfaceMeta(key, surfaceId) : null;
+    const pending = target && target.kind !== "top" ? target.kind : null;
+    const spec = snapshot ? snapshot.committedSpec || (pending ? snapshot.spec : null) : null;
+    if (!snapshot || (!spec && !pending)) return null;
+    return {
+      surfaceId,
+      spec,
+      ...(pending ? { pending } : {}),
+      inputs: meta ? meta.inputs : null,
+      data: meta ? meta.data : spec ? { ...spec.data } : {},
+
+      pictureSources: meta && meta.pictureSources ? meta.pictureSources : {},
+
+      reads: spec ? [...liveUiSpecDataKeys(spec)] : [],
+      origin: meta ? meta.origin : "agent",
+      passive: meta ? meta.passive === true : false,
+    };
+  }
+
+  let openCallCounter = 0;
+  function openLiveUiV2Records(sessionKey     , input      = {}) {
+    const key = liveUiV2Key(sessionKey);
+    const text = input && typeof input.records === "string" ? input.records : "";
+    const origin = isLiveUiSurfaceOrigin(input && input.origin) ? input.origin : "agent";
+    const passive = !!(input && input.passive === true);
+    const refuse = (reason        , notes        = [], extra                          = {}) => {
+      liveUiV2Trace("liveui_v2_open_refused", { sessionKey: key, origin, passive, reason, ...extra });
+      return { ok: false, painted: false, surfaceId: null, specRev: null, notes, reason, ...extra };
+    };
+    const check = liveUiV2Surfaces.checkText(key, text);
+    if (!check.ok) return refuse(check.reason || "nothing_placed", check.notes);
+    if (check.mode !== "new") return refuse("not_new_surface", check.notes);
+    let inputs      = null;
+    if (input && input.inputs !== undefined && input.inputs !== null) {
+      const valid = validateLiveUiInputs(input.inputs);
+      if (!valid.ok) return refuse("inputs_invalid", check.notes, { code: valid.code, detail: valid.message });
+      inputs = valid.inputs;
+    }
+
+    const wearer = (input && input.wearer === true) || liveUiWearerRunOpen(key);
+    const values = input && input.values && typeof input.values === "object" ? input.values : null;
+    const filled = fillLiveUiInputs(inputs || [], values, {}, { assets: true, files: wearer });
+    if (!filled.ok) {
+      const code = filled.reason === "unknown_key" ? "unknown_key" : filled.code;
+      return refuse("inputs_invalid", check.notes, { code, key: filled.key });
+    }
+
+    const assets                         = {};
+    if (input && input.assets && typeof input.assets === "object" && !Array.isArray(input.assets)) {
+      for (const [name, bytes] of Object.entries(input.assets)) if (typeof bytes === "string") assets[name] = bytes;
+    }
+
+    const more                         = {};
+    if (input && input.more && typeof input.more === "object" && !Array.isArray(input.more)) {
+      for (const [k, n] of Object.entries(input.more)) {
+        const declared = (inputs || []).find((entry     ) => entry.key === k);
+        if (declared && declared.type === "list" && Array.isArray(filled.data[k]) && Number.isSafeInteger(n) && (n          ) > 0) {
+          more[k] = n          ;
+        }
+      }
+    }
+    openCallCounter += 1;
+    const runId = input && typeof input.runId === "string" && input.runId ? input.runId : `open:${openCallCounter}`;
+    if (!liveUiWearerRuns.has(runId)) rememberLiveUiRun(liveUiComposeReach, runId, wearer ? "wearer" : "hosts");
+    let revision      = null;
+    liveUiV2Step("open", key, () => {
+
+      revision = liveUiV2Surfaces.commitText(key, {
+        runId,
+        text,
+        viaTool: true,
+        seed: {
+          inputs,
+          data: filled.data,
+          loading: filled.loading,
+          origin,
+          passive,
+          ...(Object.keys(assets).length > 0 ? { assets } : {}),
+          ...(Object.keys(more).length > 0 ? { more } : {}),
+        },
+      });
+    });
+    const painted = !!(revision && !revision.withdrawn);
+    liveUiV2Trace("liveui_v2_open", {
+      sessionKey: key,
+      surfaceId: revision ? revision.surfaceId : null,
+      specRev: revision ? revision.specRev : null,
+      origin,
+      passive,
+      inputs: inputs ? inputs.map((i     ) => i.key) : [],
+      loading: filled.loading,
+      reach: wearer ? "wearer" : "hosts",
+      assets: Object.keys(assets).length,
+      more,
+      painted,
+    });
+    return {
+      ok: painted,
+      painted,
+      surfaceId: revision ? revision.surfaceId : null,
+      specRev: revision ? revision.specRev : null,
+      notes: check.notes,
+      reason: painted ? null : "nothing_placed",
+    };
+  }
+
+  function withdrawLiveUiV2Surface(sessionKey     , surfaceId     , reason     ) {
+    const engine = liveUiV2Engine("withdraw");
+    if (!engine || typeof surfaceId !== "string") return false;
+    let withdrawn = false;
+    liveUiV2Step("withdraw", sessionKey, () => {
+      withdrawn = !!engine.withdraw(liveUiV2Key(sessionKey), surfaceId, typeof reason === "string" && reason ? reason : "withdrawn");
+    });
+    return withdrawn;
+  }
+
+  function noteLiveUiV2StateReport(input      = {}) {
+    const raw = input && input.report && typeof input.report === "object" ? input.report : null;
+    const surfaceId = raw && typeof raw.surface === "string" ? raw.surface : null;
+    const clientId = input && typeof input.clientId === "string" ? input.clientId : null;
+    const refuse = (reason        , extra                          = {}) => {
+      liveUiV2Trace("liveui_v2_state_report_refused", {
+        sessionKey: surfaceId ? liveUiV2State.sessionOf(surfaceId) : null,
+        surfaceId,
+        rev: raw && Number.isSafeInteger(raw.rev) ? raw.rev : null,
+        clientId,
+        reason,
+        ...extra,
+      });
+      return { accepted: false, reason };
+    };
+    if (!input || input.authoritative !== true) {
+      return refuse("not_authoritative", {
+        authorityReason: typeof input?.authorityReason === "string" ? input.authorityReason : "unbound_send",
+      });
+    }
+    const report = sanitizeLiveUiStateReport(raw);
+    if (!report) return refuse("invalid");
+    if (!liveUiV2Sender.owns(report.surface) && !liveUiV2State.knows(report.surface)) return refuse("unknown_surface");
+    const verdict = liveUiV2State.accept(report);
+
+    if (!verdict.accepted && input.via === "outcome" && verdict.cachedRev === report.rev) {
+      return { accepted: false, reason: "same_rev" };
+    }
+    if (!verdict.accepted) return refuse(verdict.reason || "stale_rev", { cachedRev: verdict.cachedRev });
+    liveUiV2Trace("liveui_v2_state_report_accepted", {
+      sessionKey: liveUiV2State.sessionOf(report.surface),
+      surfaceId: report.surface,
+      rev: report.rev,
+      cachedRev: verdict.cachedRev,
+      clientId,
+      via: input.via === "outcome" ? "outcome" : "report",
+
+      stateKeys: Object.keys(report.state).length,
+      derived: Object.keys(report.derived).length,
+      timers: Object.keys(report.timers).length,
+    });
+    return { accepted: true, reason: null };
+  }
+
+  function liveUiV2ActionSel(surfaceId        , outcome     )                                                  {
+    const row = outcome ? outcome.row : undefined;
+    if (typeof row !== "string" || !isWakeRowRefToken(row)) return {};
+    const check = liveUiV2Sender.checkTap(surfaceId, row);
+    if (!check.known || check.removed) return {};
+    return {
+      row,
+      selectedIndex: Number.isSafeInteger(outcome.selected_index) && outcome.selected_index >= 0 ? outcome.selected_index : null,
+    };
+  }
+
+  function noteLiveUiV2Outcome(input      = {}) {
+    const surfaceId = input && typeof input.surfaceId === "string" ? input.surfaceId : null;
+    const outcome = input && input.outcome && typeof input.outcome === "object" ? input.outcome : {};
+    const result = typeof outcome.result === "string" ? outcome.result : null;
+
+    const ownerKey = surfaceId ? liveUiV2Sender.surfaceSessionOf(surfaceId) : null;
+    const meta = ownerKey && liveUiV2Engine("surfaceMeta") ? (liveUiV2Surfaces       ).surfaceMeta(ownerKey, surfaceId) : null;
+    const passive = !!(meta && meta.passive === true);
+    const check = liveUiV2Sender.noteOutcome(surfaceId, outcome);
+    if (!check || !surfaceId) return null;
+    const body =
+      outcome.report && typeof outcome.report === "object" ? sanitizeLiveUiStateReport(outcome.report, surfaceId) : null;
+    if (body) {
+      noteLiveUiV2StateReport({
+        report: body,
+        clientId: input.clientId,
+        authoritative: input.reportAuthoritative === true,
+        authorityReason: input.reportAuthorityReason,
+        via: "outcome",
+      });
+    }
+    const sessionKey = check.sessionKey;
+    if (!sessionKey || !isLiveUiParkedResult(result)) return { parked: null, wake: false };
+    const drop = (reason        ) => {
+      liveUiV2Trace("liveui_v2_outcome_dropped", { sessionKey, surfaceId, result, ref: check.ref, reason });
+      return { parked: null, wake: false };
+    };
+    if (passive) {
+
+      if ((result === "action" || result === "selected") && !check.known) return drop(check.reason || "undeclared");
+      let settled = false;
+      if (result === "action" || result === "selected") {
+        liveUiV2Step("library_settle", sessionKey, () => {
+          settled = !!(liveUiV2Engine("withdraw") && (liveUiV2Surfaces       ).withdraw(sessionKey, surfaceId, "library_settled"));
+        });
+        liveUiV2Trace("liveui_v2_left_glass", { sessionKey, surfaceId, reason: "library_settled", result, ref: check.ref, settled });
+      }
+      liveUiV2Trace("liveui_v2_outcome_settled", { sessionKey, surfaceId, result, ref: check.ref, reason: "passive" });
+      return { parked: null, wake: false, settled: true };
+    }
+    let refs                          = {};
+    if (result === "action" || result === "selected") {
+
+      const ref = result === "action" ? outcome.action : outcome.row;
+      if (typeof ref !== "string") return drop("no_ref");
+      if (!check.known) return drop(check.reason || "undeclared");
+      if (!(result === "action" ? isWakeRefToken(ref) : isWakeRowRefToken(ref))) return drop("bad_ref");
+      refs =
+        result === "action"
+          ? { action: ref, ...liveUiV2ActionSel(surfaceId, outcome) }
+          : {
+              row: ref,
+              selectedIndex:
+                Number.isSafeInteger(outcome.selected_index) && outcome.selected_index >= 0 ? outcome.selected_index : null,
+            };
+    }
+    const entry = liveUiV2State.park({
+      sessionKey,
+      surface: surfaceId,
+      result,
+      ...refs,
+      ...(check.removed ? { removed: true          } : {}),
+      report: body,
+    });
+    const wake = result !== "dismissed";
+    liveUiV2Trace("liveui_v2_outcome_parked", {
+      sessionKey,
+      surfaceId,
+      eventId: entry.eventId,
+      result,
+      ref: entry.action ?? entry.row ?? null,
+
+      ...(entry.action !== undefined && entry.row !== undefined ? { sel: entry.row } : {}),
+      selectedIndex: entry.selectedIndex ?? null,
+      removed: entry.removed === true,
+      reportRev: body ? body.rev : null,
+      wake,
+    });
+    return {
+      wake,
+
+      parked: {
+        sessionKey,
+        surfaceId,
+        eventId: entry.eventId,
+        result,
+        ...(entry.action !== undefined ? { action: entry.action } : {}),
+        ...(entry.row !== undefined ? { row: entry.row, selectedIndex: entry.selectedIndex ?? null } : {}),
+        ...(entry.removed ? { removed: true } : {}),
+        queuedAtMs: entry.parkedAt,
+      },
+    };
+  }
+
+  function liveUiV2ActiveSurface(key        )                {
+    const stack = liveUiV2Surfaces.stack(key);
+    return stack.length > 0 ? stack[stack.length - 1] : liveUiV2State.latestSurfaceOf(key);
+  }
+
+  function collectLiveUiV2State(sessionKey     ) {
+    const key = liveUiV2Key(sessionKey);
+    if (!key) return null;
+    const v2 =
+      isLiveUiV2Session(sessionKey) ||
+      isLiveUiV2Session(key) ||
+      liveUiV2Sender.surfacesOf(key).length > 0 ||
+      liveUiV2State.pendingOutcomes(key) > 0 ||
+      liveUiV2State.latestSurfaceOf(key) !== null;
+    if (!v2) return null;
+    const active = liveUiV2ActiveSurface(key);
+    const read = liveUiV2State.collect(key, active, { fallback: active ? liveUiV2Sender.fallbackOnly(active) : false });
+    liveUiV2Trace("liveui_v2_outcomes_collected", {
+      sessionKey: key,
+      surfaceId: active,
+      rev: read.state && Number.isInteger(read.state.rev) ? read.state.rev : null,
+      fallback: !!(read.state && read.state.fallback === true),
+      outcomes: read.outcomes.length,
+      eventResults: read.outcomes.map((o     ) => o.result),
+    });
+    return read;
+  }
+
+  const liveUiModelSitesTaught = new Map                ();
+  function takeModelSitesLine(key        , out       ) {
+    const service = runtimeOpts.modelSites;
+    if (!key || !service || typeof service.status !== "function") return;
+    const line = modelSitesGuideLine((site) => service.status(site), { sketchfabMirror: service.mirror === true });
+    if (!line || liveUiModelSitesTaught.get(key) === line) return;
+    out.push({ kind: MODEL_SITES_FENCE_KIND, text: line });
+    liveUiModelSitesTaught.delete(key);
+    liveUiModelSitesTaught.set(key, line);
+    if (liveUiModelSitesTaught.size > 256) {
+      const oldest = liveUiModelSitesTaught.keys().next().value;
+      if (oldest !== undefined) liveUiModelSitesTaught.delete(oldest);
+    }
+    liveUiV2Trace("liveui_v2_model_sites_line", { sessionKey: key, bytes: line.length });
+  }
+  function noteLiveUiV2Compaction(v2Key        ) {
+    liveUiV2Surfaces.noteCompaction(v2Key);
+    liveUiModelSitesTaught.delete(v2Key);
+  }
+
+  function takeLiveUiV2FenceFragments(sessionKey     ) {
+    const key = liveUiV2Key(sessionKey);
+    const out        = liveUiV2Surfaces.takeFenceFragments(key);
+    liveUiV2Step("model_sites_line", key, () => takeModelSitesLine(key, out));
+    liveUiV2Step("state_fragment", key, () => {
+      const fragment = liveUiV2State.takeFragment(key, liveUiV2ActiveSurface(key));
+      if (!fragment) return;
+      out.push({ kind: "liveui_state", text: fragment.text });
+      liveUiV2Trace("liveui_v2_state_fragment", {
+        sessionKey: key,
+        bytes: fragment.bytes,
+        surfaces: fragment.surfaces,
+        parked: fragment.parked,
+        tapLines: fragment.tapLines,
+      });
+    });
+    return out;
+  }
+
+  function liveUiV2TapsRead(sessionKey     , runId     ) {
+    const key = liveUiV2Key(sessionKey);
+    const read = liveUiV2State.endTurn(key);
+    if (read > 0) liveUiV2Trace("liveui_v2_taps_read", { sessionKey: key, runId: runId || null, read });
+  }
+
+  function isLiveUiV2TapOwed(sessionKey     , eventId     ) {
+    const key = liveUiV2Key(sessionKey);
+    if (typeof key !== "string" || !key || !Number.isSafeInteger(eventId)) return null;
+    return liveUiV2State.tapOwed(key, eventId);
+  }
+
+  function normalizeGatewaySessionEvent(data     ) {
     if (getActiveBackendKind() === "hermes") return data;
     if (
       !data ||
@@ -890,7 +1799,7 @@ function createUpstreamRuntime(opts = {}) {
       return data;
     }
     let normalized = data;
-    const normalizeField = (field) => {
+    const normalizeField = (field     ) => {
       if (typeof normalized[field] !== "string") return;
       const relayKey = relaySessionKeyFor(normalized[field]);
       if (relayKey === normalized[field]) return;
@@ -911,10 +1820,10 @@ function createUpstreamRuntime(opts = {}) {
   }
 
   const gatewayListenersByEvent = new Map();
-  function onGatewayEvent(eventName, listener) {
+  function onGatewayEvent(eventName     , listener     ) {
     if (!gatewayListenersByEvent.has(eventName)) gatewayListenersByEvent.set(eventName, []);
     gatewayListenersByEvent.get(eventName).push(listener);
-    return gatewayBridge.on(eventName, (data) => {
+    return gatewayBridge.on(eventName, (data     ) => {
 
       const observeSetupEvent = Reflect.get(opts, "observeSetupEvent");
       if (typeof observeSetupEvent === "function") observeSetupEvent(eventName, data);
@@ -935,6 +1844,12 @@ function createUpstreamRuntime(opts = {}) {
     typeof opts.broadcastActivity === "function"
       ? opts.broadcastActivity
       : (activity) => activity;
+  const noteProseListener = Reflect.get(opts, "noteActivityProse");
+  const noteActivityProse =
+    typeof noteProseListener === "function" ? noteProseListener : () => null;
+  const liveProseListener = Reflect.get(opts, "liveProseHeadlines");
+  const liveProseHeadlines =
+    typeof liveProseListener === "function" ? liveProseListener : () => false;
   const broadcastProviderUsageSnapshot =
     typeof opts.broadcastProviderUsageSnapshot === "function"
       ? opts.broadcastProviderUsageSnapshot
@@ -972,6 +1887,8 @@ function createUpstreamRuntime(opts = {}) {
   const onClarify = typeof opts.onClarify === "function" ? opts.onClarify : () => false;
   const attentionListener = Reflect.get(opts, "onSessionAttention");
   const onSessionAttention = typeof attentionListener === "function" ? attentionListener : () => {};
+  const sessionsGoneListener = Reflect.get(opts, "onSessionsGone");
+  const onSessionsGone = typeof sessionsGoneListener === "function" ? sessionsGoneListener : () => {};
   const displayedHermesApprovals = new Set();
 
   function refreshSessionAttention() {
@@ -987,6 +1904,13 @@ function createUpstreamRuntime(opts = {}) {
     Promise.resolve(gatewayBridge.request("sessions.attention", { key })).catch(() => {});
   }
 
+  const takeWaitingApproval =
+
+    typeof opts.takeWaitingApproval === "function" ? opts.takeWaitingApproval : () => false;
+  const observeWaitingApprovalResolved =
+
+    typeof opts.observeWaitingApprovalResolved === "function" ? opts.observeWaitingApprovalResolved : () => false;
+
   const onQuestion = typeof opts.onQuestion === "function" ? opts.onQuestion : () => false;
   const onQuestionResolved =
 
@@ -1000,7 +1924,7 @@ function createUpstreamRuntime(opts = {}) {
   const taskApprovalRequests = new Map();
   const TASK_APPROVAL_REQUEST_MAX = 500;
 
-  function rememberTaskApproval(data) {
+  function rememberTaskApproval(data     ) {
     const request = data && data.request && typeof data.request === "object" ? data.request : {};
     const id = data && typeof data.id === "string" ? data.id.trim() : "";
     const sessionKey = typeof request.sessionKey === "string" ? request.sessionKey.trim() : "";
@@ -1164,7 +2088,8 @@ function createUpstreamRuntime(opts = {}) {
   const providerUsageCacheTtlMs =
     Number.isFinite(opts.providerUsageCacheTtlMs) && opts.providerUsageCacheTtlMs > 0
       ? Math.floor(opts.providerUsageCacheTtlMs)
-      : 60000;
+
+      : 45000;
 
   let openclawConnected = false;
 
@@ -1174,13 +2099,24 @@ function createUpstreamRuntime(opts = {}) {
   let cachedModelsCatalogFetchedAt = 0;
   let cachedModelsCatalogStale = true;
 
+  let cachedModelsCatalogScope = "";
+
+  let cachedModelInputs = new Map();
+
+  let cachedAgentsWithOwnModel = null;
+
   let inFlightModelsCatalogFetch = null;
+  let inFlightModelsCatalogScope = "";
 
   let cachedSkillsCatalog = null;
   let cachedSkillsCatalogFetchedAt = 0;
   let cachedSkillsCatalogStale = true;
 
-  let inFlightSkillsCatalogFetch = null;
+  let cachedSkillsCatalogAgentId                = null;
+  let skillsCatalogGeneration = 0;
+  let inFlightSkillsCatalogFetch                                                                         = null;
+  let inFlightSkillsCatalogAgentId                = null;
+  let inFlightSkillsCatalogGeneration = -1;
 
   let cachedCommandCatalog = null;
   let cachedCommandCatalogFetchedAt = 0;
@@ -1204,6 +2140,10 @@ function createUpstreamRuntime(opts = {}) {
     hermesProfileSettings: false,
 
     foreignSessionAdopt: false,
+
+    sharedChats: false,
+
+    autoRoute: false,
     hermesFleet: null,
   };
 
@@ -1214,14 +2154,16 @@ function createUpstreamRuntime(opts = {}) {
   let cachedProviderUsageFetchedAt = 0;
   let cachedProviderUsageObservedAt = 0;
   let cachedProviderUsageStale = true;
+  let cachedProviderUsageScope = "";
 
   let inFlightProviderUsageFetch = null;
+  let inFlightProviderUsageScope = "";
   const providerOutcomeState = new Map();
   const cachedAuthProfileCounts = new Map();
   const upstreamRunPipeline = new Map();
 
   const toolProgressBubbles = new Set();
-  function isToolProgressBubble(data, sessionKey) {
+  function isToolProgressBubble(data     , sessionKey     ) {
     if (isNarrationCommit(data)) return false;
     const messageId = normalizeStreamingToken(data.id ?? data.messageId);
     const runId = normalizeStreamingToken(data.runId);
@@ -1240,8 +2182,8 @@ function createUpstreamRuntime(opts = {}) {
     return key !== null && toolProgressBubbles.has(key);
   }
 
-  let streamMessageIdState = null;
-  function streamMessageIndexFromId(runId, messageId) {
+  let streamMessageIdState      = null;
+  function streamMessageIndexFromId(runId     , messageId     ) {
     const id = normalizeStreamingToken(messageId);
     if (!runId || !id) return null;
     if (!streamMessageIdState || streamMessageIdState.runId !== runId) {
@@ -1256,10 +2198,12 @@ function createUpstreamRuntime(opts = {}) {
     return streamMessageIdState.index;
   }
   const activeThinkingRuns = new Set();
+
+  const visibleReasoningRuns = new Map();
   const finalizedThinkingRuns = new Map();
   const finalizedThinkingRunTimers = new Map();
   let streamingThrottleTimer = null;
-  let pendingStreaming = null;
+  let pendingStreaming      = null;
 
   let activeTyping = null;
   let bootstrapRefreshTimer = null;
@@ -1276,6 +2220,12 @@ function createUpstreamRuntime(opts = {}) {
 
   let workspaceIdentityFilesUnsupported = false;
 
+  let agentBootstrapPending      = null;
+
+  let agentBootstrapProbeAgentId      = null;
+
+  let inFlightAgentBootstrapProbe      = null;
+
   function getAgentName() {
     return agentIdentity.name;
   }
@@ -1290,6 +2240,10 @@ function createUpstreamRuntime(opts = {}) {
 
   function getAgentAvatarHash() {
     return agentIdentity.avatarHash;
+  }
+
+  function getAgentBootstrapPending() {
+    return agentBootstrapPending;
   }
 
   function getAgentAvatarDataUriByHash(hash) {
@@ -1320,6 +2274,27 @@ function createUpstreamRuntime(opts = {}) {
     if (!ledgerCommitFallbackTimer) return;
     clearTimeout(ledgerCommitFallbackTimer);
     ledgerCommitFallbackTimer = 0;
+  }
+
+  function armLedgerCommitFallback(sessionKey     , runId     , stallRearms        ) {
+    clearLedgerCommitFallbackTimer();
+    const dueAtMs = Date.now() + LEDGER_COMMIT_HISTORY_GRACE_MS;
+    ledgerCommitFallbackTimer = setTimeout(() => {
+      ledgerCommitFallbackTimer = 0;
+      const lateMs = Date.now() - dueAtMs;
+      if (stallRearms > 0 && lateMs >= LEDGER_COMMIT_STALL_MS) {
+        emitDebug(
+          "openclaw.history",
+          "commit_fallback_deferred_after_stall",
+          "info",
+          { sessionKey, runId },
+          () => ({ lateMs, graceMs: LEDGER_COMMIT_HISTORY_GRACE_MS }),
+        );
+        armLedgerCommitFallback(sessionKey, runId, stallRearms - 1);
+        return;
+      }
+      broadcastPages({ reason: "commit_fallback" });
+    }, LEDGER_COMMIT_HISTORY_GRACE_MS);
   }
 
   function flushLedgerCommitFallback() {
@@ -1419,6 +2394,7 @@ function createUpstreamRuntime(opts = {}) {
     sessionService.handleUpstreamStatusChange(openclawConnected);
     if (!openclawConnected) {
       clearTyping("upstream_disconnected");
+      clearCurrentActivityReplay();
       inFlightModelsCatalogFetch = null;
       inFlightSkillsCatalogFetch = null;
       inFlightCommandCatalogFetch = null;
@@ -1430,7 +2406,11 @@ function createUpstreamRuntime(opts = {}) {
       workspaceIdentityFilesUnsupported = false;
       workspaceIdentityFallbackCache.clear();
       inFlightWorkspaceIdentityFetches.clear();
+      agentBootstrapPending = null;
+      agentBootstrapProbeAgentId = null;
+      inFlightAgentBootstrapProbe = null;
       cachedSkillsCatalogStale = true;
+      skillsCatalogGeneration += 1;
       cachedCommandCatalogStale = true;
 
       commandCatalogUnsupported = false;
@@ -1524,6 +2504,56 @@ function createUpstreamRuntime(opts = {}) {
     return promise;
   }
 
+  function refreshAgentBootstrapPending(agentId     , reason     ) {
+    if (!agentId || getActiveBackendKind() === "hermes" || workspaceIdentityFilesUnsupported) {
+      return Promise.resolve(agentBootstrapPending);
+    }
+    if (inFlightAgentBootstrapProbe) return inFlightAgentBootstrapProbe;
+    const gen = connectionGeneration;
+    const settle = (value     ) => {
+      if (gen !== connectionGeneration || agentId !== agentBootstrapProbeAgentId || inFlightAgentBootstrapProbe !== promise) return;
+      agentBootstrapProbeAgentId = agentId;
+      if (value === agentBootstrapPending) return;
+      agentBootstrapPending = value;
+      emitDebug(
+        "relay.session",
+        "agent_bootstrap_pending_changed",
+        "info",
+        { sessionKey: sessionService.ensureSessionKey() },
+        () => ({ agentId, pending: value, reason }),
+      );
+      broadcastStatus();
+    };
+    const promise = gatewayBridge
+      .request("agents.files.get", { agentId, name: "BOOTSTRAP.md" })
+      .then((result     ) => {
+        const file = result && result.file;
+        if (file && file.missing === true) return settle(false);
+        if (!(file && typeof file.content === "string")) return settle(null);
+
+        return gatewayBridge
+          .request("agents.files.get", { agentId, name: WORKSPACE_IDENTITY_FILENAME })
+          .then((identityResult     ) => {
+            const identityFile = identityResult && identityResult.file;
+            const content = identityFile && typeof identityFile.content === "string" ? identityFile.content : "";
+            const identity      = parseWorkspaceIdentityFallback(content);
+            settle(!identity.name);
+          }, () => settle(true));
+      })
+      .catch((err     ) => {
+        if (isMethodNotFoundError(err, err && err.message ? err.message : String(err))) {
+          workspaceIdentityFilesUnsupported = true;
+        }
+        settle(null);
+      })
+      .finally(() => {
+        if (inFlightAgentBootstrapProbe === promise) inFlightAgentBootstrapProbe = null;
+      })
+      .then(() => agentBootstrapPending);
+    inFlightAgentBootstrapProbe = promise;
+    return promise;
+  }
+
   function applyAgentIdentity(identity, source) {
     lastGatewayIdentity = identity || null;
     const agentId =
@@ -1569,6 +2599,15 @@ function createUpstreamRuntime(opts = {}) {
     }
     agentIdentity = next;
     conversationState.setAgentName(next.name || "Agent");
+    if (agentId && (agentId !== agentBootstrapProbeAgentId || agentBootstrapPending === true)) {
+      if (agentId !== agentBootstrapProbeAgentId) {
+        agentBootstrapProbeAgentId = agentId;
+        agentBootstrapPending = null;
+
+        inFlightAgentBootstrapProbe = null;
+      }
+      refreshAgentBootstrapPending(agentId, source).catch(() => {});
+    }
     emitDebug(
       "relay.session",
       "agent_identity_applied",
@@ -1677,7 +2716,7 @@ function createUpstreamRuntime(opts = {}) {
     }, retryDelayMs);
   }
 
-  async function refreshActiveSessionIdentity(trigger, attempt = 0) {
+  async function refreshActiveSessionIdentity(trigger     , attempt = 0) {
 
     const refreshNonce = ++bootstrapRefreshNonce;
     clearBootstrapRefreshTimer();
@@ -1731,14 +2770,21 @@ function createUpstreamRuntime(opts = {}) {
         );
       }
 
-      const parsedSpans = parseTaggedSpans(queuedStreaming.rawText, [
-        EMOJI_TAG_FAMILY_CONFIG,
-        PACE_TAG_FAMILY_CONFIG,
-      ]);
+      const uiRecords = isLiveUiV2Session(
+        queuedStreaming.sessionKey || sessionService.ensureSessionKey(),
+      );
+      const parsedSpans = parseTaggedSpans(
+        queuedStreaming.rawText,
+        uiRecords
+          ? [EMOJI_TAG_FAMILY_CONFIG, PACE_TAG_FAMILY_CONFIG, createUiRecordFamily()]
+          : [EMOJI_TAG_FAMILY_CONFIG, PACE_TAG_FAMILY_CONFIG],
+      );
       const { text, spansByFamily } = applyMarkdownWithSpans(
         {
           cleanText: parsedSpans.cleanText,
-          spansByFamily: parsedSpans.spansByFamily,
+          spansByFamily: uiRecords
+            ? splitUiRecordSpans(parsedSpans.spansByFamily).spansByFamily
+            : parsedSpans.spansByFamily,
           trailingPartialTag: parsedSpans.trailingPartialTag,
         },
         queuedStreaming.prefix,
@@ -1802,6 +2848,18 @@ function createUpstreamRuntime(opts = {}) {
         }),
       );
     }
+
+    const v2SessionKey = queuedStreaming.sessionKey || sessionService.ensureSessionKey();
+    if (isLiveUiV2Session(v2SessionKey)) {
+      liveUiV2Step("stream", v2SessionKey, () => {
+        liveUiV2Surfaces.streamText(liveUiV2Key(v2SessionKey), {
+          runId: queuedStreaming.runId || null,
+          messageIndex: queuedStreaming.messageIndex,
+          messageId: queuedStreaming.messageId || null,
+          text: queuedStreaming.rawText,
+        });
+      });
+    }
   }
 
   let simulatedModelsCatalog = null;
@@ -1832,20 +2890,35 @@ function createUpstreamRuntime(opts = {}) {
     const hasCache = Array.isArray(cachedModelsCatalog);
     const ageMs = hasCache ? currentNow - cachedModelsCatalogFetchedAt : Infinity;
     const ttlExpired = ageMs >= modelsCacheTtlMs;
+
+    const otherScope = cachedModelsCatalogScope !== gatewayReadScope();
     return {
       models: hasCache ? cachedModelsCatalog : [],
       fetchedAtMs: hasCache ? cachedModelsCatalogFetchedAt : currentNow,
-      stale: !hasCache || cachedModelsCatalogStale || ttlExpired,
+      stale: !hasCache || cachedModelsCatalogStale || ttlExpired || otherScope,
     };
   }
 
-  function cacheModelCatalog(models, fetchedAtMs, stale) {
+  function cacheModelCatalog(models, fetchedAtMs, stale, scope = gatewayReadScope()) {
     cachedModelsCatalog = Array.isArray(models) ? models : [];
     cachedModelsCatalogFetchedAt = Number.isFinite(fetchedAtMs)
       ? Math.floor(fetchedAtMs)
       : now();
     cachedModelsCatalogStale = !!stale;
+    cachedModelsCatalogScope = scope;
     return modelCatalogSnapshot(cachedModelsCatalogFetchedAt);
+  }
+
+  function gatewayReadScope() {
+    if (getActiveBackendKind() !== "hermes") return "";
+    const parsed = parseHermesPublicKey(sessionService.ensureSessionKey() || "");
+    return parsed && parsed.namespace ? parsed.namespace : "";
+  }
+
+  function gatewayReadParams() {
+    if (getActiveBackendKind() !== "hermes") return {};
+    const sessionKey = sessionService.ensureSessionKey();
+    return sessionKey ? { sessionKey } : {};
   }
 
   function skillsCatalogSnapshot(nowMs) {
@@ -1858,8 +2931,9 @@ function createUpstreamRuntime(opts = {}) {
     };
   }
 
-  function cacheSkillsCatalog(skills, fetchedAtMs, stale) {
+  function cacheSkillsCatalog(skills     , fetchedAtMs     , stale     , agentId         ) {
     cachedSkillsCatalog = Array.isArray(skills) ? skills : [];
+    cachedSkillsCatalogAgentId = typeof agentId === "string" ? agentId : "";
     cachedSkillsCatalogFetchedAt = Number.isFinite(fetchedAtMs)
       ? Math.floor(fetchedAtMs)
       : now();
@@ -1907,6 +2981,8 @@ function createUpstreamRuntime(opts = {}) {
       hermesProfileEmojiSet: cachedAgentsEnvelope.hermesProfileEmojiSet === true,
       hermesProfileSettings: cachedAgentsEnvelope.hermesProfileSettings === true,
       foreignSessionAdopt: cachedAgentsEnvelope.foreignSessionAdopt === true,
+      sharedChats: cachedAgentsEnvelope.sharedChats === true,
+      autoRoute: cachedAgentsEnvelope.autoRoute === true,
       hermesFleet: cachedAgentsEnvelope.hermesFleet || null,
       fetchedAtMs: hasCache ? cachedAgentsCatalogFetchedAt : currentNow,
       stale: !hasCache || cachedAgentsCatalogStale,
@@ -1934,6 +3010,8 @@ function createUpstreamRuntime(opts = {}) {
       hermesProfileEmojiSet: envelope && envelope.hermesProfileEmojiSet === true,
       hermesProfileSettings: envelope && envelope.hermesProfileSettings === true,
       foreignSessionAdopt: envelope && envelope.foreignSessionAdopt === true,
+      sharedChats: envelope && envelope.sharedChats === true,
+      autoRoute: envelope && envelope.autoRoute === true,
       hermesFleet: envelope && envelope.hermesFleet || null,
     };
     cachedAgentsCatalogFetchedAt = Number.isFinite(fetchedAtMs)
@@ -1954,12 +3032,27 @@ function createUpstreamRuntime(opts = {}) {
     return match ? match.name : null;
   }
 
+  function agentHasOwnModel(agentId) {
+    if (typeof agentId !== "string" || !agentId.trim()) return false;
+    return !!cachedAgentsWithOwnModel && cachedAgentsWithOwnModel.has(agentId.trim());
+  }
+
+  function getAgentPrimaryModel(agentId) {
+    if (typeof agentId !== "string" || !agentId.trim()) return null;
+    const id = agentId.trim();
+    if (!Array.isArray(cachedAgentsCatalog)) return null;
+    const match = cachedAgentsCatalog.find((entry) => entry && entry.id === id);
+    return match && match.primaryModel ? match.primaryModel : null;
+  }
+
   function providerUsageCacheState(nowMs) {
     const currentNow = Number.isFinite(nowMs) ? nowMs : now();
+
     const hasCache =
       cachedProviderUsageSummary &&
       typeof cachedProviderUsageSummary === "object" &&
-      !Array.isArray(cachedProviderUsageSummary);
+      !Array.isArray(cachedProviderUsageSummary) &&
+      cachedProviderUsageScope === gatewayReadScope();
     const ageMs = hasCache ? currentNow - cachedProviderUsageObservedAt : Infinity;
     const ttlExpired = ageMs >= providerUsageCacheTtlMs;
     return {
@@ -2070,16 +3163,24 @@ function createUpstreamRuntime(opts = {}) {
     if (!force && !snapshot.stale) {
       return snapshot;
     }
+    const scope = gatewayReadScope();
     if (inFlightProviderUsageFetch) {
-      return inFlightProviderUsageFetch;
+      if (inFlightProviderUsageScope === scope) {
+        return inFlightProviderUsageFetch;
+      }
+
+      return inFlightProviderUsageFetch
+        .catch(() => {})
+        .then(() => refreshProviderUsage(true));
     }
     if (!openclawConnected) {
       return snapshot;
     }
 
+    inFlightProviderUsageScope = scope;
     inFlightProviderUsageFetch = (async () => {
       const [usageResult, authStatusResult] = await Promise.allSettled([
-        gatewayBridge.request("usage.status", {}),
+        gatewayBridge.request("usage.status", gatewayReadParams()),
         fetchAuthProfileCounts(),
       ]);
 
@@ -2108,6 +3209,7 @@ function createUpstreamRuntime(opts = {}) {
         const result = usageResult.value;
         cachedProviderUsageSummary =
           result && typeof result === "object" && !Array.isArray(result) ? result : {};
+        cachedProviderUsageScope = scope;
         cachedProviderUsageObservedAt = now();
         cachedProviderUsageFetchedAt =
           Number.isFinite(result && result.updatedAt)
@@ -2154,22 +3256,33 @@ function createUpstreamRuntime(opts = {}) {
     if (!force && !snapshot.stale) {
       return snapshot;
     }
+    const scope = gatewayReadScope();
     if (inFlightModelsCatalogFetch) {
-      return inFlightModelsCatalogFetch;
+      if (inFlightModelsCatalogScope === scope) {
+        return inFlightModelsCatalogFetch;
+      }
+      return inFlightModelsCatalogFetch
+        .catch(() => {})
+        .then(() => refreshModelCatalog(true));
     }
     if (!openclawConnected) {
       return snapshot;
     }
 
+    const readParams = gatewayReadParams();
+    inFlightModelsCatalogScope = scope;
     inFlightModelsCatalogFetch = gatewayBridge
-      .request("models.list", {})
+      .request("models.list", readParams)
       .then(async (result) => {
         const allModels = normalizeModelCatalogRows(result && result.models);
-        const configSnapshot = await gatewayBridge.request("config.get", {});
-        const models = getActiveBackendKind() === "hermes"
+        cachedModelInputs = modelInputsFromCatalogRows(result && result.models);
+        const configSnapshot = await gatewayBridge.request("config.get", readParams);
+        const hermes = getActiveBackendKind() === "hermes";
+        const models = hermes
           ? mapHermesConfiguredCatalogRows(allModels, configSnapshot)
           : mapConfiguredCatalogRows(allModels, configSnapshot);
-        return cacheModelCatalog(models, Date.now(), false);
+        if (!hermes) cachedAgentsWithOwnModel = agentIdsWithOwnModel(configSnapshot);
+        return cacheModelCatalog(models, Date.now(), false, scope);
       })
       .catch((err) => {
         emitDebug(
@@ -2186,7 +3299,7 @@ function createUpstreamRuntime(opts = {}) {
           cachedModelsCatalogStale = true;
           return modelCatalogSnapshot();
         }
-        return cacheModelCatalog([], now(), true);
+        return cacheModelCatalog([], now(), true, scope);
       });
 
     return inFlightModelsCatalogFetch.finally(() => {
@@ -2194,24 +3307,76 @@ function createUpstreamRuntime(opts = {}) {
     });
   }
 
-  async function refreshSkillsCatalog(force) {
+  function currentSkillsCatalogAgentId() {
+    if (getActiveBackendKind() === "hermes") return "";
+    let identity      = null;
+    try {
+      identity = resolveInputPredictionIdentity({
+        backendKind: "openclaw",
+        clientSessionKey: sessionService.ensureSessionKey(),
+        getSessionAgentId:
+          typeof sessionService.getSessionAgentId === "function"
+            ? (shortKey     , fullKey     ) => sessionService.getSessionAgentId(shortKey, fullKey)
+            : undefined,
+        extractShortKey:
+          typeof sessionService.extractShortKey === "function"
+            ? (key     ) => sessionService.extractShortKey(key)
+            : undefined,
+      });
+    } catch {
+      identity = null;
+    }
+    return (identity && identity.agentId) || "main";
+  }
+
+  async function requestSkillsStatus(agentId        ) {
+    if (!agentId || agentId.toLowerCase() === "main") {
+      return gatewayBridge.request("skills.status", {});
+    }
+    try {
+      return await gatewayBridge.request("skills.status", { agentId });
+    } catch (err     ) {
+      if (isMethodNotFoundError(err, err && err.message ? err.message : String(err))) throw err;
+      return gatewayBridge.request("skills.status", {});
+    }
+  }
+
+  function invalidateSkillsCatalog(trigger     ) {
+    skillsCatalogGeneration += 1;
+    cachedSkillsCatalogStale = true;
+    if (!openclawConnected) return;
+    refreshSkillsCatalog(true).catch((err     ) => {
+      logger.warn(`[relay] Skills catalog refresh failed after ${trigger}: ${err.message}`);
+    });
+  }
+
+  async function refreshSkillsCatalog(force      )               {
+    const agentId = currentSkillsCatalogAgentId();
+    const generation = skillsCatalogGeneration;
     const snapshot = skillsCatalogSnapshot();
-    if (!force && !snapshot.stale) {
+    if (!force && !snapshot.stale && cachedSkillsCatalogAgentId === agentId) {
       return snapshot;
     }
-    if (inFlightSkillsCatalogFetch) {
+    if (
+      inFlightSkillsCatalogFetch &&
+      inFlightSkillsCatalogAgentId === agentId &&
+      inFlightSkillsCatalogGeneration === generation
+    ) {
       return inFlightSkillsCatalogFetch;
     }
     if (!openclawConnected) {
       return snapshot;
     }
 
-    inFlightSkillsCatalogFetch = gatewayBridge
-      .request("skills.status", {})
-      .then((result) => {
+    const superseded = () =>
+      generation !== skillsCatalogGeneration || agentId !== currentSkillsCatalogAgentId();
+
+    const fetch               = requestSkillsStatus(agentId)
+      .then((result     )      => {
+        if (superseded()) return refreshSkillsCatalog(false);
         const skills = normalizeSkillsCatalogRows(result && result.skills);
         const changed = !skillsCatalogRowsEqual(cachedSkillsCatalog, skills);
-        const snapshot = cacheSkillsCatalog(skills, Date.now(), false);
+        const snapshot = cacheSkillsCatalog(skills, Date.now(), false, agentId);
         if (changed) {
           Promise.resolve(getSkillsCatalogSnapshot()).then(
             (freshSnapshot) => broadcastSkillsCatalog(freshSnapshot),
@@ -2222,7 +3387,7 @@ function createUpstreamRuntime(opts = {}) {
         }
         return snapshot;
       })
-      .catch((err) => {
+      .catch((err     )      => {
         emitDebug(
           "relay.session",
           "skills_catalog_refresh_failed",
@@ -2233,15 +3398,22 @@ function createUpstreamRuntime(opts = {}) {
             hadCache: Array.isArray(cachedSkillsCatalog),
           }),
         );
-        if (Array.isArray(cachedSkillsCatalog)) {
+        if (superseded()) return refreshSkillsCatalog(false);
+
+        if (Array.isArray(cachedSkillsCatalog) && cachedSkillsCatalogAgentId === agentId) {
           cachedSkillsCatalogStale = true;
           return skillsCatalogSnapshot();
         }
-        return cacheSkillsCatalog([], now(), true);
+        return cacheSkillsCatalog([], now(), true, agentId);
       });
 
-    return inFlightSkillsCatalogFetch.finally(() => {
-      inFlightSkillsCatalogFetch = null;
+    inFlightSkillsCatalogFetch = fetch;
+    inFlightSkillsCatalogAgentId = agentId;
+    inFlightSkillsCatalogGeneration = generation;
+    return fetch.finally(() => {
+      if (inFlightSkillsCatalogFetch === fetch) {
+        inFlightSkillsCatalogFetch = null;
+      }
     });
   }
 
@@ -2364,6 +3536,8 @@ function createUpstreamRuntime(opts = {}) {
           hermesProfileEmojiSet: result && result.hermesProfileEmojiSet === true,
           hermesProfileSettings: result && result.hermesProfileSettings === true,
           foreignSessionAdopt: result && result.foreignSessionAdopt === true,
+          sharedChats: result && result.sharedChats === true,
+          autoRoute: result && result.autoRoute === true,
           hermesFleet: result && result.hermesFleet || null,
         };
         return cacheAgentsCatalog(agents, envelope, Date.now(), false);
@@ -2399,6 +3573,17 @@ function createUpstreamRuntime(opts = {}) {
 
   function trackAcceptedRun(entry) {
     if (!entry || !entry.runId) return;
+
+    rememberLiveUiRun(liveUiWearerRuns, entry.runId);
+    if (entry.modelSitesAllowed === true && typeof entry.sessionKey === "string" && entry.sessionKey) {
+      rememberLiveUiRun(liveUiModelSiteRuns, entry.runId, liveUiV2Key(entry.sessionKey));
+    }
+    else liveUiModelSiteRuns.delete(entry.runId);
+
+    const v2RunKey = entry.sessionKey || null;
+    if (v2RunKey && isLiveUiV2Session(v2RunKey) && liveUiV2Engine("endReservation")) {
+      liveUiV2Step("reservation_end", v2RunKey, () => liveUiV2Surfaces.endReservation(liveUiV2Key(v2RunKey)));
+    }
     upstreamRunPipeline.set(entry.runId, {
       runId: entry.runId,
       sessionKey: entry.sessionKey || null,
@@ -2415,6 +3600,11 @@ function createUpstreamRuntime(opts = {}) {
     });
   }
 
+  function getHostModelInput(provider     , modelId     ) {
+    const kinds = cachedModelInputs.get(modelInputKey(provider, modelId));
+    return kinds ? kinds.slice() : null;
+  }
+
   async function getModelsCatalogSnapshot() {
     const snapshot = modelCatalogSnapshot();
     if (snapshot.stale && openclawConnected) {
@@ -2425,8 +3615,13 @@ function createUpstreamRuntime(opts = {}) {
 
   async function getSkillsCatalogSnapshot() {
     const snapshot = skillsCatalogSnapshot();
-    if (snapshot.stale && openclawConnected) {
+
+    const otherAgent = cachedSkillsCatalogAgentId !== currentSkillsCatalogAgentId();
+    if ((snapshot.stale || otherAgent) && openclawConnected) {
       return refreshSkillsCatalog(true);
+    }
+    if (otherAgent) {
+      return { ...snapshot, skills: [], stale: true };
     }
     return snapshot;
   }
@@ -2460,6 +3655,7 @@ function createUpstreamRuntime(opts = {}) {
   }
 
   async function handleCurrentSessionModelConfigChanged() {
+    clearHiddenReasoning();
 
     sessionContextService.refreshActiveSessionContext().catch(() => {});
 
@@ -2477,20 +3673,27 @@ function createUpstreamRuntime(opts = {}) {
     return snapshot;
   }
 
+  function refreshSessionContext() {
+    if (!openclawConnected) return;
+    sessionContextService.refreshActiveSessionContext().catch(() => {});
+  }
+
   function handleSessionChanged(trigger) {
     clearActivityPlans();
+    clearCurrentActivityReplay();
+    visibleReasoningRuns.clear();
     refreshSessionAttention();
     if (!openclawConnected) {
-      cachedSkillsCatalogStale = true;
+      invalidateSkillsCatalog(trigger);
       cachedCommandCatalogStale = true;
       return;
     }
     refreshActiveSessionIdentity(trigger).catch((err) => {
       logger.warn(`[relay] Agent identity refresh failed after ${trigger}: ${err.message}`);
     });
-    refreshSkillsCatalog(true).catch((err) => {
-      logger.warn(`[relay] Skills catalog refresh failed after ${trigger}: ${err.message}`);
-    });
+
+    refreshSessionContext();
+    invalidateSkillsCatalog(trigger);
     refreshCommandCatalog(true).catch((err) => {
       logger.warn(`[relay] Command catalog refresh failed after ${trigger}: ${err.message}`);
     });
@@ -2537,11 +3740,41 @@ function createUpstreamRuntime(opts = {}) {
     };
   }
 
-  let cachedRunActiveSessionKey = null;
+  let cachedRunActiveSessionKey      = null;
+
+  let cachedWaitingItems        = [];
+  let cachedWaitingHost                = null;
+
+  function getWaitingReplay() {
+    if (cachedWaitingItems.length === 0) return null;
+    return formatWaiting({ items: cachedWaitingItems, host: cachedWaitingHost });
+  }
+
+  const waitingExplanations                                                          = new Map();
+
+  function getWaitingExplanationReplay()           {
+    const frames           = [];
+    for (const item of cachedWaitingItems) {
+      const entry = waitingExplanations.get(item.requestId);
+      if (!entry) continue;
+      let frame                = null;
+      if (entry.state === "pending") {
+        frame = formatWaitingExplanation({ requestId: item.requestId, state: "pending" });
+      } else if (entry.state === "done" && entry.sentence) {
+        frame = formatWaitingExplanation({
+          requestId: item.requestId,
+          state: "done",
+          sentence: entry.sentence,
+        });
+      }
+      if (frame) frames.push(frame);
+    }
+    return frames;
+  }
 
   const ACTIVITY_PLAN_CACHE_MAX = 32;
   const activityPlanFrameBySession = new Map();
-  function rememberActivityPlan(data) {
+  function rememberActivityPlan(data     ) {
     if (!data || typeof data !== "object") return;
     const plan = data.plan;
     const sessionKey = typeof data.sessionKey === "string" ? data.sessionKey : "";
@@ -2564,10 +3797,55 @@ function createUpstreamRuntime(opts = {}) {
     return activityPlanFrameBySession.get(cachedRunActiveSessionKey) || null;
   }
 
+  let currentActivityReplay      = null;
+  let currentActivityReplayRun                                               = null;
+  const closedActivityReplayRuns = new Set        ();
+  function closeActivityReplayRun(runId        ) {
+    closedActivityReplayRuns.delete(runId);
+    closedActivityReplayRuns.add(runId);
+    while (closedActivityReplayRuns.size > ACTIVITY_PLAN_CACHE_MAX) {
+      const oldestRunId = closedActivityReplayRuns.values().next().value;
+      if (oldestRunId === undefined) break;
+      closedActivityReplayRuns.delete(oldestRunId);
+    }
+  }
+  function clearCurrentActivityReplay() {
+    currentActivityReplay = null;
+    currentActivityReplayRun = null;
+  }
+  function rememberCurrentActivity(activity     ) {
+    if (!activity || !sessionService.isCurrentSession(activity.sessionKey)) return;
+    const runId = typeof activity.runId === "string" ? activity.runId.trim() : "";
+    if (!runId) return;
+    if (classifyRunOutcomeFrame(activity, activity.phase, activity.origin).terminal) {
+      closeActivityReplayRun(runId);
+      if (currentActivityReplayRun?.runId === runId) clearCurrentActivityReplay();
+      return;
+    }
+    if (closedActivityReplayRuns.has(runId) || activity.failoverPending === true) return;
+    const startsRun = activity.origin === "lifecycle" && activity.phase === "start" &&
+      activity.state === "thinking";
+    if (startsRun && currentActivityReplayRun?.runId !== runId) {
+      if (currentActivityReplayRun) closeActivityReplayRun(currentActivityReplayRun.runId);
+      currentActivityReplayRun = { runId, sessionKey: activity.sessionKey };
+      currentActivityReplay = { ...activity, runId };
+    } else if (currentActivityReplayRun?.runId === runId) {
+      currentActivityReplay = { ...activity, runId };
+    }
+  }
+  function getActivityReplay() {
+    if (!currentActivityReplayRun || !sessionService.isCurrentSession(currentActivityReplayRun.sessionKey)) return null;
+    const plan = getActivityPlanReplay();
+    return plan?.runId === currentActivityReplayRun.runId ? plan : currentActivityReplay;
+  }
+
   const sessionContextService = createSessionContextService({
     gatewayBridge,
     stateDir: opts.stateDir,
     getActiveSessionKey: () => sessionService.ensureSessionKey() || null,
+    isDraftSession: (sessionKey) =>
+      typeof sessionService.isDraftSession === "function" &&
+      sessionService.isDraftSession(sessionKey),
     getActiveModelKey: () => {
       const config = getCurrentSessionModelConfigSnapshot();
       if (!config) return null;
@@ -2601,6 +3879,16 @@ function createUpstreamRuntime(opts = {}) {
     broadcast: (frame) => {
       const server = getServer();
       if (server) server.broadcast(JSON.stringify(frame));
+
+      if (frame && frame.compactionCountKnown === true && typeof frame.sessionKey === "string") {
+        const v2Key = liveUiV2Key(frame.sessionKey);
+        const before = liveUiV2CompactionCounts.get(v2Key);
+        liveUiV2CompactionCounts.set(v2Key, frame.compactionCount);
+        const noted = liveUiV2CompactionsNoted.delete(v2Key);
+        if (!noted && Number.isFinite(before) && frame.compactionCount > before && isLiveUiV2Session(frame.sessionKey)) {
+          liveUiV2Step("compaction", v2Key, () => noteLiveUiV2Compaction(v2Key));
+        }
+      }
 
       emitDebug(
         "relay.session",
@@ -2642,13 +3930,16 @@ function createUpstreamRuntime(opts = {}) {
         messageCount: Array.isArray(data.messages) ? data.messages.length : 0,
       }),
     );
-    const sanitizedMessages = Array.isArray(data.messages)
-      ? data.messages.map((msg) =>
+    const historyMessages = getActiveBackendKind() === "openclaw" && Array.isArray(data.messages)
+      ? projectOpenClawConversationHistory(data.messages)
+      : data.messages;
+    const sanitizedMessages = Array.isArray(historyMessages)
+      ? historyMessages.map((msg     ) =>
           msg && msg.role === "assistant"
-            ? { ...msg, content: sanitizeAssistantContentBlocks(msg.content) }
+            ? { ...msg, content: sanitizeAssistantContentBlocks(msg.content, data.sessionKey) }
             : msg,
         )
-      : data.messages;
+      : historyMessages;
 
     conversationState.hydrate(sanitizedMessages, agentIdentity.name, data.sessionKey, {
       commitRunId: typeof data.commitRunId === "string" ? data.commitRunId : undefined,
@@ -2658,26 +3949,50 @@ function createUpstreamRuntime(opts = {}) {
     broadcastPages({
       reason: "gateway_history",
       sourceRowCount: Array.isArray(sanitizedMessages) ? sanitizedMessages.length : null,
+      sourceRunId: data.commitRunId,
     });
   });
 
-  function ingestMirroredRows(rows, info = {}) {
+  function ingestMirroredRows(rows     , info      = {}) {
     const sessionKey = info && info.sessionKey;
     if (!sessionService.isCurrentSession(sessionKey)) return 0;
     const author = typeof info.author === "string" && info.author.trim() ? info.author.trim() : null;
     const origin = typeof info.origin === "string" && info.origin.trim() ? info.origin.trim() : "desktop";
+    const heldIds = new Set        ();
+    for (const msg of conversationState.getRawMessages()) {
+      const id = msg ? serverIdOf(msg) : "";
+      if (id) heldIds.add(id);
+    }
     let appended = 0;
+    let skippedDuplicate = 0;
     for (const row of Array.isArray(rows) ? rows : []) {
       if (!row || (row.role !== "user" && row.role !== "assistant")) continue;
-      const content =
-        row.role === "assistant" ? sanitizeAssistantContentBlocks(row.content) : row.content;
-      const metadata = { origin };
+      const metadata      = { origin };
       if (typeof row.id === "number" || typeof row.id === "string") metadata.id = row.id;
+      const rowId = serverIdOf(metadata);
+      if (rowId && heldIds.has(rowId)) {
+        skippedDuplicate += 1;
+        continue;
+      }
+      const content =
+        row.role === "assistant" ? sanitizeAssistantContentBlocks(row.content, sessionKey) : row.content;
       if (Number.isFinite(Number(row.timestamp))) metadata.timestamp = Number(row.timestamp);
       conversationState.addMessage(row.role, content, row.role === "user" ? author : null, metadata);
+      if (rowId) heldIds.add(rowId);
       appended += 1;
     }
-    if (appended === 0) return 0;
+    if (appended === 0) {
+      if (skippedDuplicate > 0) {
+        emitDebug(
+          "openclaw.message",
+          "mirrored_rows",
+          "info",
+          { sessionKey },
+          () => ({ origin, rows: 0, skippedDuplicate }),
+        );
+      }
+      return 0;
+    }
     emitDebug(
       "openclaw.message",
       "mirrored_rows",
@@ -2686,10 +4001,11 @@ function createUpstreamRuntime(opts = {}) {
       () => ({
         origin,
         rows: appended,
-        ids: (Array.isArray(rows) ? rows : []).map((row) => (row && row.id) ?? null),
-        roles: (Array.isArray(rows) ? rows : []).map((row) => row && row.role),
+        skippedDuplicate,
+        ids: (Array.isArray(rows) ? rows : []).map((row     ) => (row && row.id) ?? null),
+        roles: (Array.isArray(rows) ? rows : []).map((row     ) => row && row.role),
         textChars: (Array.isArray(rows) ? rows : []).reduce(
-          (sum, row) => sum + fullMessageText(row && row.content).length,
+          (sum     , row     ) => sum + fullMessageText(row && row.content).length,
           0,
         ),
       }),
@@ -2698,7 +4014,7 @@ function createUpstreamRuntime(opts = {}) {
     return appended;
   }
 
-  async function rehydrateHistory(sessionKey, reason = "rehydrate") {
+  async function rehydrateHistory(sessionKey     , reason      = "rehydrate") {
     if (!sessionService.isCurrentSession(sessionKey)) return false;
 
     const fixtureHistory =
@@ -2712,12 +4028,15 @@ function createUpstreamRuntime(opts = {}) {
     }
     const result = await gatewayBridge.request("chat.history", { sessionKey, limit: 200 });
     if (!sessionService.isCurrentSession(sessionKey)) return false;
-    const messages =  (
+    const rawMessages =  (
       result && Array.isArray(result.messages) ? result.messages : []
     );
-    const sanitized = messages.map((msg) =>
+    const messages = getActiveBackendKind() === "openclaw"
+      ? projectOpenClawConversationHistory(rawMessages)
+      : rawMessages;
+    const sanitized = messages.map((msg     ) =>
       msg && msg.role === "assistant"
-        ? { ...msg, content: sanitizeAssistantContentBlocks(msg.content) }
+        ? { ...msg, content: sanitizeAssistantContentBlocks(msg.content, sessionKey) }
         : msg,
     );
     const total = result && Number.isFinite(Number(result.total)) ? Number(result.total) : null;
@@ -2770,9 +4089,17 @@ function createUpstreamRuntime(opts = {}) {
     );
   });
 
-  function sanitizeAssistantContentBlocks(content) {
+  function isLiveUiV2Session(sessionKey         ) {
+    return (
+      typeof sessionService.isLiveUiV2Session === "function" &&
+      sessionService.isLiveUiV2Session(sessionKey) === true
+    );
+  }
+
+  function sanitizeAssistantContentBlocks(content, sessionKey          ) {
+    const uiRecords = isLiveUiV2Session(sessionKey);
     if (typeof content === "string") {
-      return stripAllTaggedSpans(content);
+      return stripReplyMarkup(content, { uiRecords });
     }
     if (!Array.isArray(content)) return content;
     return content.map((block) => {
@@ -2782,7 +4109,7 @@ function createUpstreamRuntime(opts = {}) {
         block.type === "text" &&
         typeof block.text === "string"
       ) {
-        return { ...block, text: stripAllTaggedSpans(block.text) };
+        return { ...block, text: stripReplyMarkup(block.text, { uiRecords }) };
       }
       return block;
     });
@@ -2830,10 +4157,39 @@ function createUpstreamRuntime(opts = {}) {
 
   onGatewayEvent("message.retag", handleNarrationRetag);
 
+  function handleMessageEdit(data     ) {
+    const sessionKey = data.sessionKey || sessionService.ensureSessionKey();
+    const messageId = data.id ?? data.messageId;
+    const content = sanitizeAssistantContentBlocks(data.content, sessionKey);
+    const replaced = conversationState.replaceAssistantMessageContent(messageId, content);
+    if (!replaced) {
+      conversationState.addMessage("assistant", content, null, {
+        id: messageId,
+        ...(data.pluginMessage === true ? { pluginMessage: true } : {}),
+      });
+    }
+    emitDebug(
+      "openclaw.message",
+      "message_edited",
+      "info",
+      { sessionKey, runId: null },
+      () => ({
+        messageId: messageId ?? null,
+        replaced,
+        textChars: fullMessageText(content).length,
+      }),
+    );
+    broadcastPages({ reason: "message_edited" });
+  }
+
   onGatewayEvent("message", (data) => {
     if (!sessionService.isCurrentSession(data.sessionKey)) return;
     if (data && data.retag === true) {
       handleNarrationRetag(data);
+      return;
+    }
+    if (data && data.edit === true) {
+      handleMessageEdit(data);
       return;
     }
     const runId = data.runId || null;
@@ -2868,6 +4224,8 @@ function createUpstreamRuntime(opts = {}) {
       flushPendingStreamingText();
     }
     if (runId && !turnActive) {
+      closeActivityReplayRun(runId);
+      if (currentActivityReplayRun?.runId === runId) clearCurrentActivityReplay();
 
       if (typeof sessionService.markSessionRead === "function") {
         Promise.resolve(
@@ -2898,12 +4256,32 @@ function createUpstreamRuntime(opts = {}) {
       if (data.finalReplyCommitted === true && data.role === "assistant" &&
           typeof data.sessionKey === "string" && data.sessionKey.trim() &&
           !dropNarrationPage && !data.messageKind && normalizeOriginAtMs(data.originAtMs) === null &&
-          fullMessageText(sanitizeAssistantContentBlocks(data.content)).trim()) {
+          fullMessageText(sanitizeAssistantContentBlocks(data.content, data.sessionKey)).trim()) {
 
         committedReplyActivity = { ...terminalActivity, finalReplyCommitted: true };
+        if (noteCardBuildFinalReply) {
+
+          noteCardBuildFinalReply({
+            sessionKey: data.sessionKey,
+            runId,
+            text: stripDisplayMarkup(fullMessageText(sanitizeAssistantContentBlocks(data.content, data.sessionKey))),
+          });
+        }
       } else {
         broadcastActivity(terminalActivity, data.sessionKey ? null : "unattributed");
+
+        if (noteCardBuildLateReply && data.role === "assistant" && typeof data.sessionKey === "string" &&
+            data.sessionKey.trim() && !dropNarrationPage && !data.messageKind) {
+          const text = stripDisplayMarkup(fullMessageText(sanitizeAssistantContentBlocks(data.content, data.sessionKey)));
+          if (text.trim()) noteCardBuildLateReply({ sessionKey: data.sessionKey, runId, text });
+        }
       }
+    } else if (!runId && !turnActive && noteCardBuildFinalReply && data.role === "assistant" &&
+        typeof data.sessionKey === "string" && data.sessionKey.trim() &&
+        !dropNarrationPage && !data.messageKind) {
+
+      const text = stripDisplayMarkup(fullMessageText(sanitizeAssistantContentBlocks(data.content, data.sessionKey)));
+      if (text.trim()) noteCardBuildFinalReply({ sessionKey: data.sessionKey, runId: null, text });
     }
 
     const runPipeline = runId && !turnActive ? upstreamRunPipeline.get(runId) : null;
@@ -2956,15 +4334,34 @@ function createUpstreamRuntime(opts = {}) {
 
     const sanitizedContent =
       data.role === "assistant"
-        ? sanitizeAssistantContentBlocks(data.content)
+        ? sanitizeAssistantContentBlocks(
+            data.content,
+            data.sessionKey || sessionService.ensureSessionKey(),
+          )
         : data.content;
     const messageMetadata = {
       id: data.id ?? data.messageId,
       runId: data.runId,
       clientSendId: data.clientSendId ?? data.sendId,
       rev: data.rev,
+      ...(data.pluginMessage === true ? { pluginMessage: true } : {}),
     };
     if (dropNarrationPage) {
+
+      const narrationId = data.id ?? data.messageId;
+      const narrationMessageId = typeof narrationId === "string" && narrationId ? narrationId : null;
+      if (
+        data.role === "assistant" &&
+        narrationMessageId &&
+        narrationRecordMessages.delete(narrationRecordsKey(data.sessionKey || sessionService.ensureSessionKey(), runId, narrationMessageId))
+      ) {
+        paintProgressRecords(data.sessionKey || sessionService.ensureSessionKey(), {
+          runId,
+          messageId: narrationMessageId,
+          text: fullMessageText(data.content),
+          end: true,
+        });
+      }
 
       emitDebug(
         "openclaw.message",
@@ -2981,6 +4378,33 @@ function createUpstreamRuntime(opts = {}) {
       );
       broadcastStreamClear(runId, data.sessionKey, "narration_dropped");
       return;
+    }
+
+    const v2CommitKey = data.sessionKey || sessionService.ensureSessionKey();
+    if (data.role === "assistant" && !isNarrationCommit(data) && isLiveUiV2Session(v2CommitKey)) {
+
+      const runlessReply = !runId && getActiveBackendKind() === "hermes" && data.pluginMessage !== true;
+      liveUiV2Step("commit", v2CommitKey, () => {
+        if (runlessReply) liveUiRunlessReplyKey = liveUiV2Key(v2CommitKey);
+        try {
+          liveUiV2Surfaces.commitText(liveUiV2Key(v2CommitKey), {
+            runId,
+            messageId: typeof data.messageId === "string" ? data.messageId : null,
+
+            text: typeof data.liveUiText === "string" ? data.liveUiText : fullMessageText(data.content),
+          });
+        } finally {
+          liveUiRunlessReplyKey = null;
+        }
+      });
+    }
+
+    if (runId && !turnActive && isLiveUiV2Session(v2CommitKey) && liveUiV2Engine("endReservation")) {
+      liveUiV2Step("reservation_end", v2CommitKey, () => liveUiV2Surfaces.endReservation(liveUiV2Key(v2CommitKey)));
+    }
+
+    if (runId && !turnActive && isLiveUiV2Session(v2CommitKey) && liveUiV2Engine("endNamedFrame")) {
+      liveUiV2Step("named_frame_end", v2CommitKey, () => liveUiV2Surfaces.endNamedFrame(liveUiV2Key(v2CommitKey)));
     }
 
     const commitOriginAtMs = normalizeOriginAtMs(data.originAtMs);
@@ -3012,7 +4436,19 @@ function createUpstreamRuntime(opts = {}) {
         }),
       );
     } else {
-      conversationState.addMessage(data.role, sanitizedContent, null, messageMetadata);
+
+      const userAuthor =
+        data.role === "user" && typeof data.author === "string" && data.author.trim()
+          ? data.author.trim()
+          : null;
+      const origin =
+        userAuthor && typeof data.origin === "string" && data.origin.trim() ? data.origin.trim() : null;
+      conversationState.addMessage(
+        data.role,
+        sanitizedContent,
+        userAuthor,
+        origin ? { ...messageMetadata, origin } : messageMetadata,
+      );
     }
     if (committedReplyActivity) broadcastActivity(committedReplyActivity);
     if (data.role === "assistant") {
@@ -3026,25 +4462,22 @@ function createUpstreamRuntime(opts = {}) {
           runId: data.runId || null,
 
           pageOrder: (conversationState.getPages() || [])
-            .map((page) => (page && typeof page.content === "string" ? page.content : ""))
+            .map((page     ) => (page && typeof page.content === "string" ? page.content : ""))
             .join("\n\n")
             .split("\n\n")
             .slice(-12)
-            .map((line) => line.slice(0, 44)),
+
+            .map((line     ) => scrubSecretShapes(line.slice(0, 44 + 256)).slice(0, 44)),
         }),
       );
     }
     const preservedLedgerLane = broadcastPages({
       preserveLedgerLane: data.role === "assistant",
       reason: "message_commit",
+      sourceRunId: runId,
     });
     if (data.role === "assistant" && preservedLedgerLane) {
-      clearLedgerCommitFallbackTimer();
-      ledgerCommitFallbackTimer = setTimeout(() => {
-        ledgerCommitFallbackTimer = 0;
-
-        broadcastPages({ reason: "commit_fallback" });
-      }, LEDGER_COMMIT_HISTORY_GRACE_MS);
+      armLedgerCommitFallback(data.sessionKey || sessionService.ensureSessionKey(), runId, 1);
     }
 
     sessionContextService.refreshActiveSessionContext().catch(() => {});
@@ -3055,9 +4488,108 @@ function createUpstreamRuntime(opts = {}) {
     }
   });
 
-  function ingestActivityFrame(data, activitySource = null) {
+  const runSignals = createRunSignalTracker();
+  function broadcastRunSignals(frames       ) {
+    for (const frame of frames) {
+      if (noteCardBuildRunSignal) noteCardBuildRunSignal(frame);
+      if (!sessionService.isCurrentSession(frame.sessionKey)) continue;
+      const server = getServer();
+      if (!server) continue;
+      server.broadcast(handler.formatRunSignal(frame));
+      emitDebug(
+        "relay.protocol",
+        "run_signal_sent",
+        "debug",
+        { sessionKey: frame.sessionKey, runId: frame.runId },
+        () => ({
+          signal: frame.signal,
+          phase: frame.phase,
+          spanId: frame.spanId,
+          outcome: frame.outcome || null,
+          waitMs: frame.waitMs ?? null,
+        }),
+      );
+    }
+  }
+  function ingestRunSignal(data     ) {
+    broadcastRunSignals(runSignals.ingest(data));
+  }
+  onGatewayEvent("runSignal", ingestRunSignal);
+
+  onGatewayEvent("sessionCompacted", (data     ) => {
+    const sessionKey = data && typeof data.sessionKey === "string" ? data.sessionKey : "";
+    if (!sessionKey) return;
+    if (isLiveUiV2Session(sessionKey)) {
+      const v2Key = liveUiV2Key(sessionKey);
+      liveUiV2CompactionsNoted.add(v2Key);
+      liveUiV2Step("compaction", v2Key, () => noteLiveUiV2Compaction(v2Key));
+    }
+    emitDebug(
+      "relay.session",
+      "session_compacted",
+      "info",
+      { sessionKey },
+      () => ({
+        kind: typeof data.kind === "string" ? data.kind : null,
+        reason: typeof data.reason === "string" ? data.reason : null,
+        inPlace: data.inPlace === true,
+        counted: data.counted === true,
+        beforeTokens: Number.isFinite(data.beforeTokens) ? data.beforeTokens : null,
+        afterTokens: Number.isFinite(data.afterTokens) ? data.afterTokens : null,
+      }),
+    );
+    if (sessionService.isCurrentSession(sessionKey)) {
+      sessionContextService.refreshActiveSessionContext().catch(() => {});
+    }
+  });
+
+  function ingestActivityFrame(data, activitySource      = null) {
 
     data = quietCancelledRunClose(normalizeGatewaySessionEvent(data));
+
+    if (activitySource !== "simulated" && data && data.origin === "narration" && !data.tool) {
+      const armed = noteActivityProse(data);
+      emitThinkingStreamDebug(
+        armed ? "pre_tool_prose_armed" : "pre_tool_prose_ignored",
+        "debug",
+        { sessionKey: data.sessionKey || null, runId: data.runId || null },
+        () => ({
+          textLen: typeof data.summary === "string" ? data.summary.length : 0,
+          label: armed ? armed.label : null,
+          modelCallSeq: Number.isInteger(data.modelCallSeq) ? data.modelCallSeq : null,
+        }),
+      );
+      return;
+    }
+
+    if (activitySource !== "simulated" && data && data.origin === "thinking" &&
+      isReasoningHiddenForSession(data.sessionKey)) {
+      clearHiddenReasoning();
+      emitThinkingStreamDebug(
+        "thinking_activity_dropped",
+        "debug",
+        { sessionKey: data.sessionKey || null, runId: data.runId || null },
+        () => ({ reason: "reasoning_off" }),
+      );
+      return;
+    }
+
+    if (activitySource !== "simulated" && data && data.origin === "thinking" &&
+      data.thinkingLive === true && !liveProseHeadlines(data)) {
+      return;
+    }
+    if (data && data.origin === "thinking" && data.runId) {
+      const finalizedReason = finalizedThinkingRuns.get(data.runId);
+      if (finalizedReason && finalizedReason !== "response_started") {
+        emitThinkingStreamDebug(
+          "thinking_activity_dropped",
+          "debug",
+          { sessionKey: data.sessionKey || null, runId: data.runId },
+          () => ({ reason: `finalized_${finalizedReason}` }),
+        );
+        return;
+      }
+    }
     const taskSessionKey =
       data && typeof data._activeRunSessionKey === "string" && data._activeRunSessionKey.trim()
         ? data._activeRunSessionKey
@@ -3065,11 +4597,40 @@ function createUpstreamRuntime(opts = {}) {
     if (data && typeof data.tool === "string") {
       observeTaskToolUse({ sessionKey: taskSessionKey, toolName: data.tool });
     }
+    noteLiveUiMediaContinuation(data);
     if (noteRunOutcomeFrame && data && data.runId) {
       noteRunOutcomeFrame(data, data.phase || null, data.origin || null);
     }
+
+    if (data && data.runId && classifyRunOutcomeFrame(data, data.phase || null, data.origin || null).terminal) {
+      broadcastRunSignals(runSignals.endRun(data.runId));
+    }
     rememberActivityPlan(data);
-    if (!sessionService.isCurrentSession(data.sessionKey)) return;
+
+    if (agentBootstrapPending === true && data && data.runId) {
+      const bootstrapPhase = data.phase || null;
+      const bootstrapRunStart = data.origin === "lifecycle" && bootstrapPhase === "start";
+      if (bootstrapRunStart) {
+
+        const timer      = setTimeout(() => {
+          if (agentBootstrapPending !== true) return;
+          refreshAgentBootstrapPending(agentBootstrapProbeAgentId, "run_start").catch(() => {});
+        }, AGENT_BOOTSTRAP_RUN_START_PROBE_DELAY_MS);
+        if (timer && typeof timer.unref === "function") timer.unref();
+      } else if (isTerminalActivityBoundary(data.state, bootstrapPhase, data.origin || null)) {
+        refreshAgentBootstrapPending(agentBootstrapProbeAgentId, "run_end").catch(() => {});
+      }
+    }
+    if (!sessionService.isCurrentSession(data.sessionKey)) {
+      if (noteCardBuildOffSessionActivity && data) {
+        try {
+          noteCardBuildOffSessionActivity(data);
+        } catch (_) {
+
+        }
+      }
+      return;
+    }
     const runId = data.runId || null;
     const origin = data.origin || null;
     const phase = data.phase || null;
@@ -3117,7 +4678,7 @@ function createUpstreamRuntime(opts = {}) {
         sessionContextService.refreshActiveSessionContext().catch(() => {});
       }
 
-      if (!activeProviderContext().provider) {
+      if (!activeProviderContext().provider || getActiveBackendKind() === "hermes") {
         sessionService.getCurrentSessionModelConfig().catch((err) => {
           logger.warn(
             `[relay] Provider re-resolve after run-end failed: ${err && err.message ? err.message : err}`,
@@ -3127,7 +4688,8 @@ function createUpstreamRuntime(opts = {}) {
     }
     let activity = data;
     let shouldRefreshProviderUsageInBackground = false;
-    if (isProviderRateLimitedLifecycleError(data)) {
+
+    if (isProviderRateLimitedLifecycleError(data) && !saysAccountUsageIsNotExhausted(data)) {
       if (!data.failoverPending) {
         const { provider: outcomeProvider } = activeProviderContext();
         if (outcomeProvider) {
@@ -3147,15 +4709,38 @@ function createUpstreamRuntime(opts = {}) {
         shouldRefreshProviderUsageInBackground = true;
       }
     }
+    if (activitySource !== "simulated" && origin === "thinking" && runId) {
+      visibleReasoningRuns.set(runId, data.sessionKey);
+    }
     broadcastActivity(activity, activitySource);
+    if (activitySource !== "simulated") rememberCurrentActivity(activity);
     if (shouldRefreshProviderUsageInBackground) {
       refreshProviderUsage(true).catch((err) => {
         logger.warn(`[relay] Provider usage refresh failed after rate limit activity: ${err.message}`);
       });
     }
 
-    const endedWithoutReply = (data.isError === true && phase === "error") || (data.aborted === true && phase === "end");
+    const runFailed = data.isError === true && phase === "error";
+    const endedWithoutReply = runFailed || (data.aborted === true && phase === "end");
     if (runId && data.state === "idle" && endedWithoutReply) {
+
+      const v2AbortKey = data.sessionKey || sessionService.ensureSessionKey();
+      if (isLiveUiV2Session(v2AbortKey)) {
+        liveUiV2Step("abort", v2AbortKey, () => {
+
+          if (pendingStreaming && pendingStreaming.runId === runId) {
+            liveUiV2Surfaces.streamText(liveUiV2Key(v2AbortKey), {
+              runId,
+              messageIndex: pendingStreaming.messageIndex,
+              messageId: pendingStreaming.messageId || null,
+              text: pendingStreaming.rawText,
+            });
+          }
+
+          liveUiV2Surfaces.abortRun(liveUiV2Key(v2AbortKey), runId, runFailed ? "failed" : "cancelled");
+          if (liveUiV2Engine("endReservation")) liveUiV2Surfaces.endReservation(liveUiV2Key(v2AbortKey));
+        });
+      }
       upstreamRunPipeline.delete(runId);
 
       if (cachedRunActiveSessionKey) {
@@ -3163,6 +4748,26 @@ function createUpstreamRuntime(opts = {}) {
         sessionContextService.broadcastRunActive(false);
         sessionContextService.refreshActiveSessionContext().catch(() => {});
       }
+    }
+
+    if (runId && runFailed && !data.failoverPending && getActiveBackendKind() !== "hermes" &&
+        !isCancelledRunFrame(data) && activitySource !== "simulated" &&
+        sessionService.isCurrentSession(data.sessionKey)) {
+      const streamedText = pendingStreaming && pendingStreaming.runId === runId
+        ? pendingStreaming.rawText
+        : null;
+      if (typeof conversationState.recordFailedTurn === "function" &&
+          conversationState.recordFailedTurn({ runId, code: data.code, streamedText })) {
+        emitDebug("openclaw.history", "failed_turn_recorded", "info",
+          { sessionKey: data.sessionKey || sessionService.ensureSessionKey(), runId },
+          () => ({ code: data.code || null, streamedChars: streamedText ? String(streamedText).length : 0 }));
+        broadcastPages({ reason: "failed_turn" });
+      }
+    }
+
+    if (runId && classifyRunOutcomeFrame(data, phase, origin).terminal) {
+      const v2EndKey = data.sessionKey || sessionService.ensureSessionKey();
+      if (isLiveUiV2Session(v2EndKey)) liveUiV2Step("taps_read", v2EndKey, () => liveUiV2TapsRead(v2EndKey, runId));
     }
   }
   gatewayBridge.on("activity", ingestActivityFrame);
@@ -3225,6 +4830,10 @@ function createUpstreamRuntime(opts = {}) {
       if (typeof source.progressNoteId === "string" && source.progressNoteId.trim()) {
         Object.assign(frame, { progressNoteId: source.progressNoteId.trim() });
       }
+
+      if (Array.isArray(source.speckFeelings) && source.speckFeelings.length) {
+        Object.assign(frame, { speckFeelings: source.speckFeelings.slice() });
+      }
       if (typeof source.summary === "string") frame.summary = source.summary;
       if (typeof source.thinkingSummarySource === "string") {
         frame.thinkingSummarySource = source.thinkingSummarySource;
@@ -3283,6 +4892,35 @@ function createUpstreamRuntime(opts = {}) {
       }));
       return;
     }
+
+    const progressNote = data.presentation === "progress_note";
+    const hiddenReason = progressNote
+      ? normalizeAgentProgressNotes(getAgentProgressNotes()) === "off" ? "notes_off" : null
+      : data.source !== "simulate" && isReasoningHiddenForSession(frame.sessionKey) ? "reasoning_off" : null;
+    if (hiddenReason) {
+      if (hiddenReason === "reasoning_off") clearHiddenReasoning();
+      emitThinkingStreamDebug("thinking_update_dropped", "debug", ctx, () => ({
+        reason: hiddenReason,
+        ...streamRow,
+      }));
+      return;
+    }
+
+    if (data.presentation === "progress_note" && isLiveUiV2Session(frame.sessionKey)) {
+      Object.assign(frame, {
+        text: stripNoteRecords(data.text),
+        ...(typeof data.delta === "string" ? { delta: stripNoteRecords(data.delta) } : {}),
+      });
+    }
+
+    if (progressNote) {
+      const note = frame                                       ;
+      const sentence = (value         ) => progressNoteInActionVoice(splitBoldHeading(value).text ?? value);
+      Object.assign(frame, {
+        text: sentence(note.text),
+        ...(typeof note.delta === "string" ? { delta: sentence(note.delta) } : {}),
+      });
+    }
     if (!frame.text) {
       emitThinkingStreamDebug("thinking_update_dropped", "debug", ctx, () => ({
         reason: "empty_text",
@@ -3303,6 +4941,15 @@ function createUpstreamRuntime(opts = {}) {
         forgetFinalizedThinkingRun(frame.runId);
       }
       activeThinkingRuns.add(frame.runId);
+      if (!progressNote && data.source !== "simulate") {
+        visibleReasoningRuns.set(frame.runId, frame.sessionKey);
+      }
+    }
+    if (!progressNote && data.source !== "simulate" && noteCardBuildReasoning) {
+      noteCardBuildReasoning({ sessionKey: frame.sessionKey, runId: frame.runId });
+    }
+    if (progressNote && noteCardBuildAgentNote) {
+      noteCardBuildAgentNote({ sessionKey: frame.sessionKey, runId: frame.runId, text: Reflect.get(frame, "text") });
     }
     const server = getServer();
     if (server) {
@@ -3362,10 +5009,17 @@ function createUpstreamRuntime(opts = {}) {
       }));
       return false;
     }
+    if (reason === "response_started" && currentActivityReplayRun?.runId === normalizedRunId) {
+
+      currentActivityReplay = null;
+    }
+    if (reason !== "response_started") visibleReasoningRuns.delete(normalizedRunId);
     const finalizedReason = finalizedThinkingRuns.get(normalizedRunId);
     const canHardenSoftFinalize =
       finalizedReason === "response_started" && frame.reason !== "response_started";
     if (!activeThinkingRuns.has(normalizedRunId) && !canHardenSoftFinalize) {
+
+      if (reason !== "response_started") rememberFinalizedThinkingRun(normalizedRunId, reason);
       emitThinkingStreamDebug("thinking_finalize_dropped", "debug", ctx, () => ({
         reason: "no_open_pane",
         ...finalizeRow,
@@ -3417,11 +5071,35 @@ function createUpstreamRuntime(opts = {}) {
 
   function clearThinkingRunState() {
     activeThinkingRuns.clear();
+    visibleReasoningRuns.clear();
     finalizedThinkingRuns.clear();
     for (const timer of finalizedThinkingRunTimers.values()) {
       clearTimeout(timer);
     }
     finalizedThinkingRunTimers.clear();
+  }
+
+  function isReasoningHiddenForSession(sessionKey     ) {
+    if (typeof sessionService.peekSessionReasoningLevel !== "function") return false;
+    const key = typeof sessionKey === "string" && sessionKey.trim()
+      ? sessionKey
+      : typeof sessionService.peekSessionKey === "function" ? sessionService.peekSessionKey() : null;
+    return sessionService.peekSessionReasoningLevel(key) === "off";
+  }
+
+  function clearHiddenReasoning() {
+    for (const [runId, sessionKey] of visibleReasoningRuns) {
+      if (!sessionService.isCurrentSession(sessionKey) || !isReasoningHiddenForSession(sessionKey)) continue;
+      const server = getServer();
+      if (server) {
+        server.broadcast(handler.formatThinkingFinalize({ runId, sessionKey, reason: "reasoning_off" }));
+      }
+
+      visibleReasoningRuns.delete(runId);
+      emitThinkingStreamDebug("thinking_reasoning_cleared", "debug", { runId, sessionKey }, () => ({
+        reason: "reasoning_off",
+      }));
+    }
   }
 
   onGatewayEvent("thinking", (data) => {
@@ -3440,6 +5118,29 @@ function createUpstreamRuntime(opts = {}) {
     }
     broadcastThinkingUpdate(data);
   });
+
+  function paintProgressRecords(sessionKey     , input     ) {
+    const text = input && typeof input.text === "string" ? input.text : "";
+    const messageId = input && typeof input.messageId === "string" && input.messageId ? input.messageId : null;
+    if (!messageId || !text.includes("<ui") || !isLiveUiV2Session(sessionKey)) return false;
+    const key = liveUiV2Key(sessionKey);
+    const runId = input.runId || null;
+    const messageIndex = Number.isInteger(input.messageIndex) ? input.messageIndex : null;
+
+    if (input.end !== true || messageIndex !== null) {
+      liveUiV2Step("progress_stream", sessionKey, () => {
+        liveUiV2Surfaces.streamText(key, { runId, messageIndex, messageId, text });
+      });
+    }
+    if (input.end === true) {
+      liveUiV2Step("progress_commit", sessionKey, () => liveUiV2Surfaces.commitText(key, { runId, messageId, text }));
+    }
+    return true;
+  }
+
+  const narrationRecordMessages = new Set        ();
+  const narrationRecordsKey = (sessionKey     , runId     , messageId     ) =>
+    JSON.stringify([liveUiV2Key(sessionKey), runId || null, messageId]);
 
   onGatewayEvent("streaming", (data) => {
     if (isTitleDistillerStreamingEvent(data)) {
@@ -3486,6 +5187,17 @@ function createUpstreamRuntime(opts = {}) {
       return;
     }
     if (!sessionService.isCurrentSession(sessionKey)) return;
+
+    if (data.liveUiRecordsOnly === true) {
+      paintProgressRecords(sessionKey, {
+        runId,
+        messageIndex: data.messageIndex,
+        messageId: data.messageId,
+        text: data.text,
+        end: data.end === true,
+      });
+      return;
+    }
     const { provider: outcomeProvider } = activeProviderContext();
     if (outcomeProvider) {
       providerOutcomeState.set(outcomeProvider, {
@@ -3549,16 +5261,28 @@ function createUpstreamRuntime(opts = {}) {
     if (isNarrationCommit(data)) {
       const notes = normalizeAgentProgressNotes(getAgentProgressNotes());
       if (notes === "conversation") {
+
+        const noteText = typeof data.text === "string" ? stripDisplayMarkup(data.text) : "";
+        const feelings = typeof data.text === "string" ? speckFeelings(data.text) : [];
         broadcastThinkingUpdate({
           runId,
           sessionKey,
-          text: typeof data.text === "string" ? data.text : "",
-          delta: typeof data.text === "string" ? data.text : "",
+          text: noteText,
+          delta: noteText,
+          ...(feelings.length ? { speckFeelings: feelings } : {}),
           presentation: "progress_note",
           progressNoteId:
             typeof data.messageId === "string" ? data.messageId : undefined,
           source: "hermes.narration",
         });
+      }
+
+      const recordsPainted = paintProgressRecords(sessionKey, { runId, messageId: data.messageId, text: data.text });
+      if (recordsPainted) {
+        narrationRecordMessages.add(narrationRecordsKey(sessionKey, runId, data.messageId));
+        if (narrationRecordMessages.size > 256) {
+          narrationRecordMessages.delete(narrationRecordMessages.values().next().value          );
+        }
       }
       emitDebug(
         "openclaw.message",
@@ -3568,6 +5292,7 @@ function createUpstreamRuntime(opts = {}) {
         () => ({
           notes,
           textChars: typeof data.text === "string" ? data.text.length : 0,
+          recordsPainted,
         }),
       );
       return;
@@ -3595,6 +5320,7 @@ function createUpstreamRuntime(opts = {}) {
       sessionKey,
       runId,
       messageIndex,
+      messageId: typeof data.messageId === "string" ? data.messageId : null,
       rawAssistantChars,
       assistantDeltaChars,
       firstGatewayChunk,
@@ -3714,6 +5440,8 @@ function createUpstreamRuntime(opts = {}) {
         };
       },
     );
+
+    if (takeWaitingApproval(data)) return;
     const server = getServer();
     if (server) {
       const key = data && data.request && data.request.sessionKey;
@@ -3722,10 +5450,106 @@ function createUpstreamRuntime(opts = {}) {
         displayedHermesApprovals.add(data.id);
       }
       server.broadcast(handler.formatApproval(data));
+      explainApprovalLater(data);
     }
   });
 
+  function explainApprovalLater(data     ) {
+    if (!approvalExplainer || !data || typeof data.id !== "string" || !data.id) return;
+    const request = data.request && typeof data.request === "object" ? data.request : {};
+
+    if (
+      typeof request.sessionKey === "string" &&
+      request.sessionKey.startsWith("hermes:") &&
+      !displayedHermesApprovals.has(data.id)
+    ) {
+      return;
+    }
+
+    if (request.botScreen && typeof request.botScreen === "object") return;
+    const codex = codexAppServerApprovalCommand(request);
+    const command = codex ? codex.command : approvalExplainCommand(data, request);
+    if (!command) return;
+    const cwd = codex && codex.cwd ? codex.cwd : typeof request.cwd === "string" ? request.cwd : "";
+    const approvalId = data.id;
+    approvalsAwaitingExplanation.add(approvalId);
+    const analysis = request.commandAnalysis && typeof request.commandAnalysis === "object"
+      ? request.commandAnalysis
+      : null;
+
+    let pendingShown = false;
+    const sendPending = (pending         ) => {
+      if (typeof handler.formatApprovalExplanationPending !== "function") return;
+      const frame = handler.formatApprovalExplanationPending({ id: approvalId, pending });
+      const server = getServer();
+      if (frame && server) server.broadcast(frame);
+    };
+    const settleWithout = () => {
+      if (approvalsAwaitingExplanation.delete(approvalId) && pendingShown) sendPending(false);
+    };
+    Promise.resolve(
+      approvalExplainer.explain(
+        {
+          id: approvalId,
+          command,
+          cwd,
+          agentId: typeof request.agentId === "string" ? request.agentId : "",
+          warningLines: analysis && Array.isArray(analysis.warningLines) ? analysis.warningLines : [],
+          context: data.ocuclawApprovalContext || null,
+        },
+        {
+          onPending: () => {
+            if (!approvalsAwaitingExplanation.has(approvalId)) return;
+            pendingShown = true;
+            sendPending(true);
+          },
+        },
+      ),
+    )
+      .then((explanation     ) => {
+        if (!explanation) {
+          settleWithout();
+          return;
+        }
+        if (!approvalsAwaitingExplanation.delete(approvalId)) return;
+        if (typeof handler.formatApprovalExplanation !== "function") return;
+        const frame = handler.formatApprovalExplanation({ id: approvalId, explanation });
+        const server = getServer();
+        if (frame && server) server.broadcast(frame);
+        emitDebug(
+          "approvals.timeline",
+          "approval_explained",
+          "info",
+          { sessionKey: sessionService.ensureSessionKey() },
+          () => ({ approvalId, explanationLength: explanation.length }),
+        );
+      })
+      .catch(settleWithout);
+  }
+
+  function approvalExplainCommand(data     , request     ) {
+    if (typeof request.command === "string" && request.command.trim()) {
+      const isPlugin =
+        data.approvalKind === "plugin" || (typeof data.id === "string" && data.id.startsWith("plugin:"));
+      if (!isPlugin) return request.command;
+    }
+    if (request.systemRunPlan && typeof request.systemRunPlan.commandText === "string") {
+      return request.systemRunPlan.commandText;
+    }
+    if (typeof request.description === "string" && request.description.trim().startsWith("{")) {
+      try {
+        const parsed = JSON.parse(request.description);
+        if (parsed && typeof parsed.command === "string") return parsed.command;
+      } catch {
+
+      }
+    }
+    return "";
+  }
+
   onGatewayEvent("approvalResolved", (data) => {
+
+    observeWaitingApprovalResolved(data);
     const approvalId = data && typeof data.id === "string" ? data.id.trim() : "";
     const correlated = approvalId ? taskApprovalRequests.get(approvalId) : null;
     const outcome = data && typeof data.decision === "string" ? data.decision : "";
@@ -3738,6 +5562,7 @@ function createUpstreamRuntime(opts = {}) {
     }
     if (approvalId) taskApprovalRequests.delete(approvalId);
     displayedHermesApprovals.delete(approvalId);
+    approvalsAwaitingExplanation.delete(approvalId);
     emitDebug(
       "approvals.timeline",
       "approval_resolved",
@@ -3754,17 +5579,18 @@ function createUpstreamRuntime(opts = {}) {
     }
   });
 
-  onGatewayEvent("sessionAttention", (data) => {
+  onGatewayEvent("sessionAttention", (data     ) => {
     if (!data || !sessionService.isCurrentSession(data.sessionKey)) return;
     if (typeof data.runActive === "boolean") {
       cachedRunActiveSessionKey = data.runActive ? data.sessionKey : null;
+      if (!data.runActive) clearCurrentActivityReplay();
       sessionContextService.broadcastRunActive(data.runActive);
     }
     onSessionAttention(data);
     const server = getServer();
     if (!server) return;
     const approvals = Array.isArray(data.approvals) ? data.approvals : [];
-    const live = new Set(approvals.map((entry) => entry.id));
+    const live = new Set(approvals.map((entry     ) => entry.id));
     for (const id of displayedHermesApprovals) {
       if (!live.has(id)) {
 
@@ -3780,7 +5606,117 @@ function createUpstreamRuntime(opts = {}) {
     }
   });
 
-  onGatewayEvent("clarify", (data) => {
+  onGatewayEvent("sessionsGone", (data     ) => {
+    onSessionsGone(data);
+  });
+
+  onGatewayEvent("waiting", publishWaiting);
+  function publishWaiting(data     ) {
+    const normalized = normalizeWaitingPayload(data);
+    if (!normalized) {
+      logger.debug?.("[relay] waiting event without an items list; ignored");
+      return;
+    }
+    cachedWaitingItems = normalized.items;
+    cachedWaitingHost = normalized.host || null;
+    emitDebug(
+      "approvals.timeline",
+      "waiting_snapshot",
+      "info",
+      { sessionKey: null },
+      () => ({
+        count: normalized.items.length,
+        kinds: normalized.items.map((item     ) => item.kind),
+        surfaces: normalized.items.map((item     ) => item.surface),
+        cleared: normalized.cleared ? normalized.cleared.outcome : null,
+      }),
+    );
+    const server = getServer();
+    if (server) server.broadcast(formatWaiting(normalized));
+    explainWaitingApprovals(data.items, normalized.items);
+  }
+
+  function explainWaitingApprovals(rawItems       , items       ) {
+    const live = new Set(items.map((item     ) => item.requestId));
+    for (const requestId of waitingExplanations.keys()) {
+      if (!live.has(requestId)) waitingExplanations.delete(requestId);
+    }
+    if (!approvalExplainer) return;
+    const inputs = new Map();
+    for (const raw of rawItems) {
+      const input = waitingExplainInput(raw);
+      if (input && live.has(input.requestId) && !inputs.has(input.requestId)) {
+        inputs.set(input.requestId, input);
+      }
+    }
+    for (const item of items) {
+      if (item.kind !== "approval") continue;
+      const input = inputs.get(item.requestId);
+
+      if (!input) {
+        waitingExplanations.delete(item.requestId);
+        continue;
+      }
+      if (!waitingExplanations.has(item.requestId)) explainWaitingApproval(input);
+    }
+  }
+
+  function explainWaitingApproval(input     ) {
+    const requestId = input.requestId;
+    const entry                                             = { state: "asked", sentence: null };
+    waitingExplanations.set(requestId, entry);
+    const current = () => waitingExplanations.get(requestId) === entry;
+    const send = (state        , sentence         ) => {
+      const frame = formatWaitingExplanation({ requestId, state, sentence });
+      const server = getServer();
+      if (frame && server) server.broadcast(frame);
+    };
+
+    const settleWithout = () => {
+      if (!current()) return;
+      const pendingShown = entry.state === "pending";
+      entry.state = "none";
+      if (pendingShown) send("done");
+    };
+    Promise.resolve(
+      approvalExplainer.explain(
+        {
+          id: `waiting:${requestId}`,
+          command: input.command,
+          cwd: "",
+          warningLines: input.warningLines,
+          context: input.context,
+        },
+        {
+          onPending: () => {
+            if (!current()) return;
+            entry.state = "pending";
+            send("pending");
+          },
+        },
+      ),
+    )
+      .then((sentence     ) => {
+        if (typeof sentence !== "string" || !sentence) {
+          settleWithout();
+          return;
+        }
+        if (!current()) return;
+        entry.state = "done";
+        entry.sentence = sentence;
+        send("done", sentence);
+        emitDebug(
+          "approvals.timeline",
+          "waiting_explained",
+          "info",
+          { sessionKey: null },
+          () => ({ requestId, explanationLength: sentence.length }),
+        );
+      })
+      .catch(settleWithout);
+  }
+
+  onGatewayEvent("clarify", (data     ) => {
     emitDebug(
       "glasses.lifecycle",
       "clarify_requested",
@@ -3799,7 +5735,7 @@ function createUpstreamRuntime(opts = {}) {
     onClarify(data);
   });
 
-  onGatewayEvent("question", (data) => {
+  onGatewayEvent("question", (data     ) => {
     emitDebug(
       "glasses.lifecycle",
       "question_requested",
@@ -3818,7 +5754,7 @@ function createUpstreamRuntime(opts = {}) {
     onQuestion(data);
   });
 
-  onGatewayEvent("questionResolved", (data) => {
+  onGatewayEvent("questionResolved", (data     ) => {
     onQuestionResolved(data);
   });
 
@@ -3844,7 +5780,8 @@ function createUpstreamRuntime(opts = {}) {
       "warn",
       { sessionKey: sessionService.ensureSessionKey() },
       () => ({
-        reason: info && info.reason ? info.reason : null,
+
+        reason: info && info.reason ? sanitizeConnectReason(info.reason) : null,
         minProtocol: info && info.minProtocol != null ? info.minProtocol : null,
         maxProtocol: info && info.maxProtocol != null ? info.maxProtocol : null,
       }),
@@ -3859,26 +5796,122 @@ function createUpstreamRuntime(opts = {}) {
     getAgentEmoji,
     getAgentAvatarDataUri,
     getAgentAvatarHash,
+    getAgentBootstrapPending,
     getAgentAvatarDataUriByHash,
     getModelsCatalogSnapshot,
+    getHostModelInput,
     setSimulatedModelCatalog,
     getAgentsCatalogSnapshot,
     refreshAgentsCatalog,
     getAgentDisplayName,
+    getAgentPrimaryModel,
+    agentHasOwnModel,
     getProviderUsageSnapshot,
     getSkillsCatalogSnapshot,
+    invalidateSkillsCatalog,
     getCommandCatalogSnapshot,
     refreshCommandCatalog,
     handleCurrentSessionModelConfigChanged,
     handleCurrentSessionModelConfigCleared,
     handleSessionChanged,
+    refreshSessionContext,
     refreshSessionAttention,
+    getActivityReplay,
     getActivityPlanReplay,
+    getWaitingReplay,
+    getWaitingExplanationReplay,
+    publishWaiting,
     ingestActivityFrame,
     ingestSimulatedGatewayEvent,
+
+    ingestRunSignal: (data     ) => ingestRunSignal(normalizeGatewaySessionEvent(data)),
     ingestMirroredRows,
     rehydrateHistory,
     isConnected,
+    liveUiV2Surfaces,
+    liveUiV2Sender,
+    liveUiV2State,
+    takeLiveUiV2FenceFragments,
+
+    noteLiveUiV2StateReport,
+    noteLiveUiV2Outcome,
+    collectLiveUiV2State,
+    isLiveUiV2TapOwed,
+
+    liveUiV2PatchTarget: (sessionKey     ) => liveUiV2Surfaces.patchTarget(liveUiV2Key(sessionKey)),
+
+    noteLiveUiV2Stop(sessionKey     ) {
+      if (!isLiveUiV2Session(sessionKey)) return;
+      const key = liveUiV2Key(sessionKey);
+      const runIds = [...upstreamRunPipeline.values()]
+        .filter((entry     ) => entry && entry.runId && entry.sessionKey && liveUiV2Key(entry.sessionKey) === key)
+        .map((entry     ) => entry.runId);
+      liveUiV2Step("stop", key, () => liveUiV2Surfaces.noteStopped(key, runIds));
+    },
+    composeLiveUiV2Records,
+
+    writeLiveUiV2Data,
+    prefetchLiveUiV2Picture,
+    setLiveUiV2Inputs,
+    isLiveUiV2SurfaceLive,
+    liveUiV2TopSurface,
+    openLiveUiV2Records,
+    withdrawLiveUiV2Surface,
+
+    handleLiveUiPictureWant(clientId     , sessionKey     , msg     ) {
+      if (!liveUiPictures) return;
+      liveUiV2Step("picture_want", sessionKey, () => liveUiPictures.want(clientId, liveUiV2Key(sessionKey), msg));
+    },
+
+    handleLiveUiVideoWant(clientId     , sessionKey     , msg     ) {
+      if (!liveUiPictures) return;
+      liveUiV2Step("video_want", sessionKey, () => liveUiPictures.videoWant(clientId, liveUiV2Key(sessionKey), msg));
+    },
+    noteLiveUiPictureClientGone(clientId     ) {
+      if (liveUiPictures) liveUiPictures.noteClientGone(clientId);
+    },
+
+    openProgramCardPictures,
+    closeProgramCardPictures(clientId     , sub     ) {
+      const surfaceId = typeof sub === "string" && sub ? programCardPictureSurfaceId(sub) : "";
+      const entry = surfaceId ? programCardPictureSurfaces.get(surfaceId) : null;
+
+      if (!entry || entry.clientId !== clientId) return;
+      closeProgramCardPictureSurface(surfaceId, "closed");
+    },
+
+    programCardPictureSessionOf(surfaceId     , clientId     ) {
+      const entry = typeof surfaceId === "string" ? programCardPictureSurfaces.get(surfaceId) : null;
+      return entry && entry.clientId === clientId ? entry.sessionKey : null;
+    },
+
+    handleProgramCardPictureWant(clientId     , want     ) {
+      const surfaceId = want && typeof want.surfaceId === "string" ? want.surfaceId : "";
+      const entry = programCardPictureSurfaces.get(surfaceId);
+      if (!entry || entry.clientId !== clientId) {
+        liveUiV2Trace("program_card_picture_want_ignored", { surfaceId, reason: "unknown_surface" });
+        return;
+      }
+      const ids           = Array.isArray(want.ids) ? want.ids.filter((id     ) => typeof id === "string") : [];
+      const large = want.large === true;
+      for (const id of ids) {
+        const code = entry.refused.get(id);
+        if (code) sendProgramCardPictureFailed(clientId, surfaceId, id, code, large);
+      }
+      const rest = ids.filter((id) => !entry.refused.has(id));
+      if (!liveUiPictures || rest.length === 0) return;
+      liveUiV2Step("card_picture_want", entry.key, () => liveUiPictures.want(clientId, entry.key, { ...want, ids: rest }));
+    },
+
+    noteProgramCardPicturesClientGone(clientId     ) {
+      for (const [surfaceId, entry] of [...programCardPictureSurfaces.entries()]) {
+        if (entry.clientId === clientId) closeProgramCardPictureSurface(surfaceId, "client_gone");
+      }
+    },
+    liveUiPictureStats: () => (liveUiPictures ? liveUiPictures.stats() : null),
+
+    replayLiveUiV2Session: (sessionKey     , reason     ) =>
+      liveUiV2Sender.replaySession(liveUiV2Key(sessionKey), reason || null),
     start() {
       return refreshUpstreamBootstrap("runtime_start");
     },
@@ -3899,6 +5932,29 @@ function createUpstreamRuntime(opts = {}) {
     },
     synthesizeResponseStarted,
     trackAcceptedRun,
+
+    prefetchLiveUiVideo(text        ) {
+      return liveUiVideo ? liveUiVideo.prefetch(text) : 0;
+    },
+
+    async serveLiveUiAudio(envelope     ) {
+      if (!liveUiVideo) return { statusCode: 404, headers: { "content-type": "text/plain; charset=utf-8" }, body: Buffer.from("not found") };
+      const url = new URL(envelope && typeof envelope.url === "string" ? envelope.url : "/", "http://127.0.0.1");
+      const headers = (envelope && envelope.headers) || {};
+      return liveUiVideo.audioRange(url.searchParams.get("k"), headers.range);
+    },
+
+    async serveLiveUiSubtitles(envelope     ) {
+      const headers = { "access-control-allow-origin": "*", "access-control-allow-methods": "GET, OPTIONS", "cache-control": "no-store" };
+      const method = typeof envelope?.method === "string" ? envelope.method.toUpperCase() : "GET";
+      if (method === "OPTIONS") return { statusCode: 204, headers, body: Buffer.alloc(0) };
+      if (method !== "GET") return { statusCode: 405, headers: { ...headers, allow: "GET, OPTIONS" }, body: Buffer.from("method not allowed") };
+      const url = new URL(typeof envelope?.url === "string" ? envelope.url : "/", "http://127.0.0.1");
+      if (url.pathname !== LIVEUI_SUBTITLES_PATH || !liveUiVideo || typeof liveUiVideo.subtitles !== "function") {
+        return { statusCode: 404, headers, body: Buffer.from("not found") };
+      }
+      return liveUiVideo.subtitles(url.searchParams.get("k"), url.searchParams.get("lang"), url.searchParams.get("from"), url.searchParams.get("kind"));
+    },
   };
 
   function isProviderRateLimitedLifecycleError(activity) {
@@ -3910,6 +5966,13 @@ function createUpstreamRuntime(opts = {}) {
       activity.origin.trim().toLowerCase() === "lifecycle" &&
       typeof activity.phase === "string" &&
       activity.phase.trim().toLowerCase() === "error"
+    );
+  }
+
+  function saysAccountUsageIsNotExhausted(activity                                       ) {
+    return [activity.detail, activity.label].some(
+      (text) => typeof text === "string" &&
+        text.toLowerCase().includes("does not report an exhausted limit"),
     );
   }
 
@@ -3994,4 +6057,4 @@ function createUpstreamRuntime(opts = {}) {
   }
 }
 
-module.exports = { createUpstreamRuntime, STREAMING_REBROADCAST_THROTTLE_MS, normalizeAgentsCatalogRows, parseWorkspaceIdentityFallback, applyIdentityFallback, overlayRawAgentRowsWithFallback, buildModelAliasIndex, resolveConfiguredDefaultModelRef, mapConfiguredCatalogRows, mapHermesConfiguredCatalogRows, isTerminalActivityBoundary, classifyRunOutcomeFrame, quietCancelledRunClose };
+module.exports = { STREAMING_REBROADCAST_THROTTLE_MS, isTerminalActivityBoundary, classifyRunOutcomeFrame, isCancelledRunFrame, quietCancelledRunClose, buildModelAliasIndex, resolveConfiguredDefaultModelRef, agentIdsWithOwnModel, mapConfiguredCatalogRows, mapHermesConfiguredCatalogRows, AGENT_DESCRIPTION_MAX_CHARS, normalizeAgentsCatalogRows, parseWorkspaceIdentityFallback, applyIdentityFallback, overlayRawAgentRowsWithFallback, createUpstreamRuntime };

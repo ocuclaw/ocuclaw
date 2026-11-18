@@ -1,6 +1,6 @@
 # OcuClaw fresh install on Hermes — Steps 1–12 (plus Step 4b)
 
-**Guide version:** 2026-09-29 (1.3.26-hermes)
+**Guide version:** 2026-10-28 (1.3.27-hermes)
 
 Keep using the loaded setup skill for guardrails, the lane card, and the
 internal completion checklist.
@@ -8,7 +8,7 @@ internal completion checklist.
 **HOST OWNERSHIP.** Setup stays in this host conversation from the first check
 through the welcome dismissal. On every entry or post-restart resume, obey the
 setup receipt's `journey.nextCheckpoint` and do not repeat an earlier step.
-The phone/G2 conversation is only the proof subject. Do not ask the user to run `/ocuclaw-setup` in the phone app or to continue setup there.
+The phone/G2 conversation is only the proof subject. Keep setup here: do not send the user to the phone app to run `/ocuclaw-setup` or to continue setup there.
 
 **FINISH CONTRACT.** A successful Step 10 phone-origin reply is not the finish.
 Reply evidence arms the one-hour First-Run Proof Attempt — either the phone
@@ -65,10 +65,12 @@ hermes --version
 
 When `{"operation":"status"}` reports a non-unknown `hermesVersion`, that
 receipt decides the gate: PASS when it is inside `supportedRange`; a version
-outside `>=0.21.1,<0.22.0` -> `HERMES-GATE-REFUSED`, regardless of the shell
-probe. Only when `hermesVersion` is `"unknown"` does the probe decide: Hermes
-0.21.1 or a later 0.21.x is PASS, and an earlier version (0.21.0 included) or a
-later line -> `HERMES-GATE-REFUSED`.
+below 0.21.4 -> `HERMES-GATE-REFUSED`, regardless of the shell probe. Only
+when `hermesVersion` is `"unknown"` does the probe decide: Hermes 0.21.4 or
+newer is PASS, and an earlier version (0.21.3 included) ->
+`HERMES-GATE-REFUSED`. A Hermes past the tested range `>=0.21.4,<0.24.0` is
+still PASS: continue, and say once "Hermes <version> is newer than OcuClaw
+has tested (certified 0.23.2). It should work; report anything odd."
 `command not found` beside a supported `status.hermesVersion` is the
 trust-ladder case: Hermes is installed; continue, handing commands to the
 user's terminal. Only when the probe fails *and* `hermesVersion` is `"unknown"`
@@ -89,11 +91,23 @@ the credential, record the precise prerequisite and use the necessary activation
 restart with the reconnect handoff. Never claim reduction by ignoring a failed
 bootstrap. Keep any required migration restart under its existing ownership.
 
-## Step 2 · Install from the beta bundle
+## Step 2 · Install from the GitHub bundle
 
 Skip when `hermes plugins list` already shows an enabled or disabled `ocuclaw`
 plugin from the intended GitHub bundle. Do not overwrite an unexplained local
 plugin without the user's decision.
+
+**Already installed by a template.** Cloudways Agent Templates can ship OcuClaw
+already installed, from any source and at any version. On a Cloudways host an
+`ocuclaw` plugin in `hermes plugins list` counts as present, whatever its
+source: skip this step and never reinstall over it. When `ocuclaw_setup`
+offers `next`, go back to SKILL.md's **Chat setup**. Then offer an update, not
+a reinstall: when the installed version is older than the latest, or the user
+asks, load `{"operation":"update"}` and follow it.
+
+**Not installed yet.** Installing from GitHub is an unreviewed source: ask
+once before the install command, naming the source, and run it only after a
+clear yes. Never answer that question for the user.
 
 This is the one wording every OcuClaw-on-Hermes surface uses for installing and
 updating. Quote it when you explain the sequence; do not paraphrase it.
@@ -110,8 +124,9 @@ block. Continue with the applicable checks; do not change the terminal default
 or present it as an outstanding requirement in Desktop.
 
 <!-- ocuclaw:install-block:start -->
-OcuClaw needs Hermes `>=0.21.1,<0.22.0`; the certified baseline is Hermes
-`0.21.5`. Install it once, in the default Hermes profile: that profile owns the
+OcuClaw needs Hermes 0.21.4 or newer. It is tested on `>=0.21.4,<0.24.0`, and
+the certified baseline is Hermes `0.23.2`; a newer Hermes runs with a warning.
+Install it once, in the default Hermes profile: that profile owns the
 relay the glasses pair to, and a second copy in another profile is never the
 answer.
 
@@ -119,11 +134,27 @@ answer.
 invitation or GitHub sign-in to clone. Git must still be installed and working
 on the installing machine (Desktop uses Git too). Verify with
 `git ls-remote https://github.com/ocuclaw/ocuclaw.git HEAD` before installing;
-never paste an access token into setup chat. Even Hub beta access is a separate
-invitation, and the software itself is still beta.
+no GitHub token is needed, so never paste one into setup chat. Even Hub beta
+access is a separate invitation.
 
-**Terminal first.** This is the supported path and the one every beta build is
-tested on:
+**Setup runs in your agent's chat.** Once OcuClaw is installed, the main way to
+finish setup on every host is to ask your agent in its own chat (on Cloudways,
+the web UI behind **Open Agent**): "Install OcuClaw and set it up for my Even G2
+glasses." The agent relays OcuClaw's own nine setup steps word for word. You
+approve the private route on a card in the chat, open the Tailscale link it
+gives you, type the phone code from OcuClaw's **Pair this phone** sheet into the
+chat, and allow the four-words card only if the words match your phone or
+glasses. The TUI pairs the same way. Hermes Desktop shows its own pairing
+panel for the code and the words instead. Hermes loads OcuClaw only when it
+restarts, so right after the agent installs it, the agent runs
+`hermes ocuclaw setup-start`: it turns on OcuClaw's settings and restarts Hermes
+once. On Cloudways that restarts the whole container: open the chat again and
+type `continue`. If the agent cannot install OcuClaw itself, run the install
+line below yourself, then `hermes ocuclaw setup-start`, then ask again.
+The terminal commands below are the fallback.
+
+**Terminal first.** Of the two ways to install, this is the supported one and
+the one every release is tested on:
 
 **Cloudways managed Hermes: install, then one command. Do not restart yet.**
 
@@ -160,7 +191,7 @@ ten minutes, having changed nothing, and running the same command again picks
 up right there. Leave Tailscale switched on afterwards: the phone needs it to
 reach this server.
 
-**The pairing code waits for you.** It lasts two minutes, so step 7 asks you to
+**The pairing code waits for you.** It lasts five minutes, so step 7 asks you to
 have the phone in your hand with the Even app open, and waits for you to press
 Enter before it makes the code. If a code does run out before anyone uses it,
 the command does not give up: press Enter for a new one, or type `stop` to
@@ -220,15 +251,18 @@ hermes://plugin/install?repo=ocuclaw/ocuclaw
 
 installs the same bundle through the Desktop install modal, enabled by default.
 OcuClaw ships **one** Desktop UI, and the enabled plugin generates it, so the
-order is: install, then restart the gateway, and the OcuClaw UI appears in the
-Hermes Desktop title bar on the next Desktop launch or reload.
+order is: install, restart the gateway, then pair. The window stays open the
+whole time.
 
 1. Restart the gateway — use the native **Restart gateway** button when the
    OcuClaw card is visible, otherwise `hermes gateway restart` in a terminal. Until it
    restarts, OcuClaw is installed but not loaded, and there is no OcuClaw
-   Desktop UI yet.
-2. The OcuClaw setup card then appears in the title bar reading
-   **Pair your glasses**. Run `/ocuclaw-setup` and finish pairing. The card
+   Desktop UI yet. On the card, that one click also restarts Desktop's backend
+   so the pairing panel loads. The card reads **Finishing setup…** meanwhile.
+2. The OcuClaw setup card then appears in the title bar. Wait until it turns
+   green, reads **OcuClaw ready** and offers **Pair your glasses**. If the card
+   instead reads **Quit and reopen Hermes Desktop to finish setup**, do that.
+   Run `/ocuclaw-setup` and finish pairing. The card
    retires on the durable pairing receipt and stays gone, including across a
    Desktop relaunch.
 
@@ -252,13 +286,17 @@ gateway start and not a moment sooner, so restart it yourself — then run
 `/ocuclaw-setup` and let it re-verify health.
 
 **Cloudways Managed AI Agents.** The same install block applies. That host has
-no root and no system Tailscale, so OcuClaw carries its own path for it, and
-`hermes ocuclaw cloudways setup` runs the whole of it: a user-owned userspace
-Tailscale under `~/bin` and `~/.tailscale`, a Hermes cron watchdog that starts
-it again after every `hermes gateway restart` (a container restart there), the
-private tailnet route, the pairing ceremony and the first message. Cloudways has
-approved those pieces. Your only manual steps are opening the Tailscale
-authorization link it prints and the phone.
+no root, so OcuClaw carries its own path for it. Setup in the agent's chat, or
+`hermes ocuclaw cloudways setup` in the terminal, runs the whole of it: a
+user-owned userspace Tailscale (the server's own `/usr/bin` copy; a server
+without it is told to restart from the Cloudways panel) with state in
+`~/.tailscale`, kept alive by OcuClaw, which starts it again after every
+`hermes gateway restart` (a container restart there). When Cloudways' own
+Tailscale is already running and signed in, OcuClaw uses that one instead. Then
+the private tailnet route, the pairing ceremony and the first message. Cloudways
+has approved those pieces. Sign your model in from the Cloudways panel
+(**LLM & Channels**, then **OAuth**); setup does not sign it in for you. Your
+only manual steps are opening the Tailscale authorization link and the phone.
 
 The same work is still available one verb at a time (`hermes ocuclaw cloudways
 detect`, `install`, `enroll`, `status`, `retry`, `enable`, `disable`,
@@ -272,7 +310,7 @@ CHECKPOINT:
 hermes plugins install ocuclaw/ocuclaw --enable
 ```
 
-This clones the access-controlled OcuClaw Hermes beta bundle. There is no npm or ClawHub
+This clones the public OcuClaw Hermes bundle from GitHub. There is no npm or ClawHub
 leg. Never add `--ref`, for the reason the block states.
 
 VERIFY:
@@ -303,7 +341,7 @@ confirmed all-device reset. If neither credential nor marker can be read,
 bootstrap did not complete; use guided recovery and do not invent a manual
 credential-entry path.
 
-## Step 4 · Configure the beta posture
+## Step 4 · Configure the required settings
 
 Enter here directly for `journey.nextCheckpoint: mandatory-configuration`.
 The read-only `status.mandatoryConfiguration.toolProgressOff` must be true
@@ -321,7 +359,8 @@ Also require `status.mandatoryConfiguration.adoptConfigured: true` — "Continue
 here": the glasses can pick up a chat started in Hermes Desktop, the CLI or the
 TUI and carry it on. It needs `platforms.ocuclaw.extra.allow_admin_from` to list
 the one user id the plugin sends, `ocuclaw-wearer`. Write it on fresh AND
-existing installs; never ask the user to understand slash-command gating.
+existing installs. It is an internal setting: the user does not need to learn
+how slash-command gating works.
 
 Include the plugin-enable command only if `hermes plugins list` shows OcuClaw
 disabled. Inspect the applicable non-secret settings first and include only lines
@@ -347,8 +386,8 @@ recovers an older disabled install. The non-secret commands keep Hermes'
 conversational tool-progress bubbles out of the OcuClaw transcript and turn on
 per-platform reply streaming; without the streaming key the glasses show only
 "typing" for the whole reply, then the whole reply at once. Hermes TUI
-and Desktop are the guided beta pairing
-surfaces: each presents the secure QR and four-word decision directly without
+and Desktop are the guided pairing
+surfaces: each takes the phone code and presents the four-word decision directly without
 routing either through the model. For a terminal install only, inspect
 `hermes config get display.interface` and, if needed, run
 `hermes config set display.interface tui` to select the secure terminal pairing
@@ -376,7 +415,7 @@ reports `tui`). Hermes 0.21 stores the CLI value `off` as a boolean, so
 config-gated Hermes `/verbose` command changes OcuClaw's per-platform mode,
 restore `off` before continuing.
 
-## Step 4b · Live reasoning [OPTIONAL — offer, never assume]
+## Step 4b · Live reasoning default
 
 Read `status.hermesHooks.streamReasoningDeltasOffer` from the receipt you
 already have. It says exactly one of four things, and each has one response:
@@ -387,28 +426,26 @@ already have. It says exactly one of four things, and each has one response:
   offer it, do not set it, and do not present this as a defect.
 - `unknown` -> the configuration was unreadable; this belongs to the
   `config_unreadable` problem, not to this step. Skip and go to Step 5.
-- `offer` -> make the offer below.
+- `offer` -> apply the fresh-setup default below.
 
-CHECKPOINT. Tell the user what it does and what it costs, in their own words:
-reasoning streams as it is written to the glasses rather than arriving in whole pieces,
-and the key is Hermes' own and gateway-wide — it changes how Hermes calls the
-model for every surface on this gateway, not only OcuClaw. Then ask for a
-yes or a no. A no is a legitimate finished answer; record it and move on.
+Tell the user: "I'll enable live reasoning so your glasses can show reasoning
+steps as they arrive. This setting applies across this Hermes gateway."
+This is a fresh-setup default; continue without another yes/no question. If the
+user declines it in this conversation, skip the write and record their choice.
+Updates apply the same default at update U4.
 
-On an explicit yes, call the setup tool once:
+Call the setup tool once, preserving every value already saved:
 
 ```json
-{"operation":"enable_stream_reasoning_deltas","confirm":true}
+{"operation":"enable_stream_reasoning_deltas","confirm":true,"defaultsOnly":true}
 ```
 
-This is the ONLY writing operation the setup tool has, and `confirm: true` is
-what makes it write — never send it before the user has said yes, and never
-send it to "check" what would happen. The tool writes the key atomically
-through Hermes' own configuration writer; do not hand-edit `config.yaml` and
-do not run `hermes config set` for this key yourself when the tool is
-available. VERIFY from the returned receipt that
-`streamReasoningDeltas.applied` is `true` and that the fresh status shows
-`hermesHooks.streamReasoningDeltas: true`.
+`confirm: true` authorizes the write; `defaultsOnly: true` restricts it to an
+unset key. The tool writes atomically through Hermes' configuration writer.
+Verify `streamReasoningDeltas.reason`: `written` must have `applied: true`,
+`restartRequired: true`, and fresh status `hermesHooks.streamReasoningDeltas: true`.
+`existing_choice` means a saved value (including false) was preserved; record
+it and continue. `already_enabled` needs no write.
 
 The key is saved but not live: Hermes reads it when it builds its plugin hook
 set. Step 5's restart is that restart — do not add one here.
@@ -432,9 +469,23 @@ gateway by itself, and this step still applies the settings saved after it.
 Warn about the brief restart, then CHECKPOINT:
 
 Call `{"operation":"quick_reference"}` and follow `Restarting the gateway`,
-including its supervisor-specific command and wizard rule. Read
+including its Desktop handoff, caller restriction, supervisor-specific command
+and wizard rule. For `status.setupSurface: desktop`, ask the person to use
+Desktop's **Restart gateway** action after the settings are saved. If the
+OcuClaw card offers that button, use it. If it still says **Waiting for setup**
+or has no restart button, open Desktop's command palette (Ctrl+K on Linux or
+Windows, Cmd+K on macOS), search **Restart gateway**, and select it there.
+Do not claim the card has a button you have not observed. Stay in this setup
+chat; after reconnection, re-read status and verify the restart before continuing.
+Never run a gateway lifecycle command through an agent tool in Desktop.
+
+For other host surfaces, read
 `status.gatewaySupervision` first. Only `service` lets you run
-`hermes gateway restart`. For `unsupervised`, `unknown` or an absent field,
+`hermes gateway restart`, and only from outside the gateway process. A
+supervised gateway's own tool is deliberately blocked because SIGTERM would
+kill its restart command. Honor that refusal; give the separate-shell or
+supervisor handoff, without detach, kill, force, or alternative command tricks.
+For `unsupervised`, `unknown` or an absent field,
 never run `hermes gateway restart` or `hermes gateway run` from a tool: give
 the person the exact hand-off (Ctrl+C in their gateway terminal,
 `hermes gateway run` again there, then "continue") and wait for "continue".
@@ -493,7 +544,9 @@ decisive, so ask it open-ended with `clarify` and no choices: "Is this Hermes
 running on Cloudways Managed AI Agents? Type yes or no." Only a clear yes
 counts; a timeout reply is no answer.
 
-On a Cloudways host, offer the one command:
+When `ocuclaw_setup` offers `next`, do not offer it: SKILL.md's **Chat setup**
+already does these steps in this chat. Without `next`, on a Cloudways host,
+offer the one command:
 
 ```bash
 hermes ocuclaw cloudways setup
@@ -503,7 +556,7 @@ It runs Steps 6, 7, 9 and 10 in the user's own terminal as its own numbered
 steps `[1/8]` to `[8/8]`: Tailscale, the private route, the pairing ceremony
 and the first message, ending at the evidenced reply and the welcome hand-off.
 It asks the user twice, each time showing exactly what changes and defaulting
-to no. Read `{"operation":"cloudways"}` → **Fast path: one command** before you
+to no. Read `{"operation":"cloudways"}` → **Terminal fallback: one command** before you
 offer it, and say what it does in plain words first.
 
 **Step 8 · Phone Tailscale is no longer yours to finish first.** The ladder's
@@ -646,27 +699,25 @@ secure in-window pairing panel is opening and immediately call:
 {"operation":"pair_phone"}
 ```
 
-Do not run a shell command, ask for another OK, or reproduce the QR in chat.
+Do not run a shell command, ask for another OK, or ask for the phone code in chat.
 The supported Hermes TUI widget or Desktop runtime presenter obtains the
-verified private address itself, renders the relay's canonical QR directly,
-and advances automatically when the phone connects. The TUI panel opens on the
-address/code (manual) view when the QR does not fit the window, and `m` offers
-the QR only when it fits; the Desktop panel's manual toggle shows the
-address/code for the same exchange. On the
+verified private address itself, takes the phone code the user types, and
+advances automatically when the phone connects. The panel's **Pair manually**
+view shows the address and pairing code for the same exchange. On the
 phone, the user opens OcuClaw in Even Hub, taps **Pair with your agent** (older apps: **Pair with your computer**),
-then **Take a photo of the QR code**, or **Enter the pairing code instead** to
-type the address and code.
+and types the phone code OcuClaw shows into the panel. For manual pairing they
+choose **Pair manually** in the panel, then in OcuClaw tap **Pair with your
+agent > Pair manually** and type the address and pairing code.
 The user
 compares the four-word safety phrase on both devices. TUI defaults to **No**;
 Desktop has separate explicit refuse/approve buttons and Enter alone never
 approves. The tool returns only after the relay reaches a terminal state.
 
-If the phone camera cannot read the QR, the user taps **Enter the pairing code
-instead** in the phone app and types the private address and short-lived code
-visible in that same panel. The QR
-contains only the private address, one-time exchange ID, and host ephemeral
-public key. Neither initiation reveals or asks the user to enter the Relay
-Credential.
+If the phone code does not work, the user taps **Pair manually** in the phone
+app and types the private address and short-lived pairing code visible in that
+same panel. The phone code opens a sealed note that holds only the private
+address, one-time exchange ID, and host ephemeral public key. Neither route reveals or asks the user to
+enter the Relay Credential.
 
 `tui_required` is the compatibility code for classic CLI or another unsupported
 host surface. Use the one-time TUI/Desktop handoff from Step 5 and resume here;
@@ -679,12 +730,19 @@ repaired after this TUI started: relaunch Hermes once and continue this
 checkpoint, but only when a service manager runs the gateway. Never suggest
 quitting or relaunching the TUI while the gateway may be its child; quitting
 stops the gateway. For `desktop_plugin_unavailable`, keep Desktop open, reload
-Desktop plugins once, and retry the checkpoint. Any other failure code, or the
+Desktop plugins once, and retry the checkpoint. `desktop_relaunch_required`
+means OcuClaw was installed while this Desktop was open, so its pairing panel
+is not loaded yet: nothing was opened and the glasses are not at fault. Ask the
+person to use Desktop's **Restart gateway** action as described in Step 5;
+use the card's button only when present, otherwise the command palette. Wait
+until it reads **OcuClaw ready** (or, if the card asks for it, to quit and
+reopen Hermes Desktop), then call `pair_phone` again; it never counts toward
+the same failure twice. Any other failure code, or the
 same failure twice, is deterministic: ask the person to run the exact verified
 `hermes ocuclaw pair --address <phoneAddress>` command in their own terminal,
 a separate window they open themselves. Never run that interactive fallback
-through your Terminal or any other agent tool, pipe its output, or relay its QR
-or pairing code through the model.
+through your Terminal or any other agent tool, pipe its output, or relay its
+pairing code or the phone code through the model.
 
 ## Step 10 · Phone-origin hello
 
@@ -699,7 +757,7 @@ Immediately call:
 {"operation":"wait_phone_origin"}
 ```
 
-Do not ask the user to report that they sent the message. The tool returns only
+The user does not need to tell you they sent the message: the tool returns only
 after the managed gateway completes a new phone-origin turn, or after its
 bounded wait expires. Do not replace this with a host-originated CLI message.
 Retain `phoneOriginAction.candidateId` for the next private tool calls. It is an
@@ -721,7 +779,8 @@ phone: call `{"operation":"status"}` and follow troubleshooting.
 instead of an answer, and the glasses showed that error text. The chain works;
 the model is unreachable. Give the tool's `action` line as the verdict: it
 names the failure class (`providerErrorClass`) and its fix, such as
-`hermes model` to sign in again or `hermes -z hello` to check the model. Then
+`hermes model` to sign in again (`claude auth login` on a Claude plan,
+troubleshooting CLAUDE-PLAN) or `hermes -z hello` to check the model. Then
 stop. Never ask whether the reply appeared, never arm, and never call
 `welcome_round_trip` for this turn: a model error never proves setup, and the
 arm refuses it with `reply_run_errored` whatever evidence is claimed. Once the
@@ -817,8 +876,9 @@ object to the bound phone/G2 session—no extra key or changed value:
 The picture is a collab lockup the gateway carries itself: Hermes × OcuClaw, or
 Hermes × OcuClaw × Cloudways on a Cloudways managed host. You never supply it.
 
-Do not call `render_glasses_ui` from either the host or phone conversation; its
-live control link belongs to the managed gateway process. If the welcome screen
+Do not try to paint the welcome yourself from either the host or phone
+conversation; no tool does it, and its live control link belongs to the
+managed gateway process. If the welcome screen
 appears a second time, the wearer double-taps it once more: the one automatic retry
 is already covered by the blocking tool call, which waits about three and a
 half minutes, long enough for the reply hold and both cards. The deterministic
@@ -875,24 +935,34 @@ never erases a previously committed First-Run Proof or reopens completion.
 ## Step 11 · Optional voice and Even AI setup
 
 The optional-setup handoff is already in the `say` lines you repeated at
-Step 10; do not give it a second time. The card's two buttons are
-**Set up voice** and **Set up Even AI**. The card has no other buttons, and Settings
-has no separate optional-setup row. Use the names above and nothing else.
+Step 10; do not give it a second time. The card's three buttons are
+**Set up voice**, **Set up Even AI** and **Set up Jev**; **Set up voice** shows
+only while a cloud voice service is picked, so with the default On-phone engine
+the card has two. Settings has no separate optional-setup row. Use the names above and nothing else.
 Dismissing Home's invitation is separate
-from skipping Voice or Even AI. They can stop, skip each choice or return
+from skipping Voice, Even AI or Jev. They can stop, skip each choice or return
 later. This is not a ninth Cloudways stage. Keep a pending welcome warning visible
 if they chose to continue without that proof; optional work never clears it.
 
-For a new optional continuation, ask about voice and Even AI separately. For an
+For a new optional continuation, do not ask about voice: say the one voice line
+under **Soniox voice setup** below. Ask about Even AI and Jev separately
+(Jev's question is under **Jev setup** below). For an
 existing user's specific request, enter only that capability after a narrow
 read-only check; keep core receipts, pairing and other integrations intact.
 Keep the questions and popups separate. Never infer consent to one from the other.
 On a matching installed bundle advertising the private phone interface, use its
-dedicated Choose/Save/Try or Unlock/Connect/Try pages. Enter secrets only in the
-masked private form, confirm existing-secret replacement separately, and choose
-**Save privately**. Gather saves independently, then **Review activation** and
-confirm the supported host action. Unsupported lifecycle support stays pending
-with the existing host handoff; never substitute an unadvertised restart.
+dedicated voice and Even AI popups. Enter secrets only in the masked field,
+confirm existing-secret replacement separately (**Change**, then **Replace key**
+or **Replace password**), and tap **Save & continue**. A saved Soniox key waits
+for one Hermes restart: the voice popup shows **Restart Hermes to continue** and
+**Review restart**, which opens **Restart Hermes?** with a **Restart Hermes**
+button, and Home shows "Voice key saved, needs a restart" with **Restart Hermes**
+and **Later**. Where Hermes supports that restart, the Even AI password button
+reads **Save & restart Hermes**: one tap saves and restarts, and that restart
+also loads a Soniox key saved earlier. So when the user wants both, save Soniox
+first, then Even AI, and the Even AI tap does the one restart. Unsupported
+lifecycle support stays pending with the existing host handoff; never
+substitute an unadvertised restart.
 Candidate source does not establish availability in a published bundle.
 Desktop and terminal alternatives use the **Activation barrier** below.
 Saved, available-to-test and verified behavior are separate states. Resume from
@@ -905,41 +975,67 @@ through arguments, chat, screenshots or logs.
 
 ### Choose the speech path
 
-In phone Voice settings, **Soniox** shows words live and requires a Soniox project
-and key. **Hermes** transcribes after speech ends using an explicitly selected
-available provider. Model/chat sign-in does not prove speech support. Refresh the
-reported providers, preserve the current choice if one is unavailable, then start
-the spoken test for the selected provider/model. Local speech requires an already
+**Set up voice** opens on **Choose your voice engine**: **Soniox** or **Hermes**,
+then **Continue**. **Soniox** shows words live and requires a Soniox project and
+key. **Hermes** uses a speech provider set up in Hermes itself; its keys stay in
+Hermes. On Hermes 0.22+ a provider that can stream (marked "live" in the list,
+for example OpenAI with a direct key, xAI or ElevenLabs) also shows words as you
+speak, with **Live words** on by default; other providers show them a moment
+after you stop. A user who already has one of those keys in Hermes needs no
+Soniox account. Model/chat sign-in does not prove speech support.
+
+For the Hermes engine, the popup lists Hermes's providers; nothing is
+preselected, and the user taps one to save it. Until a provider is saved, every
+listen stops with "Voice isn't set up." on the glasses. If Hermes has no speech
+provider, the popup points to Hermes Desktop **Capabilities → Tools →
+Speech-to-Text**, or in a terminal `hermes tools` → Reconfigure an existing tool
+→ Speech-to-Text, then **Check availability**. Preserve the current choice if
+one becomes unavailable, then start the spoken test for the selected
+provider/model. Local speech requires an already
 installed model: OcuClaw refuses missing files instead of downloading them. Any
 model preparation is a separate explicit choice on the Hermes computer. Opening
 settings or declining voice never installs a model or changes the provider.
 
 ### Soniox voice setup
 
-CHECKPOINT. Ask:
+Voice needs no setup: by default the phone runs speech to text itself (the
+On-phone engine), with no account, no key and nothing on the Hermes computer.
+Do not ask about voice or Soniox. Say one line, record voice as resolved, and
+continue to the separate Even AI question:
 
-> Would you like to set up voice inside OcuClaw? Soniox lets you speak to your
-> agent using the glasses mic. It needs a Soniox account and API key.
+> Voice works on your phone with no account or key. Once setup is done, your
+> phone shows you how to try it.
 
-If they decline, record the skip and continue to the separate Even AI question.
-If they accept, check only `sonioxApiKeyPresent` through
+The phone downloads its speech model by itself the first time (about 150 MB).
+Do not offer Soniox or save a Soniox key unprompted.
+
+Only if the user asks for Soniox by name (for example they already pay for it, or
+their phone cannot run the on-phone model), check only `sonioxApiKeyPresent` through
 `{"operation":"status"}`. Keep an existing key; gather only a missing one.
 
 For a missing Soniox key, first guide the user to https://console.soniox.com/:
 sign up or sign in, open their project (new accounts start with **My First
-Project**), then **API Keys** and create a key. Have them keep it private and
+Project**), then **API Keys** and create a key with real-time speech-to-text,
+temporary API keys and model listing allowed (the app's "What key do I need?"
+says the same). Have them keep it private and
 ready to paste into the masked prompt below, never into chat. If account or
 billing setup blocks key creation, stay at that step or let them skip Soniox;
 do not mark it configured. The API console is distinct from the Soniox
 transcription app. These steps follow https://soniox.com/docs/stt/get-started.
 
-Once the Soniox key is ready, the supported phone path is **Set up voice** on Home's **Optional setup** card (later **Settings > Voice**) >
-Voice > Soniox > Save**. Enter it privately, confirm a replacement if needed,
-and choose **Save privately**. Fresh readback must confirm the save. Activation
-and the selected spoken test remain separate checkpoints.
-After activation, use the Try step for the selected provider/model and speak a
-short phrase. Only its matching final transcription is speech proof; typed chat,
-old transcripts and key presence are not. A changed configuration or connection
+Once the Soniox key is ready, open **Settings > Voice**. **Set up voice** on
+Home's **Optional setup** card is there only while a cloud voice service is
+picked, and Home shows one card at a time. Then **Soniox** >
+**Continue** > **Add your Soniox key**: paste it in the masked field and tap
+**Save & continue** (a saved key shows **Soniox key saved** with **Change**).
+Fresh readback must confirm the save. Activation and the selected spoken test
+remain separate checkpoints.
+After activation the popup shows **Your voice is ready**; tap **Try voice** and
+speak a short phrase. Later the test is the **Try** pill on the **Service** row
+under SPEECH TO TEXT in **Settings > Voice**, which also shows the last result.
+Only that test's matching final transcription is speech proof; typed chat,
+old transcripts and key presence are not. For a voice notice on the glasses,
+use **VOICE-ERRORS** in `{"operation":"troubleshooting"}`. A changed configuration or connection
 needs a fresh test, while pairing and completed core setup remain intact.
 
 <details><summary>Advanced: Desktop or private terminal entry</summary>
@@ -982,7 +1078,7 @@ lane after the required read-only status check; it does not replay Steps 1–10.
 
 ### Even AI activation lane
 
-After Soniox is configured or skipped, ask this separate CHECKPOINT question:
+After the voice line (or a Soniox setup the user asked for), ask this separate CHECKPOINT question:
 
 > Would you like to connect the Even Realities app's own Even AI feature to
 > your Hermes agent? This uses Agent Configuration in that app and a private token.
@@ -1018,9 +1114,11 @@ false, explain that this Token is a shared private secret chosen by the user,
 not a key issued by the Hub website. Have them create a strong random secret in
 their password manager and keep it for Hermes and the phone's Token field.
 Never generate it in an assistant response or ask them to paste it into chat.
-On the advertised phone interface, tap **Set up Even AI** on Home's **Optional setup** card (later **Settings > Defaults > Even AI**), then **Connect**.
-Enter the user-chosen secret in the masked field and choose **Save privately**;
-confirm replacement before entering a new value over an existing one.
+On the advertised phone interface, tap **Set up Even AI** on Home's **Optional setup** card (later **Settings > Even AI**), then **Connect**.
+Enter the user-chosen secret in the masked **Even AI password** field and tap
+**Save & continue**, or **Save & restart Hermes** where Hermes supports the
+one-tap restart (the warning under the button says every profile restarts);
+replacing a saved one is **Change password**, then **Replace password**.
 Keep the same secret for the Even app. Refresh readback before activation.
 
 <details><summary>Advanced: Desktop or private terminal entry</summary>
@@ -1046,15 +1144,18 @@ was saved. Preserve the other optional change and keep the failure visible.
 </details>
 
 **Activation barrier (Cloudways and local).** Finish or skip each chosen save.
-On the supported phone interface, choose **Review activation**, read its restart
-and affected-profile disclosure, then explicitly confirm. Save alone does not
-restart Hermes. Preserve reconnect details first. After reconnecting, refresh
+On the supported phone interface, tap **Review restart** in the voice popup (or
+**Restart Hermes** on the Home voice card), read the **Restart Hermes?**
+disclosure (every profile on the server restarts), then explicitly confirm with
+**Restart Hermes**. An Even AI **Save & restart Hermes** tap is the same
+restart. A Soniox save alone does not restart Hermes. Preserve reconnect details first. After reconnecting, refresh
 the current loaded state; never replay an uncertain apply operation automatically.
 If activation is unavailable, use the host's supported handoff and retain pending
 state. An applied operation receipt is for status checks only.
 
 The restart is required: a saved key stays invisible to the relay until the
-next gateway start, and every listen shows `Soniox key missing` until then.
+next gateway start, and until then every listen shows "Voice isn't set up." /
+"Set it up on your phone: Settings › Voice" on the glasses.
 Status detects a saved but unloaded key for every save path, including the
 `hermes gateway setup` masked prompts and a hand-edited `.env`, and the phone
 offers **Restart Hermes** on its Home screen; an Even AI token counts only once
@@ -1136,8 +1237,8 @@ targets another Primary Runtime, a foreign service, an ambiguous target, or a
 non-proxy web handler, or when Funnel is enabled. Never use Funnel, widen the
 relay bind, publish a public address, or run a host-wide Serve reset. Do not
 change or remove the :8446 Managed Serve Route, its ownership receipt, or its
-teardown contract. This optional :8443 mapping is not automatically removed
-during uninstall.
+teardown contract. Uninstall does not remove this optional :8443
+mapping.
 
 #### Checkpoint 5 · Configure the Even Realities app
 
@@ -1155,6 +1256,40 @@ real request. Have the wearer make a real request from the glasses through Even 
 confirm that their Hermes agent answers. An enabled flag, host configuration,
 route shape, endpoint response, or WebUI state alone is not end-to-end success.
 Do not claim `g2-validated` without wearer-confirmed real G2 evidence.
+
+### Jev setup
+
+Jev picks interface, small app or text the moment the user sends, so the agent
+skips that step and replies arrive sooner; icons and the apps the agent builds
+get smarter too. OcuClaw still shows interfaces without Jev, only slower.
+
+CHECKPOINT. Ask in one line, then let them skip:
+
+> Jev: a faster, smarter OcuClaw. Interfaces arrive sooner, and icons and the
+> apps your agent builds get smarter. Needs a TypeSafe key.
+
+If they accept, they make a TypeSafe API key at console.typesafe.ai on a
+computer. Never ask for the key in chat or echo it. The phone opens no links, so
+give the address as text.
+
+On the advertised phone interface, tap **Set up Jev** on Home's **Optional setup** card.
+If that card is not on screen, open Help > Optional setup > **Jev**.
+The popup takes the key in a masked field (**Save key**), then asks before it
+turns anything on: **Turn on** lets each message go to TypeSafe too, with no
+restart. When Hermes has not loaded a new key yet, the button reads
+**Turn on & restart Hermes** and does that one restart, with its warning under it; **Not now**
+keeps the key with Smart interfaces off. Then the host checks the key with
+TypeSafe. A rejected key offers **Change key**; an unreachable TypeSafe offers
+**Check again**. A saved key alone turns nothing on.
+
+Progress, presence and outcome only: in chat setup, `next` says each step and
+`jev.state` is where Jev is (`working` only once the switch is loaded and the
+check passed). Elsewhere read `hermes ocuclaw optional-setup status`:
+`capabilities.typesafe`, `diagnostics.liveuiJev` and `activeLiveuiJev`, and
+`jevCheck` (`working`, `key_rejected`, `unreachable`, or null when not checked
+since Hermes started). Advanced: the hidden prompt
+`hermes ocuclaw optional-setup save typesafe`; Smart interfaces is still switched on
+from the phone.
 
 ### Optional diagnostics
 

@@ -9,8 +9,8 @@ const LINK_HANDSHAKE_TIMEOUT_MS = 10_000;
 const LINK_WRITE_MAX_BYTES = 4 * 1_048_576;
 const LINK_ADMISSION_LIMIT = 128;
 
-function deliveryError(code, issued) {
-  const err = new Error(code);
+function deliveryError(code     , issued     ) {
+  const err      = new Error(code);
   err.code = code;
   err.delivery = issued ? "uncertain" : "not_sent";
   return err;
@@ -38,8 +38,8 @@ const RPC_METHOD_NOT_FOUND_CODE = -32601;
 
 const LINK_REQUEST_TIMEOUT_CODE = "link_request_timeout";
 
-function createLinkRequestTimeoutError(method, timeoutMs) {
-  const err = new Error(
+function createLinkRequestTimeoutError(method     , timeoutMs     ) {
+  const err      = new Error(
     `control link request timed out after ${timeoutMs}ms (${method})`,
   );
   err.name = "LinkRequestTimeoutError";
@@ -50,11 +50,25 @@ function createLinkRequestTimeoutError(method, timeoutMs) {
   return err;
 }
 
-function encodeLinkFrame(frame) {
+const PRIVATE_CONTROL_METHOD = "botScreen.control";
+
+function isPrivateControlFrame(frame     ) {
+  return [PRIVATE_CONTROL_METHOD, "botScreen.snapshot"].includes(frame?.method);
+}
+
+function encodeLinkFrame(frame, privateResponse = false) {
   const line = JSON.stringify(frame);
   const bytes = Buffer.byteLength(line, "utf8");
   if (bytes <= LINK_MAX_LINE_BYTES) {
-    return { line: `${line}\n`, truncated: false, originalBytes: bytes };
+    return { line: `${line}\n`, truncated: false,
+      originalBytes: privateResponse || isPrivateControlFrame(frame) ? undefined : bytes };
+  }
+
+  if (privateResponse || isPrivateControlFrame(frame)) {
+    return { line: `${JSON.stringify({ v: LINK_PROTOCOL_VERSION,
+      type: frame.type === LINK_PROTOCOL.rpcResponse ? LINK_PROTOCOL.rpcResponse : LINK_PROTOCOL.rpcRequest,
+      id: frame.id, method: PRIVATE_CONTROL_METHOD, truncated: true })}\n`,
+      truncated: true, originalBytes: undefined };
   }
   const marker = { v: frame.v, type: frame.type };
   if (frame.id !== undefined) marker.id = frame.id;
@@ -121,7 +135,11 @@ function createNdjsonLineSplitter(opts) {
   };
 }
 
-function summarizeFrame(frame, originalBytes) {
+function summarizeFrame(frame, originalBytes, privateResponse = false) {
+  if (privateResponse || isPrivateControlFrame(frame)) {
+    return { type: frame.type === LINK_PROTOCOL.rpcResponse ? LINK_PROTOCOL.rpcResponse : LINK_PROTOCOL.rpcRequest,
+      method: PRIVATE_CONTROL_METHOD, private: true };
+  }
   const summary = { type: frame.type, bytes: originalBytes };
   if (frame.id !== undefined) summary.id = frame.id;
   if (frame.method !== undefined) summary.method = frame.method;
@@ -155,23 +173,28 @@ function createHermesControlLink(opts) {
   const pendingRequests = new Map();
 
   const timedOutRequestIds = new Set();
+  const privateResponseIds = new Set();
+  function rememberPrivateResponse(id     ) {
+    privateResponseIds.add(id);
+    while (privateResponseIds.size > 256) privateResponseIds.delete(privateResponseIds.values().next().value);
+  }
   const TIMED_OUT_REQUEST_ID_LIMIT = 256;
-  function rememberTimedOutRequest(id) {
+  function rememberTimedOutRequest(id     ) {
     timedOutRequestIds.add(id);
     while (timedOutRequestIds.size > TIMED_OUT_REQUEST_ID_LIMIT) {
       const oldest = timedOutRequestIds.values().next().value;
       timedOutRequestIds.delete(oldest);
     }
   }
-  const closeHandlers = [];
-  let handshake = null;
-  let writeQueue = [];
+  const closeHandlers      = [];
+  let handshake      = null;
+  let writeQueue      = [];
   let queuedBytes = 0;
   let blocked = false;
   let activeHandlers = 0;
 
-  function removeQueued(id) {
-    writeQueue = writeQueue.filter((item) => {
+  function removeQueued(id     ) {
+    writeQueue = writeQueue.filter((item     ) => {
       if (item.id !== id) return true;
       queuedBytes -= item.bytes;
       return false;
@@ -206,9 +229,10 @@ function createHermesControlLink(opts) {
     }
   }
 
-  function writeFrame(frame) {
+  function writeFrame(frame, privateResponse = false) {
     if (closed) throw deliveryError("control link closed", false);
-    const encoded = encodeLinkFrame(frame);
+    const sensitive = privateResponse || isPrivateControlFrame(frame);
+    const encoded = encodeLinkFrame(frame, sensitive);
     const bytes = Buffer.byteLength(encoded.line, "utf8");
     if (writeQueue.length >= LINK_ADMISSION_LIMIT ||
         queuedBytes + (output.writableLength || 0) + bytes > LINK_WRITE_MAX_BYTES) {
@@ -218,12 +242,13 @@ function createHermesControlLink(opts) {
     }
     if (encoded.truncated) {
       counters.truncatedOutbound += 1;
-      logger.warn(
+      if (sensitive) logger.warn("[hermes-link] private control frame rejected: frame too large");
+      else logger.warn(
         `[hermes-link] outbound ${frame.type} truncated (${encoded.originalBytes} bytes > ${LINK_MAX_LINE_BYTES})`,
       );
     }
     counters.framesOut += 1;
-    mirror("frame_out", summarizeFrame(frame, encoded.originalBytes));
+    mirror("frame_out", summarizeFrame(frame, encoded.originalBytes, sensitive));
     writeQueue.push({
       line: encoded.line, bytes,
       id: frame.type === LINK_PROTOCOL.rpcRequest ? frame.id : null,
@@ -233,14 +258,15 @@ function createHermesControlLink(opts) {
     return !encoded.truncated;
   }
 
-  function respondError(id, code, message) {
+  function respondError(id, code, message, privateResponse = false) {
     writeFrame({
       v: LINK_PROTOCOL_VERSION,
       type: LINK_PROTOCOL.rpcResponse,
       id,
       ok: false,
       error: { code, message },
-    });
+      ...(privateResponse ? { method: PRIVATE_CONTROL_METHOD } : {}),
+    }, privateResponse);
   }
 
   async function handleRequest(frame) {
@@ -252,6 +278,11 @@ function createHermesControlLink(opts) {
     activeHandlers += 1;
     try {
       const method = typeof frame.method === "string" ? frame.method : "";
+      const sensitive = [PRIVATE_CONTROL_METHOD, "botScreen.snapshot"].includes(method);
+      if (sensitive && frame.truncated === true) {
+        respondError(frame.id, -32000, "link_frame_truncated", true);
+        return;
+      }
       const handler = Object.prototype.hasOwnProperty.call(methods, method)
         ? methods[method]
         : null;
@@ -260,6 +291,7 @@ function createHermesControlLink(opts) {
           frame.id,
           RPC_METHOD_NOT_FOUND_CODE,
           `method not found: ${method || "<missing>"}`,
+          sensitive,
         );
         return;
       }
@@ -272,9 +304,11 @@ function createHermesControlLink(opts) {
           id: frame.id,
           ok: true,
           result: result === undefined ? null : result,
-        });
+          ...(sensitive ? { method } : {}),
+        }, sensitive);
       } catch (err) {
-        if (!closed) respondError(frame.id, -32000, err && err.message ? err.message : String(err));
+        if (!closed) respondError(frame.id, -32000, sensitive ? "bot_screen_control_failed" :
+          err && err.message ? err.message : String(err), sensitive);
       }
     } catch (_) {
       onEnd();
@@ -304,8 +338,9 @@ function createHermesControlLink(opts) {
       entry.resolve(frame.result);
     } else {
       const error = frame.error || {};
-      const err = new Error(error.message || "link rpc failed");
-      err.code = error.code;
+      const err      = new Error(entry.private ? "bot_screen_control_failed" : error.message || "link rpc failed");
+      err.code = entry.private ? -32000 : error.code;
+      if (!entry.private && typeof error.errorCode === "string") err.errorCode = error.errorCode;
       entry.reject(err);
     }
   }
@@ -313,21 +348,23 @@ function createHermesControlLink(opts) {
   function handleFrame(frame) {
     if (closed) return;
     counters.framesIn += 1;
-    mirror("frame_in", summarizeFrame(frame, 0));
+    const sensitive = isPrivateControlFrame(frame) || pendingRequests.get(frame.id)?.private === true ||
+      privateResponseIds.has(frame.id);
+    mirror("frame_in", summarizeFrame(frame, 0, sensitive));
     if (frame.v !== LINK_PROTOCOL_VERSION) {
       counters.protocolErrors += 1;
-      mirror("protocol_error", { reason: "version_mismatch", got: frame.v });
+      mirror("protocol_error", sensitive ? { reason: "version_mismatch", private: true } : { reason: "version_mismatch", got: frame.v });
       if (!ready && handshake) {
         const err = new Error(
-          `link protocol version mismatch: peer sent v=${frame.v}, expected v=${LINK_PROTOCOL_VERSION}`,
+          sensitive ? "private control protocol version mismatch" :
+            `link protocol version mismatch: peer sent v=${frame.v}, expected v=${LINK_PROTOCOL_VERSION}`,
         );
         err.exitCode = LINK_EXIT_CODES.protocolMismatch;
         handshake.reject(err);
         onEnd(false);
       } else {
-        logger.warn(
-          `[hermes-link] dropping frame with protocol version ${frame.v}`,
-        );
+        logger.warn(sensitive ? "[hermes-link] dropping private control frame: protocol version mismatch" :
+          `[hermes-link] dropping frame with protocol version ${frame.v}`);
       }
       return;
     }
@@ -338,9 +375,11 @@ function createHermesControlLink(opts) {
         return;
       }
       counters.protocolErrors += 1;
-      mirror("protocol_error", { reason: "frame_before_hello_ack", type: frame.type });
+      mirror("protocol_error", sensitive ? { reason: "frame_before_hello_ack", private: true } :
+        { reason: "frame_before_hello_ack", type: frame.type });
       logger.warn(
-        `[hermes-link] dropping pre-handshake frame ${frame.type || "<untyped>"}`,
+        sensitive ? "[hermes-link] dropping private control frame before handshake" :
+          `[hermes-link] dropping pre-handshake frame ${frame.type || "<untyped>"}`,
       );
       return;
     }
@@ -353,8 +392,10 @@ function createHermesControlLink(opts) {
       return;
     }
     counters.protocolErrors += 1;
-    mirror("protocol_error", { reason: "unknown_frame_type", type: frame.type });
-    logger.warn(`[hermes-link] unknown frame type ${frame.type || "<untyped>"}`);
+    mirror("protocol_error", sensitive ? { reason: "unknown_frame_type", private: true } :
+      { reason: "unknown_frame_type", type: frame.type });
+    logger.warn(sensitive ? "[hermes-link] unknown private control frame type" :
+      `[hermes-link] unknown frame type ${frame.type || "<untyped>"}`);
   }
 
   const splitter = createNdjsonLineSplitter({
@@ -365,7 +406,8 @@ function createHermesControlLink(opts) {
         frame = JSON.parse(line);
       } catch (_) {
         counters.protocolErrors += 1;
-        mirror("protocol_error", { reason: "invalid_json", head: line.slice(0, 128) });
+
+        mirror("protocol_error", { reason: "invalid_json" });
         logger.warn("[hermes-link] dropping non-JSON line on control link");
         return;
       }
@@ -379,9 +421,10 @@ function createHermesControlLink(opts) {
     onOversize(bytes) {
       counters.oversizedInbound += 1;
       counters.protocolErrors += 1;
-      mirror("protocol_error", { reason: "oversized_inbound", bytes });
+
+      mirror("protocol_error", { reason: "oversized_inbound" });
       logger.warn(
-        `[hermes-link] dropped oversized inbound line (${bytes} bytes > ${LINK_MAX_LINE_BYTES})`,
+        "[hermes-link] dropped oversized inbound line",
       );
     },
   });
@@ -400,7 +443,7 @@ function createHermesControlLink(opts) {
     output.off("error", onEnd);
   }
 
-  function onEnd(notifyClose = true) {
+  function onEnd(notifyClose      = true) {
     if (closed) return;
     closed = true;
     ready = false;
@@ -414,6 +457,7 @@ function createHermesControlLink(opts) {
     blocked = false;
     splitter.clear();
     timedOutRequestIds.clear();
+    privateResponseIds.clear();
     if (!input.destroyed) input.destroy();
     if (!output.destroyed) output.destroy();
     mirror("link_closed", { reason: "input_eof" });
@@ -489,7 +533,7 @@ function createHermesControlLink(opts) {
     return helloPromise;
   }
 
-  function request(method, params, requestOpts = undefined) {
+  function request(method, params, requestOpts      = undefined) {
     if (closed) {
       return Promise.reject(deliveryError("control link closed", false));
     }
@@ -503,8 +547,9 @@ function createHermesControlLink(opts) {
     const timeoutMs =
       Number.isFinite(rawTimeout) && rawTimeout > 0 ? Math.floor(rawTimeout) : 0;
     const id = `n${nextRequestId++}`;
+    if ([PRIVATE_CONTROL_METHOD, "botScreen.snapshot"].includes(method)) rememberPrivateResponse(id);
     return new Promise((resolve, reject) => {
-      let timer = null;
+      let timer      = null;
       const clearTimer = () => {
         if (signal) signal.removeEventListener("abort", onAbort);
         if (timer !== null) {
@@ -512,7 +557,7 @@ function createHermesControlLink(opts) {
           timer = null;
         }
       };
-      const cancel = (err) => {
+      const cancel = (err     ) => {
         const entry = pendingRequests.get(id);
         if (!entry) return;
         err.delivery = entry.issued ? "uncertain" : "not_sent";
@@ -525,11 +570,12 @@ function createHermesControlLink(opts) {
 
       pendingRequests.set(id, {
         issued: false,
-        resolve: (value) => {
+        private: [PRIVATE_CONTROL_METHOD, "botScreen.snapshot"].includes(method),
+        resolve: (value     ) => {
           clearTimer();
           resolve(value);
         },
-        reject: (err) => {
+        reject: (err     ) => {
           clearTimer();
           reject(err);
         },
@@ -577,7 +623,7 @@ function createHermesControlLink(opts) {
     if (typeof handler === "function") closeHandlers.push(handler);
   }
 
-  function setDebugEmitter(nextEmitDebug) {
+  function setDebugEmitter(nextEmitDebug     ) {
     emitDebug =
       typeof nextEmitDebug === "function" ? nextEmitDebug : () => {};
   }

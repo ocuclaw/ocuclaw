@@ -142,9 +142,12 @@ def relay_endpoints(
     """
     extra = platform_extra if isinstance(platform_extra, Mapping) else {}
     ports: List[int] = []
+    raw_port = extra.get("wsPort", DEFAULT_RELAY_PORT)
     try:
-        configured = int(extra.get("wsPort", DEFAULT_RELAY_PORT))
-    except (TypeError, ValueError):
+        # #7316: a bool is not a port (the relay binds the default for it), and
+        # YAML `.inf` overflows int().
+        configured = DEFAULT_RELAY_PORT if isinstance(raw_port, bool) else int(raw_port)
+    except (TypeError, ValueError, OverflowError):
         configured = DEFAULT_RELAY_PORT
     if _valid_port(configured):
         ports.append(configured)

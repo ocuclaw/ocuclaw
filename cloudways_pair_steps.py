@@ -33,7 +33,7 @@ and :func:`first_use_cli.run_first_use`, so both steps run in tests through
 
 from __future__ import annotations
 
-import select
+import selectors
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
@@ -201,7 +201,7 @@ STEP_7_NO_PHONE_CAUSE_LINES = (
 )
 
 #: The same moment, whether or not a phone was seen. The other usual cause on a
-#: real box: the person was not on the pair screen yet when the two minutes
+#: real box: the person was not on the pair screen yet when the five minutes
 #: started (#3483). Shared word for word with the OpenClaw ladder.
 STEP_7_OPEN_PAIR_SCREEN_MESSAGE = "If the pair screen wasn't open yet, open it first."
 
@@ -209,15 +209,25 @@ STEP_7_OPEN_PAIR_SCREEN_MESSAGE = "If the pair screen wasn't open yet, open it f
 PAIRING_WAITING_FOR_PHONE_PHASE = "waiting-for-phone"
 
 #: Printed once, on a real terminal, immediately before the FIRST code is
-#: minted. The code lives two minutes, so a user who walks away to find their
-#: phone comes back to a code that has already gone. Worded once and shared with
-#: the OpenClaw ladder, which prints it exactly as written. The first line names
-#: the pair screen and the keypress together, so no separate "Press Enter" line
-#: is needed (#3483). Printed yellow, as an action, like OpenClaw.
+#: minted. The code lives five minutes, so a user who walks away to find their
+#: phone comes back to a code that has already gone. The first line names the
+#: pair screen and the keypress together, so no separate "Press Enter" line is
+#: needed (#3483). Printed yellow, as an action, like OpenClaw. Hermes' own
+#: wording: OpenClaw pairs by phone code, asks for it with no Enter step, and
+#: gates only a manual code, so it shares just the second line (PAIR_READY_LINES,
+#: #6354).
 STEP_7_READY_LINES = (
     "Open Even > OcuClaw on your phone and tap the Pair button, then press "
     "Enter to show the code.",
-    "The next pairing code expires in 2 minutes.",
+    "The next pairing code expires in 5 minutes.",
+)
+
+#: The same, in the Hermes WebUI's 88-column terminal, where the first line
+#: wrapped one word onto a line of its own (Matt, 2026-10-01).
+STEP_7_WEBUI_READY_LINES = (
+    "Open Even > OcuClaw on your phone and tap the Pair button.",
+    "Then press Enter to show the code.",
+    STEP_7_READY_LINES[1],
 )
 
 #: What a code that ran out costs: one keypress, not the whole eight steps. The
@@ -377,13 +387,28 @@ def _default_enter_pressed(ctx: StepContext) -> Callable[[], bool]:
     return pressed
 
 
+def _stream_ready(stream: Any, timeout_s: float) -> bool:
+    """True once ``stream`` has input, False when ``timeout_s`` runs out.
+
+    A selector, not ``select()``: ``select()`` refuses any fd numbered 1024 or
+    higher (#5121). epoll refuses regular files and ``/dev/null``, which
+    ``select()`` always reports readable, so they stay readable here. A stream
+    with no fileno raises, as it did with ``select()``.
+    """
+    with selectors.DefaultSelector() as waiting:
+        try:
+            waiting.register(stream, selectors.EVENT_READ)
+        except PermissionError:
+            return True
+        return bool(waiting.select(timeout_s))
+
+
 def _pending(stream: Any) -> bool:
     """Is there input waiting right now? Never blocks, never raises."""
     try:
-        ready, _, _ = select.select([stream], [], [], 0)
+        return _stream_ready(stream, 0)
     except Exception:  # noqa: BLE001 - a stream with no fileno is not pollable
         return False
-    return bool(ready)
 
 
 def _take_line(stream: Any) -> Optional[str]:
@@ -407,10 +432,9 @@ def _drain(stream: Any) -> None:
 def _wait_readable(stream: Any, timeout_s: float) -> Optional[bool]:
     """True input arrived, False the wait ran out, None the stream is unpollable."""
     try:
-        ready, _, _ = select.select([stream], [], [], max(0.0, float(timeout_s)))
+        return _stream_ready(stream, max(0.0, float(timeout_s)))
     except Exception:  # noqa: BLE001 - a stream with no fileno is not pollable
         return None
-    return bool(ready)
 
 
 def _default_read_line(
@@ -475,7 +499,10 @@ def hold_until_ready(
     """
     if ctx.options.assume_yes or not ctx.isatty():
         return False
-    for line in STEP_7_READY_LINES:
+    from . import webui_terminal
+
+    webui = webui_terminal.active(getattr(ctx, "env", None))
+    for line in STEP_7_WEBUI_READY_LINES if webui else STEP_7_READY_LINES:
         _say_action(ctx, line)
     (read_line_fn or (lambda: _default_read_line(ctx)))()
     return True
@@ -714,13 +741,14 @@ PAIRING_DENIED_REASON = "approval-denied"
 def _default_pair(
     ctx: StepContext, address: str, outcome_fn: Callable[[Mapping[str, Any]], None]
 ) -> int:
-    """The terminal ceremony, unchanged: QR, manual code, four words, approval.
+    """The terminal ceremony, unchanged: phone code or manual code, four words, approval.
 
     It reads the Relay Credential itself, inside its own process, and owns its
     own TTY gate — which is why ``--yes`` can never approve a pairing from
     here. The ladder's streams are handed through so the whole command reads as
     one terminal session, and ``outcome_fn`` is the ceremony's reporting seam:
-    it reports the ending, and changes nothing about it.
+    it reports the ending, and changes nothing about it. Every terminal, the
+    WebUI's included, prints the same text-only manual block (#5485).
     """
     from .pairing import run_pair
 
@@ -730,7 +758,6 @@ def _default_pair(
             stdin=ctx.stream_in,
             stdout=ctx.stream_out,
             stderr=ctx.stream_out,
-            light_terminal=ctx.options.light_terminal,
             outcome_fn=outcome_fn,
         )
     )
@@ -828,8 +855,8 @@ def step_7_pair(
             exit_code=SETUP_EXIT_STOPPED,
         )
 
-    # The code the ceremony mints lives two minutes. Hold here until the person
-    # says they have the phone in their hand, so those two minutes start when
+    # The code the ceremony mints lives five minutes. Hold here until the person
+    # says they have the phone in their hand, so those five minutes start when
     # they are ready rather than while they are still looking for it.
     hold_until_ready(ctx, read_line_fn=read_line_fn)
 
@@ -1130,6 +1157,7 @@ __all__ = [
     "STEP_7_NO_PHONE_CAUSE_LINES",
     "STEP_7_OPEN_PAIR_SCREEN_MESSAGE",
     "STEP_7_READY_LINES",
+    "STEP_7_WEBUI_READY_LINES",
     "STEP_8_AGENT_MODE_CHOICE_MESSAGE",
     "STEP_DETAILS",
     "ask_for_a_new_code",

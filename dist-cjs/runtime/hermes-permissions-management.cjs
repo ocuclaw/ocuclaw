@@ -4,6 +4,8 @@ const exact = (v     , keys          ) => record(v) && Object.keys(v).length ===
 const id = (v     ) => typeof v === "string" && /^[A-Za-z0-9_-]{12,120}$/.test(v);
 const revision = (v     ) => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
 const text = (v     ) => typeof v === "string" && v.length <= 512;
+
+const MODES = ["manual", "smart", "off", "deny", "allowlist", "ask", "auto", "full"];
 const isPermissionsOperation = (op     ) => OPS.includes(op);
 
 function permissionsRequest(op        , p     )      {
@@ -29,10 +31,12 @@ function permissionsRequest(op        , p     )      {
 function permissionsSnapshot(raw     )      {
   if (!record(raw) || !["fresh_profile_each_guard", "unverified_cached_policy"].includes(raw.cacheEffect) ||
       raw.sessionGrantEffect !== "unchanged" || raw.applyTiming !== "subsequent_guard_checks" ||
-      !["manual", "smart", "off"].includes(raw.mode) || typeof raw.processYolo !== "boolean") return null;
+      !MODES.includes(raw.mode) || typeof raw.processYolo !== "boolean") return null;
   const out      = { cacheEffect: raw.cacheEffect, sessionGrantEffect: raw.sessionGrantEffect, applyTiming: raw.applyTiming, mode: raw.mode, processYolo: raw.processYolo };
   for (const kind of ["remembered", "deny"]) {
     const list = raw[kind];
+
+    if (kind === "deny" && list === undefined) continue;
     if (!record(list) || !revision(list.revision) || typeof list.writable !== "boolean" || !["managed", "user", "default"].includes(list.source) || !Array.isArray(list.entries) || list.entries.length > 200) return null;
     const entries = [];
     for (const [index, row] of list.entries.entries()) {
@@ -57,14 +61,23 @@ function permissionsSnapshot(raw     )      {
   return out;
 }
 
-const ERRORS                         = {
+const HERMES_ERRORS                         = {
   invalid_request: "Review the selected rule and confirmation.", unsupported: "This Hermes needs native permission compatibility before editing rules or previewing commands.",
   profile_not_served: "This profile is not served by the connected gateway.", native_read_failed: "Hermes could not read supported native rule lists.",
   managed_setting: "These rules are managed or cannot be edited on this host.", config_conflict: "This rule list changed elsewhere. Refresh and review it before editing.",
   outcome_unknown: "The change outcome is unknown. Check its receipt before another edit.",
+  rate_limited: "Too many changes in a minute. Wait a moment, then try again.",
 };
 
-function permissionsManagementResult(identity     , raw     )      {
+const OPENCLAW_ERRORS                         = {
+  ...HERMES_ERRORS,
+  unsupported: "This OpenClaw host does not support this. Update OpenClaw and OcuClaw to a compatible version.",
+  profile_not_served: "This agent is no longer served here. Pick another one.",
+  native_read_failed: "OpenClaw could not read its remembered grants. Refresh when connected.",
+};
+
+function permissionsManagementResult(identity     , raw     , backend = "Hermes")      {
+  const ERRORS = backend === "OpenClaw" ? OPENCLAW_ERRORS : HERMES_ERRORS;
   const snapshot = raw.permissions == null ? null : permissionsSnapshot(raw.permissions);
   const op = identity.operation;
   const mutation = !["permissions.read", "permissions.preview", "permissions.receipt"].includes(op);

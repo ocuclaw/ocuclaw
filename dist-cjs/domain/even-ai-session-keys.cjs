@@ -3,17 +3,17 @@ const EVEN_AI_THROWAWAY_SESSION_PREFIX = "ocuclaw:even-ai:";
 const HERMES_EVEN_AI_SESSION_KEY_PATTERN =
   /^hermes:[^:]+:even-ai(?:[-_][a-z0-9][a-z0-9._-]*)?$/;
 
-function normalizeEvenAiSessionKey(value) {
+function normalizeEvenAiSessionKey(value         ) {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
 }
 
-function isHermesEvenAiSessionKey(value) {
+function isHermesEvenAiSessionKey(value         ) {
   return HERMES_EVEN_AI_SESSION_KEY_PATTERN.test(
     normalizeEvenAiSessionKey(value),
   );
 }
 
-function isEvenAiSessionKey(value) {
+function isEvenAiSessionKey(value         ) {
   const normalized = normalizeEvenAiSessionKey(value);
   return (
     normalized === DEFAULT_EVEN_AI_DEDICATED_SESSION_KEY ||
@@ -22,7 +22,7 @@ function isEvenAiSessionKey(value) {
   );
 }
 
-function extractEmbeddedEvenAiSessionKey(value) {
+function extractEmbeddedEvenAiSessionKey(value         ) {
   if (typeof value !== "string") return "";
   const trimmed = value.trim();
   if (!trimmed) return "";
@@ -39,4 +39,13 @@ function extractEmbeddedEvenAiSessionKey(value) {
   return isEvenAiSessionKey(candidate) ? candidate : "";
 }
 
-module.exports = { DEFAULT_EVEN_AI_DEDICATED_SESSION_KEY, EVEN_AI_THROWAWAY_SESSION_PREFIX, HERMES_EVEN_AI_SESSION_KEY_PATTERN, normalizeEvenAiSessionKey, isHermesEvenAiSessionKey, isEvenAiSessionKey, extractEmbeddedEvenAiSessionKey };
+function evenAiSessionKeysMatch(expected         , actual         )          {
+  const normalize = (value         ) => {
+    const text = typeof value === "string" ? value.trim() : "";
+    return (extractEmbeddedEvenAiSessionKey(text) || text).toLowerCase();
+  };
+  const left = normalize(expected), right = normalize(actual);
+  return !!left && !!right && (left === right || left.endsWith(`:${right}`) || right.endsWith(`:${left}`));
+}
+
+module.exports = { DEFAULT_EVEN_AI_DEDICATED_SESSION_KEY, EVEN_AI_THROWAWAY_SESSION_PREFIX, HERMES_EVEN_AI_SESSION_KEY_PATTERN, normalizeEvenAiSessionKey, isHermesEvenAiSessionKey, isEvenAiSessionKey, extractEmbeddedEvenAiSessionKey, evenAiSessionKeysMatch };

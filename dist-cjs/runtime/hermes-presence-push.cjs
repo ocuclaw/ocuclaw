@@ -1,3 +1,5 @@
+const { PROGRAM_CARD_CAPABILITY } = require("../tools/program-card-tool.cjs");
+
 const LINK_PRESENCE_DIRTY_METHOD = "presence.dirty";
 const LINK_PRESENCE_SNAPSHOT_METHOD = "presence.snapshot";
 
@@ -13,9 +15,9 @@ const CLIENT_VERSION_MAX_CHARS = 32;
 const CLIENT_VERSION_MAX_COUNT = 8;
 const CLIENT_VERSION_CHARSET = /^[A-Za-z0-9._+-]+$/;
 
-function boundClientVersions(value) {
+function boundClientVersions(value     ) {
   if (!Array.isArray(value)) return [];
-  const bounded = [];
+  const bounded      = [];
   for (const item of value) {
     if (typeof item !== "string") continue;
     const trimmed = item.trim();
@@ -28,11 +30,11 @@ function boundClientVersions(value) {
   return bounded;
 }
 
-function createHermesPresencePush({ relay, link, logger }) {
+function createHermesPresencePush({ relay, link, logger }     ) {
   let revision = 0;
   let disposed = false;
 
-  function warn(err) {
+  function warn(err     ) {
     if (!logger || typeof logger.warn !== "function") return;
     logger.warn(
       `[hermes-presence] push failed: ${err && err.message ? err.message : err}`,
@@ -58,7 +60,7 @@ function createHermesPresencePush({ relay, link, logger }) {
     if (!relay || typeof relay.getAppPresenceProjection !== "function") {
       return { ...UNOBSERVABLE_PROJECTION };
     }
-    let value = null;
+    let value      = null;
     try {
       value = relay.getAppPresenceProjection();
     } catch (err) {
@@ -116,8 +118,21 @@ function createHermesPresencePush({ relay, link, logger }) {
         })
       : () => {};
 
-  const methods = {};
-  methods[LINK_PRESENCE_SNAPSHOT_METHOD] = () => projection();
+  function programCards() {
+    if (!relay || typeof relay.hasConnectedAppClientCapability !== "function") return null;
+    try {
+      return relay.hasConnectedAppClientCapability(PROGRAM_CARD_CAPABILITY) === true;
+    } catch (err) {
+      warn(err);
+      return null;
+    }
+  }
+
+  const methods      = {};
+  methods[LINK_PRESENCE_SNAPSHOT_METHOD] = () => ({
+    ...projection(),
+    programCards: programCards(),
+  });
 
   function dispose() {
     if (disposed) return;

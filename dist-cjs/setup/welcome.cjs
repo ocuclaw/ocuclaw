@@ -99,6 +99,8 @@ function createSetupWelcome(store     , readPhone     , getRenderer     ,
         const outcome = await renderer.runDynamicUi({
           sessionKey: record.sessionKey, depth: 1, signal: pending.abort.signal,
           settleOnSupersede: true,
+
+          origin: "task",
           spec: { ...surface, timeoutMs: input.timeoutMs ?? surface.timeoutMs },
           onOpened({ surfaceId, declarationId }     ) {
             pending.surfaceId = surfaceId;
@@ -135,4 +137,4 @@ function createSetupWelcome(store     , readPhone     , getRenderer     ,
   };
 }
 
-module.exports = { createSetupWelcome, SETUP_WELCOME_DISCONNECT_GRACE_MS };
+module.exports = { SETUP_WELCOME_DISCONNECT_GRACE_MS, createSetupWelcome };

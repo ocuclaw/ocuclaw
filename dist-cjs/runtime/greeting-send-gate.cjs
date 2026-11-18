@@ -2,12 +2,21 @@ const GREETING_SEND_HOLD_DEADLINE_MS = 15_000;
 
 const GREETING_SEND_HOLD_MAX_MS = 90_000;
 
-function normalizeSessionKey(sessionKey) {
+const GREETING_SEND_RETRY_DELAYS_MS = [300, 600, 1200, 2400];
+
+function isRetryableGreetingRefusal(err     ) {
+  if (!err || typeof err !== "object") return false;
+  const code = typeof err.code === "string" ? err.code.trim().toUpperCase() : "";
+  const message = typeof err.message === "string" ? err.message : "";
+  return code === "UNAVAILABLE" && /\btry again\b/i.test(message);
+}
+
+function normalizeSessionKey(sessionKey     ) {
   if (typeof sessionKey !== "string") return "";
   return sessionKey.trim().replace(/^agent:[^:]+:/, "");
 }
 
-function createGreetingSendGate(deps = {}) {
+function createGreetingSendGate(deps      = {}) {
   const now = typeof deps.now === "function" ? deps.now : Date.now;
   const schedule =
     typeof deps.setTimeout === "function" ? deps.setTimeout : setTimeout;
@@ -26,9 +35,13 @@ function createGreetingSendGate(deps = {}) {
   const maxHoldMs = Number.isFinite(deps.maxHoldMs)
     ? Math.max(deadlineMs, deps.maxHoldMs)
     : Math.max(deadlineMs, GREETING_SEND_HOLD_MAX_MS);
+  const retryDelaysMs = Array.isArray(deps.retryDelaysMs)
+    ? deps.retryDelaysMs
+    : GREETING_SEND_RETRY_DELAYS_MS;
+  const onRetry = typeof deps.onRetry === "function" ? deps.onRetry : () => {};
   const gates = new Map();
 
-  function flush(gate, reason) {
+  function flush(gate     , reason     ) {
     if (!gate || gates.get(gate.key) !== gate) return false;
     gates.delete(gate.key);
     if (gate.timer) cancel(gate.timer);
@@ -57,13 +70,13 @@ function createGreetingSendGate(deps = {}) {
     return true;
   }
 
-  function arm(sessionKey) {
+  function arm(sessionKey     ) {
     const key = normalizeSessionKey(sessionKey);
     if (!key) return false;
     const prior = gates.get(key);
     if (prior) flush(prior, "session_reset");
 
-    const gate = {
+    const gate      = {
       key,
       sessionKey: key,
       armedAtMs: now(),
@@ -82,14 +95,14 @@ function createGreetingSendGate(deps = {}) {
     return true;
   }
 
-  function scheduleDeadline(gate, delayMs) {
+  function scheduleDeadline(gate     , delayMs     ) {
     gate.timer = schedule(() => onDeadline(gate), delayMs);
     if (gate.timer && typeof gate.timer.unref === "function") {
       gate.timer.unref();
     }
   }
 
-  function onDeadline(gate) {
+  function onDeadline(gate     ) {
     if (gates.get(gate.key) !== gate) return;
     gate.timer = null;
     const heldMs = Math.max(0, now() - gate.armedAtMs);
@@ -99,7 +112,7 @@ function createGreetingSendGate(deps = {}) {
       flush(gate, "deadline");
       return;
     }
-    let live;
+    let live     ;
     try {
       live = isGreetingLive({ sessionKey: gate.sessionKey, runId: gate.greetingRunId });
     } catch {
@@ -107,7 +120,7 @@ function createGreetingSendGate(deps = {}) {
       return;
     }
     Promise.resolve(live).then(
-      (stillLive) => {
+      (stillLive     ) => {
         if (gates.get(gate.key) !== gate) return;
         if (stillLive === true) {
           gate.deadlineExtensions = (gate.deadlineExtensions || 0) + 1;
@@ -120,7 +133,49 @@ function createGreetingSendGate(deps = {}) {
     );
   }
 
-  function dispatch(sessionKey, send) {
+  function sendGreeting(sessionKey     , send     , onAck     ) {
+    if (typeof send !== "function") {
+      return Promise.reject(new TypeError("greeting gate sendGreeting requires a function"));
+    }
+    const handleAck = typeof onAck === "function" ? onAck : (ack     ) => ack;
+    const gate = gates.get(normalizeSessionKey(sessionKey));
+    const attempt = (index        )               => {
+      let sent              ;
+      try {
+
+        sent = Promise.resolve(send());
+      } catch (err) {
+        sent = Promise.reject(err);
+      }
+      return sent.then(handleAck, (err     ) => {
+        const delayMs = retryDelaysMs[index];
+        if (
+          !Number.isFinite(delayMs) ||
+          !gate ||
+          gates.get(gate.key) !== gate ||
+          !isRetryableGreetingRefusal(err)
+        ) {
+          throw err;
+        }
+        try {
+          onRetry({ sessionKey: gate.sessionKey, attempt: index + 1, delayMs, error: err });
+        } catch {}
+        return new Promise((resolve, reject) => {
+          const timer = schedule(() => {
+            if (gates.get(gate.key) !== gate) {
+              reject(err);
+              return;
+            }
+            resolve(attempt(index + 1));
+          }, delayMs);
+          if (timer && typeof timer.unref === "function") timer.unref();
+        });
+      });
+    };
+    return attempt(0);
+  }
+
+  function dispatch(sessionKey     , send     ) {
     if (typeof send !== "function") {
       return Promise.reject(new TypeError("greeting gate dispatch requires a function"));
     }
@@ -138,7 +193,7 @@ function createGreetingSendGate(deps = {}) {
     });
   }
 
-  function maybePreempt(gate) {
+  function maybePreempt(gate     ) {
     if (!preempt || gates.get(gate.key) !== gate) return false;
     if (gate.preemptRequested || gate.greetingTextStarted) return false;
 
@@ -161,20 +216,20 @@ function createGreetingSendGate(deps = {}) {
           gate.awaitingAbortReceipt = false;
           if (gate.greetingTerminal) flush(gate, gate.greetingTerminal);
         },
-        release: (reason) => flush(gate, reason || "greeting_aborted"),
+        release: (reason     ) => flush(gate, reason || "greeting_aborted"),
       });
     } catch {}
     return true;
   }
 
-  function noteGreetingText(sessionKey, runId) {
+  function noteGreetingText(sessionKey     , runId     ) {
     if (!gates.size) return false;
     const normalizedRunId =
       typeof runId === "string" && runId.trim() ? runId.trim() : null;
     let gate = gates.get(normalizeSessionKey(sessionKey));
     if (!gate && normalizedRunId) {
 
-      gate = Array.from(gates.values()).find((g) => g.greetingRunId === normalizedRunId);
+      gate = Array.from(gates.values()).find((g     ) => g.greetingRunId === normalizedRunId);
     }
     if (!gate) return false;
     if (gate.greetingRunId && normalizedRunId && gate.greetingRunId !== normalizedRunId) {
@@ -184,7 +239,7 @@ function createGreetingSendGate(deps = {}) {
     return true;
   }
 
-  function noteGreetingRun(sessionKey, runId, status) {
+  function noteGreetingRun(sessionKey     , runId     , status     ) {
     if (!gates.size) return false;
     const gate = gates.get(normalizeSessionKey(sessionKey));
     if (!gate) return false;
@@ -203,7 +258,7 @@ function createGreetingSendGate(deps = {}) {
     return true;
   }
 
-  function onActivity(sessionKey, phase, runId, origin) {
+  function onActivity(sessionKey     , phase     , runId     , origin     ) {
     if (!gates.size) return false;
     const gate = gates.get(normalizeSessionKey(sessionKey));
     if (!gate) return false;
@@ -239,12 +294,12 @@ function createGreetingSendGate(deps = {}) {
     return flush(gate, "greeting_end");
   }
 
-  function holdForAbortReceipt(gate, reason) {
+  function holdForAbortReceipt(gate     , reason     ) {
     gate.greetingTerminal = reason;
     return false;
   }
 
-  function evict(sessionKey, reason = "session_reset") {
+  function evict(sessionKey     , reason = "session_reset") {
     const gate = gates.get(normalizeSessionKey(sessionKey));
     return flush(gate, reason);
   }
@@ -259,6 +314,7 @@ function createGreetingSendGate(deps = {}) {
 
   return {
     arm,
+    sendGreeting,
     dispatch,
     noteGreetingRun,
     noteGreetingText,
@@ -268,4 +324,4 @@ function createGreetingSendGate(deps = {}) {
   };
 }
 
-module.exports = { GREETING_SEND_HOLD_DEADLINE_MS, createGreetingSendGate };
+module.exports = { GREETING_SEND_HOLD_DEADLINE_MS, GREETING_SEND_HOLD_MAX_MS, GREETING_SEND_RETRY_DELAYS_MS, isRetryableGreetingRefusal, createGreetingSendGate };

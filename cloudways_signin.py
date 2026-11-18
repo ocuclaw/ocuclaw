@@ -1,8 +1,16 @@
-"""Model sign-in for the Cloudways ladder, right after step 1 (#3482).
+"""The model check for the Cloudways ladder, right after step 1 (#3482).
 
 Before this, neither ladder asked whether the agent could answer at all. A
 fresh Cloudways agent created with no provider would walk all eight steps and
 fail at the first message, and the only hint was `hermes model` in an error.
+
+#6361 · the Cloudways panel's own OpenAI sign-in (LLM & Channels → OAuth →
+OpenAI → Connect) gives a working agent, so the step is a check and setup
+never signs in itself. Each Connect restarts the container, so setup neither
+starts one nor runs through one: with no model it names the panel path and
+stops, and the same command run afterwards reads the model as signed in and
+carries on. That is the same under ``--yes``: the restart has to come before
+setup changes anything.
 
 Two halves, and they stay apart:
 
@@ -12,24 +20,16 @@ Two halves, and they stay apart:
   ``hermes_cli.models_detect.provider_has_credentials`` (the model switcher's
   own check: env or .env key, auth-store login, credential pool), then a
   selected model name. Only when those internals cannot be read at all does it
-  fall back to a live ``hermes -z`` probe, with a short timeout.
-* :func:`run_sign_in` is the chooser. It prints the engine's own commands and
-  runs them with the terminal handed straight over: their output is never
-  captured, logged, journalled or drawn as a QR code. The device-code link and
-  code are Hermes's to print, and the user reads them where Hermes prints them.
-
-The step never runs a sign-in under ``--yes`` or without a real terminal. It
-prints what is needed and the ladder carries on: steps 2 to 7 do not need a
-model, and step 8 names the model problem in its own words if it is still
-there.
+  fall back to a live ``hermes -z`` probe, with a short timeout. It is a fact
+  about the box, apart from any printing.
+* :func:`run_sign_in` turns that answer into the step's lines and outcome.
 """
 from __future__ import annotations
 
-import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 # -- verdicts -----------------------------------------------------------------
 
@@ -38,7 +38,7 @@ NOT_SIGNED_IN = "not-signed-in"
 #: Signed in to a provider, but no model is selected.
 NO_MODEL = "no-model"
 #: Could not tell. The ladder says nothing and carries on: a wrong "not signed
-#: in" would send a working agent through a sign-in it does not need.
+#: in" would stop a working agent at a sign-in it does not need.
 UNKNOWN = "unknown"
 
 #: The live probe's bound. A signed-in model answers `hello` well inside this; a
@@ -47,55 +47,41 @@ LIVE_PROBE_TIMEOUT_S = 45.0
 
 # -- the commands -------------------------------------------------------------
 
-CODEX_SIGN_IN_ARGS = ("auth", "add", "openai-codex", "--no-browser")
-NOUS_SIGN_IN_ARGS = ("auth", "add", "nous", "--no-browser")
-#: `hermes model` is also the API-key door: choosing a key-based provider there
-#: asks for the key, masked, and saves it.
+#: `hermes model` chooses the model for a provider already signed in.
 MODEL_ARGS = ("model",)
 LIVE_PROBE_ARGS = ("-z", "hello")
 
-CHOICE_CODEX = "1"
-CHOICE_NOUS = "2"
-CHOICE_API_KEY = "3"
-CHOICE_MYSELF = "4"
-
-#: choice -> the label shown, and the commands run in order.
-CHOICES: Tuple[Tuple[str, str, Tuple[Tuple[str, ...], ...]], ...] = (
-    (CHOICE_CODEX, "ChatGPT subscription", (CODEX_SIGN_IN_ARGS, MODEL_ARGS)),
-    (CHOICE_NOUS, "Nous Portal", (NOUS_SIGN_IN_ARGS, MODEL_ARGS)),
-    (CHOICE_API_KEY, "An API key", (MODEL_ARGS,)),
-    (CHOICE_MYSELF, "I'll set it up myself", ()),
-)
-
 # -- the words ----------------------------------------------------------------
 
-NOT_SIGNED_IN_LINE = "No model is signed in yet."
-NOT_SIGNED_IN_QUESTION = f"{NOT_SIGNED_IN_LINE} Which account will this agent use?"
-CHOOSE_PROMPT = "Choose 1–4: "
-NO_MODEL_LINE = "A model account is signed in, but no model is selected yet."
-RUNNING_PREFIX = "Running: "
-#: Printed for choice 4 (the ladder stops there).
-MANUAL_LEAD = "To sign in yourself, run one of these, then run setup again:"
-#: Printed under --yes and without a terminal (the ladder carries on).
-SKIP_LEAD = "To sign in, run one of these in an interactive terminal:"
-MANUAL_ROWS = (
-    ("hermes auth add openai-codex --no-browser", "ChatGPT subscription"),
-    ("hermes auth add nous --no-browser", "Nous Portal"),
-    ("hermes model", "an API key, and to choose the model"),
+#: Word for word OpenClaw's MODEL_PANEL_SIGN_IN_LINES (cloudways-setup.ts),
+#: which Speck reads on both ladders. The setup command goes under them.
+PANEL_PATH = "LLM & Channels → OAuth → OpenAI → Connect"
+#: That Connect signs in to ChatGPT with a link and a one-time code, which
+#: ChatGPT refuses until the account's "Enable device code sign-in" switch is on
+#: (Settings → Security and login → App security). Off, OpenAI only says so
+#: after account picking and MFA loops (openai/codex#34817).
+CHATGPT_DEVICE_CODE_LINE = (
+    "Using ChatGPT? First turn on device code sign-in in ChatGPT: Settings → Security and login."
 )
+PANEL_SIGN_IN_LINES = (
+    "No model is signed in yet. Sign in to OpenAI in the Cloudways panel:",
+    f"  {PANEL_PATH}",
+    CHATGPT_DEVICE_CODE_LINE,
+    "Your agent restarts after that. It can take a few minutes.",
+    "When it is back, run this again:",
+)
+NO_MODEL_LINE = "A model account is signed in, but no model is selected yet."
 MANUAL_MODEL_LEAD = "To choose a model, run this, then run setup again:"
-SKIPPED_LINE = "Setup carries on without a model. Your first message needs one."
-SIGNED_IN_LINE = "Model signed in."
-COMMAND_FAILED_LINE = "{command} did not finish. Run it again yourself, then run setup again."
-STILL_NOT_SIGNED_IN_LINE = "Still no model signed in. Run the commands above yourself, then run setup again."
-INVALID_CHOICE_LINE = "Type 1, 2, 3 or 4."
-#: How many unrecognised answers before the chooser gives up and stops.
-MAX_CHOICE_ATTEMPTS = 3
 
 
 def command_text(args: Sequence[str]) -> str:
     """What the user is shown and would type: `hermes`, never an install path."""
     return " ".join(("hermes", *args))
+
+
+def panel_sign_in_lines(command: str) -> Sequence[str]:
+    """The panel lines, then ``command`` (the setup command) under them."""
+    return (*PANEL_SIGN_IN_LINES, f"  {command}")
 
 
 # -- the check ----------------------------------------------------------------
@@ -238,60 +224,14 @@ def check_signed_in(
     return state
 
 
-# -- running a command with the terminal handed over --------------------------
-
-
-def _fileno(stream: Any) -> Optional[int]:
-    try:
-        return int(stream.fileno())
-    except Exception:  # noqa: BLE001 - a stream with no descriptor inherits
-        return None
-
-
-def run_interactive(
-    argv: Sequence[str],
-    *,
-    env: Mapping[str, str],
-    stream_in: Any = None,
-    stream_out: Any = None,
-) -> Optional[int]:
-    """Run one command with the user's terminal, never capturing a byte.
-
-    The ladder's own streams are passed through when they are real descriptors
-    (under ``--json`` the ladder writes to stderr, and the child must too, or
-    its output would land in the JSON document). Nothing is captured, so the
-    sign-in link and code reach the screen and nowhere else.
-    """
-    kwargs: dict = {"env": dict(env), "check": False}
-    in_fd = _fileno(stream_in)
-    out_fd = _fileno(stream_out)
-    if in_fd is not None:
-        kwargs["stdin"] = in_fd
-    if out_fd is not None:
-        kwargs["stdout"] = out_fd
-    try:
-        # Our own lines first, so "Running: ..." is above the child's output.
-        if stream_out is not None:
-            stream_out.flush()
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        completed = subprocess.run(list(argv), **kwargs)
-    except OSError:
-        return None
-    return int(getattr(completed, "returncode", 1))
-
-
-# -- the chooser --------------------------------------------------------------
+# -- the step -----------------------------------------------------------------
 
 #: The step's outcomes, for the journal's closed vocabulary.
-OUTCOME_SIGNED_IN = "model-signed-in"
-OUTCOME_SKIPPED = "model-sign-in-skipped"
-OUTCOME_MANUAL = "model-sign-in-manual"
-OUTCOME_FAILED = "model-sign-in-failed"
-JOURNAL_DETAILS = frozenset(
-    {OUTCOME_SIGNED_IN, OUTCOME_SKIPPED, OUTCOME_MANUAL, OUTCOME_FAILED}
-)
+#: Nobody is signed in: the panel's sign-in comes first.
+OUTCOME_PANEL = "model-sign-in-panel"
+#: Signed in, but no model chosen: `hermes model` comes first.
+OUTCOME_NO_MODEL = "model-sign-in-no-model"
+JOURNAL_DETAILS = frozenset({OUTCOME_PANEL, OUTCOME_NO_MODEL})
 
 
 @dataclass(frozen=True)
@@ -300,89 +240,42 @@ class SignInOutcome:
     outcome: Optional[str]
     #: True when the ladder must stop here.
     stop: bool = False
-    failed: bool = False
-
-
-def _say_manual(
-    say: Callable[[str], None], *, model_only: bool, lead: str = MANUAL_LEAD
-) -> None:
-    if model_only:
-        say(f"  {MANUAL_MODEL_LEAD}")
-        say(f"    {command_text(MODEL_ARGS)}")
-        return
-    say(f"  {lead}")
-    width = max(len(command) for command, _label in MANUAL_ROWS)
-    for command, label in MANUAL_ROWS:
-        say(f"    {command.ljust(width)}   {label}")
 
 
 def run_sign_in(
     state: SignInState,
     *,
     say: Callable[[str], None],
-    choose: Optional[Callable[..., Optional[str]]],
-    interactive: bool,
-    run_command: Callable[[Sequence[str]], Optional[int]],
-    recheck: Callable[[], SignInState],
+    rerun_command: str,
 ) -> SignInOutcome:
-    """Ask which account, run its commands, and check again.
+    """Say what the check found, and whether the ladder stops.
 
-    ``interactive`` is False under ``--yes`` or without a real terminal: the
-    step then prints what is needed and the ladder carries on. ``run_command``
-    takes the arguments after `hermes`.
+    Signed in, or no way to tell: nothing is said and the ladder carries on.
+    Otherwise the lines name what to do first, end with ``rerun_command``, and
+    the ladder stops. Nothing is run here.
     """
-    if state.verdict in (SIGNED_IN, UNKNOWN):
+    # A check that answers nothing usable is "could not tell".
+    verdict = getattr(state, "verdict", UNKNOWN)
+    if verdict not in (NOT_SIGNED_IN, NO_MODEL):
         return SignInOutcome(None)
-    model_only = state.verdict == NO_MODEL
-    if not interactive or choose is None:
-        say(f"  {NO_MODEL_LINE if model_only else NOT_SIGNED_IN_LINE}")
-        _say_manual(say, model_only=model_only, lead=SKIP_LEAD)
-        say(f"  {SKIPPED_LINE}")
-        return SignInOutcome(OUTCOME_SKIPPED)
-
-    if model_only:
+    if verdict == NO_MODEL:
         say(f"  {NO_MODEL_LINE}")
-        commands: Tuple[Tuple[str, ...], ...] = (MODEL_ARGS,)
-    else:
-        question = [f"  {NOT_SIGNED_IN_QUESTION}"] + [
-            f"    {key}  {label}" for key, label, _commands in CHOICES
-        ]
-        valid = [key for key, _label, _commands in CHOICES]
-        picked: Optional[str] = None
-        for _attempt in range(MAX_CHOICE_ATTEMPTS):
-            answer = choose(question, question=f"  {CHOOSE_PROMPT}", choices=valid)
-            if answer is None:
-                # No answer at all (EOF, a closed terminal): nothing ran.
-                break
-            if answer in valid:
-                picked = answer
-                break
-            question = [f"  {INVALID_CHOICE_LINE}"]
-        if picked is None or picked == CHOICE_MYSELF:
-            _say_manual(say, model_only=False)
-            return SignInOutcome(OUTCOME_MANUAL, stop=True)
-        commands = next(cmds for key, _label, cmds in CHOICES if key == picked)
-
-    for args in commands:
-        say(f"  {RUNNING_PREFIX}{command_text(args)}")
-        code = run_command(args)
-        if code != 0:
-            say(f"  {COMMAND_FAILED_LINE.format(command=command_text(args))}")
-            return SignInOutcome(OUTCOME_FAILED, stop=True, failed=True)
-
-    after = recheck()
-    if after.verdict in (NOT_SIGNED_IN, NO_MODEL):
-        say(f"  {STILL_NOT_SIGNED_IN_LINE}")
-        return SignInOutcome(OUTCOME_FAILED, stop=True, failed=True)
-    say(f"  {SIGNED_IN_LINE}")
-    return SignInOutcome(OUTCOME_SIGNED_IN)
+        say(f"  {MANUAL_MODEL_LEAD}")
+        say(f"    {command_text(MODEL_ARGS)}")
+        return SignInOutcome(OUTCOME_NO_MODEL, stop=True)
+    for line in panel_sign_in_lines(rerun_command):
+        say(f"  {line}")
+    return SignInOutcome(OUTCOME_PANEL, stop=True)
 
 
 __all__ = [
-    "CHOICES",
     "JOURNAL_DETAILS",
     "NOT_SIGNED_IN",
     "NO_MODEL",
+    "OUTCOME_NO_MODEL",
+    "OUTCOME_PANEL",
+    "PANEL_PATH",
+    "PANEL_SIGN_IN_LINES",
     "SIGNED_IN",
     "UNKNOWN",
     "SignInOutcome",
@@ -390,7 +283,7 @@ __all__ = [
     "check_in_process",
     "check_signed_in",
     "command_text",
+    "panel_sign_in_lines",
     "probe_live",
-    "run_interactive",
     "run_sign_in",
 ]

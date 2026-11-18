@@ -73,6 +73,15 @@ STREAM_CURSOR = " ▉"
 # ledger mirrors that: the cancelled head closes with code "cancelled".
 CANCELLING_SLASH_COMMANDS = ("/stop", "/new", "/reset")
 
+# #5150: slash commands hermes runs INLINE on a busy session (busy_policy
+# "dispatch", base.py _dispatch_inline_reply) without touching the running
+# turn: /steer (alias /s), /queue (alias /q) and /btw, which the Bot Screen's
+# voice sends while the bot works. They never become a turn of their own:
+# their one reply is sent from inside the dispatch's own handle_message await,
+# while the running turn keeps the head. /btw's answer follows later from a
+# background task that copied that same context.
+INLINE_REPLY_SLASH_COMMANDS = ("/steer", "/s", "/queue", "/q", "/btw")
+
 
 def validate_prompt_metadata(params: Any) -> Optional[Tuple[str, str]]:
     """Validate bounded #2089 prompt metadata on ``dispatch.send``.
@@ -131,6 +140,12 @@ def is_cancelling_slash(message: str) -> bool:
     text = (message or "").strip()
     command = text.split(None, 1)[0] if text else ""
     return command in CANCELLING_SLASH_COMMANDS
+
+
+def is_inline_reply_slash(message: str) -> bool:
+    text = (message or "").strip()
+    command = text.split(None, 1)[0] if text else ""
+    return command in INLINE_REPLY_SLASH_COMMANDS
 
 
 # The platform update command is refused for glasses sessions (P19). Running
@@ -228,6 +243,20 @@ class DispatchRecord:
     # burst semantics); resolved (terminal activity only) when the carrier
     # completes.
     riders: List["DispatchRecord"] = field(default_factory=list)
+    # A busy slash Hermes may answer or refuse inline, or queue as a turn.
+    # Its reply send carries THIS record in the delivery context and closes it
+    # (complete_inline_slash); it never belongs to the running head.
+    inline_reply: bool = False
+    # A turn a session viewer typed into this chat (Hermes Desktop or the
+    # TUI, 0.22.3+), opened by pre_llm_call rather than a dispatch. It is not
+    # a phone turn, so it never feeds the first-run phone-turn candidate. The
+    # turn Hermes starts to hand a background helper's results back opens the
+    # same way (adapter `_begin_helper_result_turn`).
+    viewer_turn: bool = False
+    # Hermes has begun running this turn (its pre_llm_call fired). A promoted
+    # head that has not started cannot own a send yet: see
+    # DispatchLedger._late_send_before_promoted_head_locked.
+    started: bool = False
 
 
 class DispatchLedger:
@@ -345,6 +374,36 @@ class DispatchLedger:
                 )
             return record
 
+    def begin_viewer_turn(
+        self, *, session_key: str, run_id: str, public_key: str
+    ) -> Optional[DispatchRecord]:
+        """Open the active record for a turn a session viewer typed.
+
+        Hermes runs a Desktop or TUI prompt on this chat as its own turn, so
+        it only ever starts on an idle session. Returns None, and opens
+        nothing, when a record is already open: that turn owns the sends.
+        """
+        with self._lock:
+            fifo = self._sessions.get(session_key, [])
+            if any(r.state in (STATE_ACTIVE, STATE_PENDING) for r in fifo):
+                return None
+            now = self._now()
+            self._last_ended.pop(session_key, None)
+            self._epoch += 1
+            record = DispatchRecord(
+                run_id=run_id,
+                session_key=session_key,
+                public_key=public_key,
+                kind=KIND_TURN,
+                state=STATE_ACTIVE,
+                epoch=self._epoch,
+                created_at=now,
+                last_activity_at=now,
+                viewer_turn=True,
+            )
+            self._sessions.setdefault(session_key, []).append(record)
+            return record
+
     # -- event correlation ---------------------------------------------------
 
     def head(self, session_key: str) -> Optional[DispatchRecord]:
@@ -362,6 +421,9 @@ class DispatchLedger:
         committed message rather than opening a stream.
         """
         with self._lock:
+            late = self._late_send_before_promoted_head_locked(session_key)
+            if late is not None:
+                return late, None, True
             record = self._activity_head_locked(session_key)
             if record is None:
                 ended = self._last_ended.get(session_key)
@@ -510,6 +572,31 @@ class DispatchLedger:
             if head is None or head.kind != KIND_SLASH:
                 return None, [], None
             return self._complete_head_locked(session_key)
+
+    def complete_inline_slash(
+        self, session_key: str, record: DispatchRecord
+    ) -> Tuple[bool, Optional[DispatchRecord]]:
+        """Close an inline-reply slash record on its reply (#5150).
+
+        Returns ``(closed, promoted)``. A record still pending behind the
+        running head simply leaves the FIFO: it was never a turn, so the head
+        and its order are untouched. One that became the head (a Hermes that
+        queued the command after all) completes as the head does, promoting
+        the next pending record. ``closed`` is False once the record has left
+        the ledger (its reply already closed it, or the janitor did): a later
+        send from the same context is then its own uncorrelated message.
+        """
+        with self._lock:
+            fifo = self._sessions.get(session_key, [])
+            if record not in fifo:
+                return False, None
+            if self._head_locked(session_key) is record:
+                _head, _riders, promoted = self._complete_head_locked(session_key)
+                return True, promoted
+            fifo.remove(record)
+            if not fifo:
+                self._sessions.pop(session_key, None)
+            return True, None
 
     def sweep_stale(
         self,
@@ -666,6 +753,46 @@ class DispatchLedger:
             if record.state == STATE_ACTIVE:
                 return record
         return None
+
+    def _late_send_before_promoted_head_locked(
+        self, session_key: str
+    ) -> Optional[DispatchRecord]:
+        """The ended turn that still owes its sole final send, or None.
+
+        Hermes can run on_session_end before that send, and ending the turn
+        promotes the next queued one. A send arriving then is still the ended
+        turn's reply as long as the promoted turn has not started (Hermes
+        only dequeues it after the send) and nothing was sent yet on either
+        side. Without this, a Desktop turn's reply landed under the glasses
+        turn queued behind it, and the glasses reply under no turn at all.
+        """
+        ended = self._last_ended.get(session_key)
+        head = self._head_locked(session_key)
+        if ended is None or head is None:
+            return None
+        ended_record, ended_at = ended
+        if (
+            ended_record is head
+            or head.started
+            or head.current_message_id is not None
+            or head.stream_chunks
+            or ended_record.current_message_id is not None
+            or self._now() - ended_at > self._ended_run_send_grace
+        ):
+            return None
+        self._last_ended.pop(session_key, None)
+        return ended_record
+
+    def note_turn_started(self, session_key: str) -> None:
+        """Hermes began running the active turn (pre_llm_call).
+
+        From here every send is that turn's own, so an ended turn's late-send
+        claim no longer applies to the promoted head.
+        """
+        with self._lock:
+            head = self._head_locked(session_key)
+            if head is not None:
+                head.started = True
 
     def _activity_head_locked(self, session_key: str) -> Optional[DispatchRecord]:
         head = self._head_locked(session_key)
@@ -929,6 +1056,77 @@ def uncorrelated_message_event(
     if message_id:
         event["id"] = str(message_id)
     return event
+
+
+# The label the adopted-lane mirror (#2513) already gives a Desktop row, so a
+# viewer's prompt reads "• Desktop: …" on the glasses either way.
+VIEWER_PROMPT_AUTHOR = "Desktop"
+VIEWER_PROMPT_ORIGIN = "desktop"
+
+
+def viewer_prompt_message_event(
+    session_identity: Dict[str, Any],
+    text: str,
+    *,
+    message_id: str,
+) -> Dict[str, Any]:
+    """The prompt of a turn a session viewer typed into this chat.
+
+    Hermes Desktop and the TUI submit straight to the session (0.22.3+), so
+    the relay never saw the prompt go out and the reply would land under
+    nothing. The row carries no runId: on the consumer, a commit with a runId
+    is a turn boundary. It carries an id for the same reason every other
+    conversation entry does (#1691).
+    """
+    return {
+        "sessionIdentity": dict(session_identity),
+        "role": "user",
+        "author": VIEWER_PROMPT_AUTHOR,
+        "origin": VIEWER_PROMPT_ORIGIN,
+        "content": [{"type": "text", "text": text}],
+        "id": str(message_id),
+    }
+
+
+def plugin_message_event(
+    session_identity: Dict[str, Any],
+    text: str,
+    *,
+    message_id: str,
+) -> Dict[str, Any]:
+    """A Hermes plugin's ``post_message``: an uncorrelated message, flagged.
+
+    ``pluginMessage`` tells the app it is not the reply of the turn it lands
+    in. A tool's status line usually arrives before the turn streams a word,
+    and the app would otherwise reveal it as the reply and end the turn.
+    """
+    event = uncorrelated_message_event(session_identity, text, message_id=message_id)
+    event["pluginMessage"] = True
+    return event
+
+
+def message_edit_event(
+    session_identity: Dict[str, Any],
+    text: str,
+    *,
+    message_id: str,
+) -> Dict[str, Any]:
+    """New text for a message this adapter already delivered, in place.
+
+    A Hermes plugin's ``handle.edit`` on the message its ``post_message`` sent.
+    It rides the ``message`` event with ``edit:true`` for the reason a retag
+    does: the bridge event names are frozen. It carries no ``originAtMs``, so
+    the message keeps its place. A consumer that no longer holds the message
+    (the session was reloaded since) shows the text as a new message.
+    """
+    return {
+        "edit": True,
+        "pluginMessage": True,
+        "sessionIdentity": dict(session_identity),
+        "role": "assistant",
+        "id": str(message_id),
+        "content": [{"type": "text", "text": text}],
+    }
 
 
 def status_activity(

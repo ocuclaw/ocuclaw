@@ -1,4 +1,4 @@
-const verifiedPluginHotReloadVersions = new Set(["2026.5.3-1", "2026.7.1", "2026.7.1-2", "2026.9.4"]);
+const verifiedPluginHotReloadVersions = new Set(["2026.5.3-1", "2026.7.1", "2026.7.1-2", "2026.9.4", "2026.9.5"]);
 
 function planOptionalSetupActivation(config     , hostVersion     ) {
   const raw = config?.gateway?.reload?.mode;

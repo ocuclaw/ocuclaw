@@ -107,6 +107,30 @@ LEG_NAMES = (
     LEG_TAILNET_ROUTE,
     LEG_PHONE_APP,
 )
+#: The user's own private route (#5209). With `phoneAddress` set, this leg
+#: takes the route slot instead of `tailnetRoute`: still exactly four legs, the
+#: same leg key set, and a Tailscale host's snapshot is unchanged byte for byte.
+LEG_CUSTOM_ROUTE = "customRoute"
+CUSTOM_LEG_NAMES = (
+    LEG_HERMES_GATEWAY,
+    LEG_OCUCLAW_RELAY,
+    LEG_CUSTOM_ROUTE,
+    LEG_PHONE_APP,
+)
+ROUTE_LEG_NAMES = (LEG_TAILNET_ROUTE, LEG_CUSTOM_ROUTE)
+CUSTOM_ROUTE_CLASSIFICATIONS = ("ready", "unverified", "wrong", "unknown")
+
+
+def route_leg(legs: Any) -> Tuple[str, Dict[str, Any]]:
+    """The route leg of a snapshot's legs, whichever route this host uses.
+
+    Returns ``(name, leg)``; ``tailnetRoute`` and an empty leg when neither
+    is present, so a caller written for the Tailscale route keeps working.
+    """
+    if isinstance(legs, Mapping) and isinstance(legs.get(LEG_CUSTOM_ROUTE), dict):
+        return LEG_CUSTOM_ROUTE, legs[LEG_CUSTOM_ROUTE]
+    leg = legs.get(LEG_TAILNET_ROUTE) if isinstance(legs, Mapping) else None
+    return LEG_TAILNET_ROUTE, leg if isinstance(leg, dict) else {}
 
 # -- source-specific freshness (#1273 §4) -------------------------------------
 
@@ -127,6 +151,8 @@ EVIDENCE_GATEWAY_RECEIPT = "hermes-gateway-receipt"
 EVIDENCE_APP_PRESENCE = "ocuclaw-app-presence"
 EVIDENCE_TAILNET_SERVE = "tailnet-serve"
 EVIDENCE_TAILNET_PROBE = "tailnet-probe"
+EVIDENCE_CUSTOM_ROUTE_CONFIG = "custom-route-config"
+EVIDENCE_CUSTOM_ROUTE_PROBE = "custom-route-probe"
 EVIDENCE_FIRST_RUN_PROOF = "ocuclaw-first-run-proof"
 EVIDENCE_HERMES_SOURCE_STATE = "hermes-source-state"
 EVIDENCE_HERMES_SOURCE_CERTIFIED = "hermes-source-certified"
@@ -184,6 +210,9 @@ FACTS_KEYS_V1: Tuple[str, ...] = (
     "hermesPackageVersion",
     "hermesSource",  # provenance receipt; producer renders its three-state label
     "hermesVersionSupported",  # True | False | None
+    # True | False | None: newer than the tested range. A warning, never a
+    # block: only ``hermesVersionSupported`` False makes setup "unsupported".
+    "hermesVersionUntested",
     "supportedHermesRange",
     # -- durable Hermes Setup State --------------------------------------
     "configReadable",  # bool
@@ -195,6 +224,17 @@ FACTS_KEYS_V1: Tuple[str, ...] = (
     "continueHereConfigured",  # bool: allow_admin_from lists the wearer id (#2509)
     "streamingConfigured",  # bool: display.platforms.ocuclaw.streaming reads true
     "streamingExplicitlyOff",  # bool: the same key reads false (an operator's choice)
+    # Live reasoning: plugins.stream_reasoning_deltas as written (True |
+    # False | None when unset or unreadable); whether this Hermes has the
+    # reasoning-delta hooks (True | False | None when the plugin never
+    # probed in this process); and whether THIS gateway registered them
+    # (True | False | None when this process is not the gateway).
+    "liveReasoningSetting",
+    "liveReasoningHooksAvailable",
+    "liveReasoningHooksRegistered",
+    # bool: platforms.ocuclaw.extra.sharedChats is on and config.yaml saves no
+    # display.busy_input_mode, so a mid-reply message cuts that reply off.
+    "sharedChatsQueueOwed",
     # -- agent choice (#2515) ---------------------------------------------
     # The raw, non-secret posture behind the phone's "+" button. Both are
     # read from config.yaml only — never from the process environment — so a
@@ -256,6 +296,17 @@ FACTS_KEYS_V1: Tuple[str, ...] = (
     # DNS cannot resolve its own MagicDNS name, so doctor's probe never leaves
     # the host. That is a local fault, never a verdict on the route.
     "serveFrontDoorUnresolved",  # bool: this run's probe could not resolve the node name
+    # -- leg 3, custom mode: the user's own private route (#5209) ---------
+    # `customPhoneAddress` is the configured `phoneAddress`, raw, or None
+    # when the host uses Tailscale. Like `serveNodeDnsName` it is route
+    # authority: it feeds the probe and the pairing address and reaches the
+    # derived document through no path at all. Its presence alone switches
+    # the route leg to `customRoute`.
+    "customPhoneAddress",  # raw configured value, or None (Tailscale mode)
+    "customRouteReason",  # custom_route reason code, or None when nothing checked
+    "customRouteObservedAt",  # stamp of the config-only checks (canonical, Cloudways)
+    "customRouteProbedAt",  # doctor's bounded network pass, or None when never probed
+    "customRouteApplicationReady",  # yes | no | unknown — loopback credentialed verifier
     # -- durable Hermes First-Run Proof ----------------------------------
     # The completion journey that WRITES this record is #1322; v1 carries the
     # key set now so the schema does not move when the writer lands.
@@ -295,10 +346,18 @@ PROFILE_KEY_SET_V1 = frozenset({"name", "hermesHomeFingerprint"})
 PRODUCER_KEY_SET_V1 = frozenset(
     {"ocuclawVersion", "hermesRelease", "hermesPackageVersion", "hermesSource"}
 )
+# ``hermesVersionUntested`` joined this set inside v1. #1273 §12 moves
+# ``contractVersion`` for a renamed or removed field, a changed type, a new
+# health state or changed semantics; an added optional key is none of those,
+# and every reader of the document ignores a key it does not know (the CLI and
+# dashboard read by name, the Node bug-report lane checks only ``contract``
+# and ``contractVersion``, debug triage keeps the document as a nested map).
+# A move to 2 would instead make that Node lane drop the snapshot.
 SETUP_KEY_SET_V1 = frozenset(
     {
         "state",
         "hermesVersionSupported",
+        "hermesVersionUntested",
         "supportedHermesRange",
         "hermesCliOnPath",
         "pluginEnabled",
@@ -358,6 +417,9 @@ _LEG_KEY_SETS = {
     LEG_TAILNET_ROUTE: TAILNET_LEG_KEY_SET_V1,
     LEG_PHONE_APP: PHONE_LEG_KEY_SET_V1,
 }
+#: The custom route leg carries the tailnet leg's key set exactly, so a
+#: presenter reads both the same way.
+CUSTOM_ROUTE_LEG_KEY_SET_V1 = TAILNET_LEG_KEY_SET_V1
 
 # -- finding catalogue --------------------------------------------------------
 #
@@ -429,6 +491,51 @@ _FINDINGS: Dict[str, Tuple[str, str, str, Optional[str]]] = {
         "at once.",
         "enable_ocuclaw_streaming",
     ),
+    # Live reasoning (plugins.stream_reasoning_deltas). A WARNING, not an
+    # error: reasoning still arrives, but only once each model call ends, so
+    # the status bar says "Thinking..." through the whole stretch. Only on a
+    # host whose Hermes HAS the reasoning-delta hooks; elsewhere the key would
+    # sit inert. Setup's defaults-only write turns an unset key on.
+    "live_reasoning_not_configured": (
+        "setup",
+        "warning",
+        "Live reasoning is unset: plugins.stream_reasoning_deltas does not "
+        "read true. The glasses status bar will say \"Thinking...\" until "
+        "each model call ends instead of naming each reasoning step as it "
+        "arrives.",
+        "enable_live_reasoning",
+    ),
+    # ADVISORY: an operator set the key to false on purpose. Never flipped
+    # back automatically; the finding only explains the "Thinking..." bar.
+    "live_reasoning_turned_off": (
+        "setup",
+        "info",
+        "Live reasoning is turned off: plugins.stream_reasoning_deltas reads "
+        "false. The glasses status bar will say \"Thinking...\" until each "
+        "model call ends.",
+        "enable_live_reasoning",
+    ),
+    # Hermes reads the key once, when it builds the plugin hook set, so a
+    # key written after the gateway started is inert until a restart.
+    "live_reasoning_restart_owed": (
+        "setup",
+        "warning",
+        "Live reasoning is saved but not running: "
+        "plugins.stream_reasoning_deltas reads true, but this gateway "
+        "started before it was set, so its reasoning-delta hooks are not "
+        "registered.",
+        "restart_hermes_gateway",
+    ),
+    # A WARNING, not an error: both replies still arrive, but a message sent
+    # from one side while the other side's reply is coming cuts it short.
+    # Shared chats is turned on by hand, usually after setup ran.
+    "shared_chats_busy_mode_unset": (
+        "setup",
+        "warning",
+        "Shared chats are on, but display.busy_input_mode is unset, so a "
+        "message sent while a reply is still coming cuts that reply off.",
+        "queue_shared_chat_messages",
+    ),
     "node_unavailable": (
         "setup",
         "error",
@@ -451,9 +558,9 @@ _FINDINGS: Dict[str, Tuple[str, str, str, Optional[str]]] = {
         "setup",
         "error",
         "This Hermes host is outside the supported OcuClaw contract. "
-        "Use Hermes 0.21.x (recommended release v2026.9.24 / engine 0.21.5), "
+        "Use Hermes 0.21.4 or newer (recommended release v0.23.2 / engine 0.23.2), "
         "then restart and run hermes ocuclaw doctor --json. "
-        "Do not force-load this bundle on older or 0.22+ engines.",
+        "Do not force-load this bundle on older engines.",
         "install_supported_hermes",
     ),
     "profile_unresolved": (
@@ -518,6 +625,74 @@ _FINDINGS: Dict[str, Tuple[str, str, str, Optional[str]]] = {
         "not be probed from here.",
         "fix_host_dns",
     ),
+    # -- custom private route (#5209). Summaries name no address. --------
+    "custom_route_address_invalid": (
+        LEG_CUSTOM_ROUTE,
+        "error",
+        "The configured phone address is not a valid wss://name:port address.",
+        "fix_phone_address",
+    ),
+    "custom_route_cloudways_host": (
+        LEG_CUSTOM_ROUTE,
+        "error",
+        "A custom phone address is not supported on Cloudways, which uses its "
+        "own Tailscale route.",
+        "clear_phone_address",
+    ),
+    "custom_route_relay_not_listening": (
+        LEG_CUSTOM_ROUTE,
+        "error",
+        "The OcuClaw relay did not answer on loopback, so the phone address "
+        "has nothing behind it.",
+        "restart_hermes_gateway",
+    ),
+    "custom_route_name_unresolved": (
+        LEG_CUSTOM_ROUTE,
+        "warning",
+        "This host cannot resolve the phone address, so the route is "
+        "unverified. Pairing can still work if the phone resolves it.",
+        "check_phone_route",
+    ),
+    "custom_route_address_not_private": (
+        LEG_CUSTOM_ROUTE,
+        "error",
+        "The phone address resolves to an address outside the private ranges. "
+        "OcuClaw pairs only over a private network.",
+        "use_private_phone_address",
+    ),
+    "custom_route_unreachable": (
+        LEG_CUSTOM_ROUTE,
+        "warning",
+        "This host could not connect to its own phone address, so the route "
+        "is unverified. Pairing can still work if the phone reaches it.",
+        "check_phone_route",
+    ),
+    "custom_route_tls_failed": (
+        LEG_CUSTOM_ROUTE,
+        "error",
+        "The phone address did not present a certificate that passes default "
+        "checks, so the phone will refuse it too.",
+        "fix_phone_route_certificate",
+    ),
+    "custom_route_probe_mismatch": (
+        LEG_CUSTOM_ROUTE,
+        "error",
+        "The phone address answered, but not with this host's OcuClaw relay.",
+        "fix_phone_route_forwarding",
+    ),
+    "custom_route_probe_no_answer": (
+        LEG_CUSTOM_ROUTE,
+        "warning",
+        "The phone address completed TLS but the route probe got no answer "
+        "in time, so the route is unverified.",
+        "check_phone_route",
+    ),
+    "custom_route_relay_credential_rejected": (
+        LEG_CUSTOM_ROUTE,
+        "error",
+        "The relay on loopback rejected this host's Relay Credential.",
+        "run_setup_assistant",
+    ),
     "ocuclaw_shadow_plugin_copy": (
         LEG_OCUCLAW_RELAY,
         "error",
@@ -560,7 +735,7 @@ _FINDINGS: Dict[str, Tuple[str, str, str, Optional[str]]] = {
 
 _TOKEN_RE = re.compile(r"[^A-Za-z0-9._+\-]")
 # A version RANGE legitimately carries comparison operators and a comma; a
-# separate, still-bounded allowlist keeps ">=0.21.1,<0.22.0" readable without
+# separate, still-bounded allowlist keeps ">=0.21.4,<0.24.0" readable without
 # widening the charset that producer/profile identity strings pass through.
 _RANGE_RE = re.compile(r"[^A-Za-z0-9._+\-<>=!~^,* ]")
 _TOKEN_MAX_CHARS = 40
@@ -688,6 +863,7 @@ def blank_facts(**overrides: Any) -> Dict[str, Any]:
         "hermesPackageVersion": None,
         "hermesSource": None,
         "hermesVersionSupported": None,
+        "hermesVersionUntested": None,
         "supportedHermesRange": None,
         "configReadable": False,
         "platformExplicitlyDisabled": False,
@@ -698,6 +874,10 @@ def blank_facts(**overrides: Any) -> Dict[str, Any]:
         "continueHereConfigured": False,
         "streamingConfigured": False,
         "streamingExplicitlyOff": False,
+        "liveReasoningSetting": None,
+        "liveReasoningHooksAvailable": None,
+        "liveReasoningHooksRegistered": None,
+        "sharedChatsQueueOwed": False,
         "multiplexProfiles": None,
         "agentMode": None,
         "secretsPresent": {},
@@ -728,6 +908,11 @@ def blank_facts(**overrides: Any) -> Dict[str, Any]:
         "serveTlsCertAvailable": TRISTATE_UNKNOWN,
         "serveFrontDoorTlsError": False,
         "serveFrontDoorUnresolved": False,
+        "customPhoneAddress": None,
+        "customRouteReason": None,
+        "customRouteObservedAt": None,
+        "customRouteProbedAt": None,
+        "customRouteApplicationReady": TRISTATE_UNKNOWN,
         "firstRunProofRecord": None,
         "firstRunProofStatus": "missing",
     }
@@ -771,9 +956,11 @@ def validate_snapshot_key_set(snapshot: Any) -> None:
     """Hold the frozen v1 JSON key set over a derived snapshot.
 
     Called on every derivation. A field cannot be added, renamed, or removed
-    without this failing — which is the point: #1273 §12 makes any such change
-    a ``contractVersion`` move, and a frozen key set is how that rule is
-    enforced rather than merely written down.
+    without this failing — which is the point: #1273 §12 makes a rename, a
+    removal, a type change or a semantic change a ``contractVersion`` move,
+    and a frozen key set is how that rule is enforced rather than merely
+    written down. An added optional key stays inside v1 only as a deliberate
+    edit to its key set, with the readers checked (see ``SETUP_KEY_SET_V1``).
     """
     _check_keys("<root>", snapshot, SNAPSHOT_KEY_SET_V1)
     _check_keys("profile", snapshot["profile"], PROFILE_KEY_SET_V1)
@@ -781,11 +968,19 @@ def validate_snapshot_key_set(snapshot: Any) -> None:
     _check_keys("setup", snapshot["setup"], SETUP_KEY_SET_V1)
     _check_keys("currentHealth", snapshot["currentHealth"], CURRENT_HEALTH_KEY_SET_V1)
     legs = snapshot["currentHealth"]["legs"]
-    if not isinstance(legs, dict) or set(legs) != set(LEG_NAMES):
+    if not isinstance(legs, dict) or set(legs) not in (
+        set(LEG_NAMES),
+        set(CUSTOM_LEG_NAMES),
+    ):
         raise SnapshotContractError(
-            "snapshot v1 must carry exactly the four legs " f"{list(LEG_NAMES)}"
+            "snapshot v1 must carry exactly the four legs "
+            f"{list(LEG_NAMES)} (or {list(CUSTOM_LEG_NAMES)} in custom route mode)"
         )
-    for name, key_set in _LEG_KEY_SETS.items():
+    key_sets = dict(_LEG_KEY_SETS)
+    if LEG_CUSTOM_ROUTE in legs:
+        del key_sets[LEG_TAILNET_ROUTE]
+        key_sets[LEG_CUSTOM_ROUTE] = CUSTOM_ROUTE_LEG_KEY_SET_V1
+    for name, key_set in key_sets.items():
         _check_keys(f"currentHealth.legs.{name}", legs[name], key_set)
     _check_keys("firstRunProof", snapshot["firstRunProof"], FIRST_RUN_PROOF_KEY_SET_V1)
     for index, finding in enumerate(snapshot["findings"]):
@@ -874,8 +1069,31 @@ def _derive_plugin_copies(facts: Mapping[str, Any], out: _Builder) -> None:
         out.finding("ocuclaw_running_version_mismatch", repair_parameters=parameters)
 
 
+def _derive_live_reasoning(facts: Mapping[str, Any], out: _Builder) -> None:
+    """At most one live-reasoning finding; silent whenever a fact is unknown.
+
+    Unset is worth a warning only where Hermes has the hooks (elsewhere the
+    key would sit inert). False is the operator's own choice: noted, never
+    flipped. True with hooks the running gateway did not register means it
+    started before the key was written; only a restart reads it.
+    """
+    if not facts["configReadable"]:
+        return
+    setting = facts["liveReasoningSetting"]
+    available = facts["liveReasoningHooksAvailable"]
+    if setting is False:
+        out.finding("live_reasoning_turned_off")
+    elif setting is True:
+        if available is True and facts["liveReasoningHooksRegistered"] is False:
+            out.finding("live_reasoning_restart_owed")
+    elif available is True:
+        out.finding("live_reasoning_not_configured")
+
+
 def _derive_setup(facts: Mapping[str, Any], out: _Builder) -> Dict[str, Any]:
     supported = facts["hermesVersionSupported"]
+    # Reported, never ranked: an untested newer Hermes leaves ``state`` alone.
+    untested = facts["hermesVersionUntested"]
     secrets = facts["secretsPresent"]
     secrets_present = {
         str(key): bool(value)
@@ -914,6 +1132,9 @@ def _derive_setup(facts: Mapping[str, Any], out: _Builder) -> Dict[str, Any]:
             if facts["streamingExplicitlyOff"]
             else "streaming_not_configured"
         )
+    _derive_live_reasoning(facts, out)
+    if facts["configReadable"] and facts["sharedChatsQueueOwed"] is True:
+        out.finding("shared_chats_busy_mode_unset")
     if node_required and not node_available:
         out.finding("node_unavailable")
     if not runtime_available:
@@ -942,6 +1163,7 @@ def _derive_setup(facts: Mapping[str, Any], out: _Builder) -> Dict[str, Any]:
     return {
         "state": state,
         "hermesVersionSupported": None if supported is None else bool(supported),
+        "hermesVersionUntested": None if untested is None else bool(untested),
         "supportedHermesRange": _sanitize_range(facts["supportedHermesRange"]),
         "hermesCliOnPath": bool(facts["hermesCliOnPath"]),
         "pluginEnabled": bool(facts["pluginEnabled"]),
@@ -1494,9 +1716,133 @@ def _derive_first_run_proof(
     }
 
 
+#: Reason code -> finding. `ok` and `not_checked` have none: one is a pass,
+#: the other is the absence of an answer.
+_CUSTOM_ROUTE_REASON_FINDINGS = {
+    "address_invalid": "custom_route_address_invalid",
+    "cloudways_host": "custom_route_cloudways_host",
+    "relay_not_listening": "custom_route_relay_not_listening",
+    "name_unresolved": "custom_route_name_unresolved",
+    "address_not_private": "custom_route_address_not_private",
+    "tcp_unreachable": "custom_route_unreachable",
+    "tls_failed": "custom_route_tls_failed",
+    "probe_mismatch": "custom_route_probe_mismatch",
+    "probe_no_answer": "custom_route_probe_no_answer",
+}
+#: The two config-only checks. Their answer comes from collection, carries no
+#: TTL, and is not this probe lane's to expire.
+_CUSTOM_ROUTE_STATIC_REASONS = frozenset({"address_invalid", "cloudways_host"})
+_CUSTOM_ROUTE_REASON_VERDICTS = {
+    "ok": "ready",
+    "address_invalid": "wrong",
+    "cloudways_host": "wrong",
+    "relay_not_listening": "wrong",
+    "name_unresolved": "unverified",
+    "address_not_private": "wrong",
+    "tcp_unreachable": "unverified",
+    "tls_failed": "wrong",
+    "probe_mismatch": "wrong",
+    "probe_no_answer": "unverified",
+}
+
+
+def custom_route_mode(facts: Mapping[str, Any]) -> bool:
+    """True when this host pairs over its own private route (#5209)."""
+    value = facts.get("customPhoneAddress")
+    return isinstance(value, str) and bool(value)
+
+
+def _derive_custom_route_leg(
+    facts: Mapping[str, Any], now: Optional[datetime], out: _Builder
+) -> Dict[str, Any]:
+    """Leg 3 in custom mode. ``ready`` only when every check passed.
+
+    The verdict is the custom route check's (``ready | unverified | wrong |
+    unknown``). ``unverified`` keeps the leg ``unknown`` with a warning,
+    never ``healthy``: the host could not reach its own address, so nothing
+    here proves the route works, but nothing proves it broken either.
+    """
+    reason = facts.get("customRouteReason")
+    reason = reason if reason in _CUSTOM_ROUTE_REASON_VERDICTS or reason == "not_checked" else None
+    observed_at = facts.get("customRouteObservedAt")
+    config_observed = isinstance(observed_at, str) and parse_timestamp(observed_at)
+    probed_at = facts.get("customRouteProbedAt")
+    probe_freshness = (
+        FRESHNESS_REJECTED
+        if probed_at is None
+        else _freshness(probed_at, now, ACTIVE_PROBE_TTL_S)
+    )
+    application_ready = _tristate(facts.get("customRouteApplicationReady"))
+    static = reason in _CUSTOM_ROUTE_STATIC_REASONS
+    if not static and probe_freshness != FRESHNESS_FRESH:
+        # Expired probe evidence stops supporting a claim about now.
+        reason = None
+        application_ready = TRISTATE_UNKNOWN
+    if not config_observed:
+        reason = None
+
+    classification = _CUSTOM_ROUTE_REASON_VERDICTS.get(str(reason), TRISTATE_UNKNOWN)
+    if not config_observed:
+        configured = TRISTATE_UNKNOWN
+    elif reason == "address_invalid":
+        configured = TRISTATE_NO
+    else:
+        configured = TRISTATE_YES
+    if reason == "ok":
+        reachable = TRISTATE_YES
+    elif reason in ("tls_failed", "probe_mismatch"):
+        # Something answered: reachable, but not as this relay's front door.
+        reachable = TRISTATE_YES
+    else:
+        reachable = TRISTATE_UNKNOWN
+
+    evidence_ids = [
+        out.evidence_entry(
+            EVIDENCE_CUSTOM_ROUTE_CONFIG,
+            "custom-route-config",
+            _valid_timestamp(observed_at),
+            FRESHNESS_FRESH if config_observed else FRESHNESS_REJECTED,
+            f"custom_route_{reason if static else ('configured' if config_observed else 'unknown')}",
+        )
+    ]
+    if probed_at is not None and not static:
+        evidence_ids.append(
+            out.evidence_entry(
+                EVIDENCE_CUSTOM_ROUTE_PROBE,
+                "custom-route-probe",
+                _valid_timestamp(probed_at),
+                probe_freshness,
+                f"custom_route_{reason or 'unknown'}",
+            )
+        )
+
+    finding = _CUSTOM_ROUTE_REASON_FINDINGS.get(str(reason))
+    if classification == "ready" and application_ready == TRISTATE_YES:
+        state = HEALTH_HEALTHY
+    elif classification == "wrong":
+        state = HEALTH_UNHEALTHY
+    elif application_ready == TRISTATE_NO:
+        state = HEALTH_UNHEALTHY
+        finding = finding or "custom_route_relay_credential_rejected"
+    else:
+        state = HEALTH_UNKNOWN
+    if finding is not None:
+        out.finding(finding, evidence_ids)
+
+    return {
+        "state": state,
+        "classification": classification,
+        "configured": configured,
+        "reachable": reachable,
+        "applicationReady": application_ready,
+        "evidenceIds": evidence_ids,
+    }
+
+
 def aggregate_health(leg_states: Mapping[str, str]) -> str:
     """Mechanical aggregate (#1273 §3). There is no ``degraded``."""
-    states = [leg_states[name] for name in LEG_NAMES]
+    names = CUSTOM_LEG_NAMES if LEG_CUSTOM_ROUTE in leg_states else LEG_NAMES
+    states = [leg_states[name] for name in names]
     if all(state == HEALTH_HEALTHY for state in states):
         return HEALTH_HEALTHY
     if any(state == HEALTH_UNHEALTHY for state in states):
@@ -1524,7 +1870,13 @@ def derive_snapshot(facts: Mapping[str, Any]) -> Dict[str, Any]:
     relay_leg = _derive_relay_leg(
         presence_record, presence_freshness, presence_ids, gateway_leg["state"], out
     )
-    tailnet_leg = _derive_tailnet_leg(facts, now, out)
+    custom_mode = custom_route_mode(facts)
+    if custom_mode:
+        route_name = LEG_CUSTOM_ROUTE
+        route_leg_value = _derive_custom_route_leg(facts, now, out)
+    else:
+        route_name = LEG_TAILNET_ROUTE
+        route_leg_value = _derive_tailnet_leg(facts, now, out)
     phone_leg = _derive_phone_leg(
         presence_record,
         presence_freshness,
@@ -1539,7 +1891,7 @@ def derive_snapshot(facts: Mapping[str, Any]) -> Dict[str, Any]:
     legs = {
         LEG_HERMES_GATEWAY: gateway_leg,
         LEG_OCUCLAW_RELAY: relay_leg,
-        LEG_TAILNET_ROUTE: tailnet_leg,
+        route_name: route_leg_value,
         LEG_PHONE_APP: phone_leg,
     }
     mode = (

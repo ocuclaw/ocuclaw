@@ -192,7 +192,7 @@ function createGlassesFeedbackLedger(deps = {}) {
     if (cls === "render_error") {
       const pending = pendingBySession.get(sessionKey) || [];
       const alreadyPending = pending.filter(
-        (e) => e.class === "render_error" && e.surfaceUuid === surfaceUuid,
+        (e     ) => e.class === "render_error" && e.surfaceUuid === surfaceUuid,
       ).length;
       if (alreadyPending >= FEEDBACK_RENDER_ERROR_CAP_PER_SURFACE) return false;
     }
@@ -316,4 +316,4 @@ function createGlassesFeedbackLedger(deps = {}) {
   return { record, buildInjection, previewInjection, ackInjection, pendingSessionCount };
 }
 
-module.exports = { createGlassesFeedbackLedger, DEFAULT_FEEDBACK_TTL_MS, FEEDBACK_MAX_ENTRIES_PER_INJECTION, FEEDBACK_PENDING_CAP_PER_SESSION, FEEDBACK_FRAGMENT_MAX_CHARS, FEEDBACK_FRAGMENT_MIN_CHARS, FEEDBACK_QUALIFYING_CLASSES, FEEDBACK_EXCLUDED_CLASSES, FEEDBACK_RECEIPT_REASONS, FEEDBACK_RENDER_ERROR_CODES, FEEDBACK_RENDER_ERROR_CAP_PER_SURFACE };
+module.exports = { DEFAULT_FEEDBACK_TTL_MS, FEEDBACK_MAX_ENTRIES_PER_INJECTION, FEEDBACK_PENDING_CAP_PER_SESSION, FEEDBACK_QUALIFYING_CLASSES, FEEDBACK_RENDER_ERROR_CODES, FEEDBACK_RENDER_ERROR_CAP_PER_SURFACE, FEEDBACK_EXCLUDED_CLASSES, FEEDBACK_RECEIPT_REASONS, FEEDBACK_FRAGMENT_MIN_CHARS, FEEDBACK_FRAGMENT_MAX_CHARS, createGlassesFeedbackLedger };

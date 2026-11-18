@@ -8,12 +8,12 @@ const REPLY_DELIVERY_MAX_RANGES = 64;
 const REPLY_DELIVERY_LANES = ["device", "simulator"];
 
 const RECEIPT_KEYS = ["type", "attemptId", "sessionKey", "runId", "entryId", "revision", "lane", "ranges"];
-const isId = (value) => typeof value === "string" && value.length > 0 && value.length <= 512;
-const isPositiveInt = (value) => Number.isSafeInteger(value) && value > 0;
+const isId = (value     ) => typeof value === "string" && value.length > 0 && value.length <= 512;
+const isPositiveInt = (value     ) => Number.isSafeInteger(value) && value > 0;
 
-const isRevision = (value) => Number.isSafeInteger(value) && value >= 0;
+const isRevision = (value     ) => Number.isSafeInteger(value) && value >= 0;
 
-function normalizeTarget(target) {
+function normalizeTarget(target     ) {
   if (!target || !isId(target.sessionKey) || !isId(target.runId) || !isId(target.entryId)) return null;
   if (!isRevision(target.revision) || !isPositiveInt(target.textLength)) return null;
   return {
@@ -25,7 +25,7 @@ function normalizeTarget(target) {
   };
 }
 
-function coveredChars(receipt, textLength) {
+function coveredChars(receipt     , textLength     ) {
   if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return null;
   const keys = Object.keys(receipt);
   if (keys.length !== RECEIPT_KEYS.length || !keys.every((key) => RECEIPT_KEYS.includes(key))) return null;
@@ -41,7 +41,7 @@ function coveredChars(receipt, textLength) {
 
   let covered = 0;
   let reach = 0;
-  for (const range of [...ranges].sort((a, b) => a.start - b.start)) {
+  for (const range of [...ranges].sort((a     , b     ) => a.start - b.start)) {
     const from = Math.max(range.start, reach);
     if (range.end > from) {
       covered += range.end - from;
@@ -57,13 +57,13 @@ function createReplyDelivery({
   maxPending = REPLY_DELIVERY_MAX_PENDING,
   deadlineMs = REPLY_DELIVERY_DEADLINE_MS,
   onSettle = null,
-} = {}) {
+}      = {}) {
 
   const pending = new Map();
   const settled = new Map();
-  const result = (status, reason, evidence = null) => ({ status, reason, evidence });
+  const result = (status     , reason     , evidence      = null) => ({ status, reason, evidence });
 
-  function settle(candidateKey, value) {
+  function settle(candidateKey     , value     ) {
     settled.delete(candidateKey);
     settled.set(candidateKey, value);
     while (settled.size > maxPending) settled.delete(settled.keys().next().value);
@@ -73,7 +73,7 @@ function createReplyDelivery({
     }
   }
 
-  function dropAttempt(attempt, reason) {
+  function dropAttempt(attempt     , reason     ) {
     pending.delete(attempt.attemptId);
     settle(attempt.candidateKey, result("unconfirmed", reason));
   }
@@ -86,14 +86,14 @@ function createReplyDelivery({
     }
   }
 
-  function attemptFor(candidateKey) {
+  function attemptFor(candidateKey     ) {
     for (const attempt of pending.values()) {
       if (attempt.candidateKey === candidateKey) return attempt;
     }
     return null;
   }
 
-  const probeOf = (attempt) => ({
+  const probeOf = (attempt     ) => ({
     type: REPLY_RENDER_PROBE_TYPE,
     attemptId: attempt.attemptId,
     sessionKey: attempt.target.sessionKey,
@@ -102,16 +102,16 @@ function createReplyDelivery({
     revision: attempt.target.revision,
   });
 
-  function sameTarget(a, b) {
+  function sameTarget(a     , b     ) {
     return a.sessionKey === b.sessionKey && a.runId === b.runId &&
       a.entryId === b.entryId && a.revision === b.revision;
   }
 
-  function observe(candidateKey, rawTarget, connections, startedAt = null) {
+  function observe(candidateKey     , rawTarget     , connections     , startedAt      = null) {
     expire();
     const done = settled.get(candidateKey);
     if (done && done.status === "sdk_accepted") return { status: done.status, reason: null };
-    const terminal = (status, reason) => {
+    const terminal = (status     , reason     ) => {
       const active = attemptFor(candidateKey);
       if (active) pending.delete(active.attemptId);
       settle(candidateKey, result(status, reason));
@@ -120,7 +120,7 @@ function createReplyDelivery({
     const target = normalizeTarget(rawTarget);
     if (!target) return terminal("unsupported", "target_identity_missing");
     const apps = (Array.isArray(connections) ? connections : [])
-      .filter((entry) => entry && entry.clientKind === "app" && isId(entry.clientId));
+      .filter((entry     ) => entry && entry.clientKind === "app" && isId(entry.clientId));
     if (apps.length === 0) return terminal("unconfirmed", "no_app_recipient");
     if (apps.length > 1) return terminal("unconfirmed", "ambiguous_recipient");
     if (apps[0].supportsReceipt !== true) return terminal("unsupported", "peer_lacks_contract");
@@ -138,14 +138,14 @@ function createReplyDelivery({
     return { status: "pending", reason: null, clientId: attempt.clientId, probe: probeOf(attempt), resend: true };
   }
 
-  function accept(connection, receipt) {
+  function accept(connection     , receipt     ) {
     const outcome = acceptPending(connection, receipt);
     expire();
     return outcome;
   }
 
-  function acceptPending(connection, receipt) {
-    const deny = (reason) => ({ ok: false, reason });
+  function acceptPending(connection     , receipt     ) {
+    const deny = (reason     ) => ({ ok: false, reason });
     if (!connection || connection.clientKind !== "app") return deny("not_app_client");
     const attemptId = receipt && typeof receipt === "object" ? receipt.attemptId : null;
     const attempt = isId(attemptId) ? pending.get(attemptId) : null;
@@ -171,7 +171,7 @@ function createReplyDelivery({
     return { ok: true, reason: null };
   }
 
-  function status(candidateKey) {
+  function status(candidateKey     ) {
     expire();
     if (attemptFor(candidateKey)) return result("pending", null);
     const done = settled.get(candidateKey);
@@ -179,13 +179,13 @@ function createReplyDelivery({
     return result(done.status, done.reason, done.evidence);
   }
 
-  function forgetClient(clientId) {
+  function forgetClient(clientId     ) {
     for (const attempt of [...pending.values()]) {
       if (attempt.clientId === clientId) dropAttempt(attempt, "recipient_disconnected");
     }
   }
 
-  function invalidate(candidateKey) {
+  function invalidate(candidateKey     ) {
     const active = attemptFor(candidateKey);
     if (active) pending.delete(active.attemptId);
     settled.delete(candidateKey);

@@ -13,6 +13,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import pairing
 from .pairing_completion import read_pairing_completion
 from .receipts import (
     ReceiptUnavailableError,
@@ -258,7 +259,11 @@ def read_activation_capability(home: Optional[Path] = None) -> Optional[Dict[str
         "runId",
         "expiresAtMs",
     }
-    if not isinstance(payload, dict) or set(payload) != required:
+    # The activation's phone-code decision is optional: an activation with an
+    # explicit wait records none.
+    if not isinstance(payload, dict) or set(payload) - {"phoneCode"} != required:
+        return None
+    if "phoneCode" in payload and payload["phoneCode"] not in PHONE_CODE_DECISIONS:
         return None
     if payload.get("v") != 1 or payload.get("surface") != "desktop":
         return None
@@ -520,16 +525,221 @@ def reconcile_pairing_plugin(
     return {"status": status, "path": str(target)}
 
 
+DESKTOP_ROUTE_PROBE_TIMEOUT_SECONDS = 3.0
+# The window's lines are the terminal's (#5223 keeps the one copy).
+PHONE_CODE_MISSING = pairing.PHONE_CODE_MISSING
+PHONE_CODE_PAIRING_TYPED = pairing.PHONE_CODE_PAIRING_TYPED
+PHONE_CODE_OUTAGE = pairing.PHONE_CODE_OUTAGE
+PHONE_CODE_SENT = pairing.PHONE_CODE_SENT
+# What a backend answers for a route nobody mounted
+# (hermes_cli/web_server_dashboard.py mount_spa). Desktop's backend is
+# headless, and its catch-all names no path; the probe below only ever asks
+# OcuClaw's own route, so that answer still speaks for OcuClaw's. A
+# `hermes dashboard` backend names the path.
+DESKTOP_UNMOUNTED_ROUTE_MARKERS = (
+    "Headless backend (hermes serve)",
+    "No such API endpoint: /api/plugins/ocuclaw/",
+)
+# The code stays desktop_relaunch_required for the SKILL's recovery table; the
+# person is sent to the card, whose "Restart gateway" restarts Desktop's
+# backend without closing the window. The card names the quit only when that
+# restart is unavailable.
+DESKTOP_RELAUNCH_REQUIRED_MESSAGE = (
+    "Hermes Desktop has not loaded OcuClaw's pairing panel yet: it was "
+    "already running when OcuClaw was installed. Click Restart gateway on "
+    "the OcuClaw card at the top right if that button is present. Otherwise "
+    "open Desktop's command palette (Ctrl+K on Linux/Windows, Cmd+K on macOS), "
+    "search Restart gateway, and select it there. Wait for OcuClaw ready, "
+    "then retry pairing. If the card asks you to quit and reopen Hermes "
+    "Desktop instead, do that. Nothing is wrong with the glasses or the phone."
+)
+
+
+def _desktop_custom_route() -> bool:
+    from . import custom_route, health
+
+    config, _ = health.setup_raw_config()
+    platforms = config.get("platforms")
+    platform = platforms.get("ocuclaw") if isinstance(platforms, dict) else None
+    extra = platform.get("extra") if isinstance(platform, dict) else None
+    return custom_route.configured_phone_address(extra) is not None
+
+
+# The terminal's waits (pairing.py), so both Hermes surfaces wait alike.
+PHONE_CODE_STATUS_TIMEOUT_SECONDS = pairing.PHONE_CODE_STATUS_TIMEOUT_SECONDS
+
+
+def phone_code_status(address: str, control_url: str, credential: str, opener: Any) -> Dict[str, Any]:
+    """Ask the relay before opening an exchange; older/unreachable relays are off."""
+    try:
+        status, body = pairing._post(
+            control_url, {"v": 1, "op": "phone-code-status", "address": address,
+                          "customRoute": _desktop_custom_route()},
+            credential=credential, opener=opener, timeout=PHONE_CODE_STATUS_TIMEOUT_SECONDS,
+        )
+    except pairing.ControlError:
+        return {"available": False, "reason": "off"}
+    if status != 200 or not isinstance(body, dict):
+        return {"available": False, "reason": "off"}
+    return body
+
+
+PHONE_CODE_CREATE_TIMEOUT_SECONDS = pairing.PHONE_CODE_CREATE_TIMEOUT_SECONDS
+
+# A phone code lives ten minutes. While one is in play the activation gives
+# the person most of that to type it in and pair, instead of the five-minute
+# exchange's 345 s.
+PHONE_CODE_WAIT_SECONDS = 600.0
+# Hermes cuts a tool call off at its tool deadline (420 s by default), and the
+# activation waits inside the setup tool's call: it ends this far before.
+TOOL_DEADLINE_MARGIN_SECONDS = 15.0
+
+
+def _host_tool_deadline_seconds() -> Optional[float]:
+    """Hermes's deadline for one tool call, in seconds; None when unbounded.
+
+    The same resolution Hermes's tool executor uses (``timeouts.tools.*`` in
+    config.yaml, then HERMES_CONCURRENT_TOOL_TIMEOUT_S, then 420 s). If it
+    cannot be read, the 420 s default is assumed.
+    """
+    try:
+        from agent.deadline import resolve_timeout
+
+        batch = resolve_timeout("tools.concurrent_batch", default=420.0,
+                                env_var="HERMES_CONCURRENT_TOOL_TIMEOUT_S")
+        return resolve_timeout("tools.sequential_call", default=batch)
+    except Exception:  # noqa: BLE001 - an older or absent Hermes: its default
+        return 420.0
+
+
+def _phone_code_wait_seconds() -> float:
+    """The activation's budget while a phone code is in play."""
+    wait = PHONE_CODE_WAIT_SECONDS
+    deadline = _host_tool_deadline_seconds()
+    if deadline is not None:
+        wait = min(wait, deadline - TOOL_DEADLINE_MARGIN_SECONDS)
+    return max(wait, PAIRING_WAIT_SECONDS)
+
+
+#: The activation's recorded answer to "does the relay offer a phone code?",
+#: which the window's claim reuses instead of asking again.
+PHONE_CODE_DECISIONS = ("available", "off", "custom_route", "unavailable")
+
+
+def _phone_code_decision(address: str, control_url: str) -> str:
+    """The relay's phone-code answer for this pairing, as one of
+    :data:`PHONE_CODE_DECISIONS`. Off when unsure."""
+    try:
+        credential = pairing._read_relay_credential()
+        if not credential:
+            return "off"
+        status = phone_code_status(address, control_url, credential, None)
+    except Exception:  # noqa: BLE001 - unsure means today's window
+        return "off"
+    if status.get("available") is True:
+        return "available"
+    reason = status.get("reason")
+    return reason if reason in ("custom_route", "unavailable") else "off"
+
+
+def create_desktop_exchange(activation: Dict[str, Any], credential: str, opener: Any,
+                            phone_code: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
+    """Open the exchange: with ``phone_code`` the relay seals it to that phone.
+
+    Without a code it opens manual pairing. The window draws no QR (#5486), so
+    the request asks for no QR colours.
+    """
+    body: Dict[str, Any] = {"v": 1, "op": "create", "address": activation["address"]}
+    if phone_code is None:
+        return pairing._post(str(activation["controlUrl"]), body, credential=credential, opener=opener)
+    if _desktop_custom_route():
+        body["customRoute"] = True
+    body["phoneCode"] = phone_code
+    return pairing._post(str(activation["controlUrl"]), body, credential=credential, opener=opener,
+                         timeout=PHONE_CODE_CREATE_TIMEOUT_SECONDS)
+
+
+def desktop_routes_missing(
+    timeout: float = DESKTOP_ROUTE_PROBE_TIMEOUT_SECONDS,
+) -> bool:
+    """True only when the running Desktop backend has not mounted OcuClaw's routes (#4047).
+
+    Hermes mounts plugin API routes once, when ``hermes serve`` starts, and a
+    Desktop install activates the plugin in that backend without restarting
+    it. Until that backend restarts, OcuClaw's own route falls through to the
+    backend's catch-all, a 404 carrying one of
+    ``DESKTOP_UNMOUNTED_ROUTE_MARKERS``. The pairing panel claims its ceremony through those routes, so waiting for
+    it would only time out. The backend is found through its host record, the
+    way Hermes's own ``notify_serve_backend`` finds it. Anything else (no
+    record, a Hermes without host records, another status, a timeout) is
+    False: this check never blocks a host it cannot read.
+    """
+
+    try:
+        import urllib.error
+        import urllib.request
+
+        from gateway import host_rendezvous as hr
+    except Exception:  # noqa: BLE001 - Hermes before 0.21.5 has no host records
+        return False
+    try:
+        record = None
+        for role in (hr.ROLE_SERVE, getattr(hr, "ROLE_DESKTOP_SERVE", None)):
+            if role is None:
+                continue
+            candidate = hr.read_record(role)
+            if (
+                candidate is not None
+                and candidate.port
+                and hr.record_token_is_consistent(candidate)
+            ):
+                record = candidate
+                break
+        if record is None:
+            return False
+        request = urllib.request.Request(
+            f"http://{hr.dial_host(record)}:{record.port}/api/plugins/ocuclaw/setup-card",
+            headers={"X-Hermes-Session-Token": hr.read_token(record.role)},
+        )
+        # Loopback only: never route this through an HTTP(S)_PROXY.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=timeout):  # noqa: S310 - loopback http
+            return False
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            return False
+        try:
+            body = error.read(4096).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 - an unreadable body is not the catch-all
+            return False
+        missing = any(marker in body for marker in DESKTOP_UNMOUNTED_ROUTE_MARKERS)
+        if missing:
+            logger.info("[ocuclaw] Desktop backend has not mounted OcuClaw's routes")
+        else:
+            logger.debug("[ocuclaw] Desktop route probe: 404 that is not the catch-all: %.200s", body)
+        return missing
+    except Exception:  # noqa: BLE001 - unreachable or unknown: fail open
+        logger.debug("[ocuclaw] Desktop route probe failed", exc_info=True)
+        return False
+
+
 def run_desktop_pairing(
     address: str,
     *,
     control_url: str,
     home: Optional[Path] = None,
-    wait_seconds: float = PAIRING_WAIT_SECONDS,
+    wait_seconds: Optional[float] = None,
     receipt_wait_seconds: float = RECEIPT_WAIT_SECONDS,
     completion_reader: Callable[[], Any] = read_pairing_completion,
+    routes_missing: Callable[[], bool] = desktop_routes_missing,
+    phone_codes: Callable[[str, str], str] = _phone_code_decision,
 ) -> Dict[str, Any]:
-    """Activate the Desktop presenter and return its secret-free result."""
+    """Activate the Desktop presenter and return its secret-free result.
+
+    Without ``wait_seconds`` the activation waits today's 345 s, or, when the
+    relay offers a phone code, a longer typing budget (:data:`PHONE_CODE_WAIT_SECONDS`
+    within Hermes's tool deadline).
+    """
 
     resolved_home = Path(home) if home is not None else resolve_receipt_home()
     if resolved_home is None:
@@ -557,6 +767,22 @@ def run_desktop_pairing(
             "code": str(report.get("reason") or "desktop_plugin_unavailable"),
             "message": "The supported Hermes Desktop pairing presenter is unavailable.",
         }
+    if routes_missing():
+        return {
+            "ok": False,
+            "state": "refused",
+            "code": "desktop_relaunch_required",
+            "message": DESKTOP_RELAUNCH_REQUIRED_MESSAGE,
+        }
+    # The decision is recorded in the activation so the window's claim follows
+    # the same answer. A caller that names its wait records none, and its
+    # claim asks the relay itself, as before.
+    decision: Optional[str] = None
+    if wait_seconds is None:
+        decision = phone_codes(address, control_url)
+        if decision not in PHONE_CODE_DECISIONS:
+            decision = "off"
+        wait_seconds = _phone_code_wait_seconds() if decision == "available" else PAIRING_WAIT_SECONDS
 
     callback_token = secrets.token_urlsafe(32)
     claim_capability = secrets.token_urlsafe(32)
@@ -573,6 +799,8 @@ def run_desktop_pairing(
         "runId": run_id,
         "expiresAtMs": int((time.time() + wait_seconds) * 1000),
     }
+    if decision is not None:
+        activation["phoneCode"] = decision
     callback_state = _ActivationState(
         token=callback_token,
         run_id=run_id,

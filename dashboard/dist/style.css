@@ -15,11 +15,24 @@
 .oc-action,
 .oc-details,
 .oc-no-action,
+.oc-warning,
 .oc-error,
 .oc-loading {
   border: 1px solid var(--oc-border);
   border-radius: 14px;
   padding: 20px;
+}
+
+.oc-warning {
+  border-color: var(--oc-unknown);
+}
+
+.oc-warning strong {
+  color: var(--oc-unknown);
+}
+
+.oc-warning p {
+  margin: 6px 0 0;
 }
 
 .oc-header {

@@ -397,12 +397,15 @@ def verify_relay_credential(
     credential: str,
     timeout_s: float = 2.0,
     socks5: tuple[str, int] | None = None,
+    nc_argv: tuple[str, ...] | None = None,
 ) -> RelayVerifyOutcome:
     """Verify one credential once, with a wall-clock cap over DNS and I/O.
 
     With ``socks5`` (a userspace tailscaled's loopback proxy, #2980) the
     proxy resolves and reaches the tailnet name; the local resolver is never
     asked, because on such a host it does not know MagicDNS names.
+    ``nc_argv`` (an adopted daemon without a SOCKS listener, #6482) does the
+    same through ``tailscale nc``; TLS still runs here, on top of it.
     """
     started = time.monotonic()
     try:
@@ -427,6 +430,14 @@ def verify_relay_credential(
 
         def connect() -> socket.socket:
             return tailnet_dial.dial(hostname, port, deadline, socks5=proxy)
+
+    elif nc_argv:
+        if not use_tls:
+            return _outcome("protocol_error", started)
+        through = tuple(nc_argv)
+
+        def connect() -> socket.socket:
+            return tailnet_dial.dial(hostname, port, deadline, nc_argv=through)
 
     else:
         try:

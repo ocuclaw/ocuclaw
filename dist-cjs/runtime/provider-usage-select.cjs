@@ -1,3 +1,20 @@
+function normalizeProviderId(rawProvider         )         {
+  const normalized = String(rawProvider || "").trim().toLowerCase();
+  if (normalized === "z.ai" || normalized === "z-ai") {
+    return "zai";
+  }
+  if (normalized === "opencode-zen") {
+    return "opencode";
+  }
+  if (normalized === "qwen") {
+    return "qwen-portal";
+  }
+  if (normalized === "kimi-code") {
+    return "kimi-coding";
+  }
+  return normalized;
+}
+
 function normalizeWindowKey(label, index) {
   const normalized = typeof label === "string" ? label.trim().toLowerCase() : "";
 
@@ -73,7 +90,7 @@ function selectLimitingWindow(windows) {
 function selectProviderUsageSnapshot(summary, opts = {}) {
   const providers = Array.isArray(summary && summary.providers) ? summary.providers : [];
   const activeProvider =
-    typeof opts.provider === "string" ? opts.provider.trim().toLowerCase() : "";
+    typeof opts.provider === "string" ? normalizeProviderId(opts.provider) : "";
 
   if (!activeProvider) {
     return null;
@@ -84,12 +101,12 @@ function selectProviderUsageSnapshot(summary, opts = {}) {
   );
 
   let match = namedEntries.find(
-    (entry) => entry.provider.trim().toLowerCase() === activeProvider,
+    (entry) => normalizeProviderId(entry.provider) === activeProvider,
   );
 
   if (!match) {
     const familyMatches = namedEntries.filter((entry) =>
-      entry.provider.trim().toLowerCase().startsWith(`${activeProvider}-`),
+      normalizeProviderId(entry.provider).startsWith(`${activeProvider}-`),
     );
     if (familyMatches.length === 1) {
       match = familyMatches[0];
@@ -175,4 +192,4 @@ function buildRateLimitInfoFromSnapshot(snapshot) {
   };
 }
 
-module.exports = { selectProviderUsageSnapshot, buildRateLimitInfoFromSnapshot };
+module.exports = { normalizeProviderId, selectProviderUsageSnapshot, buildRateLimitInfoFromSnapshot };

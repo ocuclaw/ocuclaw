@@ -1,4 +1,4 @@
-function normalizeSonioxTemporaryKeyErrorCodeForRelay(err) {
+function normalizeSonioxTemporaryKeyErrorCodeForRelay(err     ) {
   const message =
     err && typeof err.message === "string" && err.message.trim()
       ? err.message.trim()
@@ -28,7 +28,7 @@ function normalizeSonioxTemporaryKeyErrorCodeForRelay(err) {
   return "soniox_temp_key_request_failed";
 }
 
-function normalizeSonioxTemporaryKeyErrorCodeForDownstream(err) {
+function normalizeSonioxTemporaryKeyErrorCodeForDownstream(err     ) {
   const message =
     err && typeof err.message === "string" && err.message.trim()
       ? err.message.trim()

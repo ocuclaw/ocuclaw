@@ -7,7 +7,7 @@ const { countLanes } = require("../domain/debug-retention.cjs");
 const WORKER_MARKER = "ocuclawDebugBundleWorker";
 const DEBUG_BUNDLE_SLICE_EVENTS = 2500;
 
-function buildReportBundle(input) {
+function buildReportBundle(input     ) {
   const relayEvents = input.relayEvents || [];
   const phoneEvents = input.phoneEvents || [];
   const opts = input.assemble || {};
@@ -30,6 +30,9 @@ function buildReportBundle(input) {
     captureState: opts.captureState,
     connectionHealthDocument: opts.connectionHealthDocument,
     clientDiagnostics: opts.clientDiagnostics,
+
+    reservedEvents: opts.reservedEvents,
+    extraFiles: opts.extraFiles,
     lanes: {
       relay: { status: "ok", automationExcluded: beforeExcludes.relay - afterExcludes.relay,
         duplicateCopies: afterExcludes.relay - afterDedupe.relay },
@@ -50,11 +53,11 @@ function yieldToLoop() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-function postSlice(worker, kind, rows) {
+function postSlice(worker     , kind     , rows     ) {
   try {
     worker.postMessage({ kind, rows });
   } catch {
-    worker.postMessage({ kind, rows: rows.map((row) => JSON.parse(JSON.stringify(row))) });
+    worker.postMessage({ kind, rows: rows.map((row     ) => JSON.parse(JSON.stringify(row))) });
   }
 }
 
@@ -64,31 +67,31 @@ function defaultWorkerFactory() {
   });
 }
 
-async function runReportAssembly(input, options = {}) {
+async function runReportAssembly(input     , options      = {}) {
   const sliceEvents = Math.max(1, Math.floor(options.sliceEvents || DEBUG_BUNDLE_SLICE_EVENTS));
   const factory = options.workerFactory || defaultWorkerFactory;
-  const inline = (reason) => {
+  const inline = (reason     ) => {
     if (options.logError) options.logError(`debug bundle worker unavailable (${reason}); assembling inline`);
     return { ...buildReportBundle(input), mode: "inline" };
   };
   let worker;
   try {
     worker = factory();
-  } catch (err) {
+  } catch (err     ) {
     return inline(err && err.message ? err.message : "spawn_failed");
   }
   let ready = false;
   let settled = false;
-  let resolveReady;
+  let resolveReady     ;
   const readyPromise = new Promise((resolve) => { resolveReady = resolve; });
   const outcome = new Promise((resolve, reject) => {
-    const finish = (fn, value) => {
+    const finish = (fn     , value     ) => {
       if (settled) return;
       settled = true;
       resolveReady(false);
       fn(value);
     };
-    worker.on("message", (message) => {
+    worker.on("message", (message     ) => {
       if (!message) return;
       if (message.kind === "ready") { ready = true; resolveReady(true); return; }
       if (message.kind === "result") {
@@ -100,14 +103,14 @@ async function runReportAssembly(input, options = {}) {
       }
       if (message.kind === "error") finish(reject, new Error(message.message || "worker_failed"));
     });
-    worker.on("error", (err) => finish(reject, err));
-    worker.on("exit", (code) => finish(reject, new Error(`debug bundle worker exited (${code})`)));
+    worker.on("error", (err     ) => finish(reject, err));
+    worker.on("exit", (code     ) => finish(reject, new Error(`debug bundle worker exited (${code})`)));
   });
 
   outcome.catch(() => {});
   try {
     if (!(await readyPromise) || !ready) {
-      try { await outcome; } catch (err) { return inline(err && err.message ? err.message : "load_failed"); }
+      try { await outcome; } catch (err     ) { return inline(err && err.message ? err.message : "load_failed"); }
     }
     const { relayEvents, phoneEvents, ...header } = input;
     worker.postMessage({ kind: "begin", header });
@@ -128,10 +131,10 @@ async function runReportAssembly(input, options = {}) {
 
 if (!isMainThread && parentPort && workerData && workerData[WORKER_MARKER] === true) {
   const port = parentPort;
-  let header = null;
-  const relayEvents = [];
-  const phoneEvents = [];
-  port.on("message", (message) => {
+  let header      = null;
+  const relayEvents      = [];
+  const phoneEvents      = [];
+  port.on("message", (message     ) => {
     try {
       if (!message) return;
       if (message.kind === "begin") { header = message.header; return; }
@@ -146,11 +149,11 @@ if (!isMainThread && parentPort && workerData && workerData[WORKER_MARKER] === t
           result: { ...rest, zipBuffer: zip.buffer, zipOffset: zip.byteOffset, zipLength: zip.byteLength },
         }, [zip.buffer]);
       }
-    } catch (err) {
+    } catch (err     ) {
       port.postMessage({ kind: "error", message: err && err.message ? err.message : String(err) });
     }
   });
   port.postMessage({ kind: "ready" });
 }
 
-module.exports = { buildReportBundle, runReportAssembly, DEBUG_BUNDLE_SLICE_EVENTS };
+module.exports = { DEBUG_BUNDLE_SLICE_EVENTS, buildReportBundle, runReportAssembly };

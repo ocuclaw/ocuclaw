@@ -369,4 +369,4 @@ const NOISE_NN_INITIATOR_MESSAGE_BYTES = DHLEN;
 
 const NOISE_NN_RESPONDER_MESSAGE_BYTES = DHLEN + TAGLEN;
 
-module.exports = { NOISE_NN_PROTOCOL_NAME, NOISE_NN_INITIATOR_MESSAGE_BYTES, NOISE_NN_RESPONDER_MESSAGE_BYTES, generateNoiseKeyPair, importNoiseKeyPairFromPrivateScalar, createNoiseNNHandshake };
+module.exports = { NOISE_NN_PROTOCOL_NAME, generateNoiseKeyPair, importNoiseKeyPairFromPrivateScalar, createNoiseNNHandshake, NOISE_NN_INITIATOR_MESSAGE_BYTES, NOISE_NN_RESPONDER_MESSAGE_BYTES };
